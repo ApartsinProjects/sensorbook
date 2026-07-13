@@ -17,17 +17,24 @@ BOOK_CONFIG.md                     Book identity + chapter map (generated from t
 CONFORMANCE_CHECKLIST.md           Structural/formatting requirements + pre-publish gate
 CROSS_REFERENCE_MAP.md             Progressive-depth concept cross-references
 index.html                         Generated table of contents
-styles/book.css                    Shared stylesheet (15-type callout system)
+book.json                          Book metadata (single source of truth)
+html2epub.toml                     EPUB build config
+styles/book.css, styles/pygments.css   Shared stylesheets (house style, from the series)
+scripts/book.js                    Client-side book chrome (nav, search)
 vendor/                            KaTeX + Prism (installed locally; see vendor/README.md)
+front-matter/, appendices/, capstone/  Non-chapter content
 images/                            Illustrations (raster PNG)
 scripts/scaffold.py                Parses the plan and materializes the tree
 scripts/book_structure.json        Machine-readable chapter/section map (generated)
-part-NN-slug/
+part-N-slug/
     index.html                     Part landing page
-    chapter-NN-slug/
+    module-NN-slug/                (directory says "module"; prose says "Chapter")
         index.html                 Chapter landing page (lists sections)
-        sections/                  section-N-M.html (written by the book-skills pipeline)
+        section-N.M.html           Section pages (written by the book-skills pipeline)
 ```
+
+Layout follows the series house convention (as in the Building Vision AI book), so the
+book-skills `part-*/module-*/section-*.html` globs work out of the box.
 
 ## Regenerating structure
 

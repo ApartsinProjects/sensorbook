@@ -21,7 +21,7 @@ The book is written to serve three readers at once, using an explicit layering s
 
 *Building Sensory AI* is about AI systems that perceive the physical world through the full spectrum of sensing, not just RGB cameras and microphones: inertial sensors, vibration, radar, lidar, depth, thermal, magnetic, pressure, tactile, RF/Wi-Fi, event cameras, biosignals, environmental sensors, and industrial telemetry, while also integrating cameras and audio when they help. The focus is the complete sensing chain: sensor physics, calibration, synchronization, uncertainty, edge constraints, data quality, representation learning, sensor fusion, deployment, safety, and trustworthy operation.
 
-The book fills the gap between signal processing, embedded systems, IoT, robotics perception, and machine learning. It treats sensors as measurement instruments with biases, noise, drift, and failure modes, not as clean arrays handed to a neural network. It is also the first textbook to integrate the 2023–2026 shift to **foundation models and self-supervised pretraining for sensor and time-series data**, and to **agentic, language-interfaced sensing**, alongside the durable classical foundations.
+The book fills the gap between signal processing, embedded systems, IoT, robotics perception, and machine learning. It treats sensors as measurement instruments with biases, noise, drift, and failure modes, not as clean arrays handed to a neural network. It is also the first textbook to integrate the 2023-2026 shift to **foundation models and self-supervised pretraining for sensor and time-series data**, and to **agentic, language-interfaced sensing**, alongside the durable classical foundations.
 
 ## Central Thesis
 
@@ -55,7 +55,7 @@ A consistent template lets all three audiences navigate:
 
 1. **Learning objectives and prerequisites** (with pointers back to earlier chapters/appendices).
 2. **Motivation and a real-world failure story** (why the naive approach breaks).
-3. **Core sections** (5–7), building from intuition to method to math.
+3. **Core sections** (5-7), building from intuition to method to math.
 4. **Frontier box** — the current SOTA models/methods and where the research is moving **[R]**.
 5. **Hands-on lab** — runnable, dataset-backed, with a starter repo.
 6. **Exercises** — conceptual, derivation, and coding, tagged by level.
@@ -95,16 +95,16 @@ Sensor physics and measurement models; signal conditioning; time-series represen
 Engineers and researchers who build AI systems connected to physical devices: IoT, wearables, robotics, autonomous systems, industrial monitoring, medical devices, environmental sensing, and cyber-physical systems, plus the students and instructors of the courses that train them.
 
 ## F4. How to Use This Book (reading paths)
-- **First course / undergraduate (one semester):** Parts I–IV, plus selected chapters from VI, VII/VIII, and XIII. Follow **[F]**/**[C]** sections.
-- **Graduate deep-learning-for-sensing:** Parts III–V, X, XIII; **[C]**/**[A]**/**[R]**.
+- **First course / undergraduate (one semester):** Parts I-IV, plus selected chapters from VI, VII/VIII, and XIII. Follow **[F]**/**[C]** sections.
+- **Graduate deep-learning-for-sensing:** Parts III-V, X, XIII; **[C]**/**[A]**/**[R]**.
 - **IoT / edge AI track:** Parts I, II, IV, VIII, XII, XIII.
 - **Robotics / autonomous systems track:** Parts I, III, IX, X, XI, XIII.
 - **Health / wearables track:** Parts I, II, IV, VII, XII (privacy), XIII.
-- **Industrial / cyber-physical track:** Parts I–III, VIII, XII, XIII.
+- **Industrial / cyber-physical track:** Parts I-III, VIII, XII, XIII.
 - **Researcher / frontier survey:** Part V end-to-end, plus every "Frontier" box and Chapter 71.
 
 ## F5. Notation, Prerequisites, and Self-Containment
-A single notation table; a "what you need and where to get it" map. Prerequisites (calculus, linear algebra, basic Python) are light; everything else (signals, probability, estimation, deep learning) is built in Part I and Appendices A–C. Basic electronics and DSP are helpful but introduced as needed.
+A single notation table; a "what you need and where to get it" map. Prerequisites (calculus, linear algebra, basic Python) are light; everything else (signals, probability, estimation, deep learning) is built in Part I and Appendices A-C. Basic electronics and DSP are helpful but introduced as needed.
 
 ---
 
@@ -119,7 +119,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 1.4 A taxonomy of modalities and task families
 1.5 From raw signal to decision: the sensing chain
 1.6 Sampling, latency, bandwidth, power, cost, and privacy as first-class constraints
-1.7 The 2023–2026 shift: from bespoke pipelines to foundation models and agentic sensing
+1.7 The 2023-2026 shift: from bespoke pipelines to foundation models and agentic sensing
 1.8 Book map: measure, clean, represent, infer, fuse, deploy
 **Lab 1:** survey a dozen sensor datasets; classify each by sampling rate, dimensionality, modality, task, noise source, label cost, and deployment constraint.
 
@@ -145,7 +145,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 
 ## Chapter 4. Probability, Estimation, and Uncertainty Primer  **[F]**
 4.1 Random variables, distributions, and moments for signals
-4.2 Estimators, bias–variance, and maximum likelihood
+4.2 Estimators, bias-variance, and maximum likelihood
 4.3 Bayesian inference and priors
 4.4 Aleatoric vs epistemic uncertainty (introduced early, used everywhere)
 4.5 Information, entropy, and mutual information
@@ -183,7 +183,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 7.1 DFT/FFT and spectral leakage
 7.2 Spectrograms and the STFT
 7.3 Wavelets and multiresolution analysis
-7.4 Empirical mode decomposition and the Hilbert–Huang transform
+7.4 Empirical mode decomposition and the Hilbert-Huang transform
 7.5 Cepstral and envelope analysis (bearings, machines)
 7.6 Power spectral density and coherence
 7.7 Choosing a representation for a modality
@@ -243,7 +243,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 12.5 Isolation Forest, LOF, one-class SVM
 12.6 Evaluation without complete labels (and the point-adjust trap)
 12.7 Alert fatigue and threshold economics
-**Lab 12:** build a telemetry anomaly detector; analyze precision–recall under different alert budgets and a leakage-safe protocol.
+**Lab 12:** build a telemetry anomaly detector; analyze precision-recall under different alert budgets and a leakage-safe protocol.
 
 ---
 
@@ -287,7 +287,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 16.3 Selective state spaces (Mamba)
 16.4 Time-series SSM variants (SiMBA, TimeMachine, Bi-Mamba)
 16.5 SSMs vs transformers: accuracy, latency, memory, on-device fit
-16.6 Hybrid SSM–attention architectures
+16.6 Hybrid SSM-attention architectures
 16.7 When to reach for an SSM
 **Lab 16:** benchmark a Mamba-style model vs a transformer on long-horizon sensor sequences (accuracy vs latency vs memory).
 
@@ -315,7 +315,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 
 # Part V · Foundation Models and Agentic Sensing  *(represent, infer)* — **the modern core**
 
-**Part goal:** teach the pretrain-once, adapt-anywhere paradigm that reshaped sensor and time-series AI in 2023–2026, and the language-interfaced, agentic layer on top of it.
+**Part goal:** teach the pretrain-once, adapt-anywhere paradigm that reshaped sensor and time-series AI in 2023-2026, and the language-interfaced, agentic layer on top of it.
 
 ## Chapter 19. Time-Series Foundation Models  **[R]**
 19.1 What makes a model a "foundation" model for time series
@@ -388,7 +388,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 25.2 Wi-Fi, Bluetooth, and UWB positioning
 25.3 Fingerprinting vs geometric methods
 25.4 Map matching
-25.5 GNSS–inertial fusion
+25.5 GNSS-inertial fusion
 25.6 Localization metrics
 25.7 Privacy and spoofing risks of location data
 **Lab 25:** fuse GNSS and inertial readings for a smoother, drift-corrected trajectory.
@@ -605,7 +605,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 45.1 Thermal radiation, emissivity, and calibration
 45.2 Human detection and monitoring
 45.3 Industrial thermal inspection
-45.4 RGB–thermal domain adaptation (D3T, causal multiplexing)
+45.4 RGB-thermal domain adaptation (D3T, causal multiplexing)
 45.5 Visible-to-thermal translation
 45.6 Privacy-preserving thermal perception
 45.7 Multispectral fusion
@@ -617,7 +617,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 46.3 Event-to-video and recurrent vision transformers (E2VID, RVT)
 46.4 Spiking neural networks
 46.5 Neuromorphic hardware (Loihi 2, Speck)
-46.6 Event–frame–IMU fusion
+46.6 Event-frame-IMU fusion
 46.7 Low-latency, low-power edge advantages and limits
 **Lab 46:** process an event-camera stream (DSEC/Prophesee) and build an event-based classifier or tracker.
 
@@ -671,7 +671,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 51.1 Neural radiance fields and signed distance fields
 51.2 3D Gaussian splatting basics
 51.3 Sensor re-simulation (lidar and camera) from reconstructed scenes
-51.4 Joint lidar–camera splatting (SplatAD)
+51.4 Joint lidar-camera splatting (SplatAD)
 51.5 Synthetic data generation for rare events
 51.6 Real-time reconstruction constraints
 51.7 Validation of synthetic-from-real pipelines
@@ -737,7 +737,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 57.1 Body-state sensing (encoders, force/torque, IMU)
 57.2 Exteroceptive fusion for navigation
 57.3 Detection and tracking in the perception stack
-57.4 Proprioception–exteroception fusion
+57.4 Proprioception-exteroception fusion
 57.5 Failure detection and recovery
 57.6 Latency and real-time constraints
 57.7 ROS 2 perception integration
@@ -766,7 +766,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 59.4 Quantization (int8, int4, and hardware-native 2/4-bit)
 59.5 Pruning and sparsity
 59.6 Hardware-aware NAS
-59.7 Edge–cloud partitioning and the deployment lifecycle
+59.7 Edge-cloud partitioning and the deployment lifecycle
 **Lab 59:** quantize and prune a sensor classifier for edge inference; measure latency/size/accuracy tradeoffs.
 
 ## Chapter 60. Streaming Inference and Online Learning  **[C][A]**
@@ -976,10 +976,10 @@ Unified symbol table and a glossary of sensing, signal-processing, estimation, a
 
 The full 14 parts are a two-semester or reference sequence. To build a leaner path, apply these merges and cuts (coverage is preserved by dropping to **[F]**/**[C]** sections and folding closely related chapters):
 
-- **Merge** Ch 23–24 (inertial sensing + orientation) into one lecture; Ch 9–11 (Kalman → nonlinear → factor graphs) into a two-lecture estimation block; Ch 40–41 (depth fundamentals + depth foundation models) into one.
-- **Treat as optional / frontier-survey only** (assign as reading, skip labs): Ch 16 (state-space models), Ch 46–47 (event/neuromorphic, RF/Wi-Fi), Ch 51 (neural fields/splatting), Ch 53 (world models), Ch 56–58 (tactile/embodied/VLA), Ch 62–63 (on-device continual, batteryless).
-- **Pick one domain chapter** from each application cluster rather than all: one of the biosignal chapters (29–33), one industrial chapter (36–38), one active-sensing chapter (42–47).
-- **Minimum viable "Sensory AI 101"** (7 weeks): Ch 1–5, 6+8, 9, 12, 13–15, 26, one biosignal or industrial chapter, 48, 59–60, 65, 70. Core Labs only.
+- **Merge** Ch 23-24 (inertial sensing + orientation) into one lecture; Ch 9-11 (Kalman → nonlinear → factor graphs) into a two-lecture estimation block; Ch 40-41 (depth fundamentals + depth foundation models) into one.
+- **Treat as optional / frontier-survey only** (assign as reading, skip labs): Ch 16 (state-space models), Ch 46-47 (event/neuromorphic, RF/Wi-Fi), Ch 51 (neural fields/splatting), Ch 53 (world models), Ch 56-58 (tactile/embodied/VLA), Ch 62-63 (on-device continual, batteryless).
+- **Pick one domain chapter** from each application cluster rather than all: one of the biosignal chapters (29-33), one industrial chapter (36-38), one active-sensing chapter (42-47).
+- **Minimum viable "Sensory AI 101"** (7 weeks): Ch 1-5, 6+8, 9, 12, 13-15, 26, one biosignal or industrial chapter, 48, 59-60, 65, 70. Core Labs only.
 
 ---
 

@@ -11,8 +11,8 @@
 - **Level tags**: [F] foundational, [C] core, [A] advanced, [R] research frontier (per chapter and section)
 
 ## Path Rules
-- Content layout: `part-NN-slug/chapter-NN-slug/sections/section-N-M.html`
-- Part landing: `part-NN-slug/index.html`  ·  Chapter landing: `part-NN-slug/chapter-NN-slug/index.html`
+- Content layout: `part-N-slug/module-NN-slug/section-N.M.html` (house convention, matching the Building Vision AI book; directories use `module-NN` so the book-skills `part-*/module-*/section-*.html` globs match, while prose uses Part > Chapter > Section)
+- Part landing: `part-N-slug/index.html`  ·  Chapter landing: `part-N-slug/module-NN-slug/index.html`  ·  Sections live directly in the module dir (no `sections/` subdir), named `section-<id>.html` with a dot (e.g. `section-1.1.html`), 2 levels below root (`../../` to root)
 - Shared stylesheet: `styles/book.css` (link with the correct relative depth; no inline `<style>` blocks except minimal page overrides)
 - Math via KaTeX (`vendor/katex/`); syntax highlighting via Prism (`vendor/prism/`)
 - Illustrations: `images/` (raster PNG, referenced from prose)

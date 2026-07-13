@@ -78,8 +78,8 @@ index past ~16 sections, the Workflow engine queues automatically; if the server
 
 Requires `GEMINI_API_KEY` and the `gemini-imagegen` skill. Targets 5–8 images for the
 chapter (1 opener, 1–2 mental-model, 1 system-as-ecosystem, 1–2 analogy, 1 failure-mode).
-Images land in `part-01-.../chapter-01-.../images/` (per the embed pack), referenced from
-sections as `../images/NAME.png`. If `GEMINI_API_KEY` is unset, mark the run **BLOCKED on
+Images land in `part-1-.../module-01-.../images/` (per the embed pack), referenced from
+sections as `images/NAME.png`. If `GEMINI_API_KEY` is unset, mark the run **BLOCKED on
 Illustrator raster generation** rather than claiming a full pass.
 
 ## Pre-publish gate (BLOCKING before any EPUB build)
@@ -95,10 +95,8 @@ python C:/Users/apart/.claude/skills/book-skills/scripts/detect_duplicates.py --
 Then run the `bibtest` skill on the extracted bibliography (section 1.8) to catch
 hallucinated or wrong-year citations.
 
-> Note: several book-skills fix/audit scripts default to a `part-*/module-*/section-*.html`
-> glob. Our layout is `part-*/chapter-*/sections/section-*.html`; pass an explicit
-> `--section-glob` where the script supports it, or the wave-edited files (which the packs
-> located via `section_index.json`) are still correct on disk regardless.
+> Our layout is `part-*/module-*/section-*.html` (the house convention), so the book-skills
+> fix/audit scripts' default globs match out of the box.
 
 ## Cost and wall-clock (agent execution, not human)
 
