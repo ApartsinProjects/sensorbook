@@ -304,7 +304,28 @@ def build(structure: dict) -> None:
     (ROOT / "scripts" / "book_structure.json").write_text(
         json.dumps(structure, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    write_section_index(structure)
     refresh_book_config(structure)
+
+
+def write_section_index(structure: dict) -> None:
+    """Emit scripts/section_index.json listing every section whose HTML file
+    exists on disk (the wave pipeline operates on written sections only).
+    Schema: [{sec, title, path}] with path relative to the book root."""
+    index = []
+    for part in structure["parts"]:
+        pdir = part_dir(part)
+        for chap in part["chapters"]:
+            cdir = chap_dir(chap)
+            for s in chap["sections"]:
+                fname = f"section-{s['id'].replace('.', '-')}.html"
+                rel = f"{pdir}/{cdir}/sections/{fname}"
+                if (ROOT / rel).exists():
+                    index.append({"sec": s["id"], "title": s["title"], "path": rel})
+    (ROOT / "scripts" / "section_index.json").write_text(
+        json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"section_index.json: {len(index)} written sections")
 
 
 def refresh_book_config(structure: dict) -> None:
