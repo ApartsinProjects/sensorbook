@@ -63,6 +63,16 @@ A consistent template lets all three audiences navigate:
 
 Running threads that recur across chapters: **leakage-safe evaluation**, **uncertainty and calibration**, **sensor failure modes**, **privacy and biometric ethics**, and **the classical-vs-foundation-model tradeoff**.
 
+## Scope, Levels, and Size Discipline
+
+The book is deliberately large because it is meant to be a *reference* as much as a course text. Three mechanisms keep that size from overwhelming any single reader:
+
+- **Level gating.** A one-semester course reads only **[F]**/**[C]** sections; **[A]** and **[R]** sections are self-contained and skippable. Roughly half the total section count is **[A]**/**[R]**.
+- **Tiered labs.** Not all 72 labs are equal. About **30 are "Core Labs"** (full, graded, dataset-backed, one per key competency) and the rest are lighter **"Mini-Labs"** (a focused exercise, ~1 hour). Instructors pick a lab spine; the Core Labs alone form a complete practical course.
+- **A shorter-course consolidation guide** (see the end of this plan) lists chapters that can be merged or skipped for a leaner path, so the same book supports a 7-week module and a two-semester sequence.
+
+The applications part (Part XIV) is written as integrative **"playbook" chapters** by design: they are intentionally shorter than the method chapters, reusing techniques already taught rather than introducing new ones.
+
 ## Running Tools and Datasets
 
 **Core stack:** Python, NumPy, SciPy, pandas, Polars, PyTorch, PyTorch Lightning, scikit-learn, statsmodels; time series: sktime, aeon, tsai, tslib, GluonTS, Nixtla; state estimation: filterpy, GTSAM; SSL/foundation models: HuggingFace, uni2ts (Moirai), granite-tsfm (IBM TTM), momentfm, mamba-ssm, Chronos/AutoGluon-TS; 3D/perception: Open3D, MMDetection3D, OpenPCDet, Pointcept, gsplat, nerfstudio; biosignals: NeuroKit2, MNE-Python, Braindecode, WFDB; radar/event: OpenRadar, Metavision/Tonic, snnTorch/Lava; robotics/sim: ROS 2, Isaac Sim/Lab, CARLA, MuJoCo; edge: ONNX Runtime, LiteRT/TF-Lite-Micro, ExecuTorch, microTVM, Edge Impulse; uncertainty/eval: MAPIE, TorchCP, Fortuna, TSInterpret, OpenOOD; ops: MLflow/W&B, Flower, Docker, FastAPI, River.
@@ -577,7 +587,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 43.3 BEV multi-sensor fusion (BEVFusion)
 43.4 3D semantic occupancy prediction (Occ3D, SurroundOcc, TPVFormer)
 43.5 Self-supervised and Gaussian occupancy (GaussianOcc)
-43.6 Occupancy world models
+43.6 Occupancy world models (developed further in Ch 53)
 43.7 Benchmarks and metrics
 **Lab 43:** train a BEV or occupancy model on an Occ3D benchmark subset; evaluate under a missing-sensor condition.
 
@@ -642,7 +652,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 49.2 Multi-sensor Kalman filtering
 49.3 Occupancy grids
 49.4 Data association (JPDA, MHT) and tracking
-49.5 Factor-graph fusion (GTSAM) revisited
+49.5 Factor-graph fusion (GTSAM), applying the estimator from Ch 11 to multi-sensor fusion
 49.6 Uncertainty propagation
 49.7 Consistency checks and fault detection
 **Lab 49:** fuse two noisy sensors with different error profiles; visualize posterior uncertainty and detect an injected fault.
@@ -826,7 +836,7 @@ A single notation table; a "what you need and where to get it" map. Prerequisite
 **Lab 65:** write an evaluation harness that reports standard metrics plus device/site/generalization breakdowns.
 
 ## Chapter 66. Distribution Shift, OOD, and Test-Time Adaptation  **[A][R]**
-66.1 Covariate, label, and concept shift in sensing
+66.1 Covariate, label, and concept shift in sensing (builds on the uncertainty tools of Ch 18)
 66.2 OOD and novelty detection
 66.3 Domain generalization for sensors (DIVERSIFY)
 66.4 Test-time training and adaptation (TENT, CoTTA)
@@ -959,6 +969,17 @@ Unified symbol table and a glossary of sensing, signal-processing, estimation, a
 | 12 | Fusion, world models, SLAM, digital twins | Cross-attention fusion / world model |
 | 13 | Edge, TinyML, streaming, federated | Quantized streaming inference |
 | 14 | Trust, safety, evaluation; capstone | Capstone demo |
+
+---
+
+# Consolidation Guide for Shorter Courses
+
+The full 14 parts are a two-semester or reference sequence. To build a leaner path, apply these merges and cuts (coverage is preserved by dropping to **[F]**/**[C]** sections and folding closely related chapters):
+
+- **Merge** Ch 23–24 (inertial sensing + orientation) into one lecture; Ch 9–11 (Kalman → nonlinear → factor graphs) into a two-lecture estimation block; Ch 40–41 (depth fundamentals + depth foundation models) into one.
+- **Treat as optional / frontier-survey only** (assign as reading, skip labs): Ch 16 (state-space models), Ch 46–47 (event/neuromorphic, RF/Wi-Fi), Ch 51 (neural fields/splatting), Ch 53 (world models), Ch 56–58 (tactile/embodied/VLA), Ch 62–63 (on-device continual, batteryless).
+- **Pick one domain chapter** from each application cluster rather than all: one of the biosignal chapters (29–33), one industrial chapter (36–38), one active-sensing chapter (42–47).
+- **Minimum viable "Sensory AI 101"** (7 weeks): Ch 1–5, 6+8, 9, 12, 13–15, 26, one biosignal or industrial chapter, 48, 59–60, 65, 70. Core Labs only.
 
 ---
 
