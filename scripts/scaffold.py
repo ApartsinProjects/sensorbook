@@ -210,6 +210,27 @@ ROOT_INDEX_FOOT = """</main>
 </html>
 """
 
+TOC_HEAD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Table of contents. Building Sensory AI.">
+    <title>Contents · Building Sensory AI</title>
+    <link rel="stylesheet" href="styles/book.css">
+</head>
+<body class="index-page">
+<header class="chapter-header">
+    <nav class="header-nav">
+        <a href="index.html" class="book-title-link">Building Sensory AI</a>
+    </nav>
+    <div class="part-label">Table of Contents</div>
+    <h1>Building Sensory AI</h1>
+    <p class="chapter-subtitle">Machine Perception of the Physical World</p>
+</header>
+<main class="content">
+"""
+
 
 def build(structure: dict) -> None:
     toc_parts = []
@@ -230,10 +251,16 @@ def build(structure: dict) -> None:
                 f'<span class="card-num">Ch {chap["number"]}</span>'
                 f'<span class="card-title">{escape(chap["title"])}</span>{levels}</a>'
             )
-            secs = "\n".join(
-                f'        <li><span class="sec-id">{escape(s["id"])}</span> {escape(s["title"])}</li>'
-                for s in chap["sections"]
-            )
+            sec_items = []
+            for s in chap["sections"]:
+                fname = f"section-{s['id'].replace('.', '-')}.html"
+                exists = (cdir / "sections" / fname).exists()
+                label = f'<span class="sec-id">{escape(s["id"])}</span> {escape(s["title"])}'
+                if exists:
+                    sec_items.append(f'        <li><a href="sections/{fname}">{label}</a></li>')
+                else:
+                    sec_items.append(f'        <li>{label}</li>')
+            secs = "\n".join(sec_items)
             (cdir / "index.html").write_text(
                 CHAP_INDEX.format(
                     num=chap["number"],
@@ -268,6 +295,10 @@ def build(structure: dict) -> None:
 
     (ROOT / "index.html").write_text(
         ROOT_INDEX_HEAD + "\n".join(toc_parts) + "\n" + ROOT_INDEX_FOOT,
+        encoding="utf-8",
+    )
+    (ROOT / "toc.html").write_text(
+        TOC_HEAD + "\n".join(toc_parts) + "\n" + ROOT_INDEX_FOOT,
         encoding="utf-8",
     )
     (ROOT / "scripts" / "book_structure.json").write_text(
