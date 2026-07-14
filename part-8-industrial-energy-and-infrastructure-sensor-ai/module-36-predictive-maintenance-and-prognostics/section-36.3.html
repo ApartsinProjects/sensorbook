@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.3: Survival analysis and hazard models. Building Sensory AI." name="description"/>
+<title>Section 36.3: Survival analysis and hazard models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Predictive Maintenance and Prognostics</a></div>
+<h1>Survival analysis and hazard models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A regression tells you when the machine will die. A hazard model admits it might outlive us both, and quantifies exactly how surprised it would be if it did."</p><cite>A Statistically Humble AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 36.2 framed remaining useful life (RUL) as a point prediction: a number of cycles, hours, or kilometres until failure. That framing quietly assumes every machine in your training set actually failed while you were watching. Real fleets do not cooperate. A pump is swapped out during scheduled maintenance before it breaks. A wind turbine gearbox is still spinning happily when the study ends. A vehicle is sold and leaves your telemetry. In each case you know the unit survived <em>at least</em> so long, but not when it would have failed. That is <strong>censoring</strong>, and a naive regression that treats "last seen at 40,000 hours, healthy" as "failed at 40,000 hours" will systematically underestimate life. Survival analysis is the branch of statistics built precisely to learn from partially observed lifetimes, and its central object, the <strong>hazard function</strong>, turns out to be the most natural language for prognostics: it answers "given that this bearing has lasted this long, how likely is it to fail in the next hour?" This section gives you the survival, hazard, and cumulative-hazard functions; the Kaplan-Meier estimator; the Cox proportional-hazards model driven by sensor features; and the deep survival models that connect all of this to the neural encoders in the rest of Part VIII.</p>
+</div>
+
+<p>This section assumes you are comfortable with probability distributions, conditional probability, and maximum likelihood at the level of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and that you have the failure-mode and RUL vocabulary from Sections 36.1 and 36.2. The sensor features we feed these models come from the feature-engineering pipeline of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, and the leakage discipline we insist on throughout comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+<h2>Lifetimes, censoring, and three equivalent functions</h2>
+
+<p>Let \(T \ge 0\) be the random failure time of a unit. Survival analysis describes \(T\) through three interchangeable functions, each answering a different operational question. The <strong>survival function</strong> is the probability the unit is still alive past time \(t\):</p>
+
+$$S(t) = P(T > t) = 1 - F(t),$$
+
+<p>where \(F\) is the cumulative distribution of \(T\). The <strong>hazard function</strong> is the instantaneous failure rate given survival so far:</p>
+
+$$h(t) = \lim_{\Delta t \to 0} \frac{P(t \le T < t + \Delta t \mid T \ge t)}{\Delta t} = \frac{f(t)}{S(t)},$$
+
+<p>with \(f\) the density of \(T\). The hazard is the star of the show because it is <em>conditional</em>: it is exactly the question a maintenance planner asks about a machine that has already survived to today. Integrating the hazard gives the <strong>cumulative hazard</strong> \(H(t) = \int_0^t h(u)\,du\), and the three functions are locked together by the identity</p>
+
+$$S(t) = \exp\!\big(-H(t)\big) = \exp\!\Big(-\!\int_0^t h(u)\,du\Big).$$
+
+<p>Know one, know all three. A rising hazard means an aging, wear-out failure mode (the bathtub curve's right wall from Section 36.1); a flat hazard means memoryless, random failure; a falling hazard means infant mortality is being weeded out.</p>
+
+<p>Censoring is what makes this more than a distribution-fitting exercise. For unit \(i\) we observe a time \(t_i\) and an event indicator \(\delta_i\): \(\delta_i = 1\) means we saw the actual failure at \(t_i\), while \(\delta_i = 0\) means the unit was <strong>right-censored</strong>, still healthy when we last observed it. The likelihood contribution respects this: a failure contributes its density \(f(t_i)\), a censored observation contributes only its survival \(S(t_i)\), because all we learned is that \(T_i > t_i\). Writing \(f = h \cdot S\), the log-likelihood becomes the clean and famous form</p>
+
+$$\ell = \sum_i \big[\, \delta_i \log h(t_i) - H(t_i) \,\big].$$
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The reason you cannot just drop censored units and run a regression is that censoring is almost never random with respect to lifetime. Units are removed <em>because</em> they were healthy, or replaced on a preventive schedule that correlates with the very wear you are trying to model. Discarding them biases your estimated life downward; treating their last-seen time as a failure biases it downward even harder. The survival likelihood is the only estimator here that stays unbiased under non-informative censoring, and that single property is why prognostics teams reach for hazard models instead of ordinary regression.</p>
+</div>
+
+<h2>Non-parametric baselines: Kaplan-Meier</h2>
+
+<p>Before fitting any sensor-driven model, you want a picture of the raw fleet survival curve with no assumptions about its shape. The <strong>Kaplan-Meier estimator</strong> gives it. Order the distinct failure times \(t_{(1)} < t_{(2)} < \dots\); at each, let \(d_j\) be the number of failures and \(n_j\) the number of units still at risk (alive and uncensored just before \(t_{(j)}\)). The estimator is the running product of conditional survivals:</p>
+
+$$\hat{S}(t) = \prod_{t_{(j)} \le t} \left(1 - \frac{d_j}{n_j}\right).$$
+
+<p>Censored units stay in \(n_j\) up until the moment they leave, contributing their information without ever forcing a downward step. The result is a staircase curve with a confidence band (via Greenwood's formula) that you can stratify by machine type, operating regime, or site. Kaplan-Meier answers "what fraction of this population lasts past 20,000 hours?" and it is your honest baseline: any fancier model that cannot beat a well-stratified KM curve on held-out units is not earning its complexity.</p>
+
+<h2>Cox proportional hazards: sensors enter the model</h2>
+
+<p>Kaplan-Meier describes a population; prognostics needs to condition on <em>this</em> unit's sensor state. The <strong>Cox proportional-hazards model</strong> is the workhorse. It factors the hazard into a shared, unspecified baseline \(h_0(t)\) and a covariate-dependent multiplier:</p>
+
+$$h(t \mid \mathbf{x}) = h_0(t)\, \exp\!\big(\boldsymbol{\beta}^\top \mathbf{x}\big),$$
+
+<p>where \(\mathbf{x}\) is the sensor feature vector for the unit (vibration RMS, bearing temperature, oil-debris count, spectral kurtosis from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>) and \(\boldsymbol{\beta}\) are learned coefficients. The name "proportional hazards" is literal: two units' hazards stay in constant ratio \(\exp(\boldsymbol{\beta}^\top(\mathbf{x}_i - \mathbf{x}_j))\) for all time, regardless of the baseline's shape. The magic is that \(\boldsymbol{\beta}\) is estimated by maximizing the <strong>partial likelihood</strong>, which never requires you to specify \(h_0(t)\) at all:</p>
+
+$$L(\boldsymbol{\beta}) = \prod_{i:\,\delta_i = 1} \frac{\exp(\boldsymbol{\beta}^\top \mathbf{x}_i)}{\sum_{j \in R(t_i)} \exp(\boldsymbol{\beta}^\top \mathbf{x}_j)},$$
+
+<p>where \(R(t_i)\) is the risk set of units still alive just before failure \(i\). Each factor asks: among everyone who could have failed at this instant, how much of the total hazard belonged to the one who actually did? A coefficient \(\beta_k = 0.7\) means a one-unit rise in feature \(k\) multiplies the failure rate by \(e^{0.7} \approx 2\), an interpretable hazard ratio that reliability engineers can defend in a design review. When sensor features drift over a unit's life, the <strong>time-varying Cox</strong> variant lets \(\mathbf{x}(t)\) update, turning the model into a streaming hazard estimator that pairs naturally with the online feature extraction of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+from lifelines import CoxPHFitter, KaplanMeierFitter
+
+# One row per unit: last-observed time, event flag, and two sensor features.
+# event=1 means a real failure; event=0 means right-censored (still healthy).
+rng = np.random.default_rng(0)
+n = 300
+vib = rng.gamma(2.0, 1.0, n)          # vibration RMS feature
+temp = rng.normal(0.0, 1.0, n)         # standardized bearing temperature
+# Higher vibration -> higher hazard -> shorter life (Weibull-ish true model).
+scale = 50.0 * np.exp(-0.6 * vib - 0.3 * temp)
+true_life = rng.weibull(1.8, n) * scale
+censor_at = rng.uniform(10, 80, n)     # study ends / preventive swap
+time = np.minimum(true_life, censor_at)
+event = (true_life <= censor_at).astype(int)
+
+# Honest fleet baseline first (no covariates).
+km = KaplanMeierFitter().fit(time, event)
+print("Median survival (KM):", km.median_survival_time_)
+
+# Sensor-driven hazard model.
+import pandas as pd
+df = pd.DataFrame({"time": time, "event": event, "vib": vib, "temp": temp})
+cox = CoxPHFitter().fit(df, duration_col="time", event_col="event")
+print(cox.summary[["coef", "exp(coef)", "p"]])   # hazard ratios per feature
+</code></pre>
+<div class="code-caption">Fitting a Kaplan-Meier fleet baseline and a Cox proportional-hazards model on censored lifetimes with two sensor features. The <code>event</code> column is what separates survival analysis from regression: censored rows (<code>event=0</code>) contribute their survival probability, not a fabricated failure time. The printed <code>exp(coef)</code> values are directly readable hazard ratios.</div>
+
+<p>The code above computes the KM baseline and Cox fit referenced throughout this subsection. Notice that a censored unit never lies about when it failed; it simply asserts it lasted at least as long as observed, and the likelihood does the rest.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Writing the Cox partial-likelihood optimizer, the risk-set bookkeeping, tie handling (Efron's approximation), the Breslow baseline-hazard estimator, and Greenwood confidence bands from scratch is roughly 250 to 400 lines of careful, easy-to-get-wrong NumPy. <code>lifelines</code> collapses all of it to two <code>.fit()</code> calls, about 6 lines including the dataframe, and throws in the concordance index, proportional-hazards diagnostic tests, and partial-effect plots for free. Reach for the from-scratch version only when you need a custom likelihood a library will not express; otherwise the library is both shorter and more correct.</p>
+</div>
+
+<h2>Deep survival models: hazards meet sensor encoders</h2>
+
+<p>Cox is linear in \(\mathbf{x}\) and assumes proportional hazards, two assumptions that raw vibration spectra and multi-sensor histories routinely violate. <strong>Deep survival models</strong> keep the survival likelihood but replace the linear predictor with a neural encoder. <strong>DeepSurv</strong> swaps \(\boldsymbol{\beta}^\top \mathbf{x}\) for a network \(g_\theta(\mathbf{x})\) trained on the Cox partial likelihood, so it stays proportional but becomes nonlinear. To escape proportionality, <strong>DeepHit</strong> discretizes time into bins and directly predicts the probability mass of failure in each bin with a softmax, handling competing risks (multiple failure modes from Section 36.1) in one head. Continuous-time neural models such as neural ODEs for the cumulative hazard round out the family. Crucially, the encoder \(g_\theta\) can be any of the sensor-stream backbones from Part IV: a temporal convolutional network from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, or a transformer from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, ingesting the full degradation window rather than a hand-picked feature snapshot. Section 36.4 builds exactly these sequence encoders; this section supplies the loss they should be trained against when lifetimes are censored.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current frontier fuses survival objectives with the foundation-model embeddings of Section 36.5. Instead of training a hazard head on raw sensors, teams freeze a pretrained wearable or time-series encoder (MOMENT, Moirai, or a domain-specific vibration model) and fit a lightweight Cox or DeepHit head on its embeddings, getting calibrated hazards from a few dozen labeled failures. Open problems: proving proportional-hazards or discrete-time calibration holds on embedding spaces the survival model never saw during pretraining, and extending conformal survival prediction (distribution-free survival bands, tied to <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) to censored, non-exchangeable fleet data. Evaluation is unsettled too: the time-dependent concordance index and the integrated Brier score are the reported standards, but both are sensitive to the censoring distribution.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Wind-Turbine Gearbox Fleet</h3>
+<p>An operator runs 400 turbines across three sites. Over four years, 61 gearboxes failed with logged failure dates; the other 339 are still turning or were preventively rebuilt on a maintenance schedule. Treating the 339 as "failed on their last SCADA timestamp" and running a gradient-boosted RUL regressor predicted a fleet median life of 31,000 hours, and the maintenance budget was sized to it. A Cox model on oil-temperature trend, gearbox vibration RMS, and power-curve residual, fit on the same data <em>with the 339 correctly censored</em>, put the median at 44,000 hours with a hazard ratio of 2.3 per standard deviation of vibration RMS. The regression had been pulling healthy units into its loss as if they had died, shortening every prediction. Re-planning against the survival curve deferred 90 gearbox rebuilds by an average of nine months, and the vibration hazard ratio told the reliability team which units to prioritize, not just when the fleet as a whole would wear out.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the synthetic dataset from the code block. (a) Refit the Cox model but first corrupt the labels by setting every <code>event = 1</code>, that is, pretend nothing was censored. Compare the estimated median survival and the vibration hazard ratio to the correctly censored fit, and quantify the bias. (b) Split the units into "high vibration" and "low vibration" by the median of <code>vib</code>, fit a separate Kaplan-Meier curve to each, and check visually whether the two curves stay proportional (a rough proportional-hazards sanity check). (c) Add a third feature that is pure noise, refit Cox, and confirm its coefficient's p-value is not significant. What does that tell you about using p-values as a feature-selection guardrail on sensor data?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>You have \(S(t)\) for a unit. Write down its cumulative hazard \(H(t)\) and its hazard \(h(t)\) in terms of \(S\). Which of the three is the quantity a maintenance planner most directly acts on, and why?</li>
+<li>A colleague drops all right-censored units and fits an ordinary RUL regression on the survivors "to keep it simple." In which direction is the resulting life estimate biased, and what property of the censoring would have to hold for the shortcut to be even approximately valid?</li>
+<li>Cox assumes proportional hazards. Give one concrete sensor scenario in a rotating machine where that assumption fails, and name the model from this section you would switch to instead.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-36.4.html">Section 36.4</a>, we build the sequence encoders that feed these hazard heads: recurrent, convolutional, and attention-based models that read a unit's full degradation trajectory rather than a snapshot of features. The survival likelihood you just learned becomes their training objective whenever the fleet's lifetimes are censored, which, on any real fleet, is always.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

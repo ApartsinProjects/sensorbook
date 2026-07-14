@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.6: Domain shift across machines and sites. Building Sensory AI." name="description"/>
+<title>Section 37.6: Domain shift across machines and sites | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Domain shift across machines and sites</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"No two pumps are identical twins. They are cousins who grew up in different climates, and one of them is about to insist the other is broken."</p><cite>A Fleet-Weary AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 37.3 met domain shift as the DCASE challenge frames it: survive a change of operating point you were warned about, then generalize to a machine type you have never heard. This section widens the lens from the benchmark to the fleet. In a real deployment you rarely monitor one machine; you monitor a hundred nominally-identical assets scattered across a dozen sites, and the detector you trained on the pilot unit in Plant A must earn its keep on unit 74 in Plant G without a data scientist flying out to retune it. The uncomfortable truth is that "identical" machines are not identical to a sensor. Casting tolerances, bearing lots, foundation stiffness, sensor mounting torque, ambient temperature, mains frequency, and the sampling clock of the edge box all shift the signal, and every one of those shifts moves the healthy baseline. A detector that hard-codes Plant A's baseline will drown Plant G in false alarms while missing its real faults. This section gives you a taxonomy of where the shift comes from, the vocabulary to name it (covariate versus concept shift), a quantitative meter to measure how far two machines are apart <em>before</em> you trust a shared model, and the fleet-level tactics (per-unit baselining, regime conditioning, domain-invariant features, cohorting) that make one detector portable across the whole population.</p>
+</div>
+
+<p>This section builds on the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the physical origin of measurement variation from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. The general theory of distribution shift and test-time adaptation lives in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>; here we specialize it to condition monitoring, where the shift is between physical assets and the label of interest (healthy versus faulty) is exactly the thing that must stay stable.</p>
+
+<h2>Where the shift comes from: a taxonomy for fleets</h2>
+
+<p>Debugging a portability failure starts with knowing which knob moved. Cross-machine and cross-site shift decomposes into a small number of physically distinct sources, and the right fix depends entirely on which one you are facing.</p>
+<ul>
+<li><strong>Unit-to-unit manufacturing variation.</strong> Two pumps off the same line differ in bearing clearance, impeller balance, and resonance by a few percent. This shifts the exact frequencies and amplitudes of the healthy vibration signature even when nothing is wrong.</li>
+<li><strong>Installation and sensor placement.</strong> Mounting torque, accelerometer location, cable routing, and foundation stiffness change the transfer function between the fault source and the sensor. A bearing tone that is loud on a hard-mounted sensor is faint on a magnetically-coupled one three centimeters away.</li>
+<li><strong>Operating regime.</strong> Load, speed, product being processed, and duty cycle move the signal far more than most faults do. A conveyor at half load simply is a different signal from the same conveyor at full load.</li>
+<li><strong>Environment.</strong> Ambient temperature changes lubricant viscosity and clearances; site background noise, nearby machines, and seasonal humidity all leak into acoustic and vibration channels.</li>
+<li><strong>Sensor hardware and telemetry.</strong> A different accelerometer model, a re-calibrated gain, a firmware update that changes anti-alias filtering, or an edge box sampling at 25.6 kHz instead of 48 kHz all shift the data before any physics does.</li>
+</ul>
+<p>The first two are largely static per unit and can be absorbed by a per-unit baseline. The operating regime is dynamic and must be conditioned on, not averaged away. The last is a pipeline problem masquerading as a machine problem, and it is the one that most often gets misdiagnosed as a fleet of failing assets.</p>
+
+<h2>Naming the shift: covariate versus concept</h2>
+
+<p>Two failure modes hide behind the phrase "domain shift," and they demand opposite responses. Write the healthy input distribution on machine \(m\) as \(P_m(\mathbf{x})\) and the decision you care about as the conditional \(P_m(y \mid \mathbf{x})\), where \(y\) is healthy versus faulty. <strong>Covariate shift</strong> means \(P_m(\mathbf{x})\) changes across machines while the fault-versus-healthy boundary \(P(y \mid \mathbf{x})\) is stable: the pump sounds different but the meaning of "different from its own normal" transfers. This is the benign, tractable case, and per-unit normalization is designed for it. <strong>Concept shift</strong> means \(P_m(y \mid \mathbf{x})\) itself changes: the very same spectral signature is healthy on a variable-speed drive and a symptom of cavitation on a fixed-speed one. No amount of input normalization rescues you from concept shift, because the label function moved. The practical rule follows immediately: normalize away covariate shift aggressively, but detect concept shift and refuse to share a model across the boundary where it occurs.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>An anomaly detector does not need the healthy distributions of two machines to match. It needs each machine's <em>anomaly boundary</em> to sit in the same place relative to that machine's own normal. This is why per-unit baselining beats fleet-wide pooling so often: a score defined as distance from the unit's own reference bank is invariant to any static covariate shift by construction, whereas a single global threshold inherits every unit-to-unit offset as false-alarm noise. Portability is not about erasing differences between machines; it is about making the <em>score</em> speak each machine's dialect while the <em>threshold</em> speaks a shared language.</p>
+</div>
+
+<h2>Measuring how far two machines are apart</h2>
+
+<p>Before you deploy Plant A's model to Plant G, quantify the gap. A cheap, model-agnostic shift meter is a <strong>domain classifier</strong>: train a simple model to tell machine A's healthy clips from machine G's healthy clips. If it cannot (AUC near 0.5), the two are statistically interchangeable and one model will transfer. If it separates them perfectly (AUC near 1.0), a shared threshold is doomed and you need per-unit adaptation. A complementary continuous meter is the <strong>maximum mean discrepancy</strong> (MMD), the distance between the two feature distributions in a kernel space:</p>
+$$\mathrm{MMD}^2(A, G) = \big\lVert \mathbb{E}_{\mathbf{x}\sim A}[\phi(\mathbf{x})] - \mathbb{E}_{\mathbf{x}\sim G}[\phi(\mathbf{x})] \big\rVert^2_{\mathcal{H}}.$$
+<p>Both are computed on <em>healthy</em> data only, so a large value flags a covariate gap to engineer around, not a fault. Run the meter across every pair in the fleet and you get a similarity matrix that directly drives the cohorting decision below.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import cross_val_score
+
+def domain_gap_auc(feat_a, feat_g):
+    """A2-distance style shift meter on HEALTHY features only.
+    AUC ~0.5 => machines interchangeable; ~1.0 => shared threshold will fail."""
+    X = np.vstack([feat_a, feat_g])
+    y = np.r_[np.zeros(len(feat_a)), np.ones(len(feat_g))]   # domain label, not fault label
+    auc = cross_val_score(HistGradientBoostingClassifier(),
+                          X, y, cv=5, scoring="roc_auc").mean()
+    return auc
+
+def linear_mmd2(feat_a, feat_g):
+    """Unbiased linear-kernel MMD^2 between two healthy feature sets."""
+    mu = feat_a.mean(0) - feat_g.mean(0)
+    return float(mu @ mu)
+
+# gap = domain_gap_auc(healthy_A, healthy_G)
+# if gap &gt; 0.8: adapt per unit before sharing a threshold across A and G
+</code></pre>
+<div class="code-caption">A fleet shift meter run on healthy data only. The domain-classifier AUC estimates how distinguishable two machines are (an empirical proxy for the proxy-A-distance); a value near 1.0 says a single global threshold will misfire, so the machines belong in different cohorts or need per-unit baselining. The linear MMD gives a continuous companion score for building a fleet similarity matrix.</div>
+
+<p>Reading the meter turns portability from a hope into a decision. When <code>domain_gap_auc</code> is near chance across a group of units, pool them and share one model; when it saturates, that group needs its own reference or its own cohort.</p>
+
+<h2>Making a detector portable</h2>
+
+<p>Four tactics, applied in this order, absorb most cross-machine shift. First, <strong>per-unit baselining</strong>: define the anomaly score as a distance from each unit's own bank of healthy embeddings (the kNN reference idea from Section 37.3), which erases static covariate shift for free. Second, <strong>regime conditioning</strong>: partition each unit's normal by operating point (load or speed bins read from the machine's own telemetry) and score against the matching regime, so a half-load conveyor is compared to half-load normal rather than a blended average. Third, <strong>domain-invariant representation</strong>: train the encoder so its embedding predicts machine state but not machine identity, using a gradient-reversal or adversarial head that penalizes the network for being able to guess which unit produced a clip. Fourth, <strong>threshold transfer</strong>: set thresholds in a normalized score space (a per-unit robust z-score or percentile) rather than in raw units, so one policy such as "flag the 99th percentile" holds fleet-wide. The feature standardization behind steps one and four is the practical hinge, and it connects to the normalization and dimensionality-reduction toolkit of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Implementing a domain-invariant encoder from scratch (a feature extractor, a task head, a domain-discriminator head, the gradient-reversal layer, and the balancing of the two losses) is roughly 150 to 200 lines of careful PyTorch. Libraries such as <code>skorch</code> plus a published gradient-reversal layer, or a domain-adaptation toolkit like <code>ADAPT</code> and <code>pytorch-adapt</code>, reduce it to configuring an estimator and one adversarial callback, on the order of 20 lines. They handle the reversal autograd trick, the loss scheduling, and the training loop so you configure the shift objective instead of debugging sign errors in a custom backward pass.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: One Model, Twelve Wind Farms</h3>
+<p>An operator runs the same turbine gearbox model across twelve sites. A drivetrain vibration detector trained on the two pilot farms scored a clean AUC there and was rolled out fleet-wide with a single global threshold. Within a week, three coastal farms generated a wall of false alarms while an inland farm missed an early planet-bearing fault entirely. The shift meter told the story: the domain-classifier AUC between coastal and inland healthy data was 0.93, driven by salt-air-related damping and a different foundation type, pure covariate shift. The fix used no new labels. The team switched to per-unit baselining (each turbine scored against its own first month of healthy embeddings), added a regime split on wind-speed bins, and set thresholds on a per-turbine percentile. False alarms at the coastal farms fell by an order of magnitude and the inland bearing fault surfaced two weeks before the scheduled inspection. The models were never retrained; only the baseline and the score normalization became local.</p>
+</div>
+
+<h2>Fleet strategy: cohort, share, or isolate</h2>
+
+<p>The final decision is architectural: how many models does a fleet need? Three regimes answer it. <strong>Isolate</strong> (one model per unit) is safest against shift but wastes data and cannot flag a fault it has never personally seen; it suits small numbers of high-value, idiosyncratic assets. <strong>Share</strong> (one model for everything) is data-efficient and catches rare faults across the population but collapses under any real covariate gap. <strong>Cohort</strong> is the pragmatic middle: cluster units by the fleet similarity matrix your shift meter produced, train one model per cohort of statistically interchangeable machines, and give each unit its own local baseline and threshold on top. Cohorting turns the false dichotomy of "specialist versus generalist" into a data-driven grouping, and it is the pattern that scales; managing the resulting family of models, their versioning, and the per-unit baselines across a live fleet is the operations problem taken up in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, and it feeds directly into the remaining-useful-life estimates of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a multi-unit condition-monitoring dataset (MIMII-DG sections, or several machines from a public bearing dataset). (a) Extract healthy features and compute the <code>domain_gap_auc</code> and linear MMD for every pair of machines; render the result as a fleet similarity heatmap. (b) Cluster the machines from that matrix into cohorts and, for one cohort and one outlier machine, compare three detectors: an isolated per-unit model, a single shared model, and a cohort model with per-unit baselining. Report false-alarm rate on healthy target data and partial AUC on faults. (c) Identify one machine pair whose gap is driven by a telemetry or sampling difference rather than physics, and explain why normalization alone cannot fix it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Distinguish covariate shift from concept shift across two machines, and state which one per-unit normalization can absorb and which one it cannot.</li>
+<li>Your fleet shift meter reports a domain-classifier AUC of 0.95 between two nominally-identical pumps, computed on healthy data only. What does this tell you, and what does it explicitly not tell you about faults?</li>
+<li>Why does defining the anomaly score as a distance from each unit's own reference bank make a single fleet-wide threshold more portable than pooling all units into one global model?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-37.7.html">Section 37.7</a>, we turn from making detectors portable to scoring them fairly. You will meet TSB-AD and the point-adjustment trap, and see why a shift-robust detector can still post a fraudulently high number if you let the evaluation protocol cheat on your behalf, the exact mirror image of the fleet false-alarm problem you just learned to defuse.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

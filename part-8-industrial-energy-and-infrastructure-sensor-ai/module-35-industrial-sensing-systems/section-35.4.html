@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.4: Operating regimes and regime segmentation. Building Sensory AI." name="description"/>
+<title>Section 35.4: Operating regimes and regime segmentation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Industrial Sensing Systems</a></div>
+<h1>Operating regimes and regime segmentation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me the vibration doubled and asked if the pump was failing. I asked one question back: was it idling or pulling full flow? They went quiet."</p>
+<cite>A Context-Seeking AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>An industrial machine is not one system with one signature. It is the same hardware running through several distinct <em>modes</em>: idle, ramp-up, steady load, part-load, transient, and shutdown. A vibration level, a bearing temperature, or a motor-current harmonic that is perfectly healthy at full load can be an alarming outlier at idle, and vice versa. Feed raw signals into an anomaly detector without telling it which mode produced them and it will spend most of its budget flagging normal mode changes as faults. This section defines the operating regime, shows how to recover regimes from telemetry when nobody labeled them, and explains why almost every downstream model in this part, from condition monitoring to remaining-useful-life estimation, must be built <em>per regime</em> to be trustworthy.</p>
+</div>
+
+<p>This section assumes you can read the raw industrial channels of <a class="cross-ref" href="section-35.3.html">Section 35.3</a> (vibration, acoustic, thermal, electrical) and the setpoint and process tags of <a class="cross-ref" href="section-35.2.html">Section 35.2</a> (SCADA and historian data). We lean on clustering and change detection: if partitioning a feature space or spotting a distribution break feels unfamiliar, <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> covers the feature and clustering machinery and <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> covers change-point detection. Throughout, a regime is a discrete label \(r_t \in \{1, \dots, K\}\) assigned to each timestamp \(t\), and the goal is to recover the sequence \(r_{1:T}\) from telemetry so that later models can condition on it.</p>
+
+<h2>What an operating regime is, and why raw thresholds fail</h2>
+<p>An <em>operating regime</em> is a region of the machine's operating envelope in which its normal behavior is approximately stationary. Concretely, it is defined by the <em>operating condition variables</em>: the commanded setpoints and boundary conditions that the operator or controller chooses, not the health-sensitive signals you want to monitor. For a pump these are speed and discharge flow; for a gas turbine, altitude, ambient temperature, and throttle position; for a CNC spindle, the programmed feed rate and the tool engaged. Within one regime the physics that maps health state to sensor reading, the measurement model \(x = h(s)\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, is roughly fixed. Across regimes it changes wholesale.</p>
+<p>That is why a single global threshold is the classic industrial-monitoring mistake. Suppose you alarm when casing vibration exceeds \(4.5\) mm/s RMS. At full load the healthy machine sits at \(3.8\) mm/s and a genuine bearing defect pushes it past \(4.5\); the threshold works. Then the plant drops to part-load overnight, the healthy machine falls to \(1.2\) mm/s, and a developing defect that has already doubled the bearing's contribution reaches only \(2.4\) mm/s. The global threshold sleeps through it. A single number cannot separate <em>load-driven</em> variation from <em>health-driven</em> variation, because both move the same signal. Segmenting by regime first, then setting a per-regime baseline, is what makes the health signal legible.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Regime is a confounder you must control, not average over</h3>
+<p>Operating condition is a confounder: it drives both the machine's true state and the sensor reading, so a model that ignores it will attribute normal load swings to degradation and normal degradation to load. Averaging across regimes does not cancel the confounder; it blurs the very contrast you are trying to measure. Conditioning on regime, by segmenting first and modeling within each segment, is the industrial analogue of stratifying an experiment. It is also why regime labels must be derived <em>causally</em> from data available up to time \(t\), or you reintroduce the temporal leakage warned about in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<h2>Two ways to recover regimes: cluster the conditions or segment the signal</h2>
+<p>There are two complementary strategies, and mature systems use both. The first is <strong>clustering on operating condition variables</strong>. Collect the handful of setpoint and boundary channels, standardize them, and cluster with k-means or a Gaussian mixture. Each cluster is a regime; assigning a new sample is a nearest-centroid lookup. This works when the machine visits a small number of discrete setpoints, which is common: pumps run at a few fixed speeds, turbines cycle through defined power levels, HVAC chillers stage compressors. The number of regimes \(K\) is chosen from domain knowledge (how many named modes the operators talk about) or from a cluster-validity sweep.</p>
+<p>The second strategy is <strong>temporal segmentation of the signal itself</strong>: find the timestamps where the statistics of the stream break, and call the stretches between breaks segments. This is change-point detection and hidden-Markov modeling, and it matters when regimes are not cleanly indexed by a setpoint (a continuously ramping process) or when the interesting structure is the <em>transient</em> between steady states. Startup and shutdown transients are where many faults first reveal themselves, so a segmenter that isolates them is doing real work. The two views reconcile cleanly: cluster the steady stretches into named regimes, and treat the transitions between them as their own short-lived regimes.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+# Operating-condition telemetry: [altitude, ambient_temp, throttle_setting]
+# Six discrete flight conditions, as in the C-MAPSS FD002/FD004 turbofan data.
+rng = np.random.default_rng(0)
+centers = np.array([[0, 15, 100], [10, -5, 80], [20, -25, 60],
+                    [25, -40, 100], [35, -55, 80], [42, -60, 60]], float)
+labels_true = rng.integers(0, 6, size=4000)
+conds = centers[labels_true] + rng.normal(0, [0.5, 1.0, 1.5], size=(4000, 3))
+
+Xs = StandardScaler().fit_transform(conds)          # scale so no channel dominates
+km = KMeans(n_clusters=6, n_init=10, random_state=0).fit(Xs)
+regime = km.labels_                                 # r_t for every timestamp
+
+# Per-regime baseline for a health signal (here a synthetic vibration RMS)
+vib = 2.0 + 0.4 * labels_true + rng.normal(0, 0.15, size=4000)
+mu = np.array([vib[regime == k].mean() for k in range(6)])
+sd = np.array([vib[regime == k].std()  for k in range(6)])
+resid = (vib - mu[regime]) / sd[regime]             # regime-normalized deviation
+print("global std:", vib.std().round(2),
+      "| regime-residual std:", resid.std().round(2))</code></pre>
+<div class="code-caption">Recovering six operating regimes from three condition channels with k-means, then converting a raw vibration signal into a regime-normalized residual. The printed global standard deviation is dominated by regime spread; the residual isolates the health-driven part.</div>
+
+<p>The code above mirrors a real dataset: NASA's C-MAPSS turbofan benchmark (subsets FD002 and FD004) defines exactly six operating conditions from altitude, Mach number, and throttle-resolver angle, and every published remaining-useful-life pipeline on it begins by recovering those six regimes and normalizing per regime. The last line makes the payoff quantitative: the raw signal's spread is dominated by which regime the engine was in, while the regime residual strips that out and leaves a channel where a rising trend actually means degradation. That residual is exactly what the prognostics models of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a> consume, though the concrete link is drawn there rather than here.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Change-point segmentation with <code>ruptures</code></h3>
+<p>Hand-rolling an offline change-point detector, a cost function over segments plus a penalized dynamic-programming search for the optimal breakpoints, is 60 to 100 lines and easy to get subtly wrong at the penalty term. The <code>ruptures</code> library reduces it to three:</p>
+<pre><code class="language-python">import ruptures as rpt
+algo = rpt.Pelt(model="rbf").fit(signal)     # signal: (T,) or (T, d) array
+breaks = algo.predict(pen=10)                # timestamps where the regime changes</code></pre>
+<div class="code-caption">Penalized change-point detection with <code>ruptures.Pelt</code>: the library supplies the cost models (mean shift, variance shift, kernel) and the exact linear-time search, so you tune one penalty instead of writing the optimizer.</div>
+<p>The library handles the cost model, the exact PELT search, and the penalty-to-segment-count relationship internally; you supply the signal and one penalty knob. Swap <code>Pelt</code> for <code>rpt.Binseg</code> or <code>rpt.Window</code> for faster approximate segmentation on long histories.</p>
+</div>
+
+<h2>Online regime assignment and the transient problem</h2>
+<p>In deployment the regime label must be produced <em>online</em>: at time \(t\) you may use only telemetry up to \(t\). Clustering-based assignment handles this naturally, because a fitted k-means or mixture model assigns a new sample by nearest centroid with no lookahead. The subtlety is transients. A machine ramping from idle to full load passes through condition values that belong to no steady regime, so a naive nearest-centroid rule will snap each transient sample to whichever steady regime it drifts closest to, mislabeling the ramp as a sequence of instantaneous mode jumps. Two fixes are standard: add explicit transition states (label a sample as "in transition" when its distance to every centroid exceeds a threshold, or when the condition variables' short-window slope is high), and apply temporal smoothing so a single-sample excursion does not trigger a spurious regime flip. A hidden-Markov model does both at once, because its transition matrix penalizes rapid switching and its states can include transitions.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wastewater pump station that alarmed every morning</h3>
+<p>A municipal utility ran vibration-based condition monitoring on a bank of sewage lift pumps. Every weekday around 6 a.m. the system paged an on-call technician with a high-vibration alert, and every time the pump was fine. The cause was regime, not health. Overnight the pumps idled at low speed against a nearly empty wet well; at dawn the inflow surged and the controller ramped them to full speed, tripling the flow-induced vibration within seconds. The global threshold saw the morning ramp as an event. The team fit a three-regime segmenter on two SCADA tags, commanded speed and wet-well level, giving idle, ramp, and full-flow regimes, then set a separate baseline in each. Morning ramps moved into their own regime with its own generous band, the false pages stopped, and a genuine impeller imbalance that appeared weeks later was caught because it lifted the <em>full-flow</em> residual well above that regime's tighter baseline. Nothing about the vibration sensor changed; the fix was entirely in segmenting the context first.</p>
+</div>
+
+<p>One caution ties this back to the running theme of distribution shift. A regime model fit on last quarter's operating envelope can be stranded when the plant starts running a setpoint it never saw, a new product recipe, a seasonal load, an efficiency retune. Those samples land far from every centroid and, if you are not careful, get silently forced into the nearest regime and evaluated against a baseline that does not apply. Treat "far from all regimes" as its own signal: it may be a new regime worth learning rather than a fault, a distinction developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> on distribution shift and out-of-distribution detection.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: regime-blind versus regime-aware detection</h3>
+<p>Take a machine that runs in three load regimes with healthy vibration RMS baselines of \(1.0\), \(2.5\), and \(4.0\) mm/s (standard deviation \(0.2\) in each), and spends 50, 30, and 20 percent of its time in them respectively. A developing fault adds \(0.8\) mm/s on top of whatever regime the machine is in. (1) Compute the pooled healthy mean and standard deviation across all three regimes. (2) Pick a single global threshold at the pooled mean plus three standard deviations and compute the fault detection rate. (3) Now set a per-regime threshold at each regime's mean plus three of its standard deviations and recompute the detection rate. Explain in one sentence why the regime-aware detector wins even though the fault magnitude is identical in both cases.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why should regimes be derived from operating <em>condition</em> variables (setpoints, load, ambient) rather than from the health-sensitive signals you intend to monitor?</li>
+<li>You cluster condition variables with k-means and deploy nearest-centroid assignment. What goes wrong during a startup ramp, and name two ways to fix it.</li>
+<li>A sample sits far from every learned regime centroid. Give one reason this is <em>not</em> necessarily a fault, and say which downstream question you must answer before alarming.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-35.5.html">Section 35.5</a>, we turn from the inputs to the labels. Even a perfectly regime-segmented signal is useless for supervised learning if the ground-truth failure labels arrive weeks late and rounded to the nearest work order. We examine maintenance records, the label-delay problem, and how the gap between when a fault began and when a technician wrote it down quietly corrupts every model trained on it.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

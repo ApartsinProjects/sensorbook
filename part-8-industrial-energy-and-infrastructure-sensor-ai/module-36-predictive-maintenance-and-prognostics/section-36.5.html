@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.5: Foundation-model embeddings for RUL. Building Sensory AI." name="description"/>
+<title>Section 36.5: Foundation-model embeddings for RUL | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Predictive Maintenance and Prognostics</a></div>
+<h1>Foundation-model embeddings for RUL</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I have never seen this turbofan before, but I have read a billion time series. The rising ripple in your vibration trace rhymes with a thousand deaths I already know."</p>
+<cite>A Well-Read AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why borrow a brain trained on everything to predict one bearing's death</h3>
+<p>The custom sequence models of the previous section learn degradation from scratch, and they are excellent when you own thousands of run-to-failure trajectories. Most fleets do not. A wind farm may retire ten gearboxes a year; a hospital MRI compressor fails once a decade. Remaining useful life (RUL) is the rare regression problem where the target itself, actual failure, is deliberately made scarce by good maintenance. Foundation-model embeddings offer a way out of that scarcity. A time-series foundation model pretrained on billions of unrelated series has already learned the vocabulary of trends, seasonality, regime shifts, and rising variance. You freeze it, push your sensor window through once, and read off a dense vector that summarizes the window in a representation someone else paid to learn. A small head on top of that vector can fit RUL from a few dozen failures where a from-scratch network would overfit instantly. This section is about extracting those embeddings, probing them for RUL, and knowing when the borrowed brain helps and when its foreign accent hurts.</p>
+</div>
+
+<p>This section assumes you are comfortable with the RUL target and prediction horizons from <a class="cross-ref" href="section-36.2.html">Section 36.2</a> and the from-scratch sequence models of <a class="cross-ref" href="section-36.4.html">Section 36.4</a>, which are the baseline this approach competes against. The foundation models themselves are built in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a> (generic time series) and <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a> (sensor-native); the self-supervised pretraining that gives their embeddings meaning is developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. Here we treat those models as a fixed feature extractor and worry only about the last mile: window to embedding to RUL.</p>
+
+<h2>What a foundation-model embedding is, for a degrading machine</h2>
+<p>An embedding is the model's internal summary of an input window, read out before the model's own forecasting or reconstruction head. Formally, an encoder \(f_\theta\) with frozen weights \(\theta\) maps a multivariate sensor window \(X \in \mathbb{R}^{C \times L}\) (with \(C\) channels and \(L\) timesteps) to a vector \(z = f_\theta(X) \in \mathbb{R}^{d}\), where \(d\) is a few hundred to a couple of thousand. Encoder-style models such as MOMENT expose a dedicated embedding mode that pools the patch tokens into one vector; forecasters such as Chronos, TimesFM, and Moirai expose their pre-head hidden states, which you mean-pool over time to the same effect. The claim that makes this useful is that \(z\) is <em>degradation-sensitive</em>: two windows from healthy machines land near each other, and as a machine ages, its window embeddings trace a path through the space toward a failure region. RUL prediction becomes regression on that path rather than on raw sensor values, and the heavy lifting of turning noisy 100 Hz vibration into a smooth trajectory is done by the frozen encoder.</p>
+
+<p>Channel handling is the first practical fork. Univariate foundation models (Chronos, TimesFM) embed one channel at a time, so a 21-sensor turbofan yields 21 vectors you must concatenate or pool. Multivariate models (Moirai, and multivariate MOMENT variants) ingest all channels together and return one joint vector that captures cross-sensor structure, which matters for faults that show up only as a <em>changing correlation</em> between temperature and pressure rather than in any single trace. The representation-learning tradeoffs behind these choices are the subject of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Frozen embeddings convert a data-hungry problem into a data-light one</h3>
+<p>The reason this works with few failures is a shift in where the parameters live. A from-scratch RUL network must estimate millions of weights from your handful of trajectories, so it overfits. With a frozen foundation model, those millions of weights are already fixed by pretraining and never touch your labels. The only thing your scarce failures fit is the small head, perhaps a few thousand parameters. You have moved almost the entire model out of the reach of your limited labels, which is exactly why the approach shines in the low-failure regime where deep sequence models collapse.</p>
+</div>
+
+<h2>Probing: a light head on frozen features</h2>
+<p>The standard recipe is <em>linear or shallow probing</em>. Freeze the encoder, embed every training window once, cache the vectors, and fit a lightweight regressor, ridge regression, a gradient-boosted tree, or a two-layer MLP, to map \(z\) to RUL. Because the encoder is frozen, embedding is a one-pass preprocessing step, not a training loop; you pay the transformer cost exactly once per window and then iterate on cheap heads in seconds. The code below embeds C-MAPSS turbofan windows with a frozen MOMENT encoder and fits a gradient-boosted head, the whole prognostic model in a dozen lines.</p>
+
+<pre><code class="language-python">import numpy as np
+from momentfm import MOMENTPipeline          # frozen T5-style time-series encoder
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import root_mean_squared_error
+
+model = MOMENTPipeline.from_pretrained(
+    "AutonLab/MOMENT-1-large", model_kwargs={"task_name": "embedding"})
+model.eval()                                  # weights stay FROZEN, no fine-tuning
+
+def embed(windows):                           # windows: (N, C, L) float32
+    Z = []
+    for x in windows:                         # one forward pass per window, no grad
+        out = model.embed(x_enc=x[None])      # -> (1, d) pooled embedding
+        Z.append(out.embeddings.squeeze(0).detach().numpy())
+    return np.stack(Z)                         # (N, d) cached feature matrix
+
+Z_tr, Z_te = embed(X_train), embed(X_test)    # unit-encoder is fixed across splits
+head = HistGradientBoostingRegressor(max_depth=3).fit(Z_tr, y_train_rul)
+rmse = root_mean_squared_error(y_test_rul, head.predict(Z_te))
+</code></pre>
+<div class="code-caption">A complete embedding-based RUL predictor on C-MAPSS: a frozen MOMENT encoder turns each engine window into a vector, the vectors are cached once, and a shallow gradient-boosted head does the actual RUL regression. The transformer never sees a gradient; only the tree fits the scarce failure labels.</div>
+
+<p>Two disciplines keep this honest. First, the encoder must be embedded <em>identically</em> across train and test, which the frozen weights guarantee, but the head's normalization statistics must be fit on train only. Second, the window-to-trajectory split must respect unit boundaries: every window from one engine goes entirely into train or entirely into test, never both, or embeddings of adjacent windows leak the answer across the split. This is the same run-to-failure leakage trap that <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> makes central, and it bites embedding pipelines especially hard because the frozen features are smooth and highly autocorrelated in time.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The encoder is the model you did not have to write</h3>
+<p>Building a comparable representation from scratch means a patch tokenizer, a transformer encoder, a masked-reconstruction pretraining loop, and a pretraining corpus, several hundred lines and days of GPU time before you fit a single RUL label. The <code>momentfm</code> (or Hugging Face <code>transformers</code>) call collapses all of it to the two lines above: <code>from_pretrained</code> downloads a model already pretrained on the Time-Series Pile, and <code>.embed()</code> returns the pooled vector. You write only the cache-and-fit head. The library owns tokenization, the pretrained weights, pooling, and batching; you own the last dozen lines.</p>
+</div>
+
+<h2>Frozen, fine-tuned, or hybrid: choosing the coupling</h2>
+<p>Freezing is not the only option, and the right coupling depends on how far your machine sits from the pretraining distribution. Keep the encoder <em>frozen</em> when failures are very scarce (tens of trajectories) or when you need many per-asset heads sharing one encoder on the edge. Switch to <em>parameter-efficient fine-tuning</em> (LoRA adapters or unfreezing only the top block) when you have a few hundred failures and a clear domain gap, so the encoder can bend toward your sensor's statistics without discarding its priors. Reserve <em>full fine-tuning</em> for the rich-data regime where you might as well have trained the sequence model of <a class="cross-ref" href="section-36.4.html">Section 36.4</a> directly. A useful diagnostic: embed your windows, color them by RUL, and project to two dimensions. If the frozen embeddings already separate healthy from near-failure, a linear head suffices and fine-tuning buys little; if they are tangled, the domain gap is real and adapters earn their keep.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is now</h3>
+<p>As of 2026 the strongest openly documented general-purpose time-series encoders for this use are MOMENT (Auton Lab, 2024), Chronos (Amazon, 2024), TimesFM (Google, 2024), and Moirai (Salesforce, 2024), all pretrained on broad time-series corpora and all evaluated with a frozen-embedding probing protocol. Benchmarks such as the GIFT-Eval suite and MOMENT's own prognostics track report that frozen embeddings plus a shallow head are competitive with, and in low-label regimes exceed, purpose-built RUL networks on C-MAPSS and N-CMAPSS. The open frontier is sensor-native pretraining (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>): encoders pretrained on vibration and current at machine sampling rates rather than on economic and web series, which closes the domain gap that generic models still carry into the factory.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wind farm with nine gearbox failures</h3>
+<p>An offshore wind operator wanted RUL on gearbox bearings but had only nine run-to-failure records across a 60-turbine fleet, far too few for the LSTM their vendor proposed, which memorized all nine and predicted noise on the tenth. The reliability team instead embedded 10-minute SCADA windows (gearbox oil temperature, bearing temperature, rotor speed, power) with a frozen Chronos encoder, pooling the four per-channel vectors, and fit a gradient-boosted head with quantile loss. The frozen model had never seen a wind turbine, but its priors for "slow upward drift with rising short-term variance" transferred cleanly: the probe recovered a monotone RUL trend on held-out turbines and gave 30-to-45-day lead time on two subsequent failures, enough to schedule a vessel and a crane. When they later collected 40 more failures, a LoRA adapter on the top encoder block shaved another few days of error, the clean progression from frozen probe to light fine-tune that the data volume justified.</p>
+</div>
+
+<h2>Pitfalls unique to embedding-based RUL</h2>
+<p>Three failure modes are specific to this approach. First, <em>silent domain mismatch</em>: a generic encoder pretrained on daily economic series may treat your 20 kHz vibration as pure noise and return near-constant embeddings, so always sanity-check that embeddings actually vary with age before trusting the head. Second, <em>embedding leakage</em>: because frozen features are temporally smooth, a random window split leaks the label through autocorrelation, inflating offline scores; split by unit and by time, as above. Third, <em>false precision in the point estimate</em>: a shallow head on a fixed representation gives no calibrated uncertainty by default, which is dangerous for a maintenance decision. Wrap the head in a conformal predictor to get valid RUL intervals, the machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and hand those intervals, not a single number, to the decision economics of the next section.</p>
+
+<div class="callout warning">
+<h4>Common Misconception</h4>
+<p>"A frozen foundation model needs no evaluation discipline because it never saw my labels." The encoder saw no labels, but your <em>head</em> did, and the smooth, autocorrelated embeddings make leakage across a naive split easier, not harder. A per-unit, time-respecting split and train-only normalization are more important here, not less, than for a from-scratch model.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: probe versus train-from-scratch under a label budget</h3>
+<p>Using the C-MAPSS FD001 subset, subsample the training engines to 5, 15, and all trajectories. (1) For each budget, fit both a from-scratch 1D-CNN RUL regressor and a frozen-embedding probe (MOMENT or Chronos plus a gradient-boosted head), and plot test RMSE versus number of training engines. (2) Identify the crossover budget below which the frozen probe wins. (3) Project the frozen embeddings to two dimensions, color by RUL, and relate what you see to whether a linear head would have sufficed. (4) Add a per-unit split check and report how much your RMSE changes when you (wrongly) switch to a random window split.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Explain in one sentence why frozen foundation-model embeddings outperform a from-scratch sequence model when only a dozen failures are available, referring to where the parameters live.</li>
+<li>Why does temporal smoothness of embeddings make a random window split more dangerous than it would be for raw-signal features?</li>
+<li>Give one concrete signal that tells you to move from a frozen probe to a parameter-efficient fine-tune rather than staying frozen.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-36.6.html">Section 36.6</a>, we take the RUL predictions this section produces, whether from a frozen probe or a fine-tuned encoder, and make them accountable: turning a point estimate into a calibrated uncertainty interval, then feeding that interval into the maintenance decision economics that decide when repairing early actually pays.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

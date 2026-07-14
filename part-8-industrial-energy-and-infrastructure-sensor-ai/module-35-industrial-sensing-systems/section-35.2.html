@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.2: SCADA, PLCs, and historian data. Building Sensory AI." name="description"/>
+<title>Section 35.2: SCADA, PLCs, and historian data | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Industrial Sensing Systems</a></div>
+<h1>SCADA, PLCs, and historian data</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me the historian held ten years of data. They forgot to mention it had discarded every second that failed to surprise it."</p>
+<cite>A Disillusioned AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>On a factory floor, almost no measurement reaches your model straight from the sensor. It passes through a stack of industrial control equipment first: a programmable logic controller reads the raw channel, a supervisory system polls the controller, and a time-series historian stores the result after lossily compressing it. By the time a tag lands in your training set it has been sampled on a scan cycle you did not choose, filtered by a deadband you did not set, and timestamped by a clock that may not be the sensor's own. This section is about that pipeline: what SCADA, PLCs, and historians actually are, how their tag-and-protocol data model shapes what you can learn, and, above all, the reconstruction traps that turn an innocent-looking historian export into a model that has quietly memorized a compression algorithm instead of a machine.</p>
+</div>
+
+<p><a class="cross-ref" href="section-35.1.html">Section 35.1</a> framed machines, processes, and telemetry as the raw material of industrial sensing. Here we do not revisit what the signals mean physically; we take the plant's measurements as given and ask a different question: through what infrastructure do they reach you, and what does that infrastructure do to them on the way? The answer draws heavily on the sampling and timestamp machinery of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and on the leakage-safe data engineering discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because a historian is where several of those hazards hide in plain sight.</p>
+
+<h2>The control-system stack: sensor to PLC to SCADA to historian</h2>
+<p>Industrial data lives in a layered architecture often described by the <em>Purdue model</em>, a reference hierarchy that separates the plant floor from the enterprise. At the bottom (Level 1) sit <strong>programmable logic controllers (PLCs)</strong> and their cousins, distributed control system (DCS) controllers: ruggedized real-time computers that read field sensors over analog and digital I/O, execute a deterministic control program every few milliseconds, and drive actuators such as valves and motors. A PLC's job is control, not archival; it holds only the current values in memory and runs a fixed <em>scan cycle</em> (read inputs, solve logic, write outputs, repeat).</p>
+<p>Above it (Level 2) is <strong>SCADA</strong>: Supervisory Control and Data Acquisition. A SCADA system does not do the fast control loop; it <em>supervises</em>. It polls many PLCs over a network, presents human-machine-interface screens to operators, raises alarms, and lets a human issue setpoint changes. SCADA is where the plant becomes observable to people. Then, off to the side (Level 3), sits the <strong>historian</strong>: a specialized time-series database (OSIsoft PI, AVEVA Historian, Aspen InfoPlus.21, GE Proficy, and open equivalents) whose entire purpose is to record every tag's value over years so that engineers, and now models, can look backward. Understanding which layer a number came from tells you its temporal resolution: a PLC sees a valve position every scan, but the historian may have kept only one value per minute, and only when it changed enough to matter.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The layer sets the resolution</h3>
+<p>The same physical quantity carries a different effective sampling rate at each layer. The PLC observes it at scan rate (milliseconds), SCADA polls it at seconds, and the historian archives a compressed subset at an irregular cadence. When someone hands you "the temperature tag," always ask which layer exported it and at what stored resolution. The number you plot is a downstream artifact of three sampling decisions you did not make.</p>
+</div>
+
+<h2>Tags, protocols, and the polling model</h2>
+<p>Industrial data is organized not as files or tables but as <em>tags</em>: named points, each a scalar time series with a type, engineering units, and metadata. A tag name like <code>U2.BOILER.FEEDWATER.FT101.PV</code> encodes unit, area, instrument, and the fact that this is a process value (PV) rather than a setpoint (SP) or output (OP). A plant has thousands to millions of tags; learning to read the naming convention is half the battle of navigating a historian.</p>
+<p>Tags move between layers over industrial protocols. <strong>Modbus</strong> is the old, simple register-based workhorse; <strong>OPC UA</strong> (the modern successor to OPC Classic) provides a structured, typed, secure namespace and is the protocol most new integrations speak; <strong>DNP3</strong> dominates utilities and the power grid. What they share is a <em>polling</em> or report-by-exception model: values are requested or pushed on a schedule, each carries a <strong>quality flag</strong> (Good, Bad, Uncertain, or a stale/last-known-value marker), and each carries a timestamp whose origin (field device, PLC, or SCADA server) you must not assume. Those quality flags are not decoration. A tag reading a flat, plausible value with a Bad quality flag is a dead sensor holding its last number, and a model that ignores the flag will treat a failed instrument as steady-state truth. Because these protocols also define the attack surface of the plant, the same tag-and-protocol layer is the subject of <a class="cross-ref" href="../module-38-cyber-physical-anomaly-detection-and-ics/index.html">Chapter 38</a> on cyber-physical anomaly detection and ICS security.</p>
+
+<h2>How the historian lies to you: deadband and compression</h2>
+<p>Here is the single most important thing an AI practitioner must know about historian data: <strong>it is lossily compressed before you ever see it, and the compression is designed to be invisible.</strong> Historians do not store every sample. They apply two filters in sequence. The <em>exception</em> filter (a deadband) at the collection stage discards a new value if it differs from the last reported one by less than a tolerance. Then the <em>compression</em> filter, classically the <em>swinging door</em> algorithm, discards intermediate points that fall within a linear tolerance corridor, keeping only the vertices needed to reconstruct the trend within a stated error band. A tag that was scanned every second may be archived as a handful of points per hour during steady operation.</p>
+<p>The trap is the reconstruction rule. Historians return archived points, and the correct interpolation between them is usually <em>zero-order hold</em> (step, or last-known-value), because that is the semantics the deadband assumed when it decided a value "had not changed." If you instead resample with linear interpolation, or if you fit a model to the raw archived points as though they were evenly spaced samples, you inject slopes and densities that the plant never produced. Two failure modes follow. First, sample density becomes information: points cluster where the signal was moving and thin out where it was flat, so a naive model learns that "many points per minute" correlates with transients (a fact about the compressor, in the historian's algorithm, not about the compressor itself). Second, the deadband erases exactly the small fluctuations that a condition-monitoring or anomaly model most wants to see. The code below makes the deadband concrete.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def deadband_compress(t, x, deadband):
+    """Report-by-exception: keep a point only if it moved past the deadband."""
+    kept_t, kept_x = [t[0]], [x[0]]      # always keep the first sample
+    last = x[0]
+    for ti, xi in zip(t[1:], x[1:]):
+        if abs(xi - last) &gt;= deadband:  # exceeds tolerance -> archive it
+            kept_t.append(ti); kept_x.append(xi)
+            last = xi
+    return np.array(kept_t), np.array(kept_x)
+
+t = np.arange(0, 20, 0.1)                       # scanned every 0.1 s
+x = 50 + 2*np.sin(0.5*t) + 0.3*np.random.randn(t.size)
+kt, kx = deadband_compress(t, x, deadband=0.8)  # what the historian keeps
+
+# Reconstruct on a regular grid the WRONG way (linear) and the RIGHT way (hold)
+grid = np.arange(0, 20, 0.1)
+wrong = np.interp(grid, kt, kx)                          # invents slopes
+idx = np.searchsorted(kt, grid, side="right") - 1        # step / ZOH
+right = kx[np.clip(idx, 0, len(kx)-1)]
+print(f"scanned={x.size} archived={kx.size} "
+      f"linear_MAE={np.mean(np.abs(wrong-x)):.3f} "
+      f"hold_MAE={np.mean(np.abs(right-x)):.3f}")</code></pre>
+<div class="code-caption">A minimal report-by-exception deadband, then two reconstructions of the same archived points: linear interpolation invents slopes the process never took, while zero-order hold matches the semantics the deadband assumed. Running it shows the archived count collapse to a fraction of the scanned count, and the hold reconstruction tracking the truth more faithfully near steady state.</div>
+
+<p>The script archives only the points that broke the 0.8-unit deadband, then reconstructs the full grid two ways. The lesson in the printed numbers is not that one interpolation is always better, but that <em>the choice is yours to make and the historian will not make it for you</em>. Treating archived points as raw uniform samples is the mistake; you must resample explicitly, with the hold semantics the compression assumed, before any windowing or feature extraction from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> is valid.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A gas compressor whose model learned the historian</h3>
+<p>A reliability team at a natural-gas plant trained an anomaly detector on discharge-pressure and vibration tags pulled from an OSIsoft PI historian. Offline it flagged every known trip. Deployed live against the SCADA stream, it fired constantly. The cause sat in the export: the historian's swinging-door compression thinned steady operation to a few points per hour but kept dense clusters during transients, and the team had resampled with linear interpolation to a one-second grid. The model had learned that dense, steep segments meant trouble, which was true of the compression algorithm and false of the compressor. Re-exporting with a fixed interpolated interval and zero-order hold, and adding sample-density as an explicit feature rather than a hidden one, removed most of the false alarms without touching the model architecture.</p>
+</div>
+
+<h2>Reading historian data for machine learning</h2>
+<p>A model needs a rectangular matrix: rows are timestamps, columns are tags, cells are aligned values. A historian gives you the opposite: thousands of tags each on its own irregular, compressed clock. Bridging the two is the real work. You must choose a target grid (say one sample per five seconds), resample each tag onto it with hold semantics, and align them so that at every row each tag carries its most recent valid value. The natural tool is an <em>as-of join</em>: for each grid timestamp, take each tag's last observation at or before that instant. Crucially, "at or before" is not a stylistic choice; it is the causal, leakage-safe rule from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Pulling a tag's <em>next</em> value, or interpolating across a boundary using a future archived point, leaks information a live system cannot have, and the leak is easy because the historian happily serves you both sides of any timestamp.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let pandas do the as-of alignment</h3>
+<p>Hand-rolling a multi-tag, causal, last-known-value merge with per-tag pointers and boundary handling is easily 40 or more lines and a fertile source of off-by-one leaks. <code>pandas.merge_asof</code> collapses it to one call and gets the causal direction right by construction:</p>
+<pre><code class="language-python">import pandas as pd
+# each tag arrives as its own irregular (timestamp, value) frame
+grid = pd.DataFrame({"ts": pd.date_range("2026-01-01", periods=1000, freq="5s")})
+aligned = pd.merge_asof(grid, tag_ft101.sort_values("ts"),
+                        on="ts", direction="backward")   # last value at-or-before</code></pre>
+<div class="code-caption">A single <code>merge_asof</code> with <code>direction="backward"</code> aligns an irregular historian tag onto a regular grid using only past values, replacing a hand-written pointer loop and enforcing the causal, leakage-safe rule automatically.</div>
+<p>The library handles the sorted-merge, the backward direction, optional tolerance for staleness, and per-key grouping when you align many tags at once. You supply the grid and the causal direction; it removes an entire category of boundary bugs.</p>
+</div>
+
+<p>Two more habits make historian data trustworthy. Carry the quality flags through your resampling and drop or mask spans marked Bad or stale, rather than letting a held-forward dead value masquerade as a real reading. And record the export's compression settings (deadband and compression deviation per tag) as metadata, because they bound the smallest change your model can possibly detect. A downstream denoising or filtering step from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> cannot recover fluctuation the deadband already threw away.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: quantify the compression bias</h3>
+<p>Take the <code>deadband_compress</code> function above and a synthetic signal that alternates between long flat plateaus and short steep ramps. (1) Compress it with a deadband of 0.5 and count the archived points inside plateaus versus inside ramps. (2) Fit a simple threshold anomaly rule on the local point density (points per 10-second window) and show it "detects" ramps using density alone. (3) Now re-export with a fixed 1-second interpolated grid and zero-order hold, and show the density feature becomes uninformative. Write two sentences on why step (2) is a leak of the compression algorithm, not a property of the process.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>A tag shows a perfectly flat value for six hours with a Bad quality flag. What has almost certainly happened, and why is ignoring the flag dangerous for a downstream model?</li>
+<li>Why is linear interpolation between archived historian points often the wrong reconstruction, and what interpolation does the exception deadband implicitly assume?</li>
+<li>When aligning many irregular tags onto a common grid with <code>merge_asof</code>, why must the direction be backward rather than nearest, in terms of the leakage-safe constraint?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-35.3.html">Section 35.3</a>, we descend from the data-infrastructure layer to the physics of the signals themselves: vibration, acoustic emission, thermal, and electrical measurements. Those are the high-rate channels that a historian usually cannot store at full fidelity, which is exactly why they often bypass the SCADA stack entirely and demand their own acquisition path.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

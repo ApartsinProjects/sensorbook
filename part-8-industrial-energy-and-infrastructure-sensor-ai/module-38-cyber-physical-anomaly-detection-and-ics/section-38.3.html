@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.3: Reconstruction and forecasting residuals. Building Sensory AI." name="description"/>
+<title>Section 38.3: Reconstruction and forecasting residuals | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Cyber-Physical Anomaly Detection and ICS Security</a></div>
+<h1>Reconstruction and forecasting residuals</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I did not learn what an attack looks like. I learned what the plant looks like when nothing is wrong, and then I watched for the plant to argue with me."</p>
+        <cite>A Residual-Minded AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds a learned detector, so it assumes the sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> (recurrent nets and temporal convolutions that predict the next window of a multivariate stream). The scoring and thresholding machinery generalizes the classical change-and-outlier detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and the calibration of the alarm boundary rests on the conformal ideas of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. We treat the attack-versus-fault distinction from <a class="cross-ref" href="section-38.2.html">Section 38.2</a> as settled: a residual detector fires on <em>both</em>, and only later stages decide which. The leakage discipline invoked throughout is developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>You almost never have labeled attacks on a live plant, and the physical invariants of <a class="cross-ref" href="section-38.1.html">Section 38.1</a> only cover the relationships an engineer thought to write down. The dominant industrial-control detector sidesteps both problems by learning a single thing from data you actually have in abundance: what the process looks like when it is healthy. Train a model to predict the plant from itself, either by reconstructing the current sensor vector or by forecasting the next one, and the <em>residual</em>, the gap between what the model expected and what the sensors report, becomes a general-purpose anomaly signal. When a valve is spoofed, a setpoint is tampered, or a pump quietly cavitates, the process departs from the manifold of normal behavior the model memorized, and the residual swells. The entire craft of this section is turning that residual into a decision you can trust: choosing reconstruction versus forecasting, collapsing a vector of per-sensor errors into one honest score, and setting a threshold that catches the departure without drowning the operator in false alarms.</p>
+    </div>
+
+    <h2>Two ways to make a residual: reconstruct or forecast</h2>
+    <p>A residual detector needs a model of normality that produces an expected value it can subtract from the observation. Two families dominate, and the difference is what the model is allowed to see. A <strong>reconstruction</strong> model takes a window of sensor readings, compresses it through a bottleneck, and rebuilds the same window; the classic instances are the undercomplete autoencoder and its probabilistic cousin the variational autoencoder. Trained only on healthy data, it becomes fluent at re-expressing normal operating regimes and clumsy at anything off-manifold, so the reconstruction error \(\lVert \mathbf{x}_t - \hat{\mathbf{x}}_t \rVert\) rises on abnormal input. A <strong>forecasting</strong> model instead sees only the past, \(\mathbf{x}_{t-w:t-1}\), and predicts the next step \(\hat{\mathbf{x}}_t\); the residual is the one-step prediction error. LSTMs, temporal convolutional networks (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>), and transformers (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) all serve here.</p>
+    <p>The practical distinction is causality and latency. A forecaster is strictly causal, uses no future samples, and flags an anomaly the instant the process deviates from its own recent trajectory, which is what an online security monitor needs. A reconstructor sees the anomalous sample itself while scoring it, which risks the model quietly reconstructing the attack (autoencoders are notorious for generalizing too well and copying anomalies straight through the bottleneck), but it excels at spatial coherence: it catches a single sensor that has gone inconsistent with its siblings even when no time step looks temporally surprising. In control-systems practice the two are often combined, and the residual definition, not the network architecture, is the decision that governs detection behavior.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A residual detector is only as trustworthy as the assumption that it learned <em>normal</em> and nothing else. If a single labeled or unlabeled attack leaks into the training window, the model learns to reconstruct or forecast that attack too, and the residual stays flat exactly when you need it to spike. This is why normal-only (semi-supervised) training is not a convenience but a correctness requirement, and why the train split must be a contiguous, verified-clean stretch of operation rather than a random sample of all data. Randomly shuffling multivariate control data before splitting, a habit imported from image classification, silently teaches the model the test-time attacks and inflates every metric you will report. The clean-training-window rule is the residual-detector face of the leakage discipline in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+    </div>
+
+    <h2>From an error vector to one honest score</h2>
+    <p>Each time step yields a vector of per-sensor errors, and a plant has dozens to hundreds of sensors on wildly different scales (a tank level in metres, a flow in cubic metres per hour, a binary actuator state). Summing raw errors lets the loudest sensor dominate and buries a subtle attack on a quiet one, so you must whiten first. The standard construction fits a Gaussian to the residuals on a held-out clean validation stream and scores each step by its Mahalanobis distance,</p>
+    \[ s_t = (\mathbf{r}_t - \boldsymbol{\mu})^{\top} \boldsymbol{\Sigma}^{-1} (\mathbf{r}_t - \boldsymbol{\mu}), \qquad \mathbf{r}_t = \mathbf{x}_t - \hat{\mathbf{x}}_t, \]
+    <p>where \(\boldsymbol{\mu}\) and \(\boldsymbol{\Sigma}\) are the mean and covariance of the healthy residuals. This rescales every sensor to its own natural noise level and, through \(\boldsymbol{\Sigma}^{-1}\), accounts for sensors that normally err together. A cheaper per-sensor alternative is to z-score each residual channel and take the maximum, which preserves which sensor is implicated and feeds directly into the localization of <a class="cross-ref" href="index.html">Section 38.5</a>.</p>
+    <p>A single-step score is jumpy. Sensor noise and model imperfection make \(s_t\) cross any fixed line occasionally even on healthy data, so thresholding it raw produces a storm of one-sample false alarms. Two smoothers tame this. A short sliding-window average or peak-over-window trades a few samples of detection delay for a large drop in false positives. Better, a cumulative-sum (CUSUM) statistic from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> integrates small persistent residuals, which is exactly the signature of a stealthy attack that nudges a setpoint just past normal and holds it. Setting the alarm boundary is itself a calibration problem: rather than guessing, pick the threshold at a high quantile (say the 99.5th percentile) of the score on a clean validation stream so the healthy false-alarm rate is a number you chose, or use the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> to get a distribution-free bound on it.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# residuals from a normal-only-trained forecaster: r[t] = x[t] - x_hat[t]
+# shapes: r_val (clean validation), r_test (may contain an attack)
+mu = r_val.mean(axis=0)
+Sigma = np.cov(r_val, rowvar=False) + 1e-6 * np.eye(r_val.shape[1])
+Sinv = np.linalg.inv(Sigma)
+
+def mahalanobis(r):                       # per-step whitened anomaly score
+    d = r - mu
+    return np.einsum("ti,ij,tj->t", d, Sinv, d)
+
+s_val, s_test = mahalanobis(r_val), mahalanobis(r_test)
+
+tau = np.quantile(s_val, 0.995)           # threshold at chosen clean FPR
+
+# smooth before deciding: sustained exceedance, not a single spike
+win = 10
+s_smooth = np.convolve(s_test, np.ones(win) / win, mode="same")
+alarms = s_smooth > tau                   # boolean per-step detection
+print(f"threshold={tau:.1f}  alarm fraction={alarms.mean():.3%}")</code></pre>
+    <div class="code-caption"><strong>Listing 38.1.</strong> Turning a per-step residual vector into a calibrated, smoothed alarm. The covariance is estimated on clean validation residuals only, the threshold is fixed to a chosen false-alarm rate on that same clean stream (never on the test set), and a short moving average converts jittery single-sample exceedances into a decision on <em>sustained</em> departure. Swapping the forecaster for an autoencoder changes only how <code>r</code> is produced; every line below it is identical.</div>
+
+    <p>Listing 38.1 is the whole scoring stack in a dozen lines, and it exposes the two knobs that matter operationally: the threshold quantile, which trades misses against false alarms, and the smoothing window, which trades detection delay against alarm noise. Note what it does <em>not</em> do: it never touches the test labels to pick either knob, because doing so is the single most common way published ICS-detector numbers become fiction.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: reconstruction detectors without the boilerplate</h3>
+        <p>Writing an autoencoder, its training loop, the residual scoring, and a windowed threshold from scratch is roughly 120 to 150 lines before you have a single evaluation. A dedicated time-series anomaly library collapses the reconstruction detector to a few calls:</p>
+        <pre class="language-python"><code class="language-python">from pyod.models.auto_encoder import AutoEncoder
+det = AutoEncoder(hidden_neurons=[32, 8, 8, 32], epochs=50)
+det.fit(X_normal)                 # normal-only fit
+scores = det.decision_function(X_test)   # per-window reconstruction score</code></pre>
+        <div class="code-caption"><strong>Listing 38.2.</strong> A reconstruction anomaly detector in three lines with <code>pyod</code>, replacing about 130 lines of model, training-loop, and scoring code. The library owns the network, the fit loop, and the score normalization; you still own the leakage-safe split (fit on a clean, contiguous window) and the threshold calibration, which no library can choose correctly for you.</p>
+    </div>
+
+    <h2>What residuals catch, miss, and how to measure them honestly</h2>
+    <p>Residual detectors shine on departures from learned dynamics: a sensor frozen at a constant (residual grows as the true process moves away), a spoofed reading pinned to a plausible-but-wrong value, an actuator driven outside its normal envelope, and slow drifts that break a normally tight correlation between two tags. They are blind, by construction, to attacks that keep the process on the healthy manifold: a replayed segment of genuine past data produces near-zero residual because it <em>is</em> normal behavior, just at the wrong time, which is precisely why replay attacks are the standard hard case and why residual detectors are paired with the invariant checks of <a class="cross-ref" href="section-38.1.html">Section 38.1</a> and the graph models of <a class="cross-ref" href="index.html">Section 38.4</a>.</p>
+    <p>Evaluation is where this literature has done itself the most damage, so measure carefully. Anomalies in ICS data are rare and bursty, which makes accuracy meaningless and even point-wise precision and recall misleading. The widely used <em>point-adjust</em> protocol, which counts an entire contiguous anomaly segment as detected if the model fires on any one sample inside it, inflates F1 so severely that a detector emitting random alarms can appear near-perfect; treat point-adjusted F1 as an upper bound to be reported alongside, never instead of, the un-adjusted number and a detection-delay curve. What operators actually care about is caught here by three honest metrics: the fraction of attack <em>events</em> detected at a fixed plant-wide false-alarm budget, the median time-to-detection, and the alarm rate during clean operation. These, computed on chronological splits that never leak future attacks into training, are the numbers that survive contact with a real control room; the adversarial and transductive-leakage pitfalls that break the rest are the subject of <a class="cross-ref" href="index.html">Section 38.6</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the SWaT water-treatment testbed</h3>
+        <p>The Secure Water Treatment (SWaT) testbed, a six-stage water-purification plant instrumented with 51 sensors and actuators, is the canonical proving ground for ICS residual detectors. A team trains a temporal-convolutional forecaster on seven days of the operator-logged normal run, holds out the last clean day to fit the residual covariance and pick a 99.5th-percentile threshold, and only then scores the four-day attack campaign. On attack 16, an operator's setpoint for a tank level is tampered so the pump under-fills stage three. No single sensor reads out of physical range, so a limit alarm stays silent, but the forecaster expected the level to keep rising on the recent inflow trend; the residual on the level tag climbs and its Mahalanobis score crosses threshold about forty seconds after the tamper, well before the downstream chemistry drifts. On a replay attack that splices in a genuine earlier normal segment, the residual barely moves, and the team logs it as a known blind spot to be covered by the process-invariant checks rather than papered over with a lower threshold that would have flooded the seven clean days with false alarms.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current state of the art moves beyond point-wise reconstruction toward models whose residuals are both sharper and more localizable. Association-based transformers such as Anomaly Transformer exploit that anomalous points have weak association to the rest of the series, and diffusion-based reconstructors (for example the ImDiffusion line) denoise a corrupted window and use the imputation gap as the residual, reporting stronger separation on multivariate benchmarks. In parallel, a sobering revisionist thread (the work around "Anomaly Transformer" critiques and the TSB-AD benchmark) shows that once the point-adjust metric is removed and splits are made rigorously chronological, many deep detectors barely beat a well-tuned forecasting-residual or even a simple distance baseline. The open frontier is therefore twofold: representations whose residuals resist replay and stealthy-attack manipulation, and evaluation protocols honest enough that gains on paper survive deployment. Foundation-model forecasters (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>) applied zero-shot as the residual generator are the newest, still-unsettled entrant.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a multivariate process stream with a known attack window. (1) Train a one-step LSTM or TCN forecaster on a contiguous clean prefix only, and compute residuals on the full stream. (2) Build the Mahalanobis score of Listing 38.1, fit \(\boldsymbol{\mu}, \boldsymbol{\Sigma}\) on a held-out clean segment, and sweep the threshold quantile from the 95th to the 99.9th percentile. Plot the resulting curve of attack-events-detected against clean-stream false-alarm rate, and mark the median detection delay at your chosen operating point. (3) Now recompute the same detector's F1 under the point-adjust protocol and un-adjusted, and explain in two sentences why the two numbers differ so much and which one you would show an operator.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does a forecasting residual detector catch a replay attack far less reliably than a frozen-sensor attack, and what companion detector covers that blind spot?</p>
+        <p class="quiz-question">2. What goes wrong if you fit the residual covariance or pick the alarm threshold on data that includes the test-time attacks, and why is a chronological, contiguous clean training window the fix?</p>
+        <p class="quiz-question">3. Why can the point-adjust evaluation protocol make a near-random detector look excellent, and which three metrics would you report instead to a control-room owner?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="index.html">Section 38.4</a>, we give the residual a spatial backbone. A plant is a graph of physically coupled tags, and a graph neural network learns the normal message-passing between them, so its residual is not just "this value is temporally surprising" but "this value is inconsistent with the sensors it is wired to." That structure sharpens detection of the stealthy, on-manifold attacks that a per-tag forecaster misses, and it hands the next stage a natural map for localizing where the anomaly began.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

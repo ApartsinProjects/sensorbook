@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.6: Data quality in industrial systems. Building Sensory AI." name="description"/>
+<title>Section 35.6: Data quality in industrial systems | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Industrial Sensing Systems</a></div>
+<h1>Data quality in industrial systems</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A plant historian never lies about what it recorded. It simply forgets to mention that the sensor was unplugged for a month."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every model in this part, from the prognostics of <a class="cross-ref" href="../module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a> to the ICS anomaly detectors of <a class="cross-ref" href="../module-38-cyber-physical-anomaly-detection-and-ics/index.html">Chapter 38</a>, inherits its ceiling from the quality of the telemetry underneath it. Industrial data is not merely noisy: it is structurally broken in ways that mimic the very faults you are trying to detect. A frozen sensor looks like a perfectly stable process. A dropped packet looks like a machine that stopped. A quietly rescaled tag looks like a step change worth an alarm. This section teaches you to name these failure modes, quantify them, and gate them before they reach a model, because in industrial sensing the difference between a false alarm and a missed bearing failure is almost always a data-quality decision made hours earlier.</p>
+</div>
+
+<p>You arrive at industrial data expecting the concerns of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: schema drift, missing values, leakage across splits. Those all apply. But a rotating machine wired into a decades-old control network adds failure modes that clean-desk data engineering never anticipated. The signals arrive through the SCADA, PLC, and historian stack of Sections 35.1 and 35.2, and each hop in that chain corrupts data in its own signature way. Your job is to make those corruptions <em>observable</em> before a model silently learns them as physics.</p>
+
+<h2>The industrial failure taxonomy</h2>
+
+<p>Generic "missing data" thinking fails here because industrial gaps carry mechanism-specific fingerprints. Learn to recognize five that dominate plant telemetry.</p>
+
+<p><strong>Stuck-at (frozen) values.</strong> A sensor or its input card fails such that it reports the last good reading forever, or a fixed rail value. The what: a channel whose variance collapses to zero while the process is demonstrably running. The why it is dangerous: a frozen temperature tag reads as a beautifully controlled loop, so operators trust it and models treat it as ground truth. The how to catch: flag any window where the rolling standard deviation drops below the sensor's known quantization step for longer than physically plausible.</p>
+
+<p><strong>Historian compression artifacts.</strong> Plant historians like OSIsoft PI store data with swinging-door or deadband compression: a point is only written when the signal deviates from a linear interpolation by more than a configured band. This is lossy by design. The consequence is that your "1 Hz tag" may have real samples minutes apart, and naive resampling manufactures fake smoothness that hides transients. Always check the true event spacing, not the nominal rate.</p>
+
+<p><strong>Clipping and saturation.</strong> A 4 to 20 mA loop or an ADC pins at its rail when the true value exceeds range. The signal flat-tops at a suspiciously round number. Unlike a frozen sensor, the process is genuinely at an extreme, but the magnitude is censored, which quietly biases any regression trained on it.</p>
+
+<p><strong>Timestamp pathologies.</strong> Clocks drift, daylight-saving transitions duplicate an hour, and buffered edge devices flush a backlog with a single arrival timestamp. The result is out-of-order, duplicated, or bursty samples. Because so much industrial inference is time-frequency analysis (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>), a wrong timestamp corrupts every spectral feature downstream.</p>
+
+<p><strong>Unit and scaling drift.</strong> A technician recalibrates a tag, swaps a sensor for a different range, or an engineer edits a PLC scaling constant. The tag's meaning changes mid-stream with no schema event. This is the industrial analog of label drift and it is the single most common cause of a model that was fine last quarter mysteriously alarming today.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>In consumer sensing, missing data is usually random and benign. In industrial sensing, missing and corrupt data is <em>correlated with the events you care about</em>. Sensors fail more often during the same thermal and vibration extremes that precede machine faults, and outages cluster around shutdowns, which are exactly the transitions a prognostics model must see. Dropping bad data is therefore never neutral: it is a biased deletion that removes your most informative samples. Impute and flag; do not silently discard.</p>
+</div>
+
+<h2>Quantifying quality: from vibes to numbers</h2>
+
+<p>"The data looks bad" does not survive a design review. Turn each failure mode into a measurable statistic you can trend and threshold, the same way you would monitor the process itself.</p>
+
+<p>Two families of metric do most of the work. <strong>Completeness</strong> is the fraction of expected samples actually present in a window, corrected for the true (post-compression) sampling. <strong>Validity</strong> is the fraction of present samples that pass physical range, rate-of-change, and cross-channel consistency checks. A useful composite is a per-tag, per-window quality score
+
+$$q = w_c \, C + w_v \, V + w_f \, (1 - F),$$
+
+where \(C\) is completeness, \(V\) is validity, \(F\) is the frozen-fraction (share of the window with sub-quantization variance), and the weights \(w_c, w_v, w_f\) sum to one. A model then consumes both the feature <em>and</em> its \(q\); windows below a gate threshold are held back or flagged for the operator rather than scored blindly. This mirrors the uncertainty-aware decisioning of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: a low-quality window should widen predictive intervals, not be laundered into a confident number.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the gearbox that never overheated</h3>
+<p>A wind-farm operator ran a temperature-based overheating alarm on a turbine gearbox. For eleven months it never fired, and the maintenance team praised the reliability of that unit. A quality audit later computed the frozen-fraction \(F\) per tag and found the gearbox oil-temperature channel had \(F \approx 0.97\): the RTD input card had failed in May and the historian had been faithfully storing the same 58.3 C ever since. The alarm could not fire because the input could not move. A single frozen-fraction check, trended weekly, would have surfaced the dead sensor in days rather than after a bearing failure. The lesson generalizes: a silent alarm is not evidence of health, it is evidence you must verify the sensor is alive.</p>
+</div>
+
+<h2>A minimal quality gate you can run today</h2>
+
+<p>The checks above are simple enough to implement directly, which makes them ideal for an edge gateway or historian ingestion job. The routine below scores one tag's window against the three dominant failure modes and returns a composite \(q\) plus per-flaw diagnostics, so a downstream model can decide whether to trust it.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def quality_score(x, t, fs_hz, lo, hi, quant, max_gap_s,
+                  w=(0.4, 0.4, 0.2)):
+    """Score one tag window. x: values, t: unix seconds, fs_hz: nominal rate."""
+    x = np.asarray(x, float); t = np.asarray(t, float)
+    n_expected = max(1, int((t[-1] - t[0]) * fs_hz))
+    completeness = min(1.0, len(x) / n_expected)
+
+    in_range = (x >= lo) & (x <= hi)
+    dt = np.diff(t)
+    no_stall = np.all(dt <= max_gap_s) if len(dt) else True
+    validity = in_range.mean() * (1.0 if no_stall else 0.7)
+
+    # frozen: rolling variance below the quantization floor
+    win = max(4, int(fs_hz * 5))
+    fro = np.array([x[i:i+win].std() < quant
+                    for i in range(0, max(1, len(x) - win))])
+    frozen_fraction = fro.mean() if fro.size else 0.0
+
+    wc, wv, wf = w
+    q = wc*completeness + wv*validity + wf*(1 - frozen_fraction)
+    return {"q": round(q, 3), "completeness": round(completeness, 3),
+            "validity": round(validity, 3),
+            "frozen_fraction": round(frozen_fraction, 3)}
+
+t = np.arange(0, 60, 1.0)                    # 60 s at 1 Hz
+x = 58.3 * np.ones_like(t)                    # a frozen RTD
+print(quality_score(x, t, 1.0, lo=-20, hi=120, quant=0.05, max_gap_s=3))
+# -> {'q': 0.8, 'completeness': 1.0, 'validity': 1.0, 'frozen_fraction': 1.0}</code></pre>
+<div class="code-caption">A dependency-free quality gate scoring completeness, validity, and frozen-fraction for a single tag window. The frozen RTD from the wind-turbine example scores perfect completeness and validity yet a frozen-fraction of 1.0, dragging \(q\) to 0.8 and exposing the dead sensor that range checks alone would pass.</div>
+
+<p>Notice what the range check alone would miss: the frozen RTD is perfectly in range, so validity is 1.0. Only the frozen-fraction term reveals the fault. That is the whole argument for a composite score rather than a single filter.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The hand-rolled routine above is roughly 25 lines and covers three checks. A dedicated data-validation library such as <code>pandera</code> or <code>great_expectations</code> expresses the same range, completeness, and freshness rules declaratively in about 6 lines of schema and adds versioned expectation suites, HTML validation reports, and CI integration for free. It handles the bookkeeping (which tag failed which check, over which window, versus which prior run) that becomes unmanageable by hand once you have thousands of tags. Write the checks yourself once to understand them; then let the library own the fleet-scale accounting.</p>
+</div>
+
+<h2>Gating, imputation, and the leakage trap</h2>
+
+<p>Once you can score quality, you must decide what to do with a low score. Three policies, in increasing sophistication. <strong>Gate</strong>: hold the window back from the model and mark the output "insufficient data quality" rather than emitting a guess. <strong>Impute and flag</strong>: fill short gaps (forward-fill for slow process variables, model-based interpolation for dynamic ones) but carry the imputation mask forward as a feature so the model knows which samples are synthetic. <strong>Repair</strong>: correct known systematic errors, such as reversing a unit-scaling change once you have detected it. Never impute silently; an unflagged fill is indistinguishable from real data and teaches the model that flat interpolations are normal physics.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Quality gates are a classic leakage vector. If you fit imputation statistics, range bounds, or a frozen-detector threshold on the whole dataset and then split for evaluation, test-set information has bled into training exactly as warned in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and formalized in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. Fit every quality-related parameter on training data only, and apply the frozen bounds forward in time. In a plant, "forward in time" is not optional: your gate will run on data that does not exist yet, so it must be causal.</p>
+</div>
+
+<p>The reward for disciplined gating shows up downstream. A regime-segmentation model (Section 35.4) that ignores quality will treat a communications outage as a new operating regime; one that consumes \(q\) will correctly label it "unknown." An anomaly detector (<a class="cross-ref" href="../module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) that ignores quality will spend its false-alarm budget on saturated sensors instead of real faults. Data quality is not a preprocessing chore you finish and forget; it is a signal you monitor for the life of the asset, right alongside the process itself.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public turbofan or bearing run-to-failure dataset (for example C-MAPSS or the IMS bearing set). For each sensor channel, compute completeness, validity, and frozen-fraction over 60-second windows and plot each metric against time-to-failure. Do any channels degrade in quality as failure approaches? Now retrain a simple remaining-useful-life regressor twice: once dropping low-quality windows, once feeding \(q\) as an extra feature. Compare the RUL error near end-of-life and explain, in terms of the biased-deletion argument above, why dropping windows can make late-life predictions worse.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. A temperature tag shows zero variance for two hours while the pump it monitors is clearly running. Which two failure modes could produce this, and what single additional check would distinguish a frozen sensor from a genuinely stable loop?</p>
+<p>2. Why does forward-filling a gap without carrying an imputation mask risk teaching a model incorrect physics, and what does the mask let the model learn instead?</p>
+<p>3. You fit your range bounds and frozen thresholds on the full three-year archive, then split 70/30 by time for evaluation. Name the specific leakage you have introduced and the causal fix.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-35.7.html">Section 35.7</a>, we turn from the integrity of the data to the integrity of the actions it triggers: safety-critical constraints. When a model's output can open a valve, trip a turbine, or hold a furnace at temperature, the quality gates of this section become the last line of defense before a decision with physical consequences, and we will see how fail-safe design, interlocks, and human oversight are engineered around inevitably imperfect sensing.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.4: Reconstruction- and forecasting-based detection. Building Sensory AI." name="description"/>
+<title>Section 37.4: Reconstruction- and forecasting-based detection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Reconstruction- and forecasting-based detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I built a machine that reproduces the world perfectly. Then it reproduced the fault perfectly too, gave it a low error, and reported that everything was fine."</p>
+<cite>An Overtrained AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>In condition monitoring you almost never have labeled faults. Bearings fail rarely, pumps cavitate on their own schedule, and nobody will let you break a turbine to collect training examples. So the dominant strategy is to model <em>normal</em> and flag whatever the model cannot explain. Two model families do this: a <strong>reconstruction</strong> model learns to compress and rebuild healthy signals, and a <strong>forecasting</strong> model learns to predict the next samples from the recent past. In both cases the anomaly score is a <em>residual</em>: how badly the model missed. When a machine drifts into a state the model never saw during training, the residual spikes. This section explains what each family models, why residuals turn "I have only normal data" into a working detector, the failure mode where the model reconstructs the anomaly too well and hides it, and how to convert a noisy residual stream into a threshold you can actually alarm on.</p>
+</div>
+
+<p>This section builds directly on the classical residual and change-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>: a forecasting detector is a learned generalization of a prediction-residual monitor, and the CUSUM-style thresholding there applies unchanged. The sequence models we lean on, recurrent networks and temporal convolutions, come from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, and the learned representations they operate on from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. Throughout, the split between "normal" training data and evaluation data must respect the unit- and time-level leakage rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because a residual detector that has seen the test machine's future is measuring memory, not surprise.</p>
+
+<h2>Model normal, score the residual</h2>
+<p>Both families share one contract: fit a function on healthy data only, then score new data by how far reality departs from what the model expected. The difference is what the model is asked to produce. A reconstruction model \(g\) maps a window \(x\) to an approximation \(\hat{x} = g(x)\) of that same window, typically through a bottleneck (an autoencoder, a variational autoencoder, or a masked reconstruction transformer). A forecasting model \(f\) maps the recent past \(x_{t-w:t}\) to a prediction \(\hat{x}_{t:t+h}\) of the next \(h\) samples it has not yet seen. In each case the anomaly score at time \(t\) is a residual norm:</p>
+
+$$s_t^{\text{recon}} = \lVert x_t - g(x)_t \rVert, \qquad s_t^{\text{fcst}} = \lVert x_t - \hat{x}_t \rVert.$$
+
+<p>The logic is the same one that makes self-supervised pretext tasks work: a model trained to rebuild or predict healthy signals internalizes the correlations, periodicities, and cross-channel structure of the normal regime. Feed it a fault (a new harmonic, a stuck sensor, a phase slip between two motors) and it has no basis to reproduce or anticipate that pattern, so the residual grows. This is why the approach is called <em>semi-supervised</em> or <em>one-class</em>: the only label used is "this segment is normal," which is exactly the label industrial data gives you for free during commissioning and steady-state running.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Reconstruction asks "is this consistent?"; forecasting asks "is this predictable?"</h3>
+<p>The distinction is not cosmetic. Reconstruction sees the whole window at once and flags <em>structural</em> inconsistency: a spectral shape or channel correlation the normal manifold does not contain. It is strong on point and contextual anomalies and indifferent to when they occur. Forecasting is causal, it only sees the past, so it flags <em>temporal</em> surprise: a value that violates the dynamics the model learned. It excels at abrupt transients and level shifts and runs naturally online, but it degrades on signals that are inherently hard to predict (near-white noise), where even healthy data yields large residuals. Choose reconstruction when normality is a shape; choose forecasting when normality is a dynamic. Many production detectors run both and fuse the scores.</p>
+</div>
+
+<h2>The identity-shortcut trap</h2>
+<p>The central danger of reconstruction is that a model with enough capacity learns to copy its input rather than to model the normal manifold. An autoencoder whose bottleneck is too wide, or a masked model given too much context, becomes a near-identity map: it reconstructs healthy <em>and</em> faulty windows with equally low error, so the residual never fires. The anomaly is reproduced perfectly and thereby hidden. This is the reconstruction analogue of overfitting, and it is silent, because training loss looks excellent exactly when the detector is worthless.</p>
+<p>The defenses are architectural and they are why the naive "just train a big autoencoder" baseline underperforms. A tight bottleneck forces lossy compression so out-of-distribution structure cannot survive it. Denoising objectives (corrupt the input, ask for the clean version) prevent the copy solution. Adversarial reconstruction, as in the widely cited <strong>USAD</strong> detector, trains a second decoder to amplify the reconstruction error of inputs that are not clearly normal, which sharpens the boundary. Memory-augmented autoencoders (MemAE) restrict the decoder to a learned dictionary of normal prototypes so it literally cannot address a fault. Forecasting sidesteps the trap by construction: a model that has not yet seen \(x_t\) cannot copy it, which is one reason forecasting residuals are often more robust on streaming machine data even when their raw accuracy is lower.</p>
+
+<h2>From a residual stream to an alarm</h2>
+<p>A raw residual is not yet a detector. Three steps stand between them. First, <strong>aggregate across channels</strong>: a pump has vibration, temperature, current, and pressure, and a fault may perturb one or several. A per-channel residual normalized by that channel's healthy spread, then combined (a max for single-channel faults, a Mahalanobis-style sum when the covariance matters), keeps a small drift in one signal from being drowned out by a naturally noisy neighbor. Second, <strong>smooth in time</strong>: point residuals are jittery, so an exponentially weighted or windowed average suppresses one-sample spikes and exposes sustained excursions, which are what real degradation looks like. Third, <strong>threshold</strong>. Fit the score distribution on a held-out <em>normal</em> segment and set the alarm at a high quantile or a robust \(z\)-score, or feed the smoothed residual into the CUSUM change detector of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> to catch slow drifts that never produce a single large sample.</p>
+<p>The threshold is where honesty gets tested, and it is easy to cheat. Choosing the threshold on the same data you report metrics on, or using the classic point-adjustment trick that credits an entire anomalous segment when any single point inside it fires, can inflate F1 dramatically without a better detector underneath. We defer that reckoning to <a class="cross-ref" href="section-37.7.html">Section 37.7</a>, but flag it here so you build the residual-to-alarm path with an honest evaluation already in mind. Calibrating the residual into a proper false-alarm rate, rather than an arbitrary cutoff, is exactly what the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> provide.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def forecast_residual_detector(x, w=32, k=4.0):
+    """One-step forecasting detector on a 1-D signal.
+    Forecaster = local AR(1) fit on the trailing window (a stand-in for an
+    LSTM/TCN). Score = |x_t - x_hat_t|; threshold from the NORMAL warm-up only."""
+    n = len(x)
+    resid = np.zeros(n)
+    for t in range(w, n):
+        past = x[t - w:t]
+        # cheap one-step predictor: last value + local slope
+        slope = (past[-1] - past[0]) / (w - 1)
+        x_hat = past[-1] + slope
+        resid[t] = abs(x[t] - x_hat)
+    warm = resid[w:w + 400]                     # residuals over a KNOWN-normal stretch
+    thr = warm.mean() + k * warm.std()          # robust-ish z threshold
+    smooth = np.convolve(resid, np.ones(8) / 8, mode="same")   # temporal smoothing
+    alarms = np.where(smooth &gt; thr)[0]
+    return smooth, thr, alarms
+
+rng = np.random.default_rng(0)
+t = np.arange(3000)
+sig = np.sin(2 * np.pi * t / 60) + 0.05 * rng.standard_normal(3000)  # healthy periodic
+sig[2200:2260] += np.linspace(0, 1.5, 60)                            # injected drift fault
+smooth, thr, alarms = forecast_residual_detector(sig)
+print(f"threshold={thr:.3f}  first alarm at t={alarms[0] if len(alarms) else None}")</code></pre>
+<div class="code-caption">A minimal forecasting-residual detector: predict each sample from its recent past, score the miss, and threshold a smoothed residual using statistics from a warm-up window that is known to be healthy. The injected drift near t=2200 pushes the residual past the threshold; the flat periodic region stays quiet. Swap the AR predictor for an LSTM or TCN and the pipeline is unchanged.</div>
+
+<p>The snippet above is deliberately the whole detector in one function so the three stages, forecast, residual, threshold-from-normal, are visible. Notice that the threshold is fit only on the warm-up segment, never on the fault region: that is the leakage-safe habit from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> in miniature. Replacing the AR one-liner with a trained sequence model raises accuracy but does not change a single downstream step.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wastewater pump station and the residual that saw it first</h3>
+<p>A municipal utility instrumented its lift-station pumps with current, vibration, and flow sensors and trained a channel-wise LSTM forecaster on three months of normal running, one model per pump. Weeks later, the forecasting residual on a single pump began climbing on the current channel while vibration and flow still looked ordinary, so no fixed threshold on any raw sensor would have tripped. The smoothed residual crossed its normal-derived alarm level nine days before the pump seized on a wrapped rag and impeller wear. The operators did not know the fault type in advance, and they had no labeled examples of it; the detector only knew that the pump had stopped behaving the way it used to. That is the entire value proposition of residual-based detection: it converts "we have never seen this failure" from a blocker into the expected case, and it localizes the surprise to a channel, which pointed maintenance straight at the motor circuit.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let a library own the training loop, windowing, and thresholding</h3>
+<p>Hand-writing a reconstruction or forecasting detector means the model, the sliding-window tensorization, the per-channel score normalization, the smoothing, and the threshold search, easily 150 or more lines with several places for leakage and off-by-one bugs. Libraries such as <code>PyOD</code> (for AutoEncoder, VAE, and other one-class detectors) and time-series toolkits like <code>Merlion</code>, <code>tods</code>, and <code>Darts</code> wrap the full path behind a <code>fit</code>/<code>score</code> interface: you pass normal windows and get a calibrated anomaly score back. That is roughly a 150-line reduction, and the library handles the windowing and the normal-only threshold calibration that are the usual sources of silently inflated numbers.</p>
+</div>
+
+<h2>Choosing and combining the two families</h2>
+<p>In practice the choice follows the signal and the deployment. Use <strong>reconstruction</strong> when a machine has rich multichannel structure and faults show up as broken correlations or spectral shape changes, and when you can afford to score whole windows offline. Use <strong>forecasting</strong> when you need streaming, low-latency detection and when normality is a predictable dynamic (rotating machinery, controlled processes). Reconstruction tends to win on subtle contextual anomalies that only make sense as a pattern; forecasting tends to win on abrupt onsets and to be more robust against the identity-shortcut trap. Because their blind spots differ, fusing the two scores (a simple normalized sum or a max) frequently beats either alone, and it is standard in cyber-physical detectors, where the same reconstruction-and-forecasting-residual idea reappears against process invariants in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-38-cyber-physical-anomaly-detection-and-ics/index.html">Chapter 38</a>. What both families share, and what <a class="cross-ref" href="section-37.5.html">Section 37.5</a> pushes further, is that they need no fault labels, only a confident notion of normal.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: make the shortcut fail, then fix it</h3>
+<p>Start from the code above. (1) Replace the AR forecaster with an undercomplete autoencoder (bottleneck of 2) trained on healthy windows, and score by reconstruction error; confirm it flags the injected drift. (2) Now widen the bottleneck to the full window size and retrain: show that the reconstruction error on the fault drops toward the normal level, demonstrating the identity-shortcut trap. (3) Restore detection by adding a denoising objective (corrupt inputs with Gaussian noise during training) at the wide bottleneck. Report, for all three, the residual gap between the fault region and the normal region. Which architectural change bought back the most separation, and why?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Both families produce an anomaly score without any fault labels. What single assumption about the training data makes that possible, and how does it fail if the assumption is violated?</li>
+<li>Why can a forecasting detector never suffer the identity-shortcut trap, while a reconstruction autoencoder can? What one architectural change most directly prevents the trap in the reconstruction case?</li>
+<li>You have a smoothed residual stream. Name the two things you must decide to turn it into an alarm, and explain why fitting either of them on the test segment inflates your reported score.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-37.5.html">Section 37.5</a>, we scale the "model normal, score the residual" idea up to <strong>foundation models</strong>: instead of training one autoencoder per machine, we ask whether a large pretrained time-series or sensor model can reconstruct healthy behavior zero-shot and expose anomalies as its residuals, and what that buys (and costs) when a new machine arrives with no training data of its own.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

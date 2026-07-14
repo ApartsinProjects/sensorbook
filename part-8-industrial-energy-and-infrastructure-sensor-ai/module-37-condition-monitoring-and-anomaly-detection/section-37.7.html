@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.7: Honest evaluation (TSB-AD, point-adjust pitfalls). Building Sensory AI." name="description"/>
+<title>Section 37.7: Honest evaluation (TSB-AD, point-adjust pitfalls) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Honest evaluation (TSB-AD, point-adjust pitfalls)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My detector scored 0.96 F1 on the benchmark. Then I replaced it with a coin flip and scored 0.97. The coin flip was cheaper, so I shipped that."</p>
+<cite>A Chastened AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every previous section in this chapter built a detector; this one decides whether the detector is real. For most of the last decade, time-series anomaly detection was evaluated with a scoring trick called <strong>point-adjustment</strong> that quietly inflated results so much that trivial baselines, including uniform random noise, outscored carefully engineered models. Whole tables of published state-of-the-art numbers turned out to measure the metric, not the method. If you monitor a fleet of pumps or turbines, an over-optimistic F1 is not an academic embarrassment: it is a maintenance program that dispatches technicians to healthy machines and misses the bearing that actually seized. This section explains exactly how point-adjustment cheats, shows you a random "detector" beating the reported scores in a dozen lines of code, and then equips you with the evaluation protocols that survive scrutiny: range-aware and affiliation metrics, threshold-free area-under-the-curve variants, and the TSB-AD benchmark that was built specifically to stop the cheating.</p>
+</div>
+
+<p>Honest evaluation here rests on the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the general benchmarking protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>; this section is the anomaly-detection-specific instance of those rules. It also closes a loop opened in <a class="cross-ref" href="section-37.4.html">Section 37.4</a>, where we built residual-to-alarm pipelines but deferred the reckoning about how to score them, and it extends the point-adjust warning first raised for classical detectors in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Prerequisites are light: precision, recall, and the precision-recall curve from any first ML course, plus the notion of a calibrated score threshold from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<h2>The point-adjustment trap</h2>
+<p>Anomalies in machine data are almost always <em>segments</em>, not isolated points: a cavitating pump stays cavitated for hundreds of samples. A detector emits a per-sample score, you threshold it, and you would like credit for "catching the event" even if you did not flag every single sample inside it. Point-adjustment (PA), introduced with the Donut and OmniAnomaly detectors around 2018, encodes that wish as a rule: <em>if the detector flags at least one sample inside a ground-truth anomaly segment, mark the entire segment as correctly detected.</em> Then compute ordinary point-wise precision, recall, and F1 on the adjusted predictions.</p>
+<p>The intent is defensible; the arithmetic is not. Consider a segment of length \(L\). Under PA, a single true-positive sample is promoted to \(L\) true positives. As anomaly segments in the popular benchmarks are long (tens to hundreds of samples), recall becomes almost free: any score that occasionally pokes above threshold inside a long segment harvests the whole thing. Because the benchmarks are also heavily imbalanced, precision is dominated by those inflated true positives, and F1 rockets toward 1. The pathology is that PA rewards <em>hitting a segment anywhere</em> far more than it penalizes <em>flooding the normal regime with false alarms</em>, which is precisely the tradeoff a condition-monitoring system must get right.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A metric a random number generator can win is not a metric</h3>
+<p>Kim and colleagues (2022) proved the point rather than argued it: they fed <em>uniform random anomaly scores</em> through the point-adjustment protocol and matched or beat the published state of the art on the standard benchmarks (SMD, MSL, SMAP, SWaT). The reason is structural. With enough anomaly segments and a modest flagging rate, a random detector will, by chance, drop at least one flag inside most segments, and PA converts each lucky hit into a full-segment reward. The lesson is not "these papers were fraudulent." It is that a scoring protocol under which noise is competitive cannot rank real methods, so any leaderboard built on raw PA-F1 is uninformative regardless of how good the underlying models are.</p>
+</div>
+
+<h2>Watch a coin flip win</h2>
+<p>The fastest way to internalize this is to run it. The code below builds a synthetic monitoring trace with 40 anomaly segments, defines a useless detector that flags 5% of samples uniformly at random, and reports its F1 before and after point-adjustment. Raw F1 sits near chance; the point-adjusted F1 leaps into the range that gets papers accepted.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def point_adjust(pred, label):
+    """If any flagged sample lands inside a true anomaly segment,
+    promote the whole segment to 'detected' (the standard PA rule)."""
+    pred = pred.copy()
+    in_seg, start = False, 0
+    for i in range(len(label)):
+        if label[i] and not in_seg:
+            in_seg, start = True, i
+        if not label[i] and in_seg:
+            if pred[start:i].any():
+                pred[start:i] = 1
+            in_seg = False
+    if in_seg and pred[start:].any():
+        pred[start:] = 1
+    return pred
+
+def f1(pred, label, eps=1e-9):
+    tp = np.sum((pred == 1) & (label == 1))
+    fp = np.sum((pred == 1) & (label == 0))
+    fn = np.sum((pred == 0) & (label == 1))
+    p, r = tp / (tp + fp + eps), tp / (tp + fn + eps)
+    return 2 * p * r / (p + r + eps)
+
+rng = np.random.default_rng(0)
+T, label = 20_000, np.zeros(20_000, dtype=int)
+for s in rng.integers(0, T - 60, size=40):        # 40 anomaly events
+    label[s:s + rng.integers(30, 60)] = 1
+
+pred = (rng.random(T) > 0.95).astype(int)          # a USELESS detector
+
+print("raw F1          :", round(f1(pred, label), 3))
+print("point-adjusted F1:", round(f1(point_adjust(pred, label), label), 3))
+# raw F1           : 0.05
+# point-adjusted F1: 0.86
+</code></pre>
+<div class="code-caption">A 5%-random flagger scores near zero honestly, yet point-adjustment lifts its F1 above 0.8 on the same predictions. If your evaluation cannot distinguish this detector from a good one, it cannot rank the detectors you actually care about.</div>
+
+<h2>Metrics that survive scrutiny</h2>
+<p>Rejecting PA does not mean reverting to naive point-wise F1, which is too harsh in the opposite direction: it demands you flag every sample of an event and gives no partial credit for a slightly early or slightly late detection. The field has converged on a small set of range-aware alternatives, and you should report at least one from each idea below.</p>
+<p><strong>Range-based precision and recall</strong> (Tatbul et al., 2018) generalize the point-wise definitions to intervals, with tunable terms for existence (did you touch the event at all), size (how much of it), and position (front-biased credit when early detection matters, which it usually does in prognostics). <strong>Affiliation metrics</strong> (Huet et al., 2022) score the average temporal distance between predicted and true events and normalize against a random baseline, so a detector must beat chance by construction, closing the exact loophole PA leaves open. <strong>Threshold-free area metrics</strong> avoid the separate sin of tuning the alarm threshold on the test set: instead of one operating point, report the area under the precision-recall curve (preferred over ROC because anomalies are rare and PR is not fooled by the enormous true-negative mass), or its range-aware generalization <strong>VUS</strong> (Volume Under the Surface, Paparrizos et al., 2022), which integrates over both the threshold and a temporal tolerance so no single lucky cutoff can be cherry-picked. When you must report a single-threshold number, use <strong>PA%K</strong>, which only credits a segment if at least \(K\%\) of its samples are flagged and sweeps \(K\) to expose the sensitivity that plain PA hides.</p>
+<p>For condition monitoring specifically, add two operational numbers no leaderboard captures: <strong>detection delay</strong> (samples or seconds from fault onset to first alarm, because a correct alarm that arrives after the failure is worthless) and <strong>false-alarm rate per machine-day</strong> (the quantity that decides whether operators keep the system switched on). The calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> turns a raw residual into a threshold that targets that false-alarm rate directly, rather than an arbitrary quantile.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wind-farm dashboard that looked perfect and dispatched no one</h3>
+<p>An operator of a 60-turbine wind farm evaluated a gearbox anomaly detector on twelve months of SCADA vibration and temperature logs and reported 0.94 point-adjusted F1. In the field, technicians ignored it within a fortnight: it raised roughly nine alarms per turbine per week, almost all on healthy units, while a real high-speed-shaft bearing fault crept up over three weeks and triggered its first alarm only two days before the gearbox failed. Re-scored without point-adjustment, the same model sat at 0.19 range-based F1 with a median detection delay of nineteen days. The 0.94 was never a property of the detector; it was a property of long fault segments plus a permissive metric. Switching the target to VUS-PR and a false-alarm budget of one alarm per turbine per month forced a retune that cut nuisance alarms tenfold and, in the following season, flagged two developing bearing faults with a fortnight of lead time.</p>
+</div>
+
+<h2>TSB-AD and honest benchmarking</h2>
+<p>Fixing the metric is necessary but not sufficient, because several classic benchmarks are themselves flawed: they contain mislabeled anomalies, trivially detectable single spikes, and train/test contamination that a leakage audit would reject. <strong>TSB-AD</strong> (Time-Series Benchmark for Anomaly Detection, Liu and Paparrizos, NeurIPS 2024) is the community's response. It curates over a thousand time series across univariate and multivariate domains, manually screens out mislabeled and trivial cases, standardizes on threshold-free VUS and range-aware metrics rather than point-adjusted F1, and evaluates dozens of statistical, machine-learning, and deep methods under one protocol. Its headline finding is deflating and useful: once the metric is fixed, simple, well-tuned methods (nearest-neighbor distances, sub-sequence clustering, classical forecasting residuals) are competitive with or ahead of many elaborate deep models, echoing the "model normal, score the residual" pragmatism of <a class="cross-ref" href="section-37.4.html">Section 37.4</a>. TSB-AD is the benchmark to report against for a new detector, and its leaderboard is the sanity check when your in-house number looks too good.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is heading (2024 to 2026)</h3>
+<p>The current frontier is threefold. First, evaluation is being extended to <em>foundation-model</em> detectors: zero-shot scoring with TimesFM, MOMENT, and Chronos (the reconstruction-based approaches of Section 37.5) is only meaningful under leakage-audited, PA-free protocols, and TSB-AD-style suites are being adapted to test whether a pretrained model has effectively seen the benchmark during its own pretraining, a new and subtle leakage channel. Second, affiliation-style and VUS metrics are being combined with cost-sensitive objectives so the reported number reflects the operator's real false-alarm budget rather than a symmetric F1. Third, work on <em>label quality</em> itself (re-annotating legacy benchmarks, quantifying annotator disagreement on where a fault "begins") is maturing, because a metric can only be as honest as the labels underneath it. Expect the next generation of condition-monitoring papers to report VUS-PR on TSB-AD plus an operational delay-versus-false-alarm curve, and to treat a bare point-adjusted F1 as a red flag.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: do not reimplement the metrics</h3>
+<p>The range-based, affiliation, VUS, and PA%K definitions are fiddly to code correctly, and a subtle off-by-one in segment handling silently changes your conclusions. The reference implementations ship ready to use: the <code>affiliation-metrics</code> package computes affiliation precision/recall in two calls, and the <strong>TSB-AD</strong> repository exposes VUS-PR, VUS-ROC, range-based F1, and PA%K behind a single <code>evaluate(scores, labels)</code> entry point. Adopting them replaces roughly 150 to 250 lines of easy-to-get-wrong interval bookkeeping with about five lines, and, more importantly, it makes your numbers directly comparable to the published leaderboard instead of to your own private definition of "detected."</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the synthetic trace from the code above. (a) Sweep the random flagging rate from 0.1% to 20% and plot both raw F1 and point-adjusted F1 against it; identify the flagging rate that maximizes PA-F1 and explain why the peak exists. (b) Now shrink every anomaly segment to length 3 and repeat. Explain, using the segment-length argument, why PA-F1 collapses toward raw F1 as segments get short, and what that implies about which benchmarks PA flatters most. (c) Re-score your best detector from <a class="cross-ref" href="section-37.4.html">Section 37.4</a> on a MIMII-DG machine using VUS-PR and range-based F1, and report how far its PA-F1 overstated it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. In one sentence, why can a uniform-random score achieve high F1 under point-adjustment but not under range-based recall with a position term?</p>
+<p>2. Why is area under the precision-recall curve preferred over area under the ROC curve when anomalies make up under 1% of samples?</p>
+<p>3. Your model reports 0.9 PA-F1 in-house but 0.3 VUS-PR on TSB-AD. Give two distinct explanations, one about the metric and one about the data, and how you would tell them apart.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 37</h3>
+<p>build a first-shot machine-condition anomaly detector on MIMII-DG; evaluate cross-machine generalization.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">The point-adjustment critique</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2109.05257">Kim, S., Choi, K., Choi, H.-S., Lee, B., and Yoon, S. (2022). Towards a Rigorous Evaluation of Time-Series Anomaly Detection. AAAI.</a></p>
+<p class="bib-annotation">The paper that showed a random anomaly score beats published state of the art under point-adjustment, and proposed PA%K to expose the effect. Required reading before you trust any PA-F1 table.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1802.03903">Xu, H., Chen, W., Zhao, N., et al. (2018). Unsupervised Anomaly Detection via Variational Auto-Encoder for Seasonal KPIs (Donut). WWW.</a></p>
+<p class="bib-annotation">The work that popularized the point-adjustment protocol. Read it to see the reasonable original motivation, then read Kim et al. to see why the shortcut backfired.</p>
+</div>
+
+<p class="bib-category">Metrics that survive scrutiny</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://papers.nips.cc/paper/2018/hash/8f468c873a32bb0619eaeb2050ba45d1-Abstract.html">Tatbul, N., Lee, T. J., Zdonik, S., Alam, M., and Gottschlich, J. (2018). Precision and Recall for Time Series. NeurIPS.</a></p>
+<p class="bib-annotation">Introduces range-based precision/recall with tunable existence, size, and position terms. The foundation for scoring segment anomalies without the PA loophole.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3534678.3539339">Huet, A., Navarro, J. M., and Rossi, D. (2022). Local Evaluation of Time Series Anomaly Detection Algorithms (Affiliation Metrics). KDD.</a></p>
+<p class="bib-annotation">Distance-based, random-baseline-normalized precision/recall for events. Because it scores against chance, no random detector can look good, closing the gap PA leaves.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.vldb.org/pvldb/vol15/p2774-paparrizos.pdf">Paparrizos, J., Boniol, P., Palpanas, T., et al. (2022). Volume Under the Surface: A New Accuracy Evaluation Measure for Time-Series Anomaly Detection. VLDB.</a></p>
+<p class="bib-annotation">Defines VUS-PR and VUS-ROC, threshold-free measures that integrate over a temporal tolerance so no single cutoff can be cherry-picked. The metric TSB-AD standardizes on.</p>
+</div>
+
+<p class="bib-category">Honest benchmarks</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2412.20512">Liu, Q., and Paparrizos, J. (2024). The Elephant in the Room: Towards a Reliable Time-Series Anomaly Detection Benchmark (TSB-AD). NeurIPS Datasets and Benchmarks.</a></p>
+<p class="bib-annotation">A curated, mislabel-screened, leakage-audited benchmark of 1000+ series scored with VUS and range-aware metrics. The reference suite for evaluating a new detector honestly.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2009.13807">Wu, R., and Keogh, E. (2021). Current Time Series Anomaly Detection Benchmarks Are Flawed and Are Creating the Illusion of Progress. IEEE TKDE.</a></p>
+<p class="bib-annotation">A blunt audit of the legacy benchmarks (mislabeled points, trivial anomalies, run-to-failure triviality) that motivated the move to curated suites like TSB-AD.</p>
+</div>
+
+<p class="bib-category">Domain context</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2205.13962">Dohi, K., Nishida, T., Purohit, H., et al. (2022). MIMII DG: Sound Dataset for Malfunctioning Industrial Machine Investigation and Inspection for Domain Generalization. DCASE Workshop.</a></p>
+<p class="bib-annotation">The machine-sound dataset used in Lab 37; its official protocol already reports domain-split AUC and pAUC, a real-world example of leakage-aware anomaly evaluation.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-38-cyber-physical-anomaly-detection-and-ics/index.html">Chapter 38</a>, we push anomaly detection from "a machine is degrading" to "a machine is under attack." When the abnormal readings are produced by an adversary rather than a worn bearing, the physics-based process invariants, the attack-versus-fault distinction, and the evaluation protocols all change, and the honest-metric discipline you just learned becomes a security requirement rather than a scientific nicety.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

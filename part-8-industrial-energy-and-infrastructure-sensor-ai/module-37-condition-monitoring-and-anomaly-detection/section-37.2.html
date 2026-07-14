@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.2: Acoustic and vibration anomaly detection. Building Sensory AI." name="description"/>
+<title>Section 37.2: Acoustic and vibration anomaly detection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Acoustic and vibration anomaly detection</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The bearing had been screaming at 162 hertz for three weeks. Nobody heard it, because nobody was listening at 162 hertz."</p>
+        <cite>A Newly Vigilant AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section leans on the spectral and time-frequency toolkit built in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> (the STFT, spectrograms, and the resolution tradeoff) and on the sampling and anti-aliasing discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because a vibration signal aliased below its bearing frequencies is worse than no signal at all. It assumes the machine-versus-process framing and the tag vocabulary from <a class="cross-ref" href="../module-35-industrial-sensing-systems/index.html">Chapter 35</a>. The physics of what a microphone and an accelerometer actually transduce comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. We treat detection here at the level of features and simple scores; the reconstruction and forecasting detectors arrive in <a class="cross-ref" href="section-37.4.html">Section 37.4</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Rotating machines announce their own decay. A spalled bearing, a chipped gear tooth, a rubbing seal, and a cavitating pump each stamp a distinct, physics-determined signature onto the vibration of the housing and the sound in the air around it. The engineering miracle of acoustic and vibration condition monitoring is that these signatures live at <em>frequencies you can compute in advance from the geometry and the shaft speed</em>, before any fault exists. That changes the anomaly problem completely. You are not hunting blindly for "something weird"; you are watching a small set of predicted frequency bands and asking whether energy has appeared where healthy metal is silent. Get the representation right, in the correct band, at the correct resolution, and a fault that is invisible in the raw waveform becomes a clean spike you can threshold. Get it wrong, and a genuinely dying machine reads as perfectly normal RMS.</p>
+    </div>
+
+    <h2>Why machines fail at predictable frequencies</h2>
+    <p>The central fact of this section is that mechanical faults are <em>periodic events tied to rotation</em>. Every time a rolling element passes over a pit in the outer race, it produces a tiny impact. Those impacts repeat at a rate set purely by the bearing geometry and the shaft speed, so the fault energy concentrates at four computable frequencies. For a bearing with \(n\) rolling elements, ball diameter \(d\), pitch diameter \(D\), contact angle \(\phi\), and shaft rotation frequency \(f_r\), the outer-race, inner-race, ball, and cage defect frequencies are</p>
+    \[ f_{\text{BPFO}} = \tfrac{n}{2} f_r \left(1 - \tfrac{d}{D}\cos\phi\right), \qquad f_{\text{BPFI}} = \tfrac{n}{2} f_r \left(1 + \tfrac{d}{D}\cos\phi\right), \]
+    \[ f_{\text{BSF}} = \tfrac{D}{2d} f_r \left(1 - \left(\tfrac{d}{D}\cos\phi\right)^2\right), \qquad f_{\text{FTF}} = \tfrac{1}{2} f_r \left(1 - \tfrac{d}{D}\cos\phi\right). \]
+    <p>Gears behave the same way: a damaged tooth rings at the gear-mesh frequency (tooth count times shaft speed) and its harmonics, with sidebands spaced at the shaft rate. Imbalance shows up at exactly \(1\times\) the shaft speed, misalignment at \(2\times\). This is why domain knowledge is not optional here. Two numbers, the shaft speed and the bearing part number, tell you where to look before you have collected a single sample of fault data, which is decisive when, as covered in <a class="cross-ref" href="section-37.1.html">Section 37.1</a>, you almost never have labeled failures to learn from.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Bearing faults are usually invisible in the raw spectrum and obvious in the <em>envelope</em> spectrum. The impacts are weak and broadband, but they excite a high-frequency structural resonance of the housing (often several kilohertz) and <em>amplitude-modulate</em> it at the defect frequency. So the diagnostic information sits not in the carrier frequency but in how that carrier is switched on and off. Band-pass around the resonance, take the amplitude envelope with the Hilbert transform, then compute the spectrum of the envelope: the defect frequency that was buried under shaft harmonics and noise now stands alone as a sharp line. Skipping the demodulation step is the single most common reason a first vibration model "sees nothing."</p>
+    </div>
+
+    <h2>Representations: waveform, envelope, and log-mel</h2>
+    <p>Which representation you compute determines what the detector can possibly notice, so representation choice is the real modeling decision. Three levels dominate practice. The <strong>raw waveform</strong> and scalar band statistics (RMS, peak, crest factor, kurtosis) are cheap and catch gross faults, but they average away narrowband signatures; a bearing can lose most of its life with almost no change in overall RMS. The <strong>envelope spectrum</strong>, described above, is the workhorse for rolling-element and gear faults because it isolates the modulation frequencies the geometry predicts. For airborne sound and for learned models, the <strong>log-mel spectrogram</strong> is the default input: a short-time Fourier transform mapped onto a perceptually spaced mel filterbank and log-compressed, exactly the front end you met for time-frequency analysis in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. Log compression matters because machine sound spans a huge dynamic range and a fault often appears as a faint tonal component riding on a loud broadband floor.</p>
+    <p>The sensor choice couples tightly to the representation. An <strong>accelerometer</strong> bolted to the bearing housing gives a clean, high-bandwidth mechanical path (tens of kilohertz) and is the gold standard for defect frequencies, but it needs contact and per-point mounting. A <strong>microphone</strong> is non-contact and covers a whole machine at once, but it integrates reflections, other machines, and room acoustics, and its useful band is narrower. A practical rule: use vibration when you can compute a defect frequency and need to confirm it, use acoustics when you need cheap, broad, non-contact coverage and are willing to let a learned model sort out the messier signal. Both feed the same anomaly-scoring machinery.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from scipy.signal import butter, sosfiltfilt, hilbert
+
+fs = 25_600                      # accelerometer sample rate (Hz)
+fr = 30.0                        # shaft speed = 1800 rpm / 60
+# 6205 deep-groove bearing geometry -> outer-race defect frequency
+n, d, D, phi = 9, 7.94, 39.04, 0.0
+bpfo = (n / 2) * fr * (1 - (d / D) * np.cos(phi))    # ~= 107.3 Hz
+
+# synthesize 1 s of a spalled-outer-race signal: impacts ringing a 4 kHz
+#     resonance, buried in shaft harmonics and broadband noise
+t = np.arange(0, 1.0, 1 / fs)
+sig = 0.5 * np.sin(2 * np.pi * fr * t)               # 1x imbalance line
+for k in np.arange(0, 1.0, 1 / bpfo):                # one impact per BPFO period
+    m = t >= k
+    sig += 1.2 * np.exp(-800 * (t - k) * m) * np.sin(2 * np.pi * 4000 * (t - k)) * m
+sig += 0.8 * np.random.randn(t.size)                 # sensor + process noise
+
+# envelope analysis: band-pass around the resonance, Hilbert envelope, FFT
+sos = butter(4, [3000, 5000], btype="bandpass", fs=fs, output="sos")
+env = np.abs(hilbert(sosfiltfilt(sos, sig)))
+env -= env.mean()
+spec = np.abs(np.fft.rfft(env * np.hanning(env.size)))
+freqs = np.fft.rfftfreq(env.size, 1 / fs)
+
+peak = freqs[1 + np.argmax(spec[1:len(freqs)//8])]   # search 0..fs/8
+print(f"predicted BPFO = {bpfo:.1f} Hz, envelope-spectrum peak = {peak:.1f} Hz")</code></pre>
+    <div class="code-caption"><strong>Listing 37.1.</strong> Predicting the outer-race defect frequency from bearing geometry, then recovering it by envelope analysis. The raw signal is dominated by the shaft line and noise; only after band-passing around the 4 kHz resonance and demodulating with the Hilbert transform does the envelope spectrum expose a clean peak at the predicted BPFO. The gap between "predicted" and "found" is the diagnostic: a peak at BPFO means outer-race spalling, a peak at BPFI means inner-race, and no peak means the band or the geometry is wrong.</div>
+
+    <p>Listing 37.1 makes the pipeline concrete: geometry gives a target frequency, and envelope analysis turns an invisible impact train into a single spectral line you can watch over time. In production you would sweep the band with a kurtogram to find the most impulsive resonance automatically rather than hard-coding 3 to 5 kHz, and you would order-track (resample against a tachometer) so the lines stay sharp when the shaft speed varies.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: log-mel front end in one call</h3>
+        <p>Hand-rolling a windowed STFT, a mel filterbank, and log compression to get a machine-sound representation is roughly 30 to 40 lines of careful, off-by-one-prone code. A dedicated audio library collapses it to one call:</p>
+        <pre class="language-python"><code class="language-python">import librosa
+# 64-band log-mel spectrogram, the standard input for learned acoustic detectors
+mel = librosa.feature.melspectrogram(y=sound, sr=16000, n_fft=1024,
+                                     hop_length=512, n_mels=64)
+logmel = librosa.power_to_db(mel)   # (64, frames), ready for a model or a score</code></pre>
+        <div class="code-caption"><strong>Listing 37.2.</strong> A 64-band log-mel spectrogram in a single <code>librosa</code> call, replacing about 35 lines of manual STFT, filterbank, and dB conversion. The library owns the windowing, the mel spacing, and the numerical-floor handling in <code>power_to_db</code>; you still own the choices that matter for leakage-safe evaluation, namely which frames belong to which machine and split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</p>
+    </div>
+
+    <h2>From representation to an honest anomaly score</h2>
+    <p>Once the signal lives in a good representation, the detector itself can be simple, and simplicity is a virtue here because you are almost always in the unsupervised regime of <a class="cross-ref" href="section-37.1.html">Section 37.1</a>: many hours of "normal" running sound and essentially no labeled faults. The reliable recipe is to summarize each clip as a feature vector (envelope-band energies, spectral kurtosis, plus statistics of the log-mel frame) and fit a model of normality on healthy data only. A Mahalanobis distance to the healthy mean, or a k-nearest-neighbor distance to the healthy set, gives a scalar score; you threshold it, ideally at a quantile of a held-out healthy stream so the alarm rate is calibrated rather than guessed. These map onto the classical change-and-outlier detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, now applied to acoustic and vibration features instead of raw process tags.</p>
+    <p>Two traps deserve naming. First, machine sound is <em>operating-condition dependent</em>: the same healthy pump is louder under high load, so a naive distance flags load changes as faults. You must either condition on the operating point or normalize it out. Second, the mounting and the room are part of the signal; a detector trained on one sensor placement can collapse when the accelerometer is re-torqued. Both are facets of the domain-shift problem taken up in <a class="cross-ref" href="section-37.6.html">Section 37.6</a>, and both are why the honest-evaluation discipline of <a class="cross-ref" href="section-37.7.html">Section 37.7</a> insists on splitting by machine and by session, never by random clip.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the wind-turbine gearbox that sang before it failed</h3>
+        <p>A wind-farm operator streams accelerometer data from the high-speed shaft of each turbine gearbox. One unit's overall RMS sits comfortably in band for months, so the coarse dashboard shows green. An analyst, knowing the high-speed pinion turns at 24 Hz and the upwind bearing is a 6-element type, computes the expected inner-race frequency near 162 Hz and builds an envelope-spectrum monitor centered on the 6 to 8 kHz gear resonance. Three weeks before the coarse alarm would ever have tripped, a line appears at exactly 162 Hz and climbs each day, with shaft-rate sidebands confirming inner-race modulation. The turbine is scheduled for a planned bearing swap during a low-wind window instead of failing catastrophically and dropping the gearbox, the difference between a four-figure part and a six-figure crane job. The RMS never left the green zone; the diagnosis lived entirely in one predicted, demodulated frequency line.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is replacing hand-designed envelope and log-mel features with <em>learned, transferable embeddings</em> of machine sound. Self-supervised audio encoders pretrained on large corpora (for example BEATs and the earlier PANNs family) produce clip embeddings on which a simple k-NN or Mahalanobis score outperforms classical features, especially when only a handful of healthy clips from a target machine are available. The benchmark datasets driving this, MIMII, MIMII-DG, and ToyADMOS2, pair many machine types with realistic factory noise, and the community challenge that formalized first-shot and domain-generalized evaluation on them is the subject of <a class="cross-ref" href="section-37.3.html">Section 37.3</a>. The open questions are how much acoustic pretraining transfers across machine <em>physics</em> rather than just acoustic texture, and whether a single embedding can serve pumps, fans, valves, and slide rails without per-machine tuning.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>A 6205 bearing (nine 7.94 mm balls, 39.04 mm pitch diameter, zero contact angle) runs on a shaft at 1750 rpm. Compute the four defect frequencies BPFO, BPFI, BSF, and FTF. Then explain, in two or three sentences, why a rising line at BPFI plus sidebands spaced at the shaft rate points to inner-race damage rather than outer-race, and why you would expect this signature in the <em>envelope</em> spectrum but not in the raw spectrum. Finally, state one operating-condition change that could raise a Mahalanobis anomaly score without any fault being present.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can a rolling-element bearing lose most of its remaining life with almost no change in overall vibration RMS, and which representation exposes the fault instead?</p>
+        <p class="quiz-question">2. What does the Hilbert-transform envelope step accomplish that a plain FFT of the raw signal does not, and why is band-passing around a structural resonance a prerequisite for it?</p>
+        <p class="quiz-question">3. When would you reach for a microphone over an accelerometer for condition monitoring, and what does that choice cost you in the resulting signal?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-37.3.html">Section 37.3</a>, we push acoustic anomaly detection into its hardest and most realistic setting: recognizing that a machine is faulty when you have heard only a few seconds of it healthy (first-shot detection) and when the target factory sounds nothing like the one you trained on (domain generalization). We work through the DCASE challenge datasets, MIMII-DG and ToyADMOS2, and the evaluation protocol that made cross-machine, cross-site generalization the metric that actually matters.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

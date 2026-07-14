@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.5: Foundation-model reconstruction for anomalies. Building Sensory AI." name="description"/>
+<title>Section 37.5: Foundation-model reconstruction for anomalies | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Foundation-model reconstruction for anomalies</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me I had already seen a million machines, so surely I would recognize this one. I had never heard a bearing before in my life, but I nodded and reconstructed it anyway."</p>
+<cite>A Pretrained AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The reconstruction and forecasting detectors of <a class="cross-ref" href="section-37.4.html">Section 37.4</a> share one expensive habit: they train a fresh model on each machine's own healthy data. That is fine for a fleet of identical pumps you commissioned last year, and useless the day a new asset arrives with zero history. Foundation models promise to break that dependency. A large time-series model pretrained on billions of points, or a sensor model pretrained on masses of unlabeled telemetry, already carries a general prior over "what a plausible signal looks like." Point it at a new machine's healthy stream, ask it to reconstruct or forecast that stream, and treat its residual as an anomaly score, with little or no per-machine training. This section explains the two ways foundation models produce those residuals, why the same trick that works zero-shot for a stock price can quietly fail on a 20 kHz vibration channel, which pretrained models actually do reconstruction natively, and how to keep the honest-evaluation discipline the rest of this chapter insists on when the model has, in effect, already seen a great deal.</p>
+</div>
+
+<p>This section assumes the residual-detector contract of <a class="cross-ref" href="section-37.4.html">Section 37.4</a> (model normal, score the miss) and the two model families it defines. The pretrained models themselves come from Part V: the general time-series backbones of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a> and the sensor- and wearable-specific ones of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>, both trained with the masked and contrastive objectives of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. Because a pretrained model may have touched public benchmark data during training, the leakage rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> get a new twist here, and we flag it throughout.</p>
+
+<h2>From one model per machine to one prior for all machines</h2>
+<p>The structural shift is simple to state. A conventional detector learns \(g_m\) or \(f_m\) separately for each machine \(m\) from that machine's normal data. A foundation-model detector uses a single pretrained \(\Phi\) for every machine and lets the input context, not the weights, carry machine identity. Concretely, you feed \(\Phi\) a short window of the target machine's recent healthy behavior and ask it to fill in a masked span or forecast the next samples; the residual against the true values is the score. The per-machine training cost collapses from "fit a network on months of data" to "run a forward pass," which is exactly what you want on the day a new asset comes online with no history at all. This is the <em>cold-start</em> case, and it is the whole reason the approach earns a place next to the per-machine detectors that otherwise dominate: it converts commissioning from a data-collection wait into an immediate deployment.</p>
+<p>What makes this plausible at all is transfer. A model that has reconstructed millions of diverse series has internalized generic structure, periodicity, trend, noise scale, cross-channel coupling, that recurs across domains. A fault violates that generic structure just as it violates a per-machine model's specific structure, so the residual still spikes. The bet is that a broad prior, conditioned on a little context, approximates a narrow per-machine model well enough to be useful, and does so without the machine's training curve.</p>
+
+<h2>Two routes to a foundation-model residual</h2>
+<p>Foundation models generate anomaly residuals in the same two flavors as Section 37.4, and the choice of pretrained model largely dictates which one you get.</p>
+<p>The <strong>forecasting route</strong> uses a pretrained zero-shot forecaster: give it context \(x_{t-w:t}\), take its point (or median) prediction \(\hat{x}_{t:t+h}\), and score \(s_t = \lVert x_t - \hat{x}_t\rVert\). This needs nothing machine-specific because good forecasters extrapolate an unseen series from context alone. The <strong>reconstruction route</strong> uses a masked encoder: corrupt or mask patches of the window, ask the model to fill them, and score the fill error \(s_t = \lVert x_t - \Phi(\tilde{x})_t\rVert\). Masked reconstruction is the more natural fit for anomaly detection, because it is exactly the pretext task of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> repurposed at inference time, and it looks at the whole window rather than only the causal past.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The context window is the training set now</h3>
+<p>In a per-machine detector, machine identity lives in the weights and you pay for it once, up front, in training. In a foundation-model detector, machine identity lives in the context you feed at inference, and you pay for it every forward pass by supplying enough recent healthy signal to pin down what "normal" means for <em>this</em> asset. That reframing has a sharp consequence: a foundation-model detector is only as good as its context is representative. If the machine has multiple healthy operating modes (idle, ramp, full load) and your context window catches only one, every other legitimate mode looks anomalous. The engineering effort moves out of the training loop and into <em>context construction</em>: choosing a window that spans the healthy regimes without bleeding in the fault you are trying to catch.</p>
+</div>
+
+<h2>Where the pretraining gap bites</h2>
+<p>The zero-shot dream fails most often on a mismatch between what the model was pretrained on and what an industrial sensor produces. Three gaps dominate. First, <strong>frequency and scale</strong>: most public time-series corpora are low-rate business and energy series (hourly demand, daily sales), while machine-condition signals are high-rate vibration and acoustic streams whose informative content lives in spectral structure the model never saw. A forecaster that is excellent on electricity load can be worthless on a raw 20 kHz accelerometer channel, so practitioners often feed foundation models an envelope, a spectrogram row, or a downsampled feature stream (the representations of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>) rather than the raw waveform. Second, <strong>context length</strong>: capturing a slow duty cycle may need far more history than the model's window admits. Third, the reconstruction-quality paradox from Section 37.4 returns in a sharper form: a very capable model can reconstruct a subtle fault <em>too</em> well from surrounding healthy context, driving the residual down exactly when you need it up. Foundation models do not escape the identity-shortcut trap; their scale can deepen it.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">The models that make reconstruction native</h3>
+<p>Two families anchor the current frontier. <strong>MOMENT</strong> (Goswami et al., 2024) is a masked time-series transformer explicitly built with anomaly detection as one of its target tasks: it reconstructs masked patches, and the reconstruction error is the anomaly score with no fine-tuning required, which makes it the cleanest off-the-shelf reconstruction detector. On the forecasting side, <strong>Chronos</strong> (Amazon, 2024), <strong>TimesFM</strong> (Google, 2024), and <strong>Moirai</strong> (Salesforce, 2024) are strong zero-shot forecasters whose prediction residuals serve as anomaly scores, and <strong>Lag-Llama</strong> and <strong>TimeGPT</strong> occupy the same space. The sobering counter-current is empirical: large studies on the <strong>TSB-AD</strong> benchmark (see <a class="cross-ref" href="section-37.7.html">Section 37.7</a>) report that zero-shot foundation models do not yet dominate well-tuned classical and per-machine deep detectors on point-anomaly tasks, and often trail them once evaluation is done honestly. The frontier here is real but unsettled: the win is cold-start deployment and fleet-scale simplicity, not a free accuracy jump.</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+from momentfm import MOMENTPipeline   # pip install momentfm
+
+# Load a pretrained masked time-series model in reconstruction mode.
+model = MOMENTPipeline.from_pretrained(
+    "AutonLab/MOMENT-1-large",
+    model_kwargs={"task_name": "reconstruction"},
+)
+model.init(); model.eval()
+
+def foundation_residual(window, mask=None):
+    """Zero-shot reconstruction anomaly score for one (1, C, T) healthy-ish window.
+    No per-machine training: the pretrained model reconstructs, we score the miss."""
+    import torch
+    x = torch.tensor(window, dtype=torch.float32)         # (1, C, T)
+    with torch.no_grad():
+        out = model(x_enc=x, input_mask=mask)             # masked reconstruction
+    recon = out.reconstruction.numpy()
+    return np.abs(window - recon)[0]                       # (C, T) per-point residual
+
+# Fit the alarm threshold ONLY on a stretch known to be healthy (leakage-safe).
+healthy = load_normal_window()          # (1, C, T) from commissioning, this machine
+resid_ref = foundation_residual(healthy)
+thr = resid_ref.mean() + 4.0 * resid_ref.std()
+
+live = load_recent_window()             # same machine, unknown state
+score = foundation_residual(live).mean(axis=0)   # aggregate channels
+alarms = np.where(score &gt; thr)[0]
+print("first alarm index:", alarms[0] if len(alarms) else None)</code></pre>
+<div class="code-caption">Zero-shot condition monitoring with MOMENT in reconstruction mode: no per-machine training loop, only a forward pass to reconstruct the window, plus a threshold fit on a known-healthy stretch of the same asset. The pretrained prior supplies "what a plausible signal looks like"; the context window and the normal-only threshold supply the machine-specific part. Swapping in a forecasting model (Chronos, TimesFM) changes only the scoring line.</div>
+
+<p>The snippet makes the cost structure explicit. There is no training loop; the per-machine work is a threshold fit on a healthy segment, the same leakage-safe habit from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> that Section 37.4 used, now doing all of the adaptation by itself. Note the subtle leakage risk unique to this setting: if the pretrained model was trained on a public benchmark you then evaluate on, its "zero-shot" residual is contaminated, so cold-start claims must be tested on assets the model provably never saw.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A contract machine shop with a fleet of one</h3>
+<p>A precision machine shop takes on a new five-axis CNC mill for a short customer contract. Building a per-machine autoencoder is out of the question: there is no clean baseline yet, the contract is six weeks, and every machine in the shop is a different model from a different decade, so nothing transfers directly. The shop instead streams the mill's spindle-current and vibration envelope into a pretrained reconstruction model, feeds it the first two shifts of normal cutting as context, and fits an alarm threshold on that stretch alone. In week three the reconstruction residual on the vibration channel begins to rise during finishing passes while roughing passes stay quiet, a context-dependent signature no fixed vibration limit would catch. It flagged progressive tool wear on one specific operation days before the surface finish drifted out of tolerance. The shop never trained a model for this mill and never will; the pretrained prior plus two shifts of context was the entire detector, which is exactly the cold-start value that per-machine training cannot offer.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Zero-shot detection in a dozen lines</h3>
+<p>Doing this from scratch means sourcing a pretrained backbone, wiring its masking or forecasting head, tensorizing sliding windows, normalizing per-channel residuals, and calibrating a normal-only threshold, easily 200-plus lines and several leakage traps. The <code>momentfm</code> package exposes reconstruction scoring behind <code>from_pretrained</code> plus a forward pass, and forecasting toolkits like <code>Nixtla</code>'s interface to TimesFM and Chronos, or the general <code>Merlion</code> and <code>Darts</code> wrappers, expose zero-shot forecast residuals the same way. That is roughly a 200-line reduction, and the library owns the pretrained weights, the patching, and the head so the only code you write is context selection and the normal-only threshold.</p>
+</div>
+
+<h2>Adapting the prior without labels</h2>
+<p>Pure zero-shot is the extreme; in practice a thin layer of adaptation closes most of the pretraining gap while keeping the cold-start advantage. Three light options, in increasing cost, are worth knowing. <strong>Context engineering</strong> costs nothing at training time: feed richer or longer healthy context, or preprocess into the spectral features the model handles well, and the residual sharpens. <strong>Linear probing or a small head</strong> freezes the backbone and fits only a lightweight normalizer or one-class scorer on top of the pretrained embeddings, which needs only healthy data and a few minutes. <strong>Parameter-efficient fine-tuning</strong> (adapters, LoRA) nudges the backbone toward the target domain using the machine's own unlabeled normal stream, recovering much of a per-machine model's accuracy at a fraction of its data and compute. All three stay label-free, which preserves the one-class premise the whole chapter is built on. Whichever you pick, the residual still needs turning into a calibrated false-alarm rate rather than an arbitrary cutoff, which is precisely what the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> supply, and the whole pipeline still has to survive the domain shift that <a class="cross-ref" href="section-37.6.html">Section 37.6</a> and the test-time adaptation of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> treat head-on.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: zero-shot versus per-machine, honestly</h3>
+<p>Take a public machine-condition dataset (MIMII, or a bearing dataset) and hold out one machine entirely. (1) Build a per-machine reconstruction detector trained on that machine's normal data. (2) Build a zero-shot foundation-model detector using MOMENT reconstruction or a Chronos forecast residual, with the threshold fit only on the same machine's healthy segment and <em>no</em> training. (3) Compare them on the leakage-safe protocol of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, reporting a metric that does not use the point-adjustment trick (deferred to Section 37.7). Then simulate cold start: allow the per-machine model only two minutes of training data. At what point does the zero-shot detector win, and what does that tell you about when a foundation-model residual is the right tool?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>In a foundation-model detector, where does machine-specific information live, and what practical failure follows if the context window omits a legitimate healthy operating mode?</li>
+<li>Name the three pretraining gaps that make a zero-shot forecaster underperform on raw high-rate vibration, and give one preprocessing fix for each.</li>
+<li>Why is "zero-shot" a leakage hazard when a pretrained model is evaluated on a public benchmark, and how would you design an experiment that measures a genuine cold-start residual?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-37.6.html">Section 37.6</a>, we confront the problem that both per-machine and foundation-model detectors run into the moment they leave the lab: <strong>domain shift across machines and sites</strong>. A detector calibrated on one pump, one factory, or one sampling rate meets a sibling that sounds subtly different, and its normal-derived threshold starts firing on healthy behavior. We look at what actually shifts, why it wrecks a residual detector, and the domain-generalization and adaptation tactics that keep an anomaly score meaningful across a whole fleet.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

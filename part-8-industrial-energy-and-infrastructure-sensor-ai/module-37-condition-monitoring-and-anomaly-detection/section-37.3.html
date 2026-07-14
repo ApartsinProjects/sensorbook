@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.3: First-shot and domain-generalized anomalous sound detection (DCASE). Building Sensory AI." name="description"/>
+<title>Section 37.3: First-shot and domain-generalized anomalous sound detection (DCASE) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>First-shot and domain-generalized anomalous sound detection (DCASE)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You have never heard this machine before, you have never heard it break, and you must decide, on its very first recording, whether it is dying. Welcome to first-shot detection."</p><cite>An Acoustically Nervous AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 37.2 gave you the machinery of acoustic and vibration anomaly detection: turn a microphone stream into a log-mel spectrogram, learn what "normal" sounds like, and flag departures. That works beautifully when you can collect a fat library of normal recordings from the exact pump you will monitor, in the exact room, at the exact operating point. Factories do not grant that luxury. A new machine arrives, a line is re-tooled, the same valve model is installed on three continents with different mains frequency and background noise, and you are asked to have a detector running on day one with only a handful of normal clips and zero examples of failure. The DCASE (Detection and Classification of Acoustic Scenes and Events) challenge turned this exact pain into a public, ruthlessly-scored benchmark. Its machine-condition task has walked the field from "one model per machine, tuned lovingly" to <strong>domain generalization</strong> (survive a shift you were warned about but shown no labels for) and finally to <strong>first-shot</strong> detection (perform on a machine type you have never seen, with no per-type tuning at all). This section explains what those two words mean precisely, why the winning systems are discriminative rather than reconstructive, and how the scoring rules stop you from fooling yourself.</p>
+</div>
+
+<p>This section assumes you have the spectrogram and time-frequency vocabulary of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> and the unsupervised acoustic detectors of Section 37.2. The embedding trick at its heart is self-supervised representation learning from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and the domain-shift framing connects directly to the out-of-distribution and test-time-adaptation ideas of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+
+<h2>From closed-set to first-shot: how the DCASE task evolved</h2>
+
+<p>DCASE Task 2 is unsupervised anomalous sound detection (ASD): training data contains <em>only normal</em> machine sounds, anomalies appear only at test time, and you must output a real-valued anomaly score per 10-second clip. The task defines the frontier of the field, so tracking its versions is the fastest way to understand what "hard" currently means.</p>
+<ul>
+<li><strong>2020 (closed-set).</strong> Six machine types (fan, pump, valve, slider, and two toy sets from MIMII and ToyADMOS). You trained a dedicated model per machine type and even per machine ID. Autoencoders dominated: reconstruct the normal spectrogram, score the reconstruction error.</li>
+<li><strong>2021 (domain shift introduced).</strong> Training data came from a <strong>source domain</strong> (say, a specific speed and load) but test data mixed in a <strong>target domain</strong> (a different speed, a noisier room). A few target-domain normal clips were provided, so teams could adapt.</li>
+<li><strong>2022 (domain generalization).</strong> The rules hardened: you were given plenty of source-domain data and only a handful (often ten) of target normals, and were forbidden from knowing at test time which domain a clip came from. One model had to handle both. MIMII-DG and ToyADMOS2 were the datasets.</li>
+<li><strong>2023 onward (first-shot).</strong> The training and evaluation machine types no longer overlap, and no per-machine-type hyperparameter tuning is allowed. Your system meets a completely new machine type (a gearbox, a bandsaw) at scoring time and must run out of the box. This is the closest public analogue to a real factory deployment.</li>
+</ul>
+<p>The arc matters because each step deletes an assumption that hand-tuned condition monitoring silently relies on: same machine, same operating point, same room, engineer available to tune. First-shot deletes all of them at once.</p>
+
+<h2>Domain generalization, not adaptation</h2>
+
+<p>The distinction that trips people up is generalization versus adaptation. In <strong>domain adaptation</strong> you get labeled or at least abundant target data and are allowed to fit to it. In <strong>domain generalization</strong> you must produce one fixed detector that works on target conditions you were shown only faintly (a few normal clips) or not at all, without any test-time retraining keyed to the target. Formally, let a clip's log-mel feature be \(\mathbf{x}\) and let \(d \in \{\text{source}, \text{target}\}\) be its hidden domain. The training distribution is dominated by source, \(P_{\text{train}}(\mathbf{x}) \approx P(\mathbf{x} \mid d=\text{source})\), yet you are scored on both. A detector that memorizes the source acoustic background will fire on every target clip and destroy its false-positive rate. The goal is an anomaly score \(a(\mathbf{x})\) whose <em>normal-versus-anomalous</em> boundary is stable across \(d\), even though the marginal \(P(\mathbf{x})\) shifts underneath it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The reason plain autoencoders lost to discriminative models on this benchmark is a domain-shift failure, not a capacity failure. A reconstruction detector scores anomaly as reconstruction error \(\lVert \mathbf{x} - \hat{\mathbf{x}} \rVert\), which is large whenever the input is unfamiliar for <em>any</em> reason, including a benign change of room or speed. Under domain shift, "unfamiliar" and "anomalous" stop being the same thing, so reconstruction error conflates a healthy target-domain pump with a broken source-domain one. The systems that win instead learn an embedding where the axis that separates machine states is decorrelated from the axis that separates domains, and they get that decorrelation almost for free from a metadata-classification pretext task.</p>
+</div>
+
+<h2>The discriminative recipe: classify the metadata, then measure distance</h2>
+
+<p>The dominant paradigm since 2021 inverts the autoencoder logic. Instead of modeling normal sound directly, you train a network to <strong>classify auxiliary metadata</strong> that ships with every normal clip: the machine type, the section (an anonymized grouping of individual units), and attribute labels such as speed, load, or microphone position. This is a self-supervised pretext in the sense of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>: no anomaly labels are used, only free metadata. To classify these fine-grained conditions the encoder is forced to attend to the precise spectral signature of correct operation. At inference you discard the classifier head and keep the embedding \(\mathbf{z} = f_\theta(\mathbf{x})\). Normal clips cluster tightly per section; an anomalous clip lands far from every normal cluster. Scoring is then a simple distance in embedding space, and this is where domain generalization is won: you fit a separate reference set (or Gaussian) for the source cluster and for the few target normals, and score against the nearest one.</p>
+
+<p>Two distance rules dominate. The <strong>Mahalanobis</strong> score uses each section's normal mean \(\boldsymbol{\mu}_c\) and shared covariance \(\boldsymbol{\Sigma}\):</p>
+$$a(\mathbf{x}) = \min_c\, (\mathbf{z}-\boldsymbol{\mu}_c)^\top \boldsymbol{\Sigma}^{-1} (\mathbf{z}-\boldsymbol{\mu}_c).$$
+<p>The <strong>k-nearest-neighbor</strong> score is the mean distance to the \(k\) closest normal embeddings, pooling source and the handful of target normals into one reference bank so that both domains define "normal." kNN is the more robust default under first-shot conditions precisely because it makes no Gaussian assumption about a machine type it has never studied.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.neighbors import NearestNeighbors
+
+# z_train: (N, D) embeddings of NORMAL clips from a trained metadata classifier
+#          (source + the few provided target normals, pooled)
+# z_test:  (M, D) embeddings of clips to score
+def first_shot_scores(z_train, z_test, k=4):
+    z_train = z_train / (np.linalg.norm(z_train, axis=1, keepdims=True) + 1e-9)
+    z_test  = z_test  / (np.linalg.norm(z_test,  axis=1, keepdims=True) + 1e-9)
+    nn = NearestNeighbors(n_neighbors=k, metric="euclidean").fit(z_train)
+    dist, _ = nn.kneighbors(z_test)          # distance to k nearest normals
+    return dist.mean(axis=1)                  # higher = more anomalous
+
+# A machine-type-agnostic threshold is set on a validation set of normals only,
+# e.g. the 90th percentile of scores, honoring the low-false-alarm target.
+</code></pre>
+<div class="code-caption">A first-shot kNN anomaly scorer over pretrained embeddings. The encoder that produces <code>z_train</code> was trained only to classify machine section and attributes (never to see anomalies), and the same scoring code runs unchanged on a machine type it was never tuned for. Pooling target normals into the reference bank is what buys domain generalization.</div>
+
+<p>The scorer above is deliberately machine-type-agnostic: the same four lines run on a valve, a gearbox, or a bandsaw, which is exactly the first-shot constraint. All the machine-specific knowledge lives in the learned embedding, not in tuned thresholds or per-type architecture.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Building the full DCASE pipeline by hand (log-mel front end, a metadata-classification backbone with ArcFace-style margin loss, embedding extraction, per-section Mahalanobis and kNN scoring, and the partial-AUC harness) is roughly 500 to 700 lines. The official DCASE Task 2 baseline repository ships all of it, and general anomaly toolkits such as <code>anomalib</code> reduce the modeling half to a handful of config lines. A PyTorch Lightning wrapper around a pretrained audio backbone plus the kNN scorer above turns the whole detector into about 30 lines. Write the pieces from scratch once to understand the metadata trick; reach for the baseline repo when you actually need a leaderboard number, because its scoring code is the one graders trust.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: A Valve Line Re-Tooled Overnight</h3>
+<p>A packaging plant monitors 40 pneumatic valves by microphone. The team trained an autoencoder detector on three months of normal source-domain audio and it held a clean AUC near 0.95. Then maintenance swapped the compressor, raising line pressure and shifting every valve's hiss upward in frequency. Overnight the autoencoder's false-alarm rate exploded: reconstruction error rose on every valve because the whole soundscape was now "unfamiliar," and operators started ignoring the alerts. Rebuilt as a metadata-classification embedding with a pooled kNN reference bank (source clips plus ten normal clips recorded after the swap), the detector treated the pressure change as a benign domain shift and kept its target-domain AUC above 0.9, while still catching a genuinely stuck valve two shifts later. The lesson generalized to the next machine type the plant added, a labeler drive, with no retuning: that is first-shot behavior in production.</p>
+</div>
+
+<h2>Scoring without self-deception: partial AUC and the harmonic mean</h2>
+
+<p>DCASE does not report plain accuracy, and neither should you. Anomalies are rare and a maintenance team will abandon any detector that cries wolf, so the challenge scores the <strong>partial AUC</strong> (pAUC): the area under the ROC curve restricted to the low false-positive region, typically the leftmost \(p=0.1\) of the false-positive axis. A detector can only earn pAUC by ranking true anomalies above normals <em>at operating thresholds a plant would actually tolerate</em>. Results are reported separately for source-domain AUC, target-domain AUC, and pAUC, then aggregated across all machine types with the <strong>harmonic mean</strong>, which punishes any single machine type you fail on far harder than an arithmetic mean would. You cannot buy a good score by acing fans and ignoring valves.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The 2023 to 2025 DCASE Task 2 leaders pair a pretrained audio backbone (an AudioSet-trained model such as BEATs or a self-supervised spectrogram transformer) with the metadata-classification fine-tuning above, then score with a smoothed kNN or a per-section flow model. Open problems are squarely research-frontier: how to weight the few target normals against abundant source data without overfitting to ten clips; how to make the embedding invariant to domain while staying sensitive to faults, since the two are entangled; and whether general-purpose audio foundation models can deliver true zero-shot detection on an unheard machine type with <em>no</em> normals at all, which would push "first-shot" toward "zero-shot." Calibrating the anomaly score into a trustworthy probability, using the conformal tools of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, remains largely unsolved for these non-exchangeable, domain-shifted streams.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the MIMII-DG development set (or the DCASE baseline's synthetic embeddings). (a) Train a small classifier to predict machine <em>section</em> from log-mel features, discard the head, and score test clips with the kNN function above; report source-AUC, target-AUC, and pAUC at \(p=0.1\) per machine type, then their harmonic mean. (b) Replace kNN with a per-section Mahalanobis score and compare, especially on the target domain where the Gaussian assumption is shakiest. (c) Now remove the ten target normals from the reference bank and re-score. Quantify how much target-AUC collapses, and explain in one sentence why this experiment is the difference between domain adaptation and domain generalization.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>In one sentence each, distinguish domain adaptation, domain generalization, and first-shot detection as the DCASE task defines them.</li>
+<li>Why does a reconstruction-error autoencoder degrade under domain shift while a metadata-classification embedding does not, even though neither ever sees an anomaly during training?</li>
+<li>The challenge scores partial AUC at \(p=0.1\) and aggregates with a harmonic mean. What specific failure mode of a naive detector does each of those two choices catch?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-37.4.html">Section 37.4</a>, we open up the two score functions that underlie most detectors in this chapter: reconstruction error and forecasting residuals. You will see when a machine that predicts its own next window beats one that merely rebuilds the current one, why both need the honest, low-false-alarm evaluation you just met, and how the embedding-distance idea from this section fits into that broader family.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

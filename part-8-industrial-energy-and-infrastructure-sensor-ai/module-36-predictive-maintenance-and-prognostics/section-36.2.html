@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.2: Remaining useful life and prediction horizons. Building Sensory AI." name="description"/>
+<title>Section 36.2: Remaining useful life and prediction horizons | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Predictive Maintenance and Prognostics</a></div>
+<h1>Remaining useful life and prediction horizons</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I predicted the bearing had 200 cycles left. It had 40. The report called my RMSE excellent, and the bearing called the fire department."</p>
+<cite>A Chastened AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Prognostics turns a stream of degradation signals into a single actionable number: how much life is left. That number, the <strong>remaining useful life (RUL)</strong>, is what a scheduler, a spare-parts planner, or a safety case actually consumes. But RUL is deceptively slippery. The target you regress against is not measured by any sensor; it is a label you construct from run-to-failure history, and the way you construct it silently decides what your model can learn. The metric you score with decides whether a five-cycle-early prediction and a five-cycle-late prediction count the same (they must not). And the <em>horizon</em> at which a prediction becomes trustworthy decides whether the forecast arrives in time to act on. This section is about those three coupled choices: how to define and label RUL, how far ahead a prediction is worth believing, and how to score a prognostic model so the number that looks good on a leaderboard is also the number that keeps the machine safe.</p>
+</div>
+
+<p>This section assumes the degradation-mechanism vocabulary from <a class="cross-ref" href="section-36.1.html">Section 36.1</a>: we take the existence of a monotone-ish health decline as given and ask how to turn it into a life estimate. RUL is fundamentally an estimation-under-uncertainty problem, so the point-versus-distribution distinction from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> runs underneath everything here. And because every RUL label is derived from historical run-to-failure trajectories, the train/test separation must respect the unit-level leakage rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: a single engine's trajectory can never straddle the split.</p>
+
+<h2>What RUL is, and why the label is a modeling choice</h2>
+<p>Formally, at any time \(t\) before failure, the remaining useful life is the time remaining until the component crosses its failure threshold: \(\text{RUL}(t) = t_{\text{fail}} - t\). If that were the whole story, RUL labeling would be trivial: for every historical unit that ran to failure, subtract the current cycle from the failure cycle. The subtlety is that this ground truth is a straight, ever-decreasing ramp from the very first cycle, and that ramp is almost always the wrong target.</p>
+<p>The reason is physical. A healthy machine early in its life emits no degradation signal at all: its vibration spectrum, temperature, and efficiency look identical at cycle 5 and cycle 50. Asking a model to output "RUL = 195" at cycle 5 and "RUL = 150" at cycle 50 from indistinguishable inputs forces it to hallucinate a countdown from noise. The standard remedy, universal on the C-MAPSS turbofan benchmark, is a <strong>piecewise-linear RUL target</strong>: cap the label at a constant \(R_{\text{max}}\) during the healthy phase, and let it decline linearly only once degradation is plausibly underway.</p>
+
+$$\text{RUL}_{\text{label}}(t) = \min\!\left(R_{\max},\; t_{\text{fail}} - t\right)$$
+
+<p>The cap \(R_{\max}\) (commonly 125 or 130 cycles on C-MAPSS) is not a nuisance hyperparameter; it encodes a claim about when the degradation signal first becomes observable. Set it too high and you train the model to predict the future from a flat, uninformative regime, inflating error everywhere. Set it too low and you throw away genuine early-warning signal, shortening the horizon over which the model can act. The cap is where domain physics from <a class="cross-ref" href="section-36.1.html">Section 36.1</a> enters the loss function directly.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The label is a hypothesis about observability</h3>
+<p>A piecewise-linear RUL cap is not data cleaning; it is a testable assumption that degradation is unobservable before \(R_{\max}\) cycles from failure and linear thereafter. If your health indicator actually starts drifting 200 cycles out, a 125-cycle cap is discarding real signal. Choose \(R_{\max}\) by inspecting when health features first separate from the healthy baseline, not by copying the benchmark's default. The best-scoring papers on C-MAPSS tune this cap, and the tuning is doing real physical modeling disguised as a constant.</p>
+</div>
+
+<h2>Prediction horizons: how far ahead is the forecast worth believing</h2>
+<p>A prognostic model does not become useful the moment it produces a number. It becomes useful when its predictions enter and stay inside an acceptable error band with enough lead time to act. Two ideas from the prognostics literature make this precise. The <strong>prognostic horizon (PH)</strong> is the amount of time before failure at which the prediction first falls within a tolerance band around the true RUL and remains there. A larger PH means earlier trustworthy warning. The <strong>alpha-lambda metric</strong> generalizes this: at each fraction \(\lambda\) of the unit's life, it checks whether the predicted RUL lies inside a cone of relative width \(\alpha\) around truth (for example within \(\pm 20\%\)). A model can have excellent average error yet a terrible horizon if it only sharpens up in the final handful of cycles, when it is already too late to order the part.</p>
+<p>Horizon and lead time are what connect prognostics to operations. If replacing a turbine blade requires a 30-cycle procurement and shutdown window, a model whose prognostic horizon is 20 cycles is worthless no matter how low its final-cycle error. This is why RUL evaluation cannot be a single scalar: you report the error <em>and</em> the horizon, because a maintenance decision needs both the estimate and the time to use it. The economic side of choosing an action from that horizon is developed in <a class="cross-ref" href="section-36.6.html">Section 36.6</a>; here the point is simply that the horizon is a first-class output, not an afterthought.</p>
+
+<h2>Scoring RUL: why symmetric error is the wrong loss</h2>
+<p>Root-mean-square error treats a prediction that is 15 cycles early and one that is 15 cycles late as equally wrong. In maintenance they are not remotely equal. A <em>late</em> prediction (you thought there was more life than there was) risks an in-service failure, unplanned downtime, and possibly a safety incident. An <em>early</em> prediction (you replace a part with life still in it) wastes some component value but breaks nothing. Any honest prognostic metric must penalize late predictions more heavily than early ones.</p>
+<p>The C-MAPSS benchmark encodes exactly this asymmetry in its scoring function. With error \(d_i = \hat{\text{RUL}}_i - \text{RUL}_i\) (positive means the model over-predicted life, i.e. was late), the score is</p>
+
+$$S = \sum_{i=1}^{n} \begin{cases} e^{-d_i/13} - 1 & d_i < 0 \quad(\text{early, lenient}) \\[4pt] e^{\,d_i/10} - 1 & d_i \ge 0 \quad(\text{late, punished}) \end{cases}$$
+
+<p>The two time constants (13 for early, 10 for late) tilt the exponential so that lateness accumulates penalty faster. Because the penalty is exponential, a single badly-late unit can dominate the whole fleet's score, which is precisely the behavior you want: one missed failure is worse than many small early replacements. Note the flip side, though: this score is unbounded and outlier-dominated, so it should always be reported alongside RMSE, never instead of it. RMSE tells you typical accuracy; the asymmetric score tells you whether the errors point in the safe direction. The snippet below computes both on the same predictions in one pass, which is the only way the comparison is valid.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def cmapss_score(y_true, y_pred):
+    """Asymmetric NASA C-MAPSS prognostic score. Late (over-)predictions
+    are penalized harder than early ones. Lower is better."""
+    d = np.asarray(y_pred) - np.asarray(y_true)   # &gt;0 => predicted too much life (late)
+    early = d &lt; 0
+    s = np.where(early, np.exp(-d / 13.0) - 1.0,   # lenient branch
+                        np.exp( d / 10.0) - 1.0)   # punished branch
+    return float(s.sum())
+
+def rmse(y_true, y_pred):
+    return float(np.sqrt(np.mean((np.asarray(y_pred) - np.asarray(y_true))**2)))
+
+y_true = np.array([20, 20, 20, 20])
+late   = np.array([35, 35, 35, 35])   # 15 cycles LATE on every unit
+early  = np.array([ 5,  5,  5,  5])   # 15 cycles EARLY on every unit
+print(f"RMSE(late)={rmse(y_true,late):.1f}  RMSE(early)={rmse(y_true,early):.1f}")
+print(f"score(late)={cmapss_score(y_true,late):.1f}  "
+      f"score(early)={cmapss_score(y_true,early):.1f}")</code></pre>
+<div class="code-caption">The same 15-cycle error scored two ways. RMSE is identical for the late and early fleets (both 15.0), but the asymmetric C-MAPSS score punishes the late fleet by more than an order of magnitude, exactly the risk-aligned behavior a maintenance metric must have.</div>
+
+<p>Run it and the two RMSE numbers come out equal while the two scores differ by more than tenfold. That gap is the whole argument for asymmetric scoring: an evaluation that reports only RMSE would rank a dangerously-late model tied with a merely-wasteful one. Reporting both, co-computed on one set of predictions per the one-pass discipline, is the leakage-safe habit that keeps the leaderboard honest.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wind-turbine gearbox and the horizon that mattered</h3>
+<p>An operator of an offshore wind fleet trained an RUL model on gearbox vibration and oil-debris trends, and it posted a strong fleet RMSE of about 9 days. Maintenance still got surprised by failures. The diagnosis was a horizon problem, not an accuracy problem: the model only entered its \(\pm 20\%\) alpha-lambda band inside the last 6 days of life, while chartering a jack-up vessel and crew to an offshore site takes 3 to 4 weeks. The low average error came almost entirely from the final week, when the degradation signal was screaming and the prediction was easy but useless. Re-training with a higher piecewise-linear cap and re-scoring on prognostic horizon (rather than final-cycle error) surfaced a different model that warned 25 days out with looser but actionable estimates. The lesson: a metric that rewards late-life sharpness selects models that are precise exactly when precision no longer buys you anything.</p>
+</div>
+
+<h2>Building the RUL target and evaluating it in practice</h2>
+<p>Assembling an RUL supervised dataset has a fixed recipe. For each run-to-failure unit, compute cycles-to-failure, clip with the piecewise-linear cap, and slide a fixed-length window over the sensor channels so each window inherits the RUL of its final timestamp. The clipping and the windowing are the two lines everyone hand-writes, and the two lines where off-by-one leaks hide. When you split into train and test, the split is by <em>unit</em>, never by window: a window from engine 7 in training and another window from engine 7 in test would leak that engine's specific degradation trajectory, an instance of the exact hazard <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> warns against. The window and clip logic itself is short enough to keep in your head:</p>
+
+<pre><code class="language-python">import numpy as np
+
+def make_rul_labels(cycles, R_max=125):
+    """Piecewise-linear RUL: capped during the healthy phase."""
+    ttf = cycles[-1] - cycles          # true cycles-to-failure, a decreasing ramp
+    return np.minimum(ttf, R_max)      # flat at R_max until degradation is observable
+
+cycles = np.arange(1, 201)             # one engine, 200 cycles to failure
+rul = make_rul_labels(cycles, R_max=125)
+print(rul[:3], "...", rul[-3:])       # [125 125 125] ... [2 1 0]</code></pre>
+<div class="code-caption">The full RUL labeling rule for one unit: the target sits flat at 125 through the healthy phase and only ramps down over the final 125 cycles, matching the standard C-MAPSS piecewise-linear convention.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let a maintained toolkit own the labeling and metrics</h3>
+<p>Hand-rolling the per-unit clip, the sliding-window tensorization, the unit-safe split, and the alpha-lambda plus prognostic-horizon metrics runs to well over 100 lines and is a rich source of leakage bugs. Prognostics toolkits such as NASA's <code>prog_models</code>/<code>ProgPy</code> and the community C-MAPSS loaders wrap the whole path: they load run-to-failure units, apply the piecewise cap, window the sequences, and expose RMSE, the C-MAPSS score, and horizon metrics behind one API. You supply \(R_{\max}\), the window length, and the split key; the library removes roughly 100-plus lines and, more importantly, the boundary and split bugs that silently inflate a leaderboard number.</p>
+</div>
+
+<p>Once labels and metrics are in place, the model choice is open. A simple regressor on hand-crafted health features is a legitimate baseline; the recurrent and temporal-convolutional architectures of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> are the workhorses that <a class="cross-ref" href="section-36.4.html">Section 36.4</a> develops; and because a bare point estimate hides its own risk, the calibrated and conformal prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> is what turns an RUL number into a defensible interval, the subject of <a class="cross-ref" href="section-36.6.html">Section 36.6</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: the cap you choose is the model you get</h3>
+<p>Take a single C-MAPSS FD001 engine (or the synthetic 200-cycle ramp above). (1) Generate RUL labels at three caps: \(R_{\max}\in\{80,125,\infty\}\). (2) Fit the same small model (even ridge regression on a few sensor channels) under each cap and report both RMSE and the asymmetric C-MAPSS score on held-out units. (3) For each cap, estimate the prognostic horizon: how many cycles before failure the prediction first stays within \(\pm 20\%\) of truth. Write three sentences explaining why the uncapped model has the worst horizon despite sometimes posting a competitive RMSE, and why the 80-cycle cap can hurt early warning.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is the raw \(t_{\text{fail}} - t\) ramp usually a poor RUL target, and what physical assumption does the piecewise-linear cap encode?</li>
+<li>Two models have identical RMSE, but one systematically predicts a few cycles late and the other a few cycles early. Why does the C-MAPSS score separate them, and which is safer to deploy?</li>
+<li>A model has an excellent final-cycle error but a prognostic horizon of only 5 cycles. Give a concrete operational reason it can still be useless, and name the metric you would report to expose the problem.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-36.3.html">Section 36.3</a>, we reframe RUL from a regression target into a question about <em>time to an event</em>, and bring in survival analysis and hazard models. That view handles the units in your dataset that have not failed yet (censored lifetimes), a case the piecewise-linear regression of this section quietly ignores, and it gives RUL a probabilistic, hazard-rate footing rather than a single-number one.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

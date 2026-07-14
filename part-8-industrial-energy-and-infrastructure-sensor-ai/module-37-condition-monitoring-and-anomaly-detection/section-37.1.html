@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.1: Supervised vs unsupervised condition monitoring. Building Sensory AI." name="description"/>
+<title>Section 37.1: Supervised vs unsupervised condition monitoring | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Condition Monitoring and Anomaly Detection</a></div>
+<h1>Supervised vs unsupervised condition monitoring</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked me to learn what a broken machine looks like. I have seen exactly one, three years ago, and it was labeled 'maybe.'"</p>
+        <cite>An Underlabeled AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the leakage-safe dataset discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> (train, validation, and test splits that never share a machine or a run), the classical anomaly and change-detection vocabulary of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> (residuals, thresholds, control limits), and the degradation and health-indicator framing from <a class="cross-ref" href="../module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>. Basic probability and the notions of precision and recall from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> are used but not re-derived. No reliability-engineering background is required; the terms specific to this section (one-class learning, contamination, base rate) are introduced here. We deliberately hold back the detector <em>architectures</em>: acoustic and vibration pipelines are the job of <a class="cross-ref" href="section-37.2.html">Section 37.2</a>, and rigorous scoring is deferred to <a class="cross-ref" href="section-37.7.html">Section 37.7</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every condition-monitoring project begins with the same fork in the road, and choosing the wrong branch wastes months. You can treat the task as <strong>supervised classification</strong>, collect examples of healthy and faulty operation, and train a model to tell them apart. Or you can treat it as <strong>novelty detection</strong>, model only what normal looks like, and flag anything that departs from it. The instinct of most engineers, trained on balanced benchmarks, is to reach for the classifier. In the field that instinct is usually wrong. Real machines fail rarely, fail in ways nobody photographed in advance, and generate oceans of healthy data against a trickle of ambiguous fault records. This section is about reading the problem in front of you well enough to pick the branch that can actually succeed, and knowing when to blend the two.</p>
+    </div>
+
+    <h2>Two framings of the same alarm</h2>
+    <p>Fix the object of study: a stream of sensor windows \(x_1, x_2, \ldots\) from a machine, and a wish to raise an alarm when the machine is not healthy. There are two mathematically distinct ways to formalize that wish.</p>
+    <p>The <strong>supervised</strong> framing treats it as classification. You assume a labeled dataset \(\{(x_i, y_i)\}\) with \(y_i \in \{\text{healthy}, \text{fault}_1, \text{fault}_2, \ldots\}\) and learn a decision boundary \(p(y \mid x)\) that separates the classes. This is the familiar setting, and when it applies it is powerful: it can distinguish a bearing fault from a gear fault, name the failure mode, and exploit whatever subtle features discriminate them.</p>
+    <p>The <strong>unsupervised</strong> (more precisely, <strong>semi-supervised</strong> or <strong>one-class</strong>) framing treats it as novelty detection. You assume access only to <em>normal</em> data, estimate a model of the healthy operating distribution \(p_{\text{normal}}(x)\), and define an <strong>anomaly score</strong> \(s(x)\) that grows as \(x\) becomes less plausible under that model. An alarm fires when \(s(x)\) crosses a threshold \(\tau\). You never show the model a fault during training; you show it only what "well" looks like, and let anything unfamiliar trip the wire. The terminology is loose in the literature: purely unsupervised methods assume the training set is mostly-but-not-entirely normal (a small unknown <strong>contamination</strong> fraction), while semi-supervised methods assume the training set is certified clean. Both share the defining move of learning the normal class alone.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Supervised classification learns a boundary <em>between</em> known classes; one-class detection learns a boundary <em>around</em> the normal class. The difference is not a matter of taste. A classifier can only recognize fault types it saw in training, so it is blind to the failure mode that has not happened yet. A one-class detector recognizes "not normal" without needing to know what the abnormality is, so it catches novel faults, at the price of catching novel <em>benign</em> conditions too. Condition monitoring is dominated by novelty precisely because the most dangerous failure is usually the one your fleet has never logged.</p>
+    </div>
+
+    <h2>Why unsupervised usually wins in the field</h2>
+    <p>Three structural facts about industrial data push the choice toward the one-class branch, and it is worth naming each because each has a different remedy if you try to fight it.</p>
+    <p><strong>Label scarcity.</strong> A well-maintained pump may run for years between failures. To assemble a balanced supervised dataset you would need to observe, correctly diagnose, and precisely time-stamp many faults across many units, and industrial maintenance logs are notoriously coarse ("replaced bearing, Tuesday") when they exist at all. Healthy data, by contrast, is nearly free: it accumulates every second the machine runs. The natural dataset is enormous on one side and empty on the other.</p>
+    <p><strong>The open world of faults.</strong> Even a complete catalog of past faults is not a catalog of future ones. New failure modes appear as machines age, as loads change, as a supplier quietly alters a component. A supervised classifier trained on modes \(\{1, 2, 3\}\) has no defined behavior on mode \(4\); it will confidently assign the novel fault to whichever known class it superficially resembles, often "healthy." Novelty detection has no such blind spot because it never enumerated the faults in the first place.</p>
+    <p><strong>Extreme class imbalance and cost asymmetry.</strong> If faults are, say, one window in ten thousand, the <strong>base rate</strong> is \(10^{-4}\). A classifier that always predicts "healthy" scores 99.99% accuracy while catching nothing, so accuracy is a useless target and even a well-trained classifier is pulled hard toward the majority class. Worse, the costs are wildly asymmetric: a missed catastrophic failure can cost orders of magnitude more than a false alarm, yet the data volume rewards the opposite bias. This is the same base-rate reasoning that governs medical screening and fraud detection, and it is why raw accuracy is banned from this chapter's vocabulary; the honest metrics are developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> and specialized to time series in <a class="cross-ref" href="section-37.7.html">Section 37.7</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the CNC spindle that failed a way nobody had trained for</h3>
+        <p>A precision-machining shop instruments its CNC spindles with accelerometers and trains a supervised classifier on three documented faults: imbalance, bearing wear, and tool chatter. For eighteen months it works beautifully, naming each fault as it recurs. Then a coolant-line leak lets fluid ingress into a spindle bearing, a mode absent from the training catalog. The vibration signature is unlike any of the three learned classes, so the softmax classifier does what softmax classifiers do: it distributes its confidence and lands on "bearing wear," the nearest known neighbor, with a reassuring 71%. Maintenance schedules a routine bearing swap for next month. The spindle seizes in nine days. A parallel one-class detector, trained only on healthy spindle vibration, had flagged the same window as strongly anomalous on day one, because it never needed to recognize the fault, only to notice that the machine had left the region it called normal. The shop now runs the detector as the primary alarm and the classifier as a secondary "if we recognize it, name it" stage.</p>
+    </div>
+
+    <h2>The normal-only model and its Achilles heel: contamination</h2>
+    <p>The one-class recipe is disarmingly simple to state. Collect windows you believe are healthy, fit a density or boundary that encloses them, and score new windows by how far outside they fall. The score can be a reconstruction error (<a class="cross-ref" href="section-37.4.html">Section 37.4</a>), a distance in a learned embedding, an isolation depth, or an explicit likelihood. What all these share is a single fragile assumption: <strong>the training set really is normal.</strong></p>
+    <p>It rarely is. Field data labeled "healthy" is healthy only in the sense that nobody logged a repair; slow degradation, transient faults, and sensor glitches leak in. This <strong>contamination</strong> is corrosive because the model learns to treat the contaminating anomalies as normal, raising the threshold and hiding exactly the events you care about. Two defenses matter. First, quantify and cap contamination: robust one-class methods take a nominal contamination fraction \(\nu\) and fit a boundary that deliberately excludes the worst \(\nu\) of the training points, so a few bad windows do not drag the boundary outward. Second, respect operating-condition structure. Much of what looks anomalous is simply a legitimate but under-sampled regime (cold start, high load, a different product being milled), so a "normal" model must either cover every regime or be conditioned on the regime, a distinction that becomes the central theme of domain shift in <a class="cross-ref" href="section-37.6.html">Section 37.6</a>. Building the clean, regime-aware normal set is a data-engineering problem, and the leakage rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> apply with full force: a healthy window from the same machine and hour must not straddle the train/test split.</p>
+
+    <h2>When to reach back for supervision</h2>
+    <p>None of this makes supervision useless; it makes it a second tool, deployed when its preconditions are actually met. Reach for a supervised or hybrid approach when (a) you have enough labeled examples of a <em>specific, recurring, high-cost</em> failure that naming it changes the maintenance action, (b) the failure modes are genuinely closed-world and safety-critical, so an unnamed anomaly is not an acceptable output, or (c) you can obtain even a handful of labeled faults and want to <em>calibrate</em> an otherwise unsupervised detector's threshold against real events rather than guesswork.</p>
+    <p>The productive middle ground is a spectrum, not a binary. <strong>One-class detection</strong> raises the alarm; a lightweight <strong>supervised classifier</strong>, trained on the fault modes you do have, runs only on flagged windows to attach a name and a likely action. <strong>Few-shot</strong> and <strong>first-shot</strong> methods (the subject of <a class="cross-ref" href="section-37.3.html">Section 37.3</a>) push into the regime of one or zero fault examples per machine. And <strong>self-supervised representation learning</strong> (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) sidesteps the label problem entirely by learning a feature space from unlabeled healthy data, on top of which even a simple distance becomes a strong anomaly score. The design question is never "supervised or not" in the abstract; it is "how many trustworthy fault labels do I have, of how many distinct modes, and does naming the mode change what the operator does."</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The field has largely conceded that pure supervised classification is the wrong default, and the DCASE Challenge's anomalous-sound-detection tracks (2020 through the present) codify this: models train on <em>normal machine sound only</em> and are scored on their ability to flag unseen anomalies, increasingly under domain shift across machine sections and operating conditions (the MIMII-DG and ToyADMOS2 datasets). The current frontier pushes further to <strong>first-shot</strong> detection, where the evaluation machine type is unseen at training time and no anomalous examples exist anywhere, which collapses the supervised option entirely and elevates self-supervised embeddings and outlier-exposure tricks. We take up this line in detail in <a class="cross-ref" href="section-37.3.html">Section 37.3</a>, and the foundation-model variant, where a large pretrained reconstructor scores anomalies zero-shot, in <a class="cross-ref" href="section-37.5.html">Section 37.5</a>.</p>
+    </div>
+
+    <p>The listing below makes the core argument concrete. It simulates a fleet dominated by healthy windows with two fault modes, trains a supervised classifier that sees only mode A during training, and compares it against a one-class detector on a test set that also contains an unseen mode B. The classifier's recall collapses on the novel mode; the detector's does not.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+
+rng = np.random.default_rng(0)
+
+def sample(kind, n):                          # 8-dim health-indicator vectors
+    if kind == "normal":  return rng.normal(0.0, 1.0, (n, 8))
+    if kind == "faultA":  return rng.normal(3.0, 1.0, (n, 8))   # known mode
+    if kind == "faultB":  return rng.normal([0,0,0,0,0,0,4,4], 1.0, (n, 8))  # novel mode
+
+# Training: healthy-heavy, and the supervised model sees ONLY fault mode A.
+Xn, Xa = sample("normal", 4000), sample("faultA", 40)
+X_train = np.vstack([Xn, Xa])
+y_train = np.r_[np.zeros(len(Xn)), np.ones(len(Xa))]           # 0 = healthy, 1 = fault
+
+clf = RandomForestClassifier(class_weight="balanced", random_state=0).fit(X_train, y_train)
+iso = IsolationForest(contamination=0.01, random_state=0).fit(Xn)   # one-class: normal only
+
+# Test: healthy + the KNOWN mode A + an UNSEEN mode B.
+X_test = np.vstack([sample("normal", 2000), sample("faultA", 100), sample("faultB", 100)])
+is_fault = np.r_[np.zeros(2000), np.ones(200)].astype(bool)
+is_novel = np.r_[np.zeros(2100), np.ones(100)].astype(bool)   # the mode-B slice
+
+clf_fault  = clf.predict(X_test) == 1
+iso_fault  = iso.predict(X_test) == -1                        # -1 = anomaly
+
+recall = lambda flag, mask: flag[mask].mean()
+print(f"supervised recall on KNOWN faultA : {recall(clf_fault, is_fault & ~is_novel):.2f}")
+print(f"supervised recall on NOVEL faultB : {recall(clf_fault, is_novel):.2f}")
+print(f"one-class  recall on NOVEL faultB : {recall(iso_fault, is_novel):.2f}")</code></pre>
+    <div class="code-caption"><strong>Listing 37.1.</strong> A supervised classifier and a one-class detector on the same imbalanced fleet. The classifier, trained only on fault mode A, recalls A well but misses the unseen mode B almost entirely, because a boundary between known classes says nothing about a class it never met. The Isolation Forest, trained on healthy data alone, flags mode B because it simply lies outside the normal region. This is the field's argument for the one-class default, reduced to twenty lines.</div>
+
+    <p>As Listing 37.1 shows, the gap is not a tuning artifact; it is structural. The classifier cannot generalize to a fault mode absent from its training labels, while the detector never needed the fault at all. That single asymmetry, replayed across thousands of real deployments, is why condition monitoring leans unsupervised.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling one-class detectors (kernel density, one-class SVM, isolation depth, local outlier factor, autoencoder residuals) and giving them a common scoring and thresholding interface is a few hundred lines you do not need to write. The <code>PyOD</code> library exposes roughly 50 outlier detectors behind one <code>fit</code>/<code>decision_function</code> API, so swapping detectors and building an ensemble is a two-line change:</p>
+        <pre class="language-python"><code class="language-python">from pyod.models.ecod import ECOD          # parameter-free, calibrated tail scores
+det = ECOD(contamination=0.01).fit(X_normal)
+scores = det.decision_function(X_test)      # higher = more anomalous, ready to threshold</code></pre>
+        <div class="code-caption"><strong>Listing 37.2.</strong> <code>PyOD</code> collapses roughly 150 lines of detector plumbing and score normalization into two calls, and its unified interface makes a fair bake-off across detectors trivial. It handles the fitting and scoring; choosing the contamination level, cleaning the normal set, and validating the threshold on real events per <a class="cross-ref" href="section-37.7.html">Section 37.7</a> remain your responsibility.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are handed 400 GB of healthy vibration logs from a fleet of 30 identical compressors and a maintenance spreadsheet listing 11 past failures, of which 4 are precisely time-stamped and 7 are dated only to the week. (a) Argue for a primary detection framing (supervised, one-class, or hybrid) and justify it from the label and base-rate facts. (b) The 4 well-timed failures span only 2 distinct modes. Explain what role, if any, those labels should play, and why it is calibration rather than training a full classifier. (c) Describe one concrete way contamination could have entered the "healthy" logs and one check you would run before trusting them as your normal set.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. State the defining difference between a supervised classifier and a one-class detector in terms of the boundary each learns, and give the one operational consequence that matters most for condition monitoring.</p>
+        <p class="quiz-question">2. A fault occurs in 1 window per 5,000. Explain why a classifier reporting 99.98% accuracy might be catching zero faults, and name the property of the problem that makes accuracy the wrong target.</p>
+        <p class="quiz-question">3. What is contamination in a normal-only training set, why does it push the alarm threshold in the dangerous direction, and what does the parameter \(\nu\) in a robust one-class method do about it?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-37.2.html">Section 37.2</a>, we descend from this framing into the two richest sensing modalities for machine health, acoustics and vibration, and build the front end of a one-class detector: how to turn raw microphone and accelerometer streams into the spectral and time-frequency representations that make the healthy region compact and the anomalies stick out. The choice we made here, to model normal rather than enumerate faults, sets the entire pipeline that follows.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

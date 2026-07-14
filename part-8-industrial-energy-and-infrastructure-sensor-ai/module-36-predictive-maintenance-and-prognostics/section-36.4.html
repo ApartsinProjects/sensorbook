@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.4: Sequence models for degradation. Building Sensory AI." name="description"/>
+<title>Section 36.4: Sequence models for degradation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Predictive Maintenance and Prognostics</a></div>
+<h1>Sequence models for degradation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I fed it the last reading and it guessed the age of the machine. I fed it the last fifty readings and it guessed how the machine was aging. Only the second guess was worth having."</p>
+        <cite>A Recurrent AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the remaining-useful-life vocabulary and prediction-horizon framing from <a class="cross-ref" href="section-36.2.html">Section 36.2</a>, and the failure-mode picture of <a class="cross-ref" href="section-36.1.html">Section 36.1</a>. The neural machinery it wires together is developed earlier: recurrent and temporal-convolutional layers in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, attention in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and the neural-representation view of raw streams in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. We use PyTorch here but explain the modeling choices independently of the framework.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Degradation is a <em>trajectory</em>, not a snapshot. A bearing does not fail because of its temperature at one instant; it fails because that temperature, its vibration harmonics, and its motor current have been drifting together in a characteristic way for weeks. The survival and hazard models of <a class="cross-ref" href="section-36.3.html">Section 36.3</a> take you a long way with hand-built covariates, but they still need you to <em>tell them</em> what the degradation signature is. Sequence models flip that: you hand the network a window of raw multivariate telemetry and let it learn the degradation manifold and the mapping from a point on it to remaining life. This section is about how to frame that learning problem so it actually works: how to label remaining useful life without teaching the model a lie, how to window the stream, which architecture to reach for, and how to keep the prediction physically sane.</p>
+    </div>
+
+    <h2>Framing RUL as a sequence-to-target problem</h2>
+    <p>The core object is a sliding window. From a run-to-failure record of length \(T\), you extract fixed-length windows \(X_t = (x_{t-L+1}, \dots, x_t)\) of the last \(L\) timesteps, where each \(x\) is a vector of sensor channels, and you regress the scalar remaining useful life \(y_t\) at the window's end. The model learns a function \(f_\theta: \mathbb{R}^{L \times C} \rightarrow \mathbb{R}\). Why a window rather than a single reading? Because the informative content of degradation lives in the <em>rate and shape</em> of change, not the absolute level. Two engines can share an identical vibration amplitude while one is stable and the other is accelerating toward failure; only the trajectory distinguishes them. The window length \(L\) is the model's memory budget: too short and it cannot see the trend, too long and early windows straddle multiple operating regimes and dilute the signal. On the canonical C-MAPSS turbofan benchmark, windows of 30 to 50 cycles are standard.</p>
+    <p>The labeling choice is where most first attempts quietly break. The naive label is linear: if a unit fails at cycle \(T\), then \(y_t = T - t\). This asserts that a machine at 80 percent of life is measurably older than one at 79 percent, which is false. Early in life a machine is healthy and its sensors carry <em>no</em> degradation signal, so a linear label forces the network to hallucinate a countdown from noise. The fix is the <strong>piecewise-linear RUL</strong> target: clamp the label to a constant ceiling \(R_{\max}\) during the healthy phase, and let it decline linearly only once wear begins.</p>
+    $$ y_t = \min\!\left(T - t,\; R_{\max}\right) $$
+    <p>The ceiling \(R_{\max}\) (commonly 125 cycles on C-MAPSS) encodes a simple truth: beyond some horizon the machine is just healthy, and "very healthy" and "extremely healthy" are the same prediction. This one change routinely moves error more than any architecture swap.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A linear RUL label is a data-leakage generator in disguise. It tells the network that a pristine sensor window has a specific, distinct age, so the network learns to read unit-identity or operating-condition quirks as if they were wear. The piecewise-linear label removes that false gradient during the healthy phase, and the model is forced to key on genuine degradation instead of memorizing which engine is which. When your validation error is good but your test error on unseen units collapses, suspect the label before the model. This is the prognostics face of the leakage-safe discipline built in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+    </div>
+
+    <h2>Which sequence architecture, and when</h2>
+    <p>Three families dominate degradation modeling, and the right pick follows from the physics of the signal. <strong>LSTMs and GRUs</strong> (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) carry a hidden state that accumulates slowly, which matches monotone wear well and makes them the reliable default on modest datasets like C-MAPSS. Their weakness is throughput: the recurrence is sequential, so long windows train slowly. <strong>Temporal convolutional networks</strong> replace recurrence with dilated causal convolutions; they see a fixed receptive field in parallel, train fast, and excel when the degradation cue is a local morphological change (a growing sideband, a widening pulse) rather than a slow global drift. <strong>Transformers</strong> (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) use attention to relate distant timesteps directly, which helps when the failure signature couples events far apart in the window, though on the small labeled fleets typical of prognostics they need careful regularization to beat a well-tuned GRU. For very long, high-rate windows the linear-time state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> are increasingly the throughput-versus-accuracy sweet spot.</p>
+    <p>Whatever the backbone, two design touches matter more than the choice between them. First, an <strong>asymmetric loss</strong>: in maintenance, a late prediction (you thought there was more life than there was) is far costlier than an early one, because it means an unplanned failure. The C-MAPSS scoring function bakes this in with an exponential penalty that is steeper for overestimates. Second, a <strong>monotonicity or smoothness prior</strong> on the predicted health trajectory, because real degradation rarely reverses; penalizing upward jumps in successive RUL predictions removes the physically absurd "the engine got younger" artifact that raw per-window regression produces.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+def piecewise_rul(T, t, r_max=125):
+    "Clamp remaining-useful-life label to a healthy-phase ceiling."
+    return torch.clamp(T - t, max=r_max).float()
+
+class GRUProg(nn.Module):
+    def __init__(self, n_channels, hidden=64):
+        super().__init__()
+        self.gru = nn.GRU(n_channels, hidden, num_layers=2, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(hidden, 32), nn.ReLU(), nn.Linear(32, 1))
+
+    def forward(self, x):            # x: (batch, L, n_channels)
+        _, h = self.gru(x)           # h: (layers, batch, hidden)
+        return self.head(h[-1]).squeeze(-1)   # RUL at end of window
+
+def asymmetric_loss(pred, target, late=1.3):
+    "Penalise under-prediction (late warning) harder than over-prediction."
+    err = pred - target
+    w = torch.where(err < 0, late, 1.0)       # err<0 means predicted too low = late
+    return (w * err.pow(2)).mean()
+
+model = GRUProg(n_channels=14)
+x = torch.randn(32, 30, 14)                   # 32 windows, L=30, 14 sensors
+rul = model(x)                                # one RUL estimate per window
+loss = asymmetric_loss(rul, torch.full((32,), 40.0))
+</code></pre>
+    <div class="code-caption">A minimal GRU prognostic model. The <code>piecewise_rul</code> helper implements the clamped label; <code>asymmetric_loss</code> makes a late warning cost more than an early one, mirroring the C-MAPSS scoring philosophy. The full training loop (windowing, normalization per operating condition, early stopping) is left as the exercise.</div>
+
+    <p>The listing above is the whole conceptual skeleton: a recurrent backbone reads the window, a small head emits one RUL value, and the loss encodes the business asymmetry. In practice you also normalize each sensor <em>within its operating condition</em>, because a turbofan at altitude and at sea level produce different baselines that would otherwise swamp the wear signal.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: don't hand-roll the windowing and training loop</h3>
+        <p>The sliding-window tensor construction, per-condition scaling, batching, and early-stopping loop around the model above are roughly 120 lines of easy-to-get-wrong boilerplate (off-by-one window indexing and leakage across the train/test unit split are the classic bugs). A time-series framework such as <code>pytorch-forecasting</code> or <code>gluonts</code> collapses that to a dataset declaration plus <code>trainer.fit(model)</code>, about 15 lines, and it handles the group-aware split so windows from one engine never straddle train and test. Keep the from-scratch version for understanding; ship the framework version so the leakage guard is not your responsibility to remember.</p>
+    </div>
+
+    <h2>Learning a health index, not just a number</h2>
+    <p>Regressing RUL directly works, but the more interpretable and often more robust route is to have the sequence model emit a scalar <strong>health index</strong> \(h_t \in [0, 1]\): a learned one-dimensional summary that starts near 1 on a healthy machine and decays toward 0 at failure. You then map \(h_t\) to RUL with a simple, auditable curve, or trigger maintenance when \(h_t\) crosses a threshold. The health index is attractive for three reasons. It is comparable across machines even when their absolute sensor levels differ; it exposes the degradation trajectory to an operator as a single trend line they can sanity-check; and it decouples the hard perception problem (read the sensors, place the machine on the degradation manifold) from the easier, changeable business problem (how much life does this health level imply for <em>this</em> asset class). When degradation is multi-modal, one bearing fault and one lubrication fault with different signatures, you can even emit a small vector of health indices, one per known failure mode, which connects directly to the interpretability and root-cause methods of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the wind-turbine gearbox that warned in a language operators trusted</h3>
+        <p>An offshore wind operator ran a GRU RUL model on gearbox vibration and oil-debris counts across a 60-turbine fleet. The raw RUL number, "212 hours," met resistance: technicians could not audit it and would not dispatch a boat on it. The team retrained the same backbone to output a health index instead, plotted as a single 0-to-1 trend per gearbox on the control-room dashboard. Now when turbine 34's index slid from 0.9 to 0.55 over ten days while its neighbors held flat, the trajectory itself was the argument. The crew scheduled an inspection, found early tooth pitting, and swapped the gearbox during a planned low-wind window. Same network, same features; the interpretable intermediate representation is what made the prediction actionable. The uncertainty band on that index, which told them <em>how</em> confident to be, came from the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and is the subject of <a class="cross-ref" href="section-36.6.html">Section 36.6</a>.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Purely supervised sequence models are data-hungry, and run-to-failure records are scarce and expensive: every training example is a destroyed machine. The frontier is therefore moving toward <em>label-efficient</em> degradation modeling. Self-supervised pretraining on the vast pool of unlabeled healthy operation (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) yields representations that fine-tune to RUL with a fraction of the failure labels. Physics-informed sequence models constrain the learned health index to obey a known damage-accumulation law (Paris' law for crack growth, Arrhenius kinetics for thermal aging), which regularizes extrapolation into the sparse end-of-life regime. And time-series foundation models bring transfer <em>across</em> machine types, the topic of the next section. The open problem is honest evaluation: with only a few hundred failure trajectories, reported gains are fragile, and the field is converging on grouped, unit-level cross-validation as the minimum bar.</p>
+    </div>
+
+    <h2>Evaluating and trusting the prediction</h2>
+    <p>A sequence prognostic model is only as good as its evaluation split. The non-negotiable rule is that no window from a given machine may appear in both training and test; you split by <em>unit</em>, never by window, or the model scores brilliantly by recognizing engines it has already seen dying. Report both a symmetric metric (RMSE, so results compare across papers) and the asymmetric operational score (which reflects real cost), because a model can win one and lose the other. Finally, inspect the predicted trajectory per unit, not just the aggregate error: a good model produces a health index that is flat during the healthy phase and then declines smoothly and monotonically, and the shape of that curve tells you whether the network learned degradation or learned the dataset. The measurement-first humility that opened this book applies at the end too: the prediction is a lossy inference about a physical process, and its value is set by whether a maintenance crew can act on it in time.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the FD001 subset of C-MAPSS. (1) Build both a linear RUL label and a piecewise-linear label with \(R_{\max} = 125\), train the GRU from the listing on each, and compare test RMSE and the C-MAPSS score on the held-out units. (2) Add the smoothness prior by penalizing \(\sum_t \max(0,\, \hat{y}_{t} - \hat{y}_{t-1})\) within each unit's predicted sequence, and report how the per-unit trajectories change visually. (3) Re-split the data by <em>window</em> instead of by <em>unit</em> and observe the inflated, dishonest score; write one sentence explaining the leakage to a colleague.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ul>
+            <li>Why does a linear RUL label harm generalization to unseen machines, and what does the piecewise-linear ceiling fix?</li>
+            <li>Given a degradation cue that is a slow global drift versus one that is a local morphological change, which sequence architecture would you reach for first, and why?</li>
+            <li>What are two reasons to have the model emit a health index in \([0,1]\) rather than regressing remaining useful life directly?</li>
+        </ul>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-36.5.html">Section 36.5</a>, we lift the ceiling on data hunger: instead of training a fresh sequence model on each fleet's scarce failure records, we use pretrained time-series and sensor foundation-model embeddings as the front end for RUL, transferring degradation structure learned across many machines into settings where you have only a handful of run-to-failure examples of your own.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.7: Fleet-scale deployment. Building Sensory AI." name="description"/>
+<title>Section 36.7: Fleet-scale deployment | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Predictive Maintenance and Prognostics</a></div>
+<h1>Fleet-scale deployment</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A perfect remaining-life estimate for one pump is a research paper. Ten thousand mediocre estimates, ranked so the right three technicians drive to the right three sites tomorrow, is a business."</p>
+<cite>A Logistically Minded AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why one good model is not a maintenance program</h3>
+<p>Everything earlier in this chapter produced a remaining-useful-life (RUL) estimate and an uncertainty interval for a single asset. Fleet-scale deployment is the moment that stops being enough. A wind operator watches ten thousand turbines, a rail network tens of thousands of axle bearings, a cloud provider millions of disks. The question is no longer "how long until this bearing fails" but "given every asset's prediction, its uncertainty, its cost of failure, and the fact that I have four crews and one crane, what should the fleet do this week." That reframing changes the engineering. You now need models that generalize across machine variants you have never labeled, a serving path that survives intermittent connectivity, a retraining loop that notices when a firmware update silently shifts every sensor, and above all a way to turn a column of RUL numbers into a ranked work queue. This section is about the systems and decisions that live between a working prognostic model and a fleet that is measurably cheaper and safer to run.</p>
+</div>
+
+<p>This section assumes you already have a per-asset RUL model with calibrated uncertainty from <a class="cross-ref" href="section-36.6.html">Section 36.6</a>, and understands the maintenance decision economics developed there. It leans heavily on operations infrastructure taught later: the model registry, monitoring, and rollout machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, the streaming and online-inference patterns of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, and the distribution-shift detection of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Here we specialize those tools to the prognostics setting, where the label (an actual failure) is scarce, delayed by months, and expensive to earn.</p>
+
+<h2>A fleet is not one machine repeated N times</h2>
+<p>The tempting assumption is that a fleet is homogeneous, so one model trained on pooled data serves all. Real fleets are stratified. Turbines of the same model sit at different altitudes and wind classes; identical pumps move slurry at one plant and clean water at another; two nominally matched compressors run different duty cycles. These differences shift the sensor distribution enough that a single global model is systematically miscalibrated for the extremes. The standard response is a three-tier hierarchy. A <em>global</em> model, trained on the whole fleet, captures the shared physics of degradation and gives every asset a usable prediction on day one. A <em>cohort</em> model, fit per machine variant, operating regime, or site, corrects the group-level bias. A <em>per-asset</em> adaptation, often just a learned offset or a short online-updated residual, absorbs the individuality of one unit that has always run a little hot. Formally, if \(g\) is the global predictor and \(X\) a sensor window, the deployed estimate is \(\hat{r}(X) = g(X) + b_{\text{cohort}} + \delta_{\text{asset}}\), where the correction terms are cheap, fit from little data, and updated far more often than the expensive global backbone.</p>
+
+<p>This hierarchy is also the answer to cold-start. A brand-new asset with zero failure history cannot train its own model, but it inherits the global and cohort tiers immediately and starts accumulating a per-asset residual as it runs. Foundation-model embeddings (<a class="cross-ref" href="section-36.5.html">Section 36.5</a>) strengthen the global tier precisely because they transfer across variants without per-fleet retraining, and graph-structured models that share information between neighboring or similar assets, developed in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a>, can propagate a degradation signal observed on one unit to its lookalikes before they fail.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">At fleet scale, ranking quality beats point-estimate accuracy</h3>
+<p>A prognostic team's instinct is to minimize RUL error (RMSE or the asymmetric scoring function). But the fleet operator never acts on an absolute RUL; they act on a <em>priority order</em>. Two models with identical RMSE can produce wildly different maintenance value if one ranks the truly urgent assets to the top of the queue and the other scatters them. The metric that predicts business outcome is therefore a ranking or decision metric, expected avoided cost per crew-visit, or the precision of the top-\(k\) most-urgent list, not raw regression error. A model that is uniformly biased but preserves the correct order can outperform an unbiased but noisier one.</p>
+</div>
+
+<h2>From RUL column to work queue: risk-ranked triage</h2>
+<p>The core fleet operation is triage: convert every asset's predictive distribution into a single actionable priority, then sort. The right priority is not the smallest RUL. It weights urgency by consequence and by confidence. A useful, defensible score is the expected cost of deferring action over the next planning window \(H\), which combines the failure probability inside that window with the cost of an unplanned failure and discounts by how sure the model is. Given a per-asset failure-time distribution and a failure cost \(c_i\), the deferral risk is \(\rho_i = c_i \cdot P(T_i \le H)\), and the crew is dispatched down the sorted \(\rho_i\) list until the week's capacity is spent. This is the fleet analogue of the single-asset economics in <a class="cross-ref" href="section-36.6.html">Section 36.6</a>, and it is what makes calibrated uncertainty non-negotiable: a model that is overconfident about \(P(T_i \le H)\) will send crews to the wrong sites. The snippet below turns a batch of predictive quantiles into a ranked, capacity-limited dispatch list.</p>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+def triage(rul_samples, failure_cost, horizon_h, crew_capacity):
+    # rul_samples: (n_assets, n_mc) posterior draws of remaining useful life (hours)
+    # P(fail within horizon) from the predictive distribution, not a point estimate
+    p_fail = (rul_samples &lt;= horizon_h).mean(axis=1)
+    deferral_risk = failure_cost * p_fail                 # expected cost of waiting
+    order = np.argsort(-deferral_risk)                    # most urgent first
+    dispatch = order[:crew_capacity]                      # this week's work orders
+    return pd.DataFrame({
+        "asset": order,
+        "p_fail_H": p_fail[order],
+        "risk": deferral_risk[order],
+        "dispatch": np.isin(order, dispatch),
+    })
+
+rng = np.random.default_rng(0)
+rul = rng.gamma(shape=4, scale=120, size=(2000, 500))    # 2000 assets, 500 MC draws
+cost = rng.choice([5e3, 4e4, 2e5], size=2000)            # heterogeneous failure cost
+queue = triage(rul, cost, horizon_h=168, crew_capacity=12)
+print(queue.head(12))
+</code></pre>
+<div class="code-caption">Fleet triage: predictive RUL draws become a risk-ranked work queue. The failure probability is read from the distribution's mass below the planning horizon (168 hours), scaled by each asset's failure cost, then capacity-truncated to the crews available. Point RUL never appears; only the distribution and the cost do.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: batch serving and drift monitoring off the shelf</h3>
+<p>The triage logic is a dozen lines, but the surrounding plumbing, scoring thousands of assets on a schedule, versioning the model that produced each score, and alerting when input distributions drift, is where naive code balloons into hundreds of lines of cron jobs, feature-store queries, and hand-rolled histogram comparisons. A serving-and-monitoring stack such as a feature store plus an evidently-style drift monitor collapses that to a handful of declarative calls: register the model, point the batch job at the feature view, and declare the reference distribution to watch. You write the risk score; the library handles scheduling, lineage, and the population-stability report, cutting the operational surface from roughly 300 lines to about 30 and giving you an audit trail Chapter 69 will insist on.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wind fleet that learned to trust the queue, not the number</h3>
+<p>An offshore wind operator ran per-turbine gearbox RUL models that scored well on held-out RMSE, yet crews kept returning from dispatched visits finding healthy gearboxes while two unlisted units failed mid-quarter. The audit found two fleet-scale faults. First, a firmware rollout six weeks earlier had rescaled the vibration channel on one turbine variant by a constant, silently shifting every embedding for that cohort; the global model, blind to the shift, drifted into overconfidence there. Second, the team dispatched on smallest predicted RUL, ignoring that a nacelle visit offshore costs far more for the far-shore string, so cheap-to-reach healthy units kept jumping the queue. Switching to a deferral-risk ranking that multiplied failure probability by per-string visit cost, and adding a population-stability alarm on each channel that auto-quarantined a cohort's predictions when its input histogram moved, cut wasted vessel trips by a third in one season and caught the next firmware-induced shift within a day instead of a quarter.</p>
+</div>
+
+<h2>Serving, connectivity, and the retraining loop</h2>
+<p>Where the model runs is a systems decision driven by latency and connectivity, not accuracy. Prognostics is forgiving on latency, a RUL that updates hourly is fine, so most fleets favor a hybrid split: a light edge model computes features and screens for fast-moving anomalies on the asset even when the link drops, while the heavy global backbone and the fleet-wide triage run in the cloud on batched telemetry. The edge tier borrows directly from <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, and when raw sensor streams cannot leave the site for privacy or bandwidth reasons, the global model can still improve through the federated updates of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>, sharing gradients rather than data.</p>
+
+<p>The retraining loop is the part teams most often get wrong. Failures are the label, and they arrive months after the window that predicted them, so a fleet accumulates ground truth slowly and asymmetrically: you learn a lot from the assets you let run to failure and almost nothing about the ones you repaired early (their true RUL is censored, exactly the survival-analysis problem of <a class="cross-ref" href="section-36.3.html">Section 36.3</a>). Retraining must therefore respect censoring, use a strict time-and-asset split so a future failure never leaks backward into training, and be triggered by evidence, not the calendar. The trigger is drift plus label accrual: retrain when monitored input distributions have moved beyond a threshold or when enough new confirmed failures have banked to sharpen the tails.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Common pitfall: the maintenance action erases its own evidence</h3>
+<p>Predictive maintenance creates a feedback loop that quietly poisons future training. Every asset the model flags gets repaired before it fails, so the very trajectories the model is most confident about never produce a failure label; the training set fills with the failures the model <em>missed</em>. Over successive retrains the model can look worse on failure recall while actually working, because it is being graded only on its own blind spots. Log every intervention as a censored event and account for it explicitly, or the loop will train you toward a model that only predicts the failures you are already bad at.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: one prognostic backbone for a whole heterogeneous fleet</h3>
+<p>The active research direction is replacing the per-variant model zoo with a single conditioned foundation backbone. Time-series foundation models (TimesFM, Moirai, and the MOMENT encoder family from <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>) are being probed and lightly fine-tuned to serve every cohort from one set of weights, with metadata (asset type, duty cycle, site) injected as covariates so the cohort correction becomes conditioning rather than a separate model. Paired with conformal prediction (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) for distribution-free RUL intervals that stay valid across variants, and continual on-fleet adaptation, the goal is a deploy-once prognostic service that a new asset class joins without a bespoke training project. The open problems are honest cross-variant calibration and detecting when the backbone is confidently wrong on a machine type it never saw.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: rank, do not regress</h3>
+<p>Take an N-CMAPSS multi-unit dataset and split it by unit and time. (1) Train a single global RUL model and record its RMSE and the standard asymmetric prognostics score. (2) Build the deferral-risk triage from the code above, assigning each unit a synthetic but heterogeneous failure cost, and evaluate top-\(k\) precision: of the \(k\) units your queue dispatches, how many actually fail within the horizon. (3) Now degrade the model by adding a constant bias to one variant's predictions and re-measure both RMSE and top-\(k\) precision. Report which metric moves more, and explain to an operator why the ranking metric is the one to defend at the budget meeting. (4) Add a population-stability check that flags the biased variant from its inputs alone, before any failure confirms the drift.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why can two RUL models with identical RMSE deliver very different maintenance value across a fleet, and what metric captures the difference?</li>
+<li>Explain the three-tier global/cohort/per-asset hierarchy and how it solves the cold-start problem for a brand-new asset.</li>
+<li>How does successful predictive maintenance bias its own future training data, and what bookkeeping prevents the resulting degradation?</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 36</h3>
+<p>build an RUL predictor on C-MAPSS/N-CMAPSS; compare regression metrics against maintenance utility.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Prognostics benchmarks and fleet datasets</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/4711414">Saxena, A., Goebel, K., Simon, D., &amp; Eklund, N. (2008). Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation. International Conference on Prognostics and Health Management (PHM).</a></p>
+<p class="bib-annotation">The C-MAPSS turbofan dataset that became the standard multi-unit RUL benchmark; the original source of the asymmetric scoring function this section contrasts with ranking metrics.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.mdpi.com/2306-5729/6/1/5">Arias Chao, M., Kulkarni, C., Goebel, K., &amp; Fink, O. (2021). Aircraft Engine Run-to-Failure Dataset under Real Flight Conditions for Prognostics and Diagnostics. Data.</a></p>
+<p class="bib-annotation">N-CMAPSS, the larger, more realistic successor with heterogeneous flight profiles, the dataset the lab and exercise use to force genuine cross-unit generalization.</p>
+</div>
+
+<p class="bib-category">Fleet-scale prognostics and transfer</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.sciencedirect.com/science/article/pii/S0951832020306621">Fink, O., Wang, Q., Svensen, M., Dersin, P., Lee, W.-J., &amp; Ducoffe, M. (2020). Potential, Challenges and Future Directions for Deep Learning in Prognostics and Health Management Applications. Engineering Applications of Artificial Intelligence.</a></p>
+<p class="bib-annotation">A field-shaping survey that names fleet heterogeneity, transfer across units, and scarce labels as the central deployment obstacles this section addresses.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.sciencedirect.com/science/article/pii/S0888327018303108">Lei, Y., Li, N., Guo, L., Li, N., Yan, T., &amp; Lin, J. (2018). Machinery Health Prognostics: A Systematic Review from Data Acquisition to RUL Prediction. Mechanical Systems and Signal Processing.</a></p>
+<p class="bib-annotation">A comprehensive review of the RUL pipeline; useful for placing fleet deployment as the final stage after acquisition, feature construction, and modeling.</p>
+</div>
+
+<p class="bib-category">Foundation models for time series (the fleet backbone)</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2310.10688">Das, A., Kong, W., Sen, R., &amp; Zhou, Y. (2024). A Decoder-Only Foundation Model for Time-Series Forecasting (TimesFM). ICML.</a></p>
+<p class="bib-annotation">The pretrained forecaster whose embeddings and zero-shot behavior underpin the deploy-once, serve-every-cohort direction in the frontier callout.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami, M., Szafer, K., Choudhry, A., Cai, Y., Li, S., &amp; Dubrawski, A. (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p>
+<p class="bib-annotation">An encoder-style foundation model with a first-class embedding mode, the practical backbone for a single conditioned model spanning heterogeneous fleet variants.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.02592">Woo, G., Liu, C., Kumar, A., Xiong, C., Savarese, S., &amp; Sahoo, D. (2024). Unified Training of Universal Time Series Forecasting Transformers (Moirai). ICML.</a></p>
+<p class="bib-annotation">A multivariate foundation model that ingests all sensor channels jointly, relevant when fleet faults appear as changing cross-sensor correlations.</p>
+</div>
+
+<p class="bib-category">Operations, drift, and calibrated decisions</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2107.07511">Angelopoulos, A. N., &amp; Bates, S. (2021). A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification. Foundations and Trends in Machine Learning.</a></p>
+<p class="bib-annotation">The reference for distribution-free RUL intervals that remain valid across fleet variants, the calibration backbone for trustworthy triage.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/2939672.2939785">Breck, E., Cai, S., Nielsen, E., Salib, M., &amp; Sculley, D. (2017). The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction. IEEE Big Data.</a></p>
+<p class="bib-annotation">A production-readiness checklist that names data drift, training-serving skew, and feedback loops, the operational failure modes the retraining-loop discussion warns against.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>, we step back from predicting time-to-failure and ask a prior question: how do we detect that a machine has left its healthy regime at all, often with no failure examples to learn from. Condition monitoring and anomaly detection supply the fast, label-light alarms that sit upstream of the prognostic queue this section built.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
