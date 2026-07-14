@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.5: Forecasting and control. Building Sensory AI." name="description"/>
+<title>Section 39.5: Forecasting and control | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Energy, Buildings, and Environmental Sensors</a></div>
+<h1>Forecasting and control</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A forecast nobody acts on is just an expensive way of being surprised on schedule."</p>
+<cite>A Pragmatic AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Everything so far in this chapter turned raw energy and environmental sensors into clean, meaningful signals. This section is where those signals earn their keep: we predict what the building will do next, and then we act on the prediction. A day-ahead load forecast lets a facility bid into an electricity market, pre-cool thermal mass before a price spike, and size a battery dispatch. A short-horizon forecast feeds a controller that shifts load off peak without letting any zone drift out of comfort. The distinctive difficulty here is that the forecast is not the product; the <em>decision</em> is. That reframes what a good model looks like: calibrated uncertainty beats a sharper point estimate, and a forecast is only as valuable as the control loop that consumes it. This section covers both halves, the forecasting and the closing of the loop.</p>
+</div>
+
+<p>This section builds on the sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> and the calibration and conformal-prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and it assumes the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Where earlier sections in this chapter treated meters and telemetry as things to measure and clean, here we advance the <em>infer</em> and <em>deploy</em> verbs of Part VIII: turning history plus weather into a decision that changes the building's energy trajectory.</p>
+
+<h2>What load forecasting actually asks</h2>
+<p>Building and grid load forecasting is a supervised sequence problem with a strongly structured target. The load \(y_t\) (electricity kW, or thermal load, or gas) is dominated by three deterministic drivers plus a stochastic residual: <strong>calendar</strong> effects (hour of day, day of week, holidays, the double-daily-peak office rhythm), <strong>weather</strong> (temperature above all, then humidity, solar irradiance, and wind), and <strong>autocorrelation</strong> (yesterday and last week look a lot like today). The forecast horizon dictates the whole design. <em>Very short term</em> (minutes to an hour) is dominated by persistence and drives real-time control. <em>Short term</em> (a day to a week ahead) is dominated by weather and calendar and drives market bidding and unit commitment. <em>Long term</em> (months to years) is dominated by trend and growth and drives capacity planning. Getting the horizon wrong is the classic beginner error: a model tuned to nowcasting features leaks recent load into a day-ahead task and collapses in production.</p>
+
+<p>Two baselines must be beaten before any deep model is worth deploying. <strong>Seasonal-naive</strong> predicts \(\hat{y}_t = y_{t-168}\) (the same hour last week), and a <strong>temperature-response regression</strong> fits load against a piecewise-linear function of outdoor temperature plus hour-of-week dummies. Both are cheap, interpretable, and stubbornly hard to beat; utilities have run variants of the second for decades. The code below fits exactly this kind of linear day-ahead model with lagged-load, calendar, and weather features, and reports skill against seasonal-naive.</p>
+
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+H = 24 * 60  # 60 days of hourly load
+t = np.arange(H)
+hour = t % 24
+dow = (t // 24) % 7
+temp = 15 + 10*np.sin(2*np.pi*(t-6)/24) + rng.normal(0, 2, H)  # outdoor degC
+# Synthetic load: office double-peak, weekend dip, cooling above 22 C
+base = 40 + 25*np.exp(-((hour-14)**2)/18) + 15*np.exp(-((hour-9)**2)/8)
+load = base * (1 - 0.4*(dow >= 5)) + 3*np.maximum(temp-22, 0) + rng.normal(0, 3, H)
+
+def features(i):                       # leakage-safe: only info known at forecast time
+    return np.concatenate([
+        np.eye(24)[hour[i]],           # hour-of-day one-hot
+        [dow[i] >= 5],                 # weekend flag
+        [temp[i], max(temp[i]-22, 0)], # weather + cooling degree
+        [load[i-24], load[i-168]],     # yesterday, last week (same hour)
+    ])
+
+idx = np.arange(168, H)
+X = np.array([features(i) for i in idx]); y = load[idx]
+cut = int(0.8 * len(idx))              # chronological split, no shuffling
+Xtr, ytr, Xte, yte = X[:cut], y[:cut], X[cut:], y[cut:]
+w, *_ = np.linalg.lstsq(np.c_[Xtr, np.ones(cut)], ytr, rcond=None)
+pred = np.c_[Xte, np.ones(len(Xte))] @ w
+naive = load[idx[cut:] - 168]
+mae = lambda a, b: np.mean(np.abs(a - b))
+print(f"model MAE {mae(pred, yte):.2f} kW  vs  seasonal-naive {mae(naive, yte):.2f} kW")
+</code></pre>
+<div class="code-caption">A leakage-safe day-ahead load forecaster: hour-of-day, weekend, temperature, cooling-degree, and same-hour lags, split chronologically and scored against the seasonal-naive baseline it must beat.</div>
+
+<p>Notice that the split is chronological, never shuffled, and every feature uses only information available at forecast time. Shuffle the rows and the reported error becomes a fantasy, because adjacent hours are nearly identical and random folds let the model peek across the gap.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Forecast for the decision, not for the metric</h3>
+<p>The forecast that minimizes mean-squared error is rarely the forecast that minimizes cost. If under-predicting load triggers an expensive real-time market purchase while over-predicting only wastes a cheap reserve, the economically optimal forecast is deliberately biased high. This is the <em>predict-then-optimize</em> versus <em>decision-focused learning</em> distinction: train on the loss the downstream controller actually pays, or at minimum output a full predictive distribution so the optimizer can weigh the asymmetric costs itself. A point forecast throws that information away before the decision is made.</p>
+</div>
+
+<h2>Probabilistic forecasts and calibration</h2>
+<p>Because the value lives in the tails, building forecasting has moved decisively to <strong>probabilistic</strong> output: quantile forecasts, a predictive interval, or a full distribution over the horizon. A quantile model trained with the pinball loss at levels such as 0.1, 0.5, and 0.9 gives the dispatcher a band; conformal prediction (from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) wraps any point forecaster with a finite-sample coverage guarantee, which is what lets an operator trust that a "90 percent interval" is breached about ten percent of the time. Calibration is the property that matters in the field: a battery dispatched against a miscalibrated interval will be systematically under- or over-charged, and the failure is invisible until the bill arrives.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">A whole forecasting bake-off in a dozen lines</h3>
+<p>The hand-written model above is about 30 lines and covers one architecture. Libraries such as <code>statsforecast</code> and <code>neuralforecast</code> collapse an entire benchmark into roughly ten: <code>StatsForecast(models=[AutoARIMA(), MSTL(), SeasonalNaive()])</code> then <code>.forecast(h=24, level=[90])</code> fits classical seasonal models with prediction intervals across every meter in a panel, in parallel, with cross-validated backtesting built in. You supply weather as exogenous columns and get calibrated quantiles for free, replacing several hundred lines of feature plumbing, model wiring, and rolling-origin evaluation. Reach for the library to establish strong baselines fast, and hand-roll only when a decision-focused loss demands it.</p>
+</div>
+
+<h2>Closing the loop: model predictive control</h2>
+<p>A forecast becomes control through <strong>model predictive control (MPC)</strong>. MPC uses a model of the building (often the grey-box thermal-RC model of the kind introduced in <a class="cross-ref" href="section-39.2.html">Section 39.2</a>) to optimize a sequence of control actions over a receding horizon, then applies only the first action and re-optimizes at the next step. For building energy the canonical problem is: minimize energy cost over the next \(N\) hours subject to comfort. With zone temperature \(T_k\), control \(u_k\) (heating or cooling power), forecast disturbances \(d_k\) (outdoor temperature, solar, occupancy), and time-of-use price \(p_k\),</p>
+
+$$\min_{u_{0:N-1}} \; \sum_{k=0}^{N-1} p_k\,u_k \quad\text{s.t.}\quad T_{k+1} = a T_k + b u_k + c\,d_k, \;\; \underline{T} \le T_k \le \overline{T}, \;\; 0 \le u_k \le u_{\max}.$$
+
+<p>The linear dynamics and linear cost make this a linear program the size of the horizon, solvable in milliseconds. The magic is what the optimizer discovers on its own: given a price forecast and the building's thermal capacitance, it <em>pre-cools</em> the mass during cheap overnight hours so it can coast through the afternoon peak with the chillers idle, keeping every zone inside its comfort band the whole time. No rule wrote that behavior; it fell out of forecast plus model plus constraint. The forecasts feeding \(d_k\) and \(p_k\) are exactly the probabilistic outputs of the previous subsection, and a robust MPC optimizes against the interval, not just the median.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Pre-cooling a campus ahead of a heat wave</h3>
+<p>A university campus energy team ran MPC across a cluster of lab and office buildings served by a central chilled-water plant on a summer time-of-use tariff with a punishing 4-to-9 pm peak. Their controller ingested a day-ahead temperature forecast and the published price schedule, fit a two-state RC model per building from a month of telemetry, and solved a receding-horizon LP every fifteen minutes. On heat-wave days it drove the chillers hard from 2 am, parked the buildings a degree below setpoint by noon, and let them drift up through the afternoon so the plant ran near-minimum during the peak window. Measured against the prior rule-based schedule, peak-window electricity fell by roughly a quarter with zero comfort complaints, because the constraint \(\underline{T} \le T_k \le \overline{T}\) was never a suggestion. The whole gain came from trusting a forecast enough to act hours before the load arrived.</p>
+</div>
+
+<h2>When the model is too hard to write: learning to control</h2>
+<p>MPC needs a model. When the building is too nonlinear, too coupled, or too poorly instrumented to model well, <strong>reinforcement learning</strong> (RL) offers a data-driven alternative that learns a control policy from interaction, and this is an active research frontier for building control.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where control learning is heading</h3>
+<p>Deep RL agents trained in high-fidelity simulators (EnergyPlus wrapped by environments such as Sinergym, and the CityLearn benchmark for grid-interactive building portfolios) have matched or beaten tuned MPC on demand-response tasks, but sample efficiency and the safety of a still-exploring policy remain the blockers to live deployment. The pragmatic frontier is hybrid: MPC for the safety-critical inner loop with an RL or offline-RL layer that tunes setpoints and adapts to drift, and, increasingly, LLM-agent supervisors that read forecasts, prices, and alarms to orchestrate the loop, a direction developed in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>. Time-series foundation models (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>) are also starting to supply zero-shot load forecasts that a controller can consume without any per-building training.</p>
+</div>
+
+<p>Whichever path you take, the same discipline binds forecasting and control together: the loop is only trustworthy if the forecast is calibrated, the model is validated on held-out time, and the controller's constraints are hard. A confident forecast plumbed into a greedy controller is how a building ends up cold, expensive, and surprised all at once.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code example into a two-quantile forecaster by training two extra linear models with the pinball (quantile) loss at levels 0.1 and 0.9, using a subgradient step or <code>scipy.optimize</code>. Report empirical coverage of the resulting 80 percent interval on the chronological test set. Then feed the median and the interval into a one-line pre-cooling heuristic (cool one degree below setpoint whenever the forecast upper bound exceeds a threshold in the next three hours) and compare peak-hour energy against a fixed-setpoint baseline. Which matters more to the saving, a sharper median or a well-calibrated upper bound?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does shuffling rows before splitting a load-forecast dataset produce an optimistic and misleading error, and what split replaces it?</p>
+<p>2. Give one concrete situation where the cost-optimal forecast is deliberately biased away from the mean-squared-error-optimal forecast.</p>
+<p>3. In the MPC formulation, which term causes the optimizer to discover overnight pre-cooling, and which term guarantees it never trades comfort for savings?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-39.6.html">Section 39.6</a>, we confront what happens when the sensors feeding all of this forecasting and control go silent or start lying: gaps, dropouts, drift, and stuck values. A control loop is only as reliable as its inputs, so we turn to detecting, imputing, and staying robust to missing and faulty sensors.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

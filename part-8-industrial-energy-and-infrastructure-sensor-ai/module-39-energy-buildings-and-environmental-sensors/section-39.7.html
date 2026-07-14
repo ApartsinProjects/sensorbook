@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.7: Sustainability applications. Building Sensory AI." name="description"/>
+<title>Section 39.7: Sustainability applications | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Energy, Buildings, and Environmental Sensors</a></div>
+<h1>Sustainability applications</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to prove we saved a thousand tonnes of carbon. I asked them to hand over the parallel universe where we did nothing. Negotiations are ongoing."</p>
+<cite>A Counterfactual AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every previous section in this chapter taught you to measure a building: disaggregate its meter, read its HVAC telemetry, watch its air and soil, span it with a sensor network, forecast it, and repair its missing points. Sustainability is where that measurement is asked to earn its keep. A retrofit is only funded if someone can prove the kilowatt-hours it avoided; a carbon-aware control policy is only credible if it shifts load to genuinely cleaner hours; a methane program is only useful if it finds the leak before a year of gas escapes. Each of these is a sensing-and-inference problem with a hard, adversarial evaluation attached, because money and regulatory claims ride on the answer. This section is about turning environmental and energy telemetry into defensible statements about avoided energy, avoided carbon, and demand flexibility. It is the section where the six verbs of this book, measure through deploy, are pointed at a planetary constraint.</p>
+</div>
+
+<p>This section builds directly on the forecasting and control of <a class="cross-ref" href="section-39.5.html">Section 39.5</a> and the load disaggregation of <a class="cross-ref" href="section-39.1.html">Section 39.1</a>, and it leans hard on the leakage-safe evaluation discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The single idea that unifies everything below is the <em>counterfactual</em>: sustainability claims are almost never about what happened, but about the gap between what happened and what would have happened otherwise. That gap is never observed, only estimated, which is why it is a modeling problem before it is an accounting one.</p>
+
+<h2>Measurement and verification: proving a negative</h2>
+<p>The foundational sustainability task is <strong>measurement and verification (M&amp;V)</strong>: quantifying the energy a project saved. The trouble is that savings are unmeasurable in principle. You can meter what a building used after an efficiency upgrade, but the thing you want, the energy it <em>would</em> have used without the upgrade, was erased the moment you acted. The standard response, codified in the International Performance Measurement and Verification Protocol (IPMVP) and operationalized by the open <strong>CalTRACK</strong> methods, is to build a <em>baseline model</em>: fit whole-building energy as a function of weather (and calendar) over a pre-intervention year, then run that fitted model forward on the post-intervention weather to predict the counterfactual. Avoided energy is the predicted counterfactual minus the metered actual.</p>
+
+$$\widehat{\text{Savings}} \;=\; \sum_{t \in \text{post}} \Big( \hat{f}_{\text{pre}}(w_t) - y_t \Big), \qquad \hat{f}_{\text{pre}} = \arg\min_{f}\sum_{t \in \text{pre}} \big(y_t - f(w_t)\big)^2$$
+
+<p>Here \(y_t\) is metered energy in an interval, \(w_t\) is the weather covariate (usually outdoor temperature, entered through heating- and cooling-degree-day features), and \(\hat{f}_{\text{pre}}\) is trained only on the pre period. The leakage rule is absolute and is the entire reason for the pre/post split: a single post-period sample touching the baseline fit inflates the very savings the fit is meant to certify.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A savings number without an interval is a guess with good posture</h3>
+<p>Because the counterfactual is a model prediction, the savings estimate inherits the model's uncertainty, and that uncertainty is often the same order of magnitude as the savings itself. A 6% efficiency project sits comfortably inside the year-to-year prediction error of a naive baseline, which means the honest deliverable is not a point estimate but an interval: "we avoided 42,000 &plusmn; 9,000 kWh at 90% confidence." The fractional savings uncertainty scales roughly with the baseline's normalized prediction error divided by the fractional saving, so a noisy building needs a bigger intervention (or more data) to prove anything. This is exactly where the conformal-prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> earns its place: it wraps the baseline model in a distribution-free interval, so the savings claim carries a coverage guarantee instead of an optimistic single number.</p>
+</div>
+
+<p>The code below implements the whole M&amp;V loop on synthetic daily data: a temperature-response baseline fit on the pre year, projected onto post-year weather, differenced against actuals, and finally converted to avoided carbon using an emissions factor.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Daily energy (kWh) vs outdoor temperature. Pre = baseline year, post = after retrofit.
+rng = np.random.default_rng(0)
+def hdd_cdd(T, base=15.5):                     # heating/cooling degree days from daily mean T
+    return np.maximum(base - T, 0), np.maximum(T - base, 0)
+
+T_pre  = 15 + 10*np.sin(np.arange(365)*2*np.pi/365) + rng.normal(0, 2, 365)
+T_post = 15 + 10*np.sin(np.arange(365)*2*np.pi/365) + rng.normal(0, 2, 365)
+# True response: baseload + heating + cooling; retrofit cuts heating slope by 30%.
+def energy(T, heat_slope):
+    h, c = hdd_cdd(T)
+    return 40 + heat_slope*h + 3.0*c + rng.normal(0, 4, len(T))
+y_pre, y_post = energy(T_pre, 5.0), energy(T_post, 3.5)
+
+# Fit baseline f(T) = b0 + b1*HDD + b2*CDD on the PRE year ONLY (no post leakage).
+Hp, Cp = hdd_cdd(T_pre)
+X_pre  = np.column_stack([np.ones(365), Hp, Cp])
+beta, *_ = np.linalg.lstsq(X_pre, y_pre, rcond=None)
+
+# Counterfactual on POST weather, then avoided energy and avoided carbon.
+Ho, Co = hdd_cdd(T_post)
+counterfactual = np.column_stack([np.ones(365), Ho, Co]) @ beta
+avoided_kwh = float((counterfactual - y_post).sum())
+resid_sd    = float((y_pre - X_pre @ beta).std(ddof=3))
+ci95        = 1.64 * resid_sd * np.sqrt(365)   # rough aggregate savings uncertainty
+grid_kgco2_per_kwh = 0.35                       # average grid emissions factor
+print(f"avoided: {avoided_kwh:,.0f} +/- {ci95:,.0f} kWh/yr  "
+      f"({avoided_kwh*grid_kgco2_per_kwh/1000:,.1f} tCO2/yr)")</code></pre>
+<div class="code-caption">A CalTRACK-style whole-building M&amp;V calculation: a degree-day baseline is fit on the pre-retrofit year, projected onto post-retrofit weather to form the counterfactual, and differenced against metered energy to yield avoided kWh with an uncertainty band and an avoided-carbon conversion.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let OpenEEmeter own the CalTRACK edge cases</h3>
+<p>The toy fit above ignores the parts of M&amp;V that actually consume engineering time: automatic changepoint selection for the temperature balance point, sufficiency checks on data coverage, daily-versus-billing-cadence handling, and the CalTRACK compliance rules regulators require. The open-source <code>eemeter</code> library (the OpenEEmeter project) encodes all of it: fitting a compliant hourly or daily model, projecting the counterfactual, and returning savings with metadata is a few dozen lines instead of the several thousand a from-scratch CalTRACK implementation would take, and the result is the same specification utilities settle on. You supply meter and temperature series; it supplies a defensible, audited savings number.</p>
+</div>
+
+<h2>Carbon-aware operation: not all kilowatt-hours are equal</h2>
+<p>Saving energy is one lever; the second is <em>when</em> you use it. The carbon intensity of the grid swings by a factor of two or more across a day as coal, gas, wind, and solar cycle in and out, so a kilowatt-hour drawn at noon under heavy solar can carry a fraction of the emissions of the same kilowatt-hour at a still winter evening peak. Two intensity signals matter and are routinely confused. The <strong>average</strong> emissions factor attributes the whole grid's emissions across all its load; the <strong>marginal</strong> emissions factor asks which generator moves when <em>you</em> change your demand by one more unit. For any decision about shifting or curtailing load, the marginal factor is the correct one, because it describes the plant your action actually turns up or down. Providers such as WattTime and Electricity Maps publish these signals, including short-horizon forecasts, so a controller can pre-cool a building, charge a battery, or defer a pump into the cleanest hours ahead.</p>
+
+<p>This turns the forecasting-and-control problem of <a class="cross-ref" href="section-39.5.html">Section 39.5</a> into a carbon-optimization problem: minimize \(\sum_t \text{MEF}_t \cdot P_t\) subject to comfort and equipment constraints, where the marginal emissions factor \(\text{MEF}_t\) is itself a forecast with its own uncertainty. Modern time-series foundation models like TimesFM (see <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>) are increasingly used to produce the multi-horizon load and emissions forecasts these controllers consume, precisely because they generalize across sites without per-building retraining.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A refrigerated warehouse that chills on solar</h3>
+<p>A cold-storage operator ran a fleet of refrigerated warehouses, each a giant thermal battery holding pallets at &minus;20 &deg;C. The insight was that the product did not care <em>when</em> the compressors ran, only that the setpoint held within a band. The team fed a marginal-emissions forecast and a day-ahead price into a model-predictive controller that deep-cooled the rooms during midday solar surplus and coasted through the dirty evening peak on stored cold. Nothing about the sensing stack changed: the same zone thermometers, door-position sensors, and power meters from earlier in this chapter fed the optimizer. Metered against a CalTRACK baseline, the sites cut operating carbon by roughly a fifth with no new refrigeration hardware and no measurable effect on product temperature compliance. The freezer had quietly become a grid asset.</p>
+</div>
+
+<h2>Grid-interactive buildings and demand flexibility</h2>
+<p>The warehouse example generalizes into the concept of the <strong>grid-interactive efficient building (GEB)</strong>: a building that is not a passive load but a controllable, communicating resource that can shed, shift, or modulate demand on request. The sensing prerequisites are exactly the capabilities this chapter built. You cannot offer flexibility you cannot measure, so demand-response settlement reuses the same counterfactual baseline as M&amp;V, only now over event hours: the payment for shedding load is the gap between a predicted "business as usual" demand and the metered reduced demand. Disaggregation (<a class="cross-ref" href="section-39.1.html">Section 39.1</a>) tells you which loads are sheddable; occupancy inference tells you which zones can coast without complaint; forecasting tells you how much headroom the next hour holds. Aggregated across thousands of buildings, this flexibility becomes a <em>virtual power plant</em> that firms the renewables it is timed against, closing the loop between building sensing and grid decarbonization.</p>
+
+<h2>Watching what escapes: emissions and resource monitoring</h2>
+<p>The last sustainability frontier is not energy at all but the direct measurement of what leaks. <strong>Methane</strong> is the sharpest case: a potent greenhouse gas whose emissions are dominated by a small number of large, intermittent "super-emitter" leaks that are invisible to periodic manual inspection. The sensing answer is a hierarchy: continuous ground-based point sensors and optical-gas cameras at facilities, aircraft and drone surveys, and satellites (TROPOMI for wide screening, targeted instruments like GHGSat and MethaneSAT for facility-scale attribution). Turning a plume image or a concentration trace into an emission <em>rate</em> is an inverse problem coupling the sensor reading to a dispersion model and wind field, and it draws directly on the multispectral and thermal-infrared imaging of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-45-thermal-infrared-and-multispectral-sensing/index.html">Chapter 45</a>. The same pattern (cheap continuous sensors plus AI attribution) reappears for water: leak detection on distribution networks and irrigation-efficiency inference from soil-moisture nodes are resource-sustainability twins of the energy work above. Because all of these feed regulatory and financial claims, they inherit the accountability and disclosure obligations discussed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: stress the savings claim</h3>
+<p>Using the M&amp;V code above: (1) reduce the true retrofit effect until the avoided energy falls inside the &plusmn;95% band, and state the smallest heating-slope reduction the baseline can certify as non-zero. (2) Replace the average emissions factor with a synthetic hourly marginal profile that is high on winter evenings, then recompute avoided carbon assuming the retrofit primarily cut evening heating; explain why the carbon saving can exceed the naive energy-times-average-factor estimate. (3) Introduce a deliberate leak: fit the baseline on a window that overlaps three post-period days and report how much the savings estimate inflates. Write two sentences connecting that inflation to the leakage-safe splitting rule of Chapter 5.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is energy savings fundamentally unmeasurable, and what does a baseline model actually estimate in its place?</li>
+<li>What is the difference between average and marginal grid emissions factors, and which one should drive a load-shifting decision?</li>
+<li>How does demand-response settlement reuse the M&amp;V counterfactual, and why does the same leakage rule apply to both?</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 39</h3>
+<p>build a building-energy anomaly + forecasting pipeline with weather covariates.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Measurement and verification</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://evo-world.org/en/products-services-mainmenu-en/protocols/ipmvp">Efficiency Valuation Organization (2012). International Performance Measurement and Verification Protocol (IPMVP), Core Concepts. EVO.</a></p>
+<p class="bib-annotation">The reference framework that defines baseline-and-counterfactual M&amp;V; every whole-building savings method in this section is an operationalization of its options.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.caltrack.org/">CalTRACK Working Group (2020). CalTRACK Methods for Whole-Building Energy Savings.</a></p>
+<p class="bib-annotation">The open, testable specification for weather-normalized whole-building savings that regulators and utilities settle on; the degree-day baseline in the code follows its logic.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://github.com/openeemeter/eemeter">OpenEEmeter Project (2024). eemeter: An open source toolkit for standardized energy efficiency metering.</a></p>
+<p class="bib-annotation">The production library that implements CalTRACK end to end, including changepoint selection and data-sufficiency checks; the library-shortcut callout is built around it.</p>
+</div>
+
+<p class="bib-category">Carbon-aware operation and grid interaction</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1086/698465">Callaway, D., Fowlie, M., McCormick, G. (2018). Location, Location, Location: The Variable Value of Renewable Energy and Demand-Side Efficiency Resources. Journal of the Association of Environmental and Resource Economists.</a></p>
+<p class="bib-annotation">The rigorous case for using marginal, spatially and temporally resolved emissions factors rather than average grid intensity when valuing efficiency and load shifting.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.watttime.org/marginal-emissions-methodology/">WattTime (2021). Marginal Emissions Methodology.</a></p>
+<p class="bib-annotation">Documents how a real-time and forecast marginal operating emissions rate is estimated from grid data, the signal a carbon-aware controller consumes.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.energy.gov/eere/buildings/grid-interactive-efficient-buildings">Neukomm, M., Nubbe, V., Fares, R. (2019). Grid-interactive Efficient Buildings Technical Report Series. U.S. Department of Energy.</a></p>
+<p class="bib-annotation">Defines the GEB concept and the sense-communicate-control capabilities that turn a building into a demand-flexibility resource.</p>
+</div>
+
+<p class="bib-category">Forecasting and emissions sensing</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2310.10688">Das, A., Kong, W., Sen, R., Zhou, Y. (2024). A decoder-only foundation model for time-series forecasting (TimesFM). ICML.</a></p>
+<p class="bib-annotation">The zero-shot forecasting backbone increasingly used for multi-site load and emissions prediction without per-building retraining.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.5194/acp-22-9617-2022">Jacob, D. J., et al. (2022). Quantifying methane emissions from the global scale down to point sources using satellite observations of atmospheric methane. Atmospheric Chemistry and Physics.</a></p>
+<p class="bib-annotation">A comprehensive account of the satellite sensing hierarchy (TROPOMI, GHGSat, MethaneSAT) and the inverse modeling that converts plume observations into emission rates.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://github.com/NREL/rdtools">Deceglie, M. G., et al. (NREL, 2023). RdTools: An open source Python library for PV degradation and performance analysis.</a></p>
+<p class="bib-annotation">The renewable analog of M&amp;V: weather-normalized performance and degradation estimation for solar assets, using the same counterfactual-baseline discipline.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, the book pivots from scalar energy and environmental streams to the geometry of the physical world itself. We open Part IX with the fundamentals of depth and 3D sensing, stereo, structured light, and time-of-flight, the active modalities that let a machine measure not just how much a space is using, but exactly what shape it is.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

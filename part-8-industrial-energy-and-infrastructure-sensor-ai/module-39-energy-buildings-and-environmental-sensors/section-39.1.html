@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.1: Smart meters and load disaggregation. Building Sensory AI." name="description"/>
+<title>Section 39.1: Smart meters and load disaggregation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Energy, Buildings, and Environmental Sensors</a></div>
+<h1>Smart meters and load disaggregation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"One wire enters the house. One number leaves the meter every fifteen minutes. From that trickle they expect me to name the kettle, the fridge, and the exact hour someone runs a bath."</p>
+        <cite>An Eavesdropping AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the sampling-rate and aliasing vocabulary from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, since the gap between fifteen-minute meter data and megahertz waveform sampling defines the entire problem. It leans on the event- and change-detection framing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> for spotting appliance switching, and on the sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> for the neural approaches. No power-systems background is needed; the small amount of electrical vocabulary (real power, reactive power, apparent power) is introduced here.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A smart meter measures one thing: the aggregate electrical power crossing the boundary into a building. Everything else, which appliance is on, how much the fridge costs per month, whether an elderly resident skipped breakfast, is <em>inferred</em> from that single superimposed signal. This is the defining sensory-AI move of the chapter: a cheap, non-intrusive sensor at one chokepoint, and a model that unmixes the sum back into its parts. The unmixing task is called <strong>non-intrusive load monitoring</strong> (NILM), or load disaggregation, and it is a blind source separation problem with a brutal constraint: you often have far fewer measurements than sources. Get it right and one 15-minute meter delivers itemized, appliance-level feedback that changes how people use energy. Get it wrong and you confidently tell a household its dishwasher runs at 3 a.m.</p>
+    </div>
+
+    <h2>What a smart meter actually senses</h2>
+    <p>A residential smart meter is part of an <strong>advanced metering infrastructure</strong> (AMI): a solid-state meter that measures voltage and current at the service entrance and reports consumption back to the utility over a mesh or cellular link. The critical design parameter for AI is the reporting cadence. The overwhelming majority of deployed meters log <strong>interval data</strong>: total energy accumulated over 15-minute, 30-minute, or hourly windows, giving an average power sample every few minutes at best. This is low-frequency data, and it is what you will almost always be handed. A small research and pilot fleet samples much faster, capturing real power at 1 Hz, or the raw current and voltage waveforms at kilohertz to megahertz. The sampling rate is not a detail; it determines which appliances are even distinguishable, because a fifteen-minute average smears a two-minute microwave burst into near-invisibility, an aliasing consequence of the sampling theory in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+    <p>What the meter reports also matters as much as how often. The simplest channel is <strong>real power</strong> \(P\) in watts, the energy actually consumed. Better meters also expose <strong>reactive power</strong> \(Q\), the energy that sloshes back and forth in motors and transformers without doing net work, and together they define <strong>apparent power</strong> \(S = \sqrt{P^2 + Q^2}\). The \((P, Q)\) plane is the workhorse feature space of classical disaggregation, because a resistive kettle (pure \(P\), near-zero \(Q\)) and an inductive fridge compressor (substantial \(Q\)) occupy visibly different regions even when they draw similar watts. High-frequency meters add far richer signatures: current harmonics, and the transient inrush shape at the instant an appliance switches on, which acts almost like a fingerprint.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Disaggregation is governed by an additivity assumption. If the building draws total power \(y_t\) at time \(t\), NILM models it as a sum of \(K\) appliance contributions plus noise:</p>
+        \[ y_t = \sum_{k=1}^{K} p_t^{(k)} \, s_t^{(k)} + \varepsilon_t, \qquad s_t^{(k)} \in \{0, 1\} \]
+        <p>where \(s_t^{(k)}\) is the on/off state of appliance \(k\) and \(p_t^{(k)}\) its power draw in that state. Because power adds linearly at the meter, disaggregation is blind source separation. The difficulty is that \(K\) can be dozens, the states are discrete, and at 15-minute resolution you get one scalar equation per timestep to constrain all of them. The problem is massively underdetermined; every useful method injects prior structure (appliance libraries, temporal persistence, sparsity) to make it solvable.</p>
+    </div>
+
+    <h2>From edges to states: classical disaggregation</h2>
+    <p>The founding idea, due to George Hart in 1992, is <strong>event-based</strong> disaggregation. Watch the aggregate power for step changes: a sharp jump of +2000 W is an appliance turning on, a matching drop is it turning off. Cluster these edges in the \((P, Q)\) plane, pair on-edges with off-edges, and each cluster becomes an appliance. This is elegant and interpretable, and it reduces directly to the change-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>: an appliance switch is a mean shift in a piecewise-constant signal. Its weakness is that overlapping events, continuously variable loads (a dimmer, a laptop charger), and multi-state appliances (a washing machine cycling through heat, wash, and spin) break the clean edge-pairing story.</p>
+    <p>The dominant classical generalization is the <strong>factorial hidden Markov model</strong> (FHMM). Each appliance is a small HMM whose hidden states are its operating modes (off, low, high) with characteristic power draws; the observed meter reading is the sum of all the appliance emissions. This is the same latent-state, temporal-persistence machinery as the filters of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, but factorized across many parallel chains. FHMMs handle multi-state appliances gracefully and encode the crucial prior that appliances stay in a state for a while rather than flickering. The cost is inference: the joint state space is the product of every appliance's states, so exact inference is intractable and you rely on approximate methods.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: itemizing a home from a single meter</h3>
+        <p>A European utility rolls out an app that shows households a monthly breakdown of their bill by appliance category, computed entirely from the 30-minute interval data their existing smart meters already send, with no in-home sensors. The disaggregation engine flags one home spending far more on "always-on" standby load than its neighbors. The culprit turns out to be an aging second refrigerator in the garage, short-cycling because its door seal had failed, its compressor kicking on far more often than a healthy unit. The household never saw the fridge on any bill line; they saw a persistent baseline the model attributed to a refrigeration-shaped \((P, Q)\) signature running at an abnormal duty cycle. Replacing the seal cut the always-on figure by a fifth. The sensor was a meter the utility installed for billing; the perception was an AI reading the aggregate signal it was never designed to explain.</p>
+    </div>
+
+    <h2>Neural disaggregation and the seq2point trick</h2>
+    <p>Since roughly 2015, deep learning has reframed NILM as a supervised sequence-to-sequence regression: feed a window of aggregate power and predict the power trace of one target appliance. The influential refinement is <strong>sequence-to-point</strong> (seq2point), which takes a window of the mains signal and predicts the target appliance's power at only the <em>midpoint</em> of that window. Predicting a single centered value instead of the whole window lets the network use both past and future context to disambiguate the moment of interest, and it sidesteps the awkward averaging of overlapping window predictions. The backbone is typically a temporal convolutional or recurrent network from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, trained per appliance on labelled sub-metered data.</p>
+    <p>The catch is data and generalization. Neural NILM needs ground-truth appliance-level power to train against, which comes from instrumented research homes: <strong>REDD</strong>, <strong>UK-DALE</strong>, and <strong>REFIT</strong> are the canonical public datasets, each a handful of houses with plug-level sub-meters. A model trained on these houses must transfer to unseen homes with different appliance makes, and this is exactly where leakage discipline bites. If you evaluate on the same houses you trained on, you measure memorization, not disaggregation; honest NILM benchmarks split by <em>house</em>, holding entire unseen homes for test, the unseen-entity protocol argued in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The gap between same-house and unseen-house accuracy is large, and reporting only the former is the single most common way NILM results are oversold.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# One day of 1-minute mains power (W): a fridge cycling + a 2-minute kettle burst.
+t = np.arange(0, 1440)
+fridge = 90 * ((t // 40) % 2)          # ~90 W compressor, on/off every 40 min
+kettle = np.where((t >= 420) & (t < 422), 2000, 0)   # 07:00, two minutes
+mains  = 30 + fridge + kettle + np.random.normal(0, 5, t.size)  # +baseload +noise
+
+def detect_events(x, threshold=500):
+    """Return indices where step change in power exceeds threshold (an on/off edge)."""
+    dx = np.diff(x)
+    return np.where(np.abs(dx) > threshold)[0]
+
+events = detect_events(mains)
+print("edge times (min):", events)                 # -> near 420 (on) and 422 (off)
+print("kettle energy (Wh):", kettle.sum() / 60)    # integrate W over hours</code></pre>
+    <div class="code-caption"><strong>Listing 39.1.</strong> A minimal edge detector on synthetic 1-minute mains data. The 500 W threshold isolates the kettle's on and off transitions while ignoring the 90 W fridge, illustrating why threshold choice is really a decision about which appliances you can resolve. On real 15-minute interval data the kettle's two-minute burst would be averaged away entirely before this detector ever runs.</div>
+
+    <p>Listing 39.1 makes the resolution problem concrete: the same code that cleanly finds the kettle at 1-minute sampling would miss it at 15-minute sampling, because the burst is shorter than one sample. That is not a bug in the detector; it is the sampling theorem deciding what is knowable, and it is why high-value appliances often demand higher-rate meters.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Rolling your own dataset loaders, resamplers, and FHMM baselines for NILM is hundreds of lines and a minefield of alignment bugs. <strong>NILMTK</strong> (the Non-Intrusive Load Monitoring Toolkit) standardizes REDD, UK-DALE, and REFIT into one on-disk format and ships reference disaggregators plus metrics, turning a multi-day plumbing effort into a short script:</p>
+        <pre class="language-python"><code class="language-python">from nilmtk import DataSet
+from nilmtk.disaggregate import CombinatorialOptimisation
+
+data = DataSet("ukdale.h5")
+data.set_window(start="2014-01-01", end="2014-02-01")
+elec = data.buildings[1].elec
+co = CombinatorialOptimisation()
+co.train(elec)                          # learn appliance power states
+predictions = co.disaggregate(elec.mains())</code></pre>
+        <div class="code-caption"><strong>Listing 39.2.</strong> NILMTK loads a standardized dataset, trains a combinatorial-optimization disaggregator, and predicts appliance traces in a few lines, replacing roughly 200 lines of custom parsing, resampling, and baseline code. It also enforces train/test house splits and computes the standard NILM metrics, so your evaluation stays leakage-safe by construction.</p>
+    </div>
+
+    <h2>Privacy: the signal cuts both ways</h2>
+    <p>The same signature that lets you itemize a bill also leaks intimate detail. High-resolution load data reveals occupancy, sleep and meal times, which television show is playing (from its power-draw fingerprint), and whether the home is empty. This is why load data is regulated as personal data in many jurisdictions, and why the disaggregation you build for a helpful energy app is, run by a different party, a surveillance tool. Designing NILM responsibly, on-device inference, aggregation, and consent, is a recurring theme picked up in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>. Treat the granularity of the meter as a privacy dial, not just an accuracy dial.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are given one month of 15-minute interval mains data (real power only) for 200 homes and plug-level ground truth for 5 of them. You want to report per-home accuracy for detecting electric-vehicle charging. In three or four sentences: (a) state which appliances you can realistically disaggregate at 15-minute resolution and which you cannot, and why; (b) describe the train/test split you would use so your reported accuracy is not inflated by house memorization; and (c) name one feature beyond raw \(P\) that would help most if you could upgrade to a 1 Hz meter reporting \(Q\).</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does a resistive kettle and an inductive refrigerator separate cleanly in the \((P, Q)\) plane even when they draw similar real power?</p>
+        <p class="quiz-question">2. What does sequence-to-point regression predict, and why is predicting a single centered value easier to use than predicting the whole window?</p>
+        <p class="quiz-question">3. Two NILM papers both report 92 percent accuracy. One trains and tests on the same houses; the other holds out entire unseen houses. Which number is trustworthy, and what is the failure mode of the other?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-39.2.html">Section 39.2</a>, we move from the single meter at the service entrance to the dense telemetry inside the building: the HVAC system, its temperature and airflow sensors, and the building-management network that ties them together. You will see how the same disaggregation instinct, inferring hidden operating states from aggregate readings, reappears when a handful of zone sensors must stand in for the comfort and energy behavior of an entire floor.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

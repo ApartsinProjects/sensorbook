@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.7: Security-operations integration. Building Sensory AI." name="description"/>
+<title>Section 38.7: Security-operations integration | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Cyber-Physical Anomaly Detection and ICS Security</a></div>
+<h1>Security-operations integration</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A detector that raises a perfect alarm into a channel nobody watches has committed the most expensive kind of correctness."</p>
+        <cite>A Well-Integrated AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you already have a working residual detector from <a class="cross-ref" href="section-38.3.html">Section 38.3</a>, a localizer from <a class="cross-ref" href="section-38.5.html">Section 38.5</a>, and the attack-versus-fault framing of <a class="cross-ref" href="section-38.2.html">Section 38.2</a>. The calibration language (score quantiles, false-alarm budgets) comes from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the fleet-operations backdrop (versioning, drift, rollback of a deployed model) is developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>. No prior knowledge of a specific SIEM product is needed; we treat the security stack abstractly.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every previous section in this chapter made the detector <em>smarter</em>. This one makes it <em>useful</em>. A cyber-physical anomaly detector does not run in a vacuum: it sits between an operational-technology (OT) network of PLCs and sensors and a security-operations center (SOC) staffed by analysts who already drown in alerts from firewalls, endpoints, and IT logs. The integration problem is the difference between a model that scores 0.98 on SWaT in a notebook and a model that shortens the mean time to detect a real intrusion on a real plant. That difference is made of unglamorous plumbing: emitting alerts in a schema the SIEM can parse, enriching each alert with the physical context an analyst needs to act, mapping the observed behavior onto a shared threat vocabulary so it can be correlated with network evidence, and routing the response through a playbook that respects the fact that an actuator command in the physical world cannot be un-sent. Get this wrong and the best detector in the literature produces alert fatigue and gets muted. Get it right and a residual spike becomes a contained incident.</p>
+    </div>
+
+    <h2>The OT alert is not the IT alert</h2>
+    <p>A SOC is built around the security-information-and-event-management (SIEM) platform: a log aggregator that ingests events from across the enterprise, correlates them, and surfaces the ones worth a human's attention. Feeding an ICS detector into it sounds like a solved problem, but the OT alert differs from the IT alert in ways that break naive integration. An IT alert is discrete and self-describing: <em>user X failed authentication five times</em>. An OT anomaly alert is a continuous score crossing a threshold on a physical process, and the raw fact "residual score = 41.7 at 14:03:12" is meaningless to an analyst who has never seen a reverse-osmosis skid. The alert must carry <strong>physical enrichment</strong>: which sensors are implicated (from the localizer of <a class="cross-ref" href="section-38.5.html">Section 38.5</a>), what the healthy range for those tags is, the current setpoint, and whether the deviation is trending or transient.</p>
+    <p>The second break is <strong>volume and correlation</strong>. A plant sampled at one hertz across two hundred tags produces a firehose; if the detector emits an event every time the score is nonzero, it buries the SOC. The integration layer must therefore do alert consolidation: debounce with the smoothing of <a class="cross-ref" href="section-38.3.html">Section 38.3</a>, group contiguous flagged samples into a single incident with a start time and duration, and deduplicate repeated flaps on the same tag cluster. Structurally the vehicle is a common event schema. Most deployments emit newline-delimited JSON or the Elastic Common Schema so the SIEM can index, search, and alert on the fields without a custom parser. The point is to make a physics event legible to a tool designed for login events.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The metric that governs whether your detector earns its place in the SOC is not precision or recall in isolation: it is the analyst's effective workload, roughly the alert rate multiplied by the per-alert triage time. A detector at 90% recall and a false-positive rate of one alert per hour will be muted within a week, because an analyst covering fifty sites cannot open twelve hundred alerts a day. Two levers move workload without retraining the model: raise the score threshold (trading recall for fewer alerts, calibrated against a false-alarm <em>budget</em> rather than a magic number) and raise per-alert information density (enrichment, so each alert is dispositioned in thirty seconds instead of ten minutes). Integration engineering, not model accuracy, is usually the binding constraint on real-world value.</p>
+    </div>
+
+    <h2>Speaking the SOC's language: ATT&CK for ICS</h2>
+    <p>A residual detector answers "something is physically wrong." A SOC needs "what is the adversary doing, and where are they in the kill chain." Bridging the two is the job of a shared threat taxonomy, and the industry standard is <strong>MITRE ATT&CK for ICS</strong>, a matrix of adversary tactics (Impair Process Control, Inhibit Response Function, Impact) and techniques (Spoof Reporting Message, Modify Parameter, Unauthorized Command Message) grounded in real incidents like the 2015 Ukraine grid attack and TRITON/TRISIS. Tagging each alert with the ATT&CK technique it most plausibly evidences turns an isolated physics anomaly into a correlatable observation: the SIEM can now line up "sensor spoofing detected on flow transmitter FT-401" (a physical residual) with "unexpected write to PLC register" (a network intrusion-detection event) and recognize them as one campaign rather than two unrelated blips.</p>
+    <p>This mapping is also where the attack-versus-fault classifier of <a class="cross-ref" href="section-38.2.html">Section 38.2</a> pays off operationally. A fault routes to the maintenance queue and the prognostics pipeline of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>; an attack routes to incident response. Getting that fork right is what keeps the plant engineers and the security team from fighting over every alert. The mapping is necessarily probabilistic and should be presented as a ranked hypothesis with the supporting evidence, not a hard label, because the same residual signature can have innocent and malicious causes and only the correlated network context disambiguates them.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: the water-treatment stealth valve</h3>
+        <p>At a municipal water-treatment plant modeled on the SWaT testbed, a forecasting detector flags a slow drift in the dosing-pump residual for stage P3. Raw, this is a shrug: pumps drift. The integration layer enriches it: the localizer implicates the chemical-dosing flow sensor, the deviation is a monotonic ramp over forty minutes (not the jitter of a failing bearing), and the ATT&CK tagger marks it "Modify Parameter." The SOAR playbook auto-queries the historian and finds a HMI parameter write eight minutes before the ramp began, from an engineering workstation that normally never touches P3. Correlated, the picture is unambiguous: an operator-console compromise nudging a setpoint below the alarm limit to under-dose disinfectant. The analyst escalates, isolates the workstation, and reverts the setpoint, all before any downstream water-quality sensor would have caught the shortfall. The detector found the physics; the integration found the intrusion.</p>
+    </div>
+
+    <h2>From alert to action: SOAR and the irreversibility constraint</h2>
+    <p>The layer above the SIEM is security orchestration, automation, and response (SOAR): playbooks that execute steps automatically when an alert fires, from enrichment queries to containment actions. In pure IT, SOAR happily quarantines a laptop or disables an account. In OT, <strong>automated response is dangerous</strong>, because the assets are physical and many actions are irreversible or safety-critical. You do not let a model automatically close a valve, trip a turbine, or switch a controller to manual, because a false positive that halts a running process can cause the very damage an attacker wants, and a wrong automated action can violate the safety-instrumented system's authority. The governing principle is human-in-the-loop for any state-changing OT action: SOAR automates <em>investigation</em> (pull the historian window, screenshot the HMI, check the firewall logs, assemble the ATT&CK story) and <em>notification</em>, but the physical response stays a human decision, supported by a pre-approved playbook.</p>
+    <p>Concretely, an OT incident-response playbook specifies, per alert class, the enrichment to gather, the on-call to page, the containment options that are safe to pre-authorize (isolating a compromised workstation on the IT side is usually fine; touching the process is not), and the rollback that MLOps must support if the detector itself is found to be the faulty component (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>). The code below shows the shape of the emit-and-enrich step: it takes a scored, localized detection and produces the structured, ATT&CK-tagged, physically-enriched event that the SIEM ingests.</p>
+
+    <pre class="language-python"><code class="language-python">import json, time
+
+# Healthy operating ranges, learned offline on the clean training window.
+TAG_RANGES = {"FT-401": (2.1, 2.8), "P3_dose": (0.40, 0.55)}
+# Coarse residual-signature -> ATT&CK for ICS technique (ranked hypothesis).
+ATTACK_MAP = {"monotonic_ramp": ("T0836", "Modify Parameter"),
+              "step_jump":      ("T0856", "Spoof Reporting Message")}
+
+def emit_ot_alert(score, threshold, culprit_tags, values, signature, ts=None):
+    """Turn a scored, localized detection into a SIEM-ready enriched event."""
+    ts = ts or time.time()
+    tech_id, tech_name = ATTACK_MAP.get(signature, ("T0806", "Impair Process Control"))
+    enriched = []
+    for tag in culprit_tags:
+        lo, hi = TAG_RANGES.get(tag, (None, None))
+        v = values.get(tag)
+        enriched.append({"tag": tag, "value": v, "healthy_range": [lo, hi],
+                         "out_of_range": (v is not None and lo is not None
+                                          and not (lo <= v <= hi))})
+    return json.dumps({
+        "event.kind": "alert", "event.module": "ics_anomaly_detector",
+        "@timestamp": ts, "anomaly.score": round(score, 2),
+        "anomaly.threshold": threshold, "anomaly.margin": round(score - threshold, 2),
+        "process.signature": signature, "affected_tags": enriched,
+        "threat.technique.id": tech_id, "threat.technique.name": tech_name,
+        "disposition": "attack_suspected" if score > 2 * threshold else "review",
+        "response.mode": "human_in_the_loop"})  # never auto-actuate the plant
+
+print(emit_ot_alert(41.7, 12.0, ["P3_dose"], {"P3_dose": 0.34},
+                    "monotonic_ramp"))</code></pre>
+    <div class="code-caption">A minimal alert-emission step: a scalar score and a set of culprit tags become a structured, Elastic-Common-Schema-flavored event carrying physical context (healthy ranges, out-of-range flags), an ATT&CK for ICS technique tag, a disposition, and an explicit human-in-the-loop response mode. This is the object the SIEM indexes and the SOAR playbook keys off.</div>
+
+    <p>The function above is deliberately schematic, and rebuilding a full connector by hand is a large effort. In practice the emission, batching, retry, and schema-validation are handled by a shipping library.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>The 40-plus lines of hand-rolled JSON assembly, buffering, and delivery above collapse to about five lines with a log-shipping client such as the Elastic Python client or an OpenTelemetry logs exporter: you hand it a dict and it handles schema conformance, batching, back-pressure, TLS transport to the SIEM, and retry-on-failure. The library owns the transport and reliability concerns; you own only the physical enrichment and the ATT&CK mapping, which are the parts no library can know. Use the library for delivery, keep your domain logic thin and testable.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current frontier is the LLM-assisted SOC analyst applied to OT. Instead of a human reading a raw enriched alert, an LLM agent (the pattern of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>) ingests the residual time series, the localizer output, the ATT&CK tags, and the correlated network events, then drafts a plain-language incident narrative with a recommended (human-approved) response. Multimodal sensor-language models (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>) are being explored to let an analyst literally ask "why did P3 trip?" and get an answer grounded in the raw signals. The open problems are hallucination under distribution shift, the leakage risk of an agent that has read the test attacks, and the hard rule that the agent may reason and recommend but never actuate. Purple-teaming these agents (adversarial red-team attacks scored by a blue-team detector, jointly) is an active benchmark direction.</p>
+    </div>
+
+    <h2>Closing the loop: feedback, tuning, and the mute trap</h2>
+    <p>Integration is not a one-way pipe. Every analyst disposition (true positive, false positive, benign-but-real fault) is a label, and those labels are the only real-world supervision your semi-supervised detector will ever get. Feeding dispositions back lets you track precision <em>in production</em>, retune thresholds per site against the measured false-alarm budget, and detect concept drift when a plant is re-commissioned or a season changes its baseline (the distribution-shift machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>). The failure mode to design against is the <strong>mute trap</strong>: when a detector is noisy, analysts create a broad suppression rule, and the suppression silently swallows the one true attack months later. Guard against it by making suppressions narrow, time-boxed, and auditable, and by monitoring the suppression rules themselves as a first-class signal of a detector that needs retuning rather than muting.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take your Lab 38 detector on SWaT or HAI and wrap it in an emission layer like the one above. Then compute the operational metric that matters: over a held-out test stream, how many <em>distinct incidents</em> (contiguous flagged runs, after debouncing) does it emit per operating day at three thresholds set to the 99th, 99.5th, and 99.9th score percentiles on a clean validation stream? For each threshold, report detection recall on the labeled attacks and the incidents-per-day rate. Plot recall against alert rate and mark the point where an analyst covering ten such plants (assume a 300-alert/day human budget) would still be able to keep up. Which threshold would you ship, and what enrichment would you add to make the surviving alerts dispositionable in under a minute?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why is automated actuation (closing a valve, tripping a turbine) forbidden in an OT SOAR playbook even when the detector's confidence is very high, and what <em>is</em> safe to automate?</li>
+            <li>An analyst dispositions 200 of your alerts per day as false positives and asks you to "just make it quieter." Name two ways to reduce their workload that do <em>not</em> lower recall, and explain why raising the threshold is a different kind of trade.</li>
+            <li>What does tagging an alert with a MITRE ATT&CK for ICS technique buy you that a raw anomaly score does not, and how does it interact with the attack-versus-fault fork of <a class="cross-ref" href="section-38.2.html">Section 38.2</a>?</li>
+        </ol>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 38</h3>
+        <p>train an ICS anomaly detector on SWaT/WADI/HAI with a leakage-safe protocol; test under simulated faults and attacks.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Threat models and shared vocabulary</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://attack.mitre.org/matrices/ics/">MITRE (2020-2026). ATT&CK for ICS: Adversary Tactics and Techniques for Industrial Control Systems. MITRE Corporation.</a></p>
+            <p class="bib-annotation">The standard taxonomy that lets a physical anomaly be correlated with network evidence and communicated in the SOC's language; the source of the technique tags in this section.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://csrc.nist.gov/pubs/sp/800/82/r3/final">Stouffer et al. (2023). Guide to Operational Technology (OT) Security. NIST SP 800-82 Rev. 3.</a></p>
+            <p class="bib-annotation">The reference framework for OT security programs, including monitoring, incident response, and the human-in-the-loop constraints that shape OT SOAR playbooks.</p>
+        </div>
+
+        <p class="bib-category">Incident response and OT operations</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.sans.org/white-papers/36297/">Assante and Lee (2015). The Industrial Control System Cyber Kill Chain. SANS Institute.</a></p>
+            <p class="bib-annotation">Adapts the intrusion kill chain to ICS, clarifying where a physics detector sits in the attack timeline and why detection latency and response staging matter.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.mandiant.com/resources/blog/attackers-deploy-new-ics-attack-framework-triton">Johnson et al. (2017). TRITON: Attackers Deploy New ICS Attack Framework Targeting Safety Instrumented Systems. Mandiant/FireEye.</a></p>
+            <p class="bib-annotation">The safety-system attack that made concrete why automated OT response is dangerous and why detectors must reach humans fast; a canonical case for the irreversibility constraint.</p>
+        </div>
+
+        <p class="bib-category">Detectors, benchmarks, and datasets</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://itrust.sutd.edu.sg/testbed/">Goh et al. (2016). A Dataset to Support Research in the Design of Secure Water Treatment Systems (SWaT). iTrust, SUTD.</a></p>
+            <p class="bib-annotation">The most widely used ICS anomaly benchmark; the substrate for Lab 38 and for measuring incidents-per-day rather than notebook accuracy.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2004.02737">Shin et al. (2020). HAI (HIL-based Augmented ICS) Security Dataset. arXiv:2004.02737.</a></p>
+            <p class="bib-annotation">A hardware-in-the-loop ICS dataset with labeled attacks across turbine and boiler processes, useful for stress-testing the alert-consolidation and threshold-tuning steps.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3372297.3423359">Fung et al. (2020). Perspectives from a Comprehensive Evaluation of Reconstruction-based Anomaly Detection in Industrial Control Systems. ACM CCS / ESORICS.</a></p>
+            <p class="bib-annotation">Shows how detector metrics degrade under realistic operating conditions, motivating the operational-metric framing (analyst workload, not F1) used throughout this section.</p>
+        </div>
+
+        <p class="bib-category">Evaluation caveats for operational metrics</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ojs.aaai.org/index.php/AAAI/article/view/20680">Kim et al. (2022). Towards a Rigorous Evaluation of Time-series Anomaly Detection. AAAI 2022.</a></p>
+            <p class="bib-annotation">Exposes how the popular point-adjustment protocol inflates scores, a direct warning for anyone reporting SOC-facing detection rates; use incident-level metrics instead.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>Chapter 38 has taken you from physical invariants through learned residuals, graph models, root-cause localization, adversarial robustness, and finally into the security-operations stack where those detectors earn their keep. In <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-39-energy-buildings-and-environmental-sensors/index.html">Chapter 39</a>, we widen the lens from adversarial ICS to the everyday infrastructure of energy and buildings: smart-meter load disaggregation, HVAC telemetry, air and water quality networks, and forecasting with weather covariates, where the sensors are noisier, the stakes are sustainability rather than sabotage, and the same anomaly-and-forecasting toolkit meets a very different operating context.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

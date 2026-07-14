@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.6: Missing and faulty sensors. Building Sensory AI." name="description"/>
+<title>Section 39.6: Missing and faulty sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Industrial, Energy, and Infrastructure Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Energy, Buildings, and Environmental Sensors</a></div>
+<h1>Missing and faulty sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A dead sensor never lies. It just keeps telling you the same true thing about a moment that ended three weeks ago."</p>
+<cite>A Patient AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every model in this chapter has quietly assumed that the sensor feeding it is alive, honest, and reporting on schedule. Real energy, building, and environmental deployments break all three assumptions constantly. Meters lose network connectivity, humidity probes saturate, a chilled-water temperature sensor freezes at its last value, an outdoor air-quality station drifts a full unit over a season, and a low-cost soil node runs its battery flat mid-summer. The data that reaches your pipeline is therefore a mix of true readings, absent readings, and confidently wrong readings, and nothing in the raw stream tells you which is which. This section is about that reality: how to name the failure modes, how to detect them, and how to keep forecasting and control running when part of the sensing fabric is missing or lying. Getting this wrong is not a rounding error. A single stuck sensor treated as ground truth can drive a control loop to waste energy for weeks.</p>
+</div>
+
+<p>This section builds on the anomaly and change-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> and the uncertainty vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Where earlier sections in this chapter treated telemetry as raw material to model, here we treat the telemetry itself as suspect, and we ask what a perception system owes a downstream consumer when its inputs are unreliable.</p>
+
+<h2>A taxonomy of sensor failure modes</h2>
+<p>Sensor problems in the field fall into a small, recurring set of shapes, and naming them precisely is the first step, because each shape needs a different detector and a different repair. The core catalogue:</p>
+<ul>
+<li><strong>Missing (dropout)</strong>: no value arrives. A gateway loses power, a cellular modem drops, a change-of-value subscription lapses. The gap is honest; the sample is simply absent.</li>
+<li><strong>Stuck (frozen, flatline)</strong>: the sensor reports the same value repeatedly. A probe ices over, a firmware buffer latches, an analog input shorts. This is the dangerous one, because a flatline is a perfectly valid-looking number that carries zero new information.</li>
+<li><strong>Bias and drift</strong>: readings are offset by a constant (bias) or slowly wandering offset (drift) from truth. Electrochemical gas sensors and low-cost particulate monitors drift with temperature, humidity, and age; a poorly calibrated CT clamp on a meter reads a fixed percentage high.</li>
+<li><strong>Gain and scaling errors</strong>: the sensor tracks the true signal but with the wrong slope, often from a units mismatch or a mis-set transducer range (recall the 0 to 1 versus 0 to 100 valve-position clash from Section 39.2).</li>
+<li><strong>Spikes and outliers</strong>: brief, physically impossible excursions from electrical noise, packet corruption, or a loose connector.</li>
+<li><strong>Complete failure</strong>: the channel goes to a rail (zero, full-scale, or a sentinel like -9999) and stays there.</li>
+</ul>
+<p>The reason to insist on this taxonomy is that the failures differ in <em>detectability</em>. A dropout announces itself by absence. A spike violates a rate-of-change bound. But a stuck sensor and a slowly drifting one both produce values that pass every range check individually; they are only visible in their temporal or spatial context, which is precisely why naive validation misses them.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A missing value and a mask are not the same object</h3>
+<p>The most consequential design decision in this whole area is how you represent absence. A common and costly mistake is to fill a gap with a plausible number and then hand it downstream indistinguishably from a real reading. The disciplined alternative is to carry two aligned channels: the (possibly imputed) value <strong>and</strong> a binary <em>mask</em> that records, for every timestamp, whether the value was observed or invented. The mask is not bookkeeping; it is information. It lets a forecaster down-weight imputed inputs, lets an evaluation exclude filled points from its error metric so you never score a model on its own guesses, and lets a control policy fall back to a safe mode when too much of its input is synthetic. Impute if you must, but never let the pipeline forget that it did.</p>
+</div>
+
+<h2>Detecting faults before they poison the model</h2>
+<p>Detection layers on top of the taxonomy. Range and rate checks catch the easy cases: reject values outside physical bounds, and reject changes faster than the process can move (a room does not warm ten degrees in one second). Stuck sensors need a temporal test: flag any channel whose rolling standard deviation stays below a small threshold for longer than the signal's natural quiet period, tuned so that a genuinely stable overnight setpoint is not mistaken for a dead probe. Drift and bias are the hardest to catch in isolation because a single sensor has no reference for truth; they surface only through <em>redundancy</em>. Two nearby air-quality nodes that once agreed and now diverge by a growing margin reveal a drift that neither could show alone, which is one more reason the spatial networks of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-39-energy-buildings-and-environmental-sensors/index.html">this chapter</a> earn their redundancy. The general principle, developed formally in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, is analytical redundancy: predict what a sensor should read from a model of the process and its neighbors, and treat a persistent gap between prediction and reading as evidence of a fault.</p>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+def flag_sensor_faults(x, fs_hz=1/60, flat_minutes=30, spike_z=6.0):
+    """Return per-sample fault labels for a 1-D sensor series.
+    'missing' = NaN input, 'stuck' = flatlined, 'spike' = local outlier."""
+    x = pd.Series(x, dtype="float64")
+    labels = pd.Series("ok", index=x.index)
+    labels[x.isna()] = "missing"
+
+    # Stuck: rolling std stays ~0 over the flat window.
+    win = max(2, int(flat_minutes * 60 * fs_hz))
+    roll_std = x.rolling(win, min_periods=win).std()
+    labels[(roll_std < 1e-6) & (labels == "ok")] = "stuck"
+
+    # Spike: robust z-score on the first difference (median/MAD, outlier-safe).
+    d = x.diff()
+    mad = (d - d.median()).abs().median() + 1e-9
+    z = 0.6745 * (d - d.median()).abs() / mad
+    labels[(z > spike_z) & (labels == "ok")] = "spike"
+    return labels
+</code></pre>
+<div class="code-caption">A minimal three-mode fault flagger: absence, flatline, and spike each get a distinct label rather than being silently smoothed away. The median/MAD z-score is used instead of mean/standard-deviation so that the very spikes we hunt do not inflate the threshold that is supposed to catch them.</div>
+
+<p>The flagger above deliberately returns <em>labels</em>, not a cleaned array. That keeps the mask explicit and lets the caller decide, per fault type, whether to impute, drop, or route to a human. Notice it uses a robust dispersion estimate; the accompanying exercise asks you to feel why the non-robust version fails.</p>
+
+<h2>Repair: imputation and virtual sensors</h2>
+<p>Once a fault is flagged, you either fill the gap or synthesize the reading. For short dropouts, temporal imputation is enough: forward-fill for slowly varying setpoints, linear or spline interpolation for smooth physical quantities, seasonal fill for signals with a strong daily cycle. These break down over long gaps, where the signal can change more than any local extrapolation predicts. The stronger tool is a <strong>virtual (soft) sensor</strong>: a model that reconstructs the missing channel from the channels that remain, exploiting the fact that building and environmental variables are heavily correlated. A supply-air temperature can be inferred from valve position, airflow, and return temperature; a failed outdoor node can be back-filled from neighboring stations by <em>kriging</em>, the spatial Gaussian-process interpolation introduced with the sensor networks of this chapter. Because these correlations are structured as a graph of related channels, the graph neural networks of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a> have become a strong default for learned imputation across a sensor network, and the missing-modality fusion strategies of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a> address the same problem one level up, when an entire sensing stream disappears.</p>
+
+<p>Whatever the method, an imputed value must carry uncertainty. A gap filled by interpolating across two seconds deserves near-total trust; a gap filled by extrapolating across three days deserves almost none, and the downstream forecaster should be told the difference. This is where the conformal and calibrated-uncertainty methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> pay off: an imputation that reports an honest interval, wide where it is guessing and tight where it is confident, lets everything downstream reason about how much of its input is real.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The chiller that chased a frozen thermometer</h3>
+<p>At a university district-energy plant, a chilled-water supply-temperature sensor iced over during a humid week and froze at 6.1 degrees Celsius. The reading was in range, changed by nothing, and tripped no alarm. The plant's optimization loop, seeing a supply temperature that never rose no matter how it modulated the chillers, kept pushing compressor output to correct an error that did not exist, and overcooled the loop for eleven days before an operator noticed the energy bill. The fix was not a better controller; it was a stuck-sensor detector exactly like the rolling-variance test above, plus a virtual sensor that cross-checked supply temperature against return temperature and flow. When the physical probe flatlined, the plant switched to the virtual estimate, widened its uncertainty, and backed off the aggressive optimization until a technician swapped the sensor. Two lines of fault logic would have saved eleven days of wasted compressor work.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Do not hand-roll the imputation zoo</h3>
+<p>The temporal fills, gap-aware resampling, and multivariate imputers you would otherwise write by hand are already packaged. A from-scratch masked, multivariate imputer with per-channel strategies and a preserved mask is easily 150 or more lines; with <code>pandas</code> for gap-aware resampling and <code>scikit-learn</code>'s <code>IterativeImputer</code> or <code>KNNImputer</code> it collapses to roughly 5 lines, and the library handles the missing-value bookkeeping, the per-feature model fitting, and the convergence loop for you. Reserve your own code for the one thing libraries cannot know: the mask policy and the fault-specific routing that decide <em>when</em> imputation is even appropriate.</p>
+</div>
+
+<h2>Designing for graceful degradation</h2>
+<p>The deepest lesson is architectural. A perception system for the physical world should be built assuming its sensors will fail, not patched after they do. That means three habits. First, the mask travels with the data end to end, so evaluation never scores a model on imputed points and control always knows how much of its input is synthetic (this is the sensor-failure thread that runs through the whole book, and it connects directly to the leakage-safe evaluation discipline). Second, models are trained with realistic missingness injected, so a network that will face dropouts at deployment has seen dropouts in training rather than meeting them for the first time in production. Third, the system defines an explicit fallback ladder: full sensing, degraded sensing with virtual estimates and widened uncertainty, and a safe default mode when too much is missing to act responsibly. A forecaster or controller that silently trusts a flatline is not robust; a system that notices the flatline, reports reduced confidence, and falls back to a conservative estimate is.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: break the naive detector</h3>
+<p>Take the <code>flag_sensor_faults</code> function and replace the median/MAD z-score with an ordinary mean/standard-deviation z-score. Construct a synthetic series with one genuine spike and re-run both versions. (a) Show that the non-robust version can fail to flag the spike, and explain why the outlier inflates its own threshold. (b) Now add a slow linear drift of 0.5 units per day to an otherwise clean signal and confirm that neither version flags it. What second sensor or model would you add to make the drift detectable, and what assumption does that fix rely on?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is a stuck (flatlined) sensor more dangerous to a control loop than a dropped (missing) one, even though the dropout loses more raw data?</li>
+<li>What does the mask channel let you do that carrying only the imputed value cannot, in both evaluation and control?</li>
+<li>Why can bias and drift usually not be detected from a single sensor in isolation, and what property of a sensor network makes them detectable?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-39.7.html">Section 39.7</a>, we close the chapter by turning all of this reliable, fault-aware telemetry toward its purpose: sustainability applications, from carbon-aware building operation to grid-scale demand response, where the value of a robust sensing pipeline is measured in kilowatt-hours and emissions avoided.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
