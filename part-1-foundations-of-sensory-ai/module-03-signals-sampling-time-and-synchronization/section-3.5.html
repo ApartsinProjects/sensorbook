@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.5: Quantization and compression. Building Sensory AI." name="description"/>
+<title>Section 3.5: Quantization and compression | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Signals, Sampling, Time, and Synchronization</a></div>
+<h1>Quantization and compression</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Sampling decides when I get to look. Quantization decides how many answers the sensor is allowed to give. Compression decides how many of those answers survive the trip to me. I inherit whatever is left."</p>
+        <cite>A Pragmatic AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The big picture</h3>
+        <p><a href="section-3.1.html">Section 3.1</a> handled the time axis: how fast to sample before aliasing corrupts the signal. This section handles the <em>amplitude</em> axis and the <em>storage</em> axis. A physical quantity is a continuum, but an analog-to-digital converter can only report one of finitely many levels, and a link to the cloud can only carry finitely many bits per second. Quantization is the rounding that turns a voltage into an integer; compression is what you do afterward to make those integers cheaper to store and send. Both are lossy budgets you spend on purpose, and both leave fingerprints in the data that a downstream model will happily learn as if they were real. Getting the budget wrong is how a 24-bit accelerometer ends up carrying 11 bits of actual information, or how a lossy codec invents a feature your classifier keys on.</p>
+    </div>
+
+    <p>This section assumes the sampling picture from <a href="section-3.1.html">Section 3.1</a> and the noise vocabulary from <a class="cross-ref" href="../module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. It also leans on the notion of information content that <a class="cross-ref" href="../module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> makes precise: entropy is exactly the yardstick that tells you how few bits a stream can be squeezed into. We build the amplitude story first, then the storage story, because the second only makes sense once you understand what the first threw away.</p>
+
+    <h2>Amplitude quantization: a continuum forced onto a ladder</h2>
+
+    <p><strong>What it is.</strong> An \(N\)-bit converter with full-scale range \(V_{\text{FS}}\) partitions that range into \(2^N\) equal steps. Each step has width \(\Delta = V_{\text{FS}} / 2^N\), the value of the least significant bit (LSB). A true voltage \(v\) is reported as the nearest rung of this ladder, so the reading carries an error \(e = \hat v - v\) bounded by \(\pm \Delta/2\). Twelve bits over a \(\pm 2g\) accelerometer range give \(\Delta \approx 4g / 4096 \approx 0.001g\) per step: that is the finest distinction the sensor can express, no matter how quiet its analog front end.</p>
+
+    <p><strong>Why it behaves like noise.</strong> For a signal that is busy relative to \(\Delta\) (it crosses many levels between samples), the rounding error \(e\) is well modeled as uniform on \([-\Delta/2, \Delta/2]\), independent from sample to sample. A uniform distribution of width \(\Delta\) has variance \(\Delta^2/12\), so quantization injects an effective noise power of \(\sigma_q^2 = \Delta^2/12\). This is the "quantization noise" that sets a hard floor: you cannot filter below it, because it was created at the moment of rounding and carries no structure to exploit.</p>
+
+    <p><strong>How much resolution you actually buy.</strong> Comparing full-scale signal power to that noise floor gives the classic signal-to-quantization-noise ratio for a full-scale sinusoid:</p>
+
+    $$\text{SQNR}_{\text{dB}} \approx 6.02\,N + 1.76.$$
+
+    <p>Every added bit buys about 6 dB of headroom, roughly one extra factor of two in amplitude resolution. That single formula is the entire economics of bit depth: it tells you a 16-bit ECG channel tops out near 98 dB of dynamic range on paper, and it warns you that if your analog noise already sits 40 dB below full scale, the bottom eight bits are just digitizing that noise. The honest resolution of a real channel is captured by its effective number of bits (ENOB), which folds analog noise and distortion back in and is almost always smaller than the nameplate \(N\).</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key insight</h3>
+        <p>Bit depth is a claim about the <em>amplitude</em> axis exactly as sample rate is a claim about the <em>time</em> axis. Nyquist has an amplitude twin: there is no point spending bits below the analog noise floor, just as there is no point sampling faster than the anti-alias filter passes. The right quantizer resolution is the one whose \(\Delta\) sits just under the smallest signal feature you care about and just under the analog noise, so the LSB dithers the noise rather than the signal. More bits past that point store noise at full price.</p>
+    </div>
+
+    <p><strong>Dithering: the counterintuitive fix.</strong> When a signal is <em>small</em> relative to \(\Delta\), quantization stops looking like friendly noise and starts looking like distortion: a slow ramp gets rendered as flat plateaus with sudden stair-steps, and those steps are harmonically related to the signal, so they survive averaging and masquerade as real structure. Adding a tiny amount of noise (dither) of order \(\Delta\) <em>before</em> quantizing breaks the correlation, trading a visible staircase for a benign broadband hiss you can then average down. It feels wrong to add noise to reduce error, yet it is standard practice in audio and instrumentation converters for exactly this reason.</p>
+
+    <h2>Non-uniform quantization: spend bits where the signal lives</h2>
+
+    <p><strong>What it is.</strong> A uniform ladder wastes resolution when the signal's amplitude distribution is heavy-tailed: most samples are small, yet a uniform quantizer reserves as many levels for the rare large excursions as for the common small ones. Non-uniform quantization allocates fine steps where samples are dense and coarse steps where they are sparse. The workhorse trick is <em>companding</em>: pass the signal through a compressive nonlinearity (logarithmic \(\mu\)-law or A-law in telephony), quantize the result uniformly, and expand on the far side. An 8-bit \(\mu\)-law channel delivers the perceptual dynamic range of roughly 12 uniform bits for speech, because human loudness perception is itself logarithmic.</p>
+
+    <p><strong>Why it matters for sensors.</strong> Many physical measurands share this heavy-tailed shape. Vibration is quiet most of the time and spikes at faults; audio and PPG have long calm stretches punctuated by events. Allocating quantization levels on a log or perceptual scale keeps small-signal fidelity where the interesting structure hides while still surviving the rare large event without clipping. The cost is that the quantization noise is now signal-dependent, which any calibration or uncertainty model downstream must account for rather than assume a flat \(\Delta^2/12\).</p>
+
+    <h2>Compression: the same information in fewer bits</h2>
+
+    <p>Quantization decided how many distinct values exist; compression decides how compactly the resulting stream of values is stored. Two families matter, and confusing them is a classic sensor-pipeline bug.</p>
+
+    <p><strong>Lossless compression</strong> reconstructs the exact integers you fed in. It exploits redundancy: successive sensor samples are highly correlated, so instead of storing each absolute value you store the small difference from a prediction (delta or linear-predictive coding), then hand those small residuals to an entropy coder (Huffman, arithmetic, or range coding) that spends few bits on the common near-zero residuals and more on the rare large ones. The entropy of the residual stream from <a class="cross-ref" href="../module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> is the theoretical floor; FLAC does this for audio, and the same predict-then-entropy-code recipe compresses slowly varying industrial telemetry by three to five times with zero fidelity loss. Because it is exact, lossless compression never changes what a model sees; it only changes the bandwidth bill.</p>
+
+    <p><strong>Lossy compression</strong> throws away information deemed unimportant to buy far larger savings: quantizing transform coefficients (as MP3 and JPEG do), dropping high-frequency detail, or downsampling. The ratios are dramatic (10x and beyond), but the discarded information is gone, and its absence is structured, not random. This is where sensor AI gets bitten.</p>
+
+    <div class="callout warning">
+        <h4>Common Misconception</h4>
+        <p><em>"Compression is just a storage detail; it does not affect the model."</em> True for lossless, dangerous for lossy. A lossy codec introduces artifacts that are correlated with the content: MP3 pre-echo, blocking edges, band-limited plateaus. If those artifacts differ between your training set (recorded raw) and your deployment stream (compressed on a bandwidth-limited device), your model learns the codec, not the phenomenon. Worse, if one class in your dataset happened to be recorded at a higher bitrate, the classifier can key on the artifact and post gorgeous, meaningless accuracy. Codec settings belong in the dataset metadata that <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> insists you record, precisely so this leakage is auditable.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In practice: the wearable ECG patch that ran out of radio</h3>
+        <p>A cardiac patch samples one ECG lead at 500 Hz with a 24-bit converter and must stream over Bluetooth Low Energy for days on a coin cell. Raw, that is 12 kbit/s per channel of a link whose real budget, after protocol overhead and duty cycling to save battery, is a fraction of that. The first instinct, dropping to a lossy audio codec, is a clinical disaster: the codec smooths the sharp QRS complex and can erase the low-amplitude ST-segment shifts that signal ischemia, the very features the device exists to catch. The engineering answer is layered and lossless. First, recognize that the honest ENOB of the front end is about 16 bits, so the bottom of the 24-bit word is amplifier noise and can be masked without losing signal. Then delta-encode successive samples (an ECG baseline barely moves between 2 ms samples) and entropy-code the residuals. The result is a three-to-four-times reduction that fits the radio budget, preserves every diagnostically relevant morphology exactly, and keeps the pipeline defensible when a regulator asks what the compression did to the waveform.</p>
+    </div>
+
+    <p>The short simulation below makes the amplitude story concrete: it quantizes a sinusoid at several bit depths, measures the achieved SQNR, and checks it against the \(6.02N + 1.76\) prediction.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def quantize(x, n_bits, v_fs):
+    step = v_fs / (2 ** n_bits)                 # LSB width
+    q = np.round(x / step) * step               # snap to nearest rung
+    return np.clip(q, -v_fs / 2, v_fs / 2)      # respect the rails
+
+t = np.linspace(0, 1, 20000, endpoint=False)
+x = 0.5 * np.sin(2 * np.pi * 7 * t)             # full-scale sinusoid, V_FS = 1.0
+
+for n in (4, 8, 12, 16):
+    xq = quantize(x, n, v_fs=1.0)
+    noise = xq - x
+    sqnr = 10 * np.log10(np.mean(x ** 2) / np.mean(noise ** 2))
+    print(f"{n:2d} bits: measured SQNR {sqnr:5.1f} dB   "
+          f"predicted {6.02 * n + 1.76:5.1f} dB")</code></pre>
+    <div class="code-caption">Quantizing a full-scale sinusoid at 4, 8, 12, and 16 bits and comparing measured signal-to-quantization-noise ratio against the \(6.02N + 1.76\) rule. The measured values track the prediction closely, confirming that each added bit buys about 6 dB, and the residual <code>noise</code> array is the quantization noise you can never filter out below.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The right tool: lossless sensor compression without writing a codec</h3>
+        <p>Hand-rolling the delta-plus-entropy pipeline from the ECG story (prediction, residual computation, a working range coder, framing, and a decoder that inverts all of it) is roughly a hundred lines before it round-trips correctly on edge cases. A maintained array codec collapses it to a declarative filter chain:</p>
+        <pre><code class="language-python">import numcodecs, numpy as np
+
+samples = (x * 32767).astype(np.int16)          # 16-bit ECG-like stream
+codec = numcodecs.Delta(dtype='i2')             # predict: store differences
+blosc = numcodecs.Blosc(cname='zstd', clevel=5) # entropy-code the residuals
+packed = blosc.encode(codec.encode(samples))
+back = codec.decode(blosc.decode(packed))
+assert np.array_equal(samples, back)            # exactly lossless
+print(f"ratio: {samples.nbytes / len(packed):.1f}x")</code></pre>
+        <div class="code-caption">Lossless delta-plus-entropy compression of an integer sensor stream with <code>numcodecs</code>. The <code>Delta</code> filter supplies the predictor and <code>Blosc</code> the entropy back end; the round-trip assertion proves nothing was lost. About a hundred lines of custom codec become six, and the fidelity guarantee comes for free.</div>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the quantization simulation to study the small-signal regime where dithering matters:</p>
+        <ol>
+            <li>Shrink the sinusoid amplitude to about one LSB of a 6-bit quantizer and plot the quantized output. Describe the staircase you see and explain why it is <em>distortion</em>, not noise.</li>
+            <li>Add uniform dither of width \(\Delta\) before quantizing, then average many quantized records of the same signal. Show that the averaged, dithered estimate recovers the underlying sinusoid while the undithered one stays locked on plateaus.</li>
+            <li>Measure the entropy (bits per sample) of the residual stream after delta-encoding your 16-bit quantized signal. How does it compare to 16, and what compression ratio does that entropy floor predict?</li>
+        </ol>
+        <details>
+            <summary>Hint</summary>
+            <p>Dither works because it decorrelates the rounding error from the signal, turning a signal-locked staircase into broadband noise that averages toward zero. For part three, estimate entropy as \(-\sum_k p_k \log_2 p_k\) over the histogram of residual values; a well-predicted stream concentrates mass near zero and yields far fewer than 16 bits per sample.</p>
+        </details>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Your sensor's nameplate says 24 bits but its ENOB is 16. What is happening in the bottom 8 bits, and why is it wasteful to store and stream them at full price?</li>
+            <li>Why does adding noise (dither) before a quantizer sometimes reduce error rather than increase it?</li>
+            <li>A colleague reports 99% accuracy on an audio classifier, but the positive class was recorded at 320 kbit/s MP3 and the negative class at 64 kbit/s. Name the failure and the one metadata field that would have caught it.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-3.6.html">Section 3.6</a>, we assemble quantized, compressed sample streams into the units a model actually consumes: buffers, windows, and frames. Quantization and compression decided <em>how faithful</em> each sample is and <em>how cheap</em> it is to move; framing decides how those samples are grouped in time before they reach a feature extractor or a network, closing the loop from raw acquisition to model-ready tensors. The bit-budget decisions here also foreshadow the on-device tradeoffs of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, where quantizing the <em>model</em> rather than the signal follows the very same 6-dB-per-bit logic.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

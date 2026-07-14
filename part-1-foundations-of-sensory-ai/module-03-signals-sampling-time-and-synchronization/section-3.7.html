@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.7: Acquisition protocols and metadata. Building Sensory AI." name="description"/>
+<title>Section 3.7: Acquisition protocols and metadata | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Signals, Sampling, Time, and Synchronization</a></div>
+<h1>Acquisition protocols and metadata</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A number with no units, no clock, and no sensor ID is not data. It is a rumor. I can fit a model to a rumor, and it will be exactly as trustworthy as one."</p>
+        <cite>A Fastidious AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The big picture</h3>
+        <p>The previous six sections treated the sample as if it arrived on your desk labeled and ready. It does not. Between the transducer and the array your model consumes sits an <em>acquisition stack</em>: a chain of buses, transports, and drivers that moves raw counts off silicon, plus a body of <em>metadata</em> that records what those counts mean. Get the protocol wrong and you drop samples or scramble their order; omit the metadata and you ship a stream that is numerically intact yet scientifically meaningless. This section is about the layer where measurement becomes a durable, self-describing record. It is unglamorous plumbing, and it is where most real sensor projects quietly fail: not in the model, but in a dataset whose sample rate was guessed, whose units were assumed, and whose provenance nobody wrote down.</p>
+    </div>
+
+    <p>This section closes Chapter 3 by tying the acquisition machinery to the timing discipline of <a href="section-3.3.html">Section 3.3</a> and the framing of <a href="section-3.6.html">Section 3.6</a>. It leans on the calibration and units vocabulary from <a class="cross-ref" href="../module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and it is the direct on-ramp to the dataset engineering of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Where Chapter 5 asks how to build leakage-safe datasets, this section supplies the raw material: the fields you must capture at acquisition time, because they cannot be reconstructed afterward.</p>
+
+    <h2>The acquisition stack: from counts to a timestamped record</h2>
+
+    <p><strong>What it is.</strong> Getting a sample from a transducer to storage crosses at least two protocol layers. At the <em>bus</em> level, a microcontroller pulls raw registers over a wired interface: I2C and SPI for on-board chips (an IMU or a pressure sensor), UART or CAN in vehicles, and analog lines into an ADC for everything else. At the <em>transport</em> level, framed samples travel to a host or the cloud over MQTT, gRPC, WebSocket, a ROS topic, or Lab Streaming Layer. Each layer imposes its own bandwidth ceiling, its own framing, and its own failure mode.</p>
+
+    <p><strong>Why the choice matters.</strong> The protocol decides three things a model inherits. First, <em>ordering and loss</em>: a lossy transport (UDP, BLE notifications) can reorder or drop frames, so you cannot assume sample \(n+1\) followed sample \(n\) in time (revisit <a href="section-3.4.html">Section 3.4</a> on packet loss). Second, <em>where the timestamp is stamped</em>: a clock applied at the sensor MCU is worth far more than one applied when a buffer finally reaches the host, because the intervening queue delay is variable and unknown. Third, <em>throughput headroom</em>: an I2C bus at 400 kHz cannot sustain a 4 kHz burst across eight chips, so the driver silently decimates and your effective rate is a fiction. The competent answer is to timestamp as early as physically possible, prefer transports that expose sequence numbers, and measure the real delivered rate rather than trusting the configured one.</p>
+
+    <p><strong>Push versus pull.</strong> Two acquisition disciplines dominate. In <em>polling</em>, the host reads on a timer, which is simple but couples your timeline to the host scheduler's jitter. In <em>interrupt or FIFO</em> mode, the sensor buffers samples on-chip and raises a data-ready line, so timing is governed by the sensor's own crystal and the host merely drains a queue. FIFO acquisition is almost always the right default for anything above a few hundred hertz, because it decouples the sample clock from the noisy host and lets you batch transfers to save power, a tradeoff that returns in force in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+    <h2>Metadata: the fields that make a stream self-describing</h2>
+
+    <p><strong>What it is.</strong> Metadata is the set of facts required to interpret a sample that are not themselves samples. A defensible sensor record carries, at minimum: a device and channel identifier, the nominal and <em>measured</em> sample rate, physical units and the scale factor from raw counts to those units, the sensor range and configured gain, the timestamp source and its epoch and timezone, the firmware and calibration versions, and the sensor's placement or mounting. None of these are optional decoration. Each answers a question a downstream model or auditor will eventually ask, and each is cheap to record now and impossible to recover later.</p>
+
+    <p><strong>Why it is load-bearing.</strong> Consider what breaks without each field. No units, and a fusion stage adds acceleration in \(g\) to acceleration in \(\text{m/s}^2\). No measured rate, and your spectral analysis in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> places every peak at the wrong frequency. No calibration version, and a firmware update that changed the gain silently splits your dataset into two incompatible populations. No device ID, and you cannot split train and test by device, the single most important guard against the leakage that <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is built around. Metadata is the join key between a raw stream and its physical meaning.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key insight</h3>
+        <p>Record the metadata that <em>cannot be recovered from the samples</em>, and record it at the moment of acquisition. A sample rate can sometimes be re-estimated from timestamps; a sensor's firmware version, mounting orientation, and coordinate convention cannot be inferred from the numbers at all. The test for whether a field belongs in metadata is simple: if a stranger handed only the raw array could reconstruct it, it is derivable; if they could not, it must be captured now or it is gone. Treat acquisition metadata as write-once provenance, not as a configuration file you might edit later.</p>
+    </div>
+
+    <h2>Schemas and standards: agreeing on the record's shape</h2>
+
+    <p><strong>Why standards exist.</strong> Every lab that invents its own metadata layout invents its own way to be incompatible with everyone else, including its future self. Community schemas encode the hard-won list of required fields so you do not rediscover it after losing a dataset. In biosignals, EDF+ standardized channel labels, per-channel scaling, and annotations for clinical recordings; the neuroimaging world formalized folder-level provenance as BIDS. For self-describing arrays, HDF5 and its cloud-native cousin Zarr attach named dimensions and arbitrary attributes directly to the data, so units and sample rate travel <em>inside</em> the file rather than in a fragile sidecar. For sensor descriptions on the web, W3C's SOSA/SSN ontology and OGC SensorML give a vocabulary for observations, procedures, and platforms. Robotics leans on ROS bag files and message definitions to keep a timestamped, typed record of every topic.</p>
+
+    <p><strong>The FAIR frame.</strong> The unifying principle is that data should be Findable, Accessible, Interoperable, and Reusable. In practice FAIR reduces to a discipline you can apply on any project: a stable identifier per recording, a documented schema, units and vocabularies that other tools recognize, and enough provenance that a result can be reproduced. You do not need a heavyweight ontology on day one; you need to pick one self-describing container and never write a bare CSV of unlabeled columns again.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In practice: the automotive fleet whose two trucks disagreed</h3>
+        <p>A logistics company logged wheel-speed and IMU data over the vehicle CAN bus across a fleet to train a road-surface classifier. The pilot model scored beautifully in validation and then behaved erratically on new trucks. The cause was buried in missing metadata. Half the fleet ran a firmware revision that reported yaw rate in degrees per second; the other half, after an over-the-air update, reported radians per second, and nobody logged the firmware version alongside the samples. The two conventions differ by a factor of about 57, so the model had effectively learned to separate trucks by their units and called it "road surface." Worse, because validation split randomly rather than by vehicle, both unit conventions appeared in training and test, hiding the defect until deployment on a truck the split had never isolated. The fix was not a better model. It was a one-line addition to the CAN logger that stamped the firmware version, units, and vehicle ID into every record, plus a device-wise split. The classifier's honest accuracy dropped, then became real.</p>
+    </div>
+
+    <p>The code below encodes the discipline as a small guard: an ingestion gate that refuses any batch missing the fields required to interpret it, and that flags when the measured rate drifts from the nominal one. Wiring this in front of storage turns a whole class of silent dataset corruption into a loud, early failure.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+REQUIRED = ("device_id", "channel", "units", "scale",
+            "nominal_rate_hz", "t0_unix", "timezone",
+            "firmware", "calibration_id")
+
+def ingest(samples_raw, timestamps, meta, rate_tol=0.02):
+    missing = [k for k in REQUIRED if k not in meta]
+    if missing:
+        raise ValueError(f"refusing batch: missing metadata {missing}")
+
+    # Verify the delivered rate against the claim; a drift here means
+    # dropped samples, a wrong config, or a lying driver.
+    dt = np.diff(timestamps)
+    measured = 1.0 / np.median(dt)
+    if abs(measured - meta["nominal_rate_hz"]) / meta["nominal_rate_hz"] > rate_tol:
+        raise ValueError(f"rate mismatch: claimed {meta['nominal_rate_hz']} Hz, "
+                         f"measured {measured:.1f} Hz")
+
+    physical = samples_raw.astype(np.float64) * meta["scale"]   # counts -> units
+    return {"values": physical, "t": timestamps, "meta": meta,
+            "measured_rate_hz": float(measured)}
+
+meta = dict(device_id="imu-0421", channel="gyro_z", units="rad/s", scale=1.526e-4,
+            nominal_rate_hz=200.0, t0_unix=1_752_000_000.0, timezone="UTC",
+            firmware="2.3.1", calibration_id="cal-2026-05-tumble")
+raw = np.random.randint(-2000, 2000, size=1000)
+t = meta["t0_unix"] + np.arange(1000) / 200.0
+print(ingest(raw, t, meta)["measured_rate_hz"])</code></pre>
+    <div class="code-caption">An acquisition gate that rejects any batch lacking the nine fields needed to interpret it and cross-checks the delivered rate against the nominal one. The <code>scale</code> field converts raw gyro counts to rad/s, and the rate check catches the dropped-sample and wrong-config failures from <a href="section-3.4.html">Section 3.4</a> before they reach storage. This function is the enforcement point referenced by the metadata discipline above.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The right tool: self-describing arrays instead of a sidecar zoo</h3>
+        <p>Hand-managing a parallel JSON sidecar for every array (keeping units, rates, coordinates, and axis labels in sync with the data through every slice and resample) is roughly eighty lines of bookkeeping that drifts out of date the first time someone edits one file and not the other. An <code>xarray</code> dataset attaches named dimensions, coordinates, and attributes to the array itself, so the metadata rides <em>inside</em> the object and survives slicing:</p>
+        <pre><code class="language-python">import numpy as np, xarray as xr
+
+da = xr.DataArray(
+    np.random.randn(1000, 3), dims=("time", "axis"),
+    coords={"time": np.arange(1000) / 200.0, "axis": ["x", "y", "z"]},
+    attrs={"units": "rad/s", "device_id": "imu-0421",
+           "nominal_rate_hz": 200.0, "firmware": "2.3.1"})
+da.to_netcdf("gyro.nc")            # units + coords + attrs travel with the data
+window = da.sel(time=slice(0.0, 1.0))   # metadata preserved through the slice
+print(window.attrs["units"], window.sizes)</code></pre>
+        <div class="code-caption">A self-describing gyro record with <code>xarray</code>: named axes, a real time coordinate, and physical attributes stored with the array and written to a single netCDF/HDF5 file. Eighty lines of sidecar synchronization collapse to a constructor call, and the units cannot silently detach from the numbers.</div>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Harden the ingestion gate into something you would trust in a fleet:</p>
+        <ol>
+            <li>Extend <code>ingest</code> to also reject a batch whose timestamps are non-monotonic (out-of-order delivery) and to report the fraction of inter-sample gaps that exceed twice the nominal period, a proxy for packet loss.</li>
+            <li>Add a metadata field <code>coordinate_frame</code> and write a check that two IMU streams claiming to fuse share the same frame, refusing the fusion otherwise. Explain which single character of a wrong answer this would have caught in the automotive story.</li>
+            <li>Serialize an accepted batch to both a bare CSV and an <code>xarray</code> netCDF file. Hand each to a colleague with no context and note which fields they can recover from each.</li>
+        </ol>
+        <details>
+            <summary>Hint</summary>
+            <p>For part one, <code>np.all(np.diff(timestamps) &gt; 0)</code> tests monotonicity and the gap fraction is <code>np.mean(np.diff(timestamps) &gt; 2 / rate)</code>. For part three, the CSV strips units, rate, and provenance the moment it is written; that asymmetry is the whole argument for self-describing containers.</p>
+        </details>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why is a timestamp applied at the sensor MCU generally more trustworthy than one applied when the buffer reaches the host?</li>
+            <li>Name three metadata fields that cannot be reconstructed from the raw samples alone, and one that sometimes can.</li>
+            <li>A dataset trains and tests by random split and reaches suspiciously high accuracy. Which single metadata field would let you re-split to expose device-level leakage, and why does that field belong in the acquisition record rather than added later?</li>
+        </ol>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 3</h3>
+        <p>build a streaming ingestion pipeline with windowing, missing-data markers, and cross-sensor time alignment.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Sensor description and metadata standards</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.w3.org/TR/vocab-ssn/">Haller, A., Janowicz, K., Cox, S., et al. (2017). Semantic Sensor Network Ontology (SOSA/SSN). W3C Recommendation.</a></p>
+            <p class="bib-annotation">The web standard vocabulary for describing sensors, observations, procedures, and platforms; the reference model when your metadata must interoperate across organizations.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.ogc.org/standard/sensorml/">Botts, M., and Robin, A. (2014). OGC SensorML: Model and XML Encoding Standard. Open Geospatial Consortium.</a></p>
+            <p class="bib-annotation">A rich schema for sensor systems and processing chains, widely used in geospatial and environmental sensor networks where provenance of the measurement process is mandatory.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1016/S1388-2457(03)00123-8">Kemp, B., and Olivan, J. (2003). European data format 'plus' (EDF+), an EDF alike standard format for the exchange of physiological data. Clinical Neurophysiology.</a></p>
+            <p class="bib-annotation">The de facto container for clinical biosignals, standardizing per-channel labels, physical scaling, and annotations; the model for how to make a physiological recording self-describing.</p>
+        </div>
+
+        <p class="bib-category">Self-describing data formats</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.hdfgroup.org/solutions/hdf5/">The HDF Group (1998-present). Hierarchical Data Format version 5 (HDF5).</a></p>
+            <p class="bib-annotation">The workhorse binary container that stores named datasets with attached attributes, letting units and sample rates live inside the file; the substrate under netCDF, NWB, and many sensor archives.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://zarr.dev/">Zarr Developers (2024). Zarr: chunked, compressed, N-dimensional arrays.</a></p>
+            <p class="bib-annotation">Cloud-native self-describing arrays with per-chunk compression and JSON attribute metadata; the format of choice for large sensor archives read in parallel from object storage.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1038/sdata.2016.44">Gorgolewski, K. J., Auer, T., Calhoun, V. D., et al. (2016). The Brain Imaging Data Structure (BIDS), a format for organizing and describing neuroimaging experiments. Scientific Data.</a></p>
+            <p class="bib-annotation">A concrete, adopted example of folder-level provenance and naming conventions; a template for how a community turns metadata discipline into a shareable standard.</p>
+        </div>
+
+        <p class="bib-category">Provenance, documentation, and reproducibility</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1038/sdata.2016.18">Wilkinson, M. D., Dumontier, M., Aalbersberg, I. J., et al. (2016). The FAIR Guiding Principles for scientific data management and stewardship. Scientific Data.</a></p>
+            <p class="bib-annotation">The Findable, Accessible, Interoperable, Reusable principles that frame why acquisition metadata is not optional; the citation behind most modern data-management mandates.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1145/3458723">Gebru, T., Morgenstern, J., Vecchione, B., et al. (2021). Datasheets for Datasets. Communications of the ACM.</a></p>
+            <p class="bib-annotation">Argues that every dataset should ship a datasheet documenting how it was collected and its intended use; the machine-learning analogue of acquisition metadata, and a direct feed into Chapter 5.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://labstreaminglayer.readthedocs.io/">Kothe, C., et al. (2014-present). Lab Streaming Layer (LSL).</a></p>
+            <p class="bib-annotation">A transport that unifies time-series streams from many devices with a common clock and per-stream metadata header; a practical reference design for real-time multi-sensor acquisition.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, we leave the mechanics of getting clean, labeled, timestamped samples and start reasoning about what they tell us. The metadata gate here decides whether a number is admissible; the probability toolkit next decides what to believe once it is admitted, giving us estimators, priors, and the aleatoric-versus-epistemic split that lets every later chapter attach honest uncertainty to a sensor reading rather than a bare point estimate.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

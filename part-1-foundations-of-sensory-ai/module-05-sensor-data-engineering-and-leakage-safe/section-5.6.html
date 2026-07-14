@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.6: Annotation quality, weak labels, and label delay. Building Sensory AI." name="description"/>
+<title>Section 5.6: Annotation quality, weak labels, and label delay | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Annotation quality, weak labels, and label delay</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Your model is a mirror held up to your labels. Polish the glass all you like; it still shows whatever the annotator was looking at, a second and a half too late."</p><cite>A Sceptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every supervised sensor model has a ceiling it cannot see: the quality of the labels it learned from. Unlike photographs, sensor streams are rarely self-evident to a human. Nobody can look at a 6-axis accelerometer trace and confidently say "this is stair-climbing, that is a stumble." Labels therefore come from proxies: a rater watching video, a button a subject presses, a clinical chart written hours later, a rule fired on another channel. Each proxy is imperfect in a way that is specific to sensing: it is noisy, it is weak (coarse or indirect), and it arrives late. This section is about measuring those three defects and building datasets that survive them, because a leakage-safe split (<a class="cross-ref" href="section-5.3.html">Section 5.3</a>) protects you from optimistic evaluation but does nothing to fix labels that are simply wrong.</p>
+</div>
+
+<p>This section assumes you can already cut a stream into windows and attach a label to each (<a class="cross-ref" href="section-5.2.html">Section 5.2</a>), and that you are comfortable treating a label as a random variable with its own error distribution, the estimation mindset from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. We take a windowed dataset as input and ask a harder question than "what model": <em>how good are these labels, and what do I do when they are not good enough?</em></p>
+
+<h2>Why annotation quality is the real ceiling</h2>
+
+<p><strong>What.</strong> Annotation quality is the degree to which the recorded label matches the true state of the world the sensor observed. <strong>Why it is hard for sensors specifically.</strong> Image and text labels are usually verifiable by the same human who assigns them; sensor labels are not. The annotator does not perceive the signal directly, so they annotate a <em>surrogate</em> (a synchronized video, a self-report diary, a lab reference instrument) and hope it aligns with the trace. Every gap between surrogate and signal becomes label noise.</p>
+
+<p><strong>How to quantify it.</strong> The workhorse is inter-rater agreement. Have multiple raters label the same windows and compute Cohen's \(\kappa\) (two raters) or Fleiss' \(\kappa\) (many), which correct raw agreement for chance:</p>
+$$ \kappa = \frac{p_o - p_e}{1 - p_e}, $$
+<p>where \(p_o\) is observed agreement and \(p_e\) is the agreement expected by chance. A \(\kappa\) of 0.9 says humans barely disagree, so a model scoring 0.88 is near the human ceiling; a \(\kappa\) of 0.55 says your "ground truth" is soft, and a model reporting 0.95 accuracy against it is almost certainly fitting rater idiosyncrasies. <strong>When to insist on it.</strong> Any project where the label is a human judgement (sleep stages, activity type, pain, arrhythmia class) needs at least a subset double-annotated. Skipping this is how teams ship a "97% accurate" classifier that argues with cardiologists.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Report your model's metric next to the inter-rater agreement, always. A model cannot meaningfully exceed the agreement of the humans who defined its target; if it appears to, it is exploiting a single annotator's quirks and will not generalize to a second one. The human ceiling is not a nuisance to be explained away, it is the correct baseline. This is the label-quality twin of the leakage-safe evaluation thread that runs through the book: honest numbers require an honest denominator.</p>
+</div>
+
+<h2>Weak labels: coarse, indirect, and programmatic supervision</h2>
+
+<p><strong>What.</strong> A <em>weak</em> label is one that is cheaper and lower-fidelity than the label you actually want. Three flavours dominate sensor work. <em>Coarse (multiple-instance) labels</em>: you know a 30-minute recording "contains snoring" but not which seconds, so the bag is labeled while its instances are not. <em>Indirect (distant) labels</em>: a maintenance log says a pump failed on Tuesday, and you retro-attach "faulty" to the preceding week of vibration without knowing when degradation truly began. <em>Programmatic labels</em>: a heuristic ("heart rate above 100 and motion low implies stress") stamps millions of windows automatically.</p>
+
+<p><strong>Why bother.</strong> Because hand-labeling sensor data at scale is brutal. A single subject-day of high-rate IMU is millions of samples; expert biosignal annotation runs at minutes per record. Weak supervision trades label <em>fidelity</em> for label <em>volume</em>, and for pretraining or coarse tasks that trade often wins. <strong>How to use weak labels without poisoning the model.</strong> The modern recipe is a <em>label model</em>: treat each heuristic (each "labeling function") as a noisy voter, estimate each voter's accuracy and correlations from their agreement pattern (no ground truth needed), then combine them into probabilistic labels \(\tilde{y} \in [0,1]\). Train on the soft labels rather than hard-voted ones so the model inherits uncertainty instead of overconfident errors, a theme developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: bootstrapping an arrhythmia detector from partial cardiologist review</h3>
+<p>A wearable-ECG team had 40,000 hours of single-lead recordings and cardiologist review on only 300 hours. Rather than train on the 300 hours alone, they wrote labeling functions: a beat-detector flagging RR-interval irregularity, a template-matcher for ectopic morphology, and the sparse expert reads. The label model learned that the RR heuristic was reliable during clean signal but nearly random during motion artifact (it correlated with the noise-level channel), and down-weighted it there automatically. Training on the resulting soft labels beat training on the expert-only subset, because the model saw two orders of magnitude more (imperfect) atrial-fibrillation examples. The expert reads were not discarded; they became the held-out set for honest evaluation and the anchor that calibrated the label model. Full clinical-grade validation still followed the process in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<h2>Label delay and temporal misalignment</h2>
+
+<p><strong>What.</strong> Label delay is a temporal offset between when an event happens in the signal and when its label is timestamped. <strong>Why it is endemic to sensing.</strong> Reaction time (a rater presses a marker after they notice the event), annotation-tool lag, clock skew between the labeling device and the sensor (see synchronization in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), and retrospective charting (a nurse logs "seizure at 14:05" from memory) all shift labels relative to the trace. A 300 ms button-press lag is trivial for detecting an hour-long sleep stage and catastrophic for detecting a 200 ms tap gesture.</p>
+
+<p><strong>How to handle it.</strong> First, <em>estimate</em> the offset: cross-correlate a strong signal feature (an onset energy burst) against the label edges and read off the lag. Second, <em>correct</em> it by shifting labels, or, when the delay is variable, <em>score with tolerance</em>: count a detection as correct if it lands within a window \(\pm\delta\) of the annotation, the standard practice in event detection. Third, in causal deployment, remember the model can only label the past, so a trailing-edge label carries its own structural delay that you must budget separately from annotation lag. <strong>When it bites hardest.</strong> Short-duration events and any evaluation that demands sample-exact boundaries. If you score a delayed-label dataset with zero tolerance, you will punish a correct model for the annotator's reflexes.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Watch Out: delay masquerading as poor accuracy</h3>
+<p>A constant label delay makes an otherwise-perfect detector look mediocre under exact-match scoring, and worse, it can teach the model the delay. If every "impact" label sits 120 ms after the true impact, the model learns to predict the shoulder of the event, not the event, and that bias ships to production. Always plot predicted-vs-labeled event times before trusting a low score; a tell-tale diagonal offset means fix the labels, not the model.</p>
+</div>
+
+<h2>Measuring and living with label noise</h2>
+
+<p>You cannot fix what you cannot find. <em>Confident learning</em> gives a practical, model-agnostic way to locate likely-mislabeled windows: train a classifier with cross-validation so every example gets an out-of-fold predicted probability, then flag examples the model confidently disagrees with. Examples where the given label has low self-confidence and another class has high confidence are your prime suspects for relabeling. The snippet below implements the core idea on a windowed sensor dataset.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import cross_val_predict
+
+def suspect_labels(X, y, threshold=0.5):
+    """Flag windows whose given label is likely wrong.
+    X: (N, D) window features; y: (N,) integer labels."""
+    clf = HistGradientBoostingClassifier(max_iter=200)
+    # out-of-fold probabilities: no window scores itself
+    proba = cross_val_predict(clf, X, y, cv=5, method="predict_proba")
+    self_conf = proba[np.arange(len(y)), y]        # P(given label)
+    best_other = proba.max(axis=1)                 # P(model's pick)
+    pred = proba.argmax(axis=1)
+    # low confidence in the given label, high in a different class
+    suspect = (pred != y) & (self_conf < threshold) & (best_other > 0.7)
+    return np.where(suspect)[0], self_conf
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(2000, 16))
+y = (X[:, 0] + 0.3 * rng.normal(size=2000) > 0).astype(int)
+y[:40] = 1 - y[:40]                                # inject 40 flipped labels
+idx, conf = suspect_labels(X, y)
+print(f"flagged {len(idx)} windows; "
+      f"{np.sum(idx < 40)}/40 injected errors caught")
+</code></pre>
+<div class="code-caption">Confident-learning label auditing on windowed features. Cross-validated probabilities ensure no window judges its own label; the model flags windows where it strongly prefers a different class than the one on file, surfacing the injected flips for human re-review.</div>
+
+<p>The audit above does not silently overwrite labels; it produces a <em>queue</em> for a human to re-check, cheapest-first. That distinction matters: automated relabeling of your own suspects can amplify the model's biases, whereas targeting scarce annotator time at the highest-suspicion windows is almost pure upside.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: label models and noise audits in a few lines</h3>
+<p>Rolling your own label model (estimating labeling-function accuracies and correlations from their agreement matrix) or a full confident-learning pipeline (per-class thresholds, joint noise-matrix estimation, ranking) is roughly 150 to 300 lines of subtle probability code. <code>snorkel</code>'s <code>LabelModel</code> turns a stack of weak labeling functions into calibrated soft labels in about 5 lines, and <code>cleanlab</code>'s <code>find_label_issues</code> reduces the audit above to a single call over out-of-fold probabilities. You still supply the labeling functions and the model; the library handles the estimation math that is easy to get quietly wrong.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a labeled activity-recognition recording (for example the human-activity data revisited in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). (a) Inject a constant 400 ms label delay and score a simple change-point detector with exact-match and with \(\pm250\) ms and \(\pm500\) ms tolerance; report how the F1 changes. (b) Estimate the injected delay by cross-correlating windowed signal energy against the label edges and confirm you recover roughly 400 ms. (c) Flip 3% of window labels at random, run the confident-learning audit from the code above, and report precision and recall of the flagged set against the known flips. Write two sentences on which defect, delay or noise, would have hurt a naive model more.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Your classifier reports 0.94 accuracy and the two annotators who defined the labels agree at \(\kappa = 0.61\). What is the most likely explanation, and what should you do before celebrating?</li>
+<li>Why should a label model output soft probabilities rather than hard majority votes over the labeling functions, and where does that uncertainty help downstream?</li>
+<li>You detect a constant 120 ms offset between predicted and labeled impact times. Name one fix at the label level and one at the evaluation level, and say which you would prefer for a production detector and why.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-5.7.html">Section 5.7</a>, we make all of these decisions reproducible. Windowing choices, split boundaries, calibration constants, and now label provenance and label-model versions become part of a versioned data contract, so that when your labels improve or your delay estimate changes, every downstream artifact can be rebuilt and re-evaluated without guesswork.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

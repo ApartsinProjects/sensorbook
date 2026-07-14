@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.3: Clocks, timestamps, and multi-sensor synchronization. Building Sensory AI." name="description"/>
+<title>Section 3.3: Clocks, timestamps, and multi-sensor synchronization | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Signals, Sampling, Time, and Synchronization</a></div>
+<h1>Clocks, timestamps, and multi-sensor synchronization</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Each of my sensors swears it knows the time. The trouble is that no two of them agree, and none of them will admit it."</p>
+        <cite>A Multi-Sensor AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why a whole section on telling time</h3>
+        <p>The moment you have more than one sensor, a new quantity appears that neither of them measures directly: the shared instant. A camera frame and a lidar sweep can each be flawless and still be useless together if you cannot say which frame and which sweep saw the world at the same time. Every fusion result, every state estimate, every "the accelerometer spiked when the microphone heard the impact" claim rests on a timebase you have to construct, because the hardware does not hand it to you for free. This section is about that construction: what a clock actually is, where a timestamp really comes from, how far apart independent clocks drift, and the concrete mechanisms (from GPS pulses to IEEE 1588) that pull many sensors onto one timeline. Get this wrong and the errors are not noisy; they are <em>systematic</em>, and they masquerade as everything from bad calibration to a broken model.</p>
+    </div>
+
+    <p><a class="cross-ref" href="section-3.1.html">Section 3.1</a> treated a single stream sampled on a single clock, and <a class="cross-ref" href="section-3.2.html">Section 3.2</a> contrasted clock-driven with event-driven acquisition. Here we assume the readings exist and ask the question that fusion forces on us: how do we place samples from independent devices on a common axis? This presumes a little probability vocabulary for talking about timing error, which the <a class="cross-ref" href="../module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> uncertainty primer supplies, and it feeds directly into <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, where misalignment becomes fusion error you can measure.</p>
+
+    <h2>What a clock actually is: offset, skew, and drift</h2>
+    <p>A sensor's clock is a counter driven by an oscillator, usually a quartz crystal, that ticks at a nominal frequency. It is never exactly right. We model device \(i\)'s reported time \(C_i\) as an affine function of true time \(t\):</p>
+    $$C_i(t) = (1 + \epsilon_i)\,t + \theta_i.$$
+    <p>Here \(\theta_i\) is the <em>offset</em> (how far the clock is ahead or behind at \(t=0\)) and \(\epsilon_i\) is the <em>skew</em> (its fractional rate error, the reason it gains or loses time). Skew is quoted in parts per million (ppm): a garden-variety consumer crystal is rated at \(\pm 20\) to \(\pm 50\) ppm. That sounds negligible until you unpack the unit. One ppm is one microsecond of error per second, which is about \(86\ \mathrm{ms}\) per day. A 50 ppm crystal can therefore drift more than four seconds in a single day if left uncorrected. Two independent 50 ppm clocks can move apart at up to 100 ppm relative to each other. <em>Drift</em> is the slow change of \(\epsilon_i\) itself, driven mostly by temperature: the same crystal that reads 20 ppm on a bench can swing tens of ppm as a device warms in a pocket or a bearing housing.</p>
+    <p>The practical takeaway is that offset and skew are not one-time nuisances you subtract once. Offset must be re-estimated because clocks are set imperfectly; skew must be re-estimated because a fixed rate error accumulates without bound; and drift means both estimates go stale, so synchronization is a process you run continuously, not a calibration you do at the factory.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Alignment is a linear-map estimation problem</h3>
+        <p>Putting sensor \(i\) onto a reference timeline means estimating two numbers, \(\theta_i\) and \(\epsilon_i\), that map \(C_i\) back to \(t\). That is the entire mathematical content of clock synchronization at this level: fit a line. Everything harder (PTP, GPS discipline, cross-correlation) is a better way to gather the paired timestamps you fit that line to, or a way to re-fit it as it drifts.</p>
+    </div>
+
+    <h2>Where a timestamp really comes from</h2>
+    <p>A single sensor sample can carry several different timestamps, and confusing them is the most common synchronization bug in practice. A reading acquires its <em>capture</em> time when the physical event is transduced, a <em>hardware</em> timestamp if the sensor's own clock latches the sample, an <em>arrival</em> timestamp when the packet reaches the host, and a <em>host</em> timestamp when your software finally reads it off a queue. Between capture and host there is exposure time, bus transfer, driver buffering, and operating-system scheduling, and each adds a delay that is partly fixed and partly random. The fixed part is <em>latency</em>; the random part is <em>jitter</em>, treated as a failure mode in its own right in <a class="cross-ref" href="section-3.4.html">Section 3.4</a>.</p>
+    <p>The rule that saves projects is: <strong>timestamp as close to the physical event as the hardware allows, and record which clock did it.</strong> A camera that exposes a hardware timestamp at the middle of its integration window is worth far more than one you stamp when the USB frame lands, because the arrival time smears the true capture instant by a variable few milliseconds. On the software side, always separate the <em>monotonic</em> clock (a counter that only ever increases, immune to being reset) from the <em>wall</em> clock (calendar time, which can jump backward when NTP corrects it or a leap second lands). Use the monotonic clock to measure durations and align streams; use the wall clock only to label data with human-readable dates. Mixing them produces negative time intervals and reversed sample orders that are maddening to debug.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a 40-millisecond offset that bent the road</h4>
+        <p>An autonomous-driving team projected lidar points into camera images to color the point cloud and to fuse detections. On straight highway their bounding boxes were crisp; on cloverleaf on-ramps they smeared by a full car width, and a validation engineer nearly filed it as a calibration defect. The cause was timing, not geometry. The lidar was hardware-timestamped from a GPS-disciplined clock, but the camera frames were stamped on arrival at the host, roughly 40 ms late and jittery. At highway speed a car covers about \(1.1\ \mathrm{m}\) in 40 ms, so on a curve the vehicle had rotated measurably between the true camera instant and the assumed one, shearing the projection. No amount of re-running the extrinsic calibration could fix it, because the extrinsics were correct; the two sensors were simply describing different instants. The remedy lived entirely in the timing layer: a hardware trigger that exposed the camera and latched the lidar angle together, plus interpolation of vehicle pose to the exact stamp.</p>
+    </div>
+
+    <h2>Mechanisms that pull sensors onto one clock</h2>
+    <p>There is a ladder of synchronization techniques, and the right rung depends on how tightly your sensors must agree. From loosest to tightest:</p>
+    <p><strong>NTP (Network Time Protocol)</strong> disciplines a host's wall clock over an ordinary network to within a few milliseconds on a LAN, tens of milliseconds over the internet. It is enough to correlate slow logs and timestamp events for humans, and nowhere near enough to fuse a 100 Hz IMU with a camera. <strong>PTP (Precision Time Protocol, IEEE 1588)</strong> uses hardware timestamping in the network interface to exchange delay-measurement messages and reach sub-microsecond agreement across devices on the same switched network; it is the backbone of synchronized industrial and automotive sensor buses. <strong>GPS with a PPS (pulse-per-second) signal</strong> gives every receiver a physical electrical edge aligned to UTC to within tens of nanoseconds, which is why GPS-disciplined clocks anchor large outdoor multi-sensor rigs and are covered further in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>. <strong>A hardware trigger</strong> is the tightest of all: one electrical line fires multiple sensors at the same instant, so they share not just a clock but a common exposure event, eliminating offset by construction.</p>
+    <p>When you cannot rewire the hardware, you fall back to <strong>post-hoc software alignment</strong>: record the best timestamps you have, then estimate the residual offset from the data itself. If two sensors observe the same physical event (a shake felt by two IMUs, an audio-visual clap), the lag that maximizes their cross-correlation is a direct estimate of \(\theta_i - \theta_j\). This is cheap, requires no special hardware, and is the workhorse for aligning consumer devices that were never designed to be synchronized. It cannot fix skew on its own, though, so for long recordings you fit the full affine map, not just a constant shift.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+# Paired timestamps: each row is (sensor_clock_reading, reference_clock_reading)
+# gathered whenever a shared event let us observe both clocks at once.
+sensor = np.array([0.001, 1.002, 2.004, 3.005, 4.007, 5.008])   # device clock (s)
+ref    = np.array([0.000, 1.000, 2.000, 3.000, 4.000, 5.000])   # reference clock (s)
+
+# Fit ref = a * sensor + b  (a undoes skew, b undoes offset)
+A = np.vstack([sensor, np.ones_like(sensor)]).T
+(a, b), *_ = np.linalg.lstsq(A, ref, rcond=None)
+
+skew_ppm = (a - 1.0) * 1e6
+print(f"skew = {skew_ppm:6.1f} ppm, offset = {b*1e3:6.2f} ms")
+
+# Map any future device stamp onto the reference timeline:
+def to_reference(device_stamp):
+    return a * device_stamp + b</code></pre>
+    <div class="code-caption">Least-squares fit of the affine clock model \(C_{\text{ref}} = a\,C_{\text{sensor}} + b\) from a handful of paired timestamps; the slope <code>a</code> recovers skew (here about a 1600 ppm rate error) and the intercept <code>b</code> recovers offset, giving a single <code>to_reference</code> function that re-times every later sample.</div>
+    <p>The code above is the whole idea in a dozen lines: gather pairs of readings taken at the same real instant, fit a line, and reuse it. In production you re-fit this map on a sliding window so it tracks drift rather than freezing a stale skew estimate.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Let a library do the nearest-timestamp join</h3>
+        <p>Once every stream is on a common timeline, you still have to pair samples that never share an exact stamp: a 100 Hz IMU and a 30 Hz camera land on different grids. Writing a correct tolerance-bounded nearest-neighbor join by hand (two moving pointers, boundary handling, a maximum-gap guard) is easily 40 or more lines and a magnet for off-by-one bugs. <code>pandas.merge_asof</code> collapses it to one call:</p>
+        <pre><code class="language-python">import pandas as pd
+# imu, cam: DataFrames sorted by a common-timeline column "t"
+aligned = pd.merge_asof(cam, imu, on="t",
+                        direction="nearest",
+                        tolerance=0.005)   # drop pairs &gt; 5 ms apart</code></pre>
+        <div class="code-caption">A single <code>merge_asof</code> attaches to each camera frame the temporally nearest IMU sample and refuses any match more than 5 ms away, replacing a hand-written two-pointer join.</div>
+        <p>The library handles the sorted-merge, the direction choice (nearest, backward, or forward), and the tolerance gate that marks unmatched samples as missing rather than silently pairing distant ones. For robot stacks, the ROS <code>message_filters</code> ApproximateTimeSynchronizer does the same job live on message streams.</p>
+    </div>
+
+    <h2>The timestamp contract: what to record so alignment stays possible</h2>
+    <p>Synchronization is only recoverable if you preserve the information it needs, and this is a data-engineering discipline as much as a signal one, revisited under leakage-safe pipelines in <a class="cross-ref" href="../module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Every sample should carry: the timestamp value, the clock domain it came from (monotonic versus wall, and which device), and ideally the stamping stage (capture, hardware, or arrival). Store timestamps at nanosecond resolution in integer counts, not 32-bit floats, because a float32 second-count loses millisecond precision within an hour of uptime. Never overwrite a hardware timestamp with a host one to "clean up" the record; you are destroying the very evidence a later alignment step depends on. If you log the delay-measurement exchanges from PTP or the PPS edges from GPS, you can reconstruct and audit the timebase after the fact, which is the difference between a dataset that can be re-synchronized and one that is permanently smeared.</p>
+
+    <div class="callout warning">
+        <h4>Common Misconception</h4>
+        <p>"The host receive time is good enough; the network is fast." The network may be fast on average, but arrival timestamps inherit every millisecond of bus contention, driver buffering, and OS scheduling jitter, and that jitter is exactly the quantity fusion is most sensitive to. A mean latency you could subtract is harmless; the variance around it is not, and no averaging removes it after the fact. The fix is to stamp earlier (in hardware), not to hope the arrival time is stable.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: budget the drift and choose a mechanism</h3>
+        <p>You are building a wearable that fuses a 200 Hz IMU with a 25 Hz PPG optical sensor, each on its own \(\pm 30\) ppm crystal, and your fusion step tolerates at most \(2\ \mathrm{ms}\) of relative misalignment. (1) If you synchronize the two clocks once at power-on and never again, how long until worst-case relative drift exceeds the 2 ms budget? (2) Would NTP-class (few-ms) synchronization ever satisfy this budget, and why or why not? (3) Propose a re-synchronization schedule or mechanism from the ladder in this section that keeps you inside 2 ms, and state what timestamp fields each sample must carry for your scheme to be auditable later.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Write the affine clock model and say, in one sentence each, what offset, skew, and drift are and why estimating one does not remove the need to re-estimate the others.</li>
+            <li>Distinguish a hardware timestamp, an arrival timestamp, and a host timestamp, and explain why fusing on arrival timestamps was the root cause of the smeared lidar-camera projection in the worked example.</li>
+            <li>You have two consumer phones that were never designed to be synchronized. Which mechanism from this section lets you align their recordings after the fact, what shared signal does it need, and what can it <em>not</em> correct on its own?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-3.4.html">Section 3.4</a>, we confront what happens when the timeline you just built develops holes: samples that never arrive, timestamps that jitter around their true instant, and packets lost in transit. Clean synchronization assumes every sample is present and stamped; the next section drops that assumption and shows how to detect, mark, and reason about the gaps without letting them poison a downstream model.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

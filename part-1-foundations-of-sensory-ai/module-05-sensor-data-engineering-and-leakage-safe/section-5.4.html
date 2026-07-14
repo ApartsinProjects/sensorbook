@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.4: Device, user, site, session, and machine splits. Building Sensory AI." name="description"/>
+<title>Section 5.4: Device, user, site, session, and machine splits | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Device, user, site, session, and machine splits</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The test set exists to answer one question: what happens when something new walks in the door. If the door already knows the visitor, you asked a different question and reported the wrong answer."</p><cite>A Disciplined AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous section named the disease: leakage lets test information contaminate training and inflates your numbers. This section prescribes the cure that fixes most sensor leakage in one move: <em>group-aware splitting</em>. Instead of shuffling windows at random, you decide which real-world entity your model must generalize across, hold all of that entity's data on one side of the split, and never let it straddle. The entity might be a device, a wearer, a factory site, a recording session, or a physical machine. Choosing it correctly is the single highest-leverage decision in your evaluation protocol, because it defines what "new" means for your deployed system. Choose it wrong and a model that has secretly memorized individuals will post a benchmark it can never reproduce in the field.</p>
+</div>
+
+<p>This section assumes you have already cut streams into windows (<a class="cross-ref" href="section-5.2.html">Section 5.2</a>) and understand the leakage mechanisms catalogued in <a class="cross-ref" href="section-5.3.html">Section 5.3</a>. Here we turn the diagnosis into a construction procedure. We take a windowed, labeled dataset carrying entity identifiers and produce train, validation, and test partitions whose accuracy estimate matches the deployment question you actually care about.</p>
+
+<h2>The grouping unit is a modeling decision, not a default</h2>
+
+<p><strong>What.</strong> A grouping unit is the entity across whose boundary your model must generalize at deployment. Every window belongs to exactly one value of that unit (this wearer, that machine, this recording session), and a group-disjoint split guarantees that all windows sharing a group value land entirely in train or entirely in test, never split between them. <strong>Why.</strong> Sensor data is riddled with nuisance signals that are constant within an entity and irrelevant to the label: a specific accelerometer's bias, one person's gait idiosyncrasy, a particular lathe's bearing hum, a room's acoustic reverberation. A random split scatters an entity's windows across train and test, so the model can lower its loss by recognizing the entity rather than the phenomenon. That shortcut evaporates the instant a genuinely new entity appears.</p>
+
+<p><strong>How.</strong> Pick the unit by asking a single question: <em>at deployment, what will be new?</em> The answer names your holdout axis. The common units, roughly ordered from finest to coarsest, are:</p>
+
+<ul>
+<li><strong>Session (recording).</strong> One continuous capture from one entity. Holding out sessions defeats the crudest leakage (adjacent overlapping windows) but still lets the same person or device appear in train and test.</li>
+<li><strong>Device.</strong> One physical sensor unit. Device-disjoint splits test whether the model survives manufacturing tolerance, mounting variation, and per-unit calibration drift (the subject of <a class="cross-ref" href="section-5.5.html">Section 5.5</a>).</li>
+<li><strong>User / subject.</strong> One person wearing or operating the sensor. Subject-disjoint splitting is mandatory for any wearable, biosignal, or activity model, because human physiology and behavior are the dominant nuisance variables.</li>
+<li><strong>Machine.</strong> One physical asset in industrial monitoring: a pump, a turbine, a CNC spindle. Fault models must generalize to machines never seen during training.</li>
+<li><strong>Site.</strong> A whole location: a hospital, a factory floor, a building. Site-disjoint splits probe environmental and installation shift, the coarsest and usually hardest generalization gap.</li>
+</ul>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The grouping unit and the deployment claim are the same object viewed twice. "Our fall detector works for new users" is only supported by a <em>subject</em>-disjoint test. "Our bearing model works on unseen pumps" requires a <em>machine</em>-disjoint test. "Our air-quality model transfers to new cities" demands a <em>site</em>-disjoint test. If the sentence in your paper or product spec says "new X", then X is your grouping unit, and any split that lets an X appear on both sides is measuring a weaker claim than the one you are making. Match the split to the sentence.</p>
+</div>
+
+<h2>Nested entities and the strictest-boundary rule</h2>
+
+<p>Real datasets carry several nested identifiers at once. A wearable study has <em>subject</em> ⊃ <em>device</em> (a loaner watch) ⊃ <em>session</em> (each day's wear) ⊃ <em>window</em>. These nest: every session belongs to one device, every device to one subject. <strong>The rule:</strong> split at the <em>coarsest</em> boundary your deployment claim requires, and the finer boundaries take care of themselves automatically, because holding out a subject also holds out all of that subject's devices and sessions.</p>
+
+<p>The danger is a partial identifier that silently couples the two sides. If one subject wore two devices and you split by device, that subject's physiology now appears in both partitions even though no device does; you have a subject leak hiding inside a clean-looking device split. Formally, a split into train set \(\mathcal{T}\) and evaluation set \(\mathcal{E}\) is group-safe for unit \(g\) when their group sets are disjoint:</p>
+
+$$ \{\, g(w) : w \in \mathcal{T} \,\} \;\cap\; \{\, g(w) : w \in \mathcal{E} \,\} \;=\; \varnothing. $$
+
+<p>When several units matter at once (say subject and site), the safe construction holds out on the <em>composite</em> key, or splits on the coarsest unit that dominates the others. Verify the intersection is empty for every unit you claim to generalize across, not just the one you sorted on.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the seizure detector that only knew four patients</h3>
+<p>A clinical team trained an EEG seizure detector on continuous recordings from a small epilepsy-monitoring unit and reported 97% window-level accuracy from a random 80/20 split. Deployed on a new admission, it collapsed to little better than chance. The autopsy was textbook nested leakage. With only a handful of patients but days of recording each, a random window split placed thousands of windows from every patient into both train and test. The model had learned each patient's individual EEG signature, electrode montage, and baseline artifacts, then recognized the patient and recalled their seizure pattern. Re-run as a <em>patient</em>-disjoint split (leave-one-patient-out), accuracy fell to a sober 78%, which was the real, deployable number. The 19-point gap was pure identity memorization. Nothing about the model changed; only the split told the truth. EEG and clinical validation return in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-31-eeg-neural-signals-and-brain-computer-interfaces/index.html">Chapter 31</a>.</p>
+</div>
+
+<h2>Constructing grouped splits in practice</h2>
+
+<p>The mechanics are short once the group vector exists. You never shuffle windows; you shuffle <em>groups</em>, then gather every window of the chosen groups. For cross-validation you want each fold's test groups disjoint from its training groups, which is exactly what grouped K-fold provides. The snippet below shows a manual subject-disjoint split and the grouped-CV equivalent, and prints the group overlap so you can prove disjointness rather than assume it.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+
+# X: (N, L, C) windows; y: (N,) labels; groups: (N,) subject id per window
+rng = np.random.default_rng(0)
+N = 2000
+groups = rng.integers(0, 20, size=N)      # 20 subjects
+y = rng.integers(0, 3, size=N)
+
+# One held-out split: whole subjects go to test, none shared
+gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=0)
+train_idx, test_idx = next(gss.split(np.zeros(N), y, groups))
+overlap = set(groups[train_idx]) &amp; set(groups[test_idx])
+print("shared subjects:", len(overlap))    # must be 0
+
+# K-fold where every fold is subject-disjoint
+for k, (tr, te) in enumerate(GroupKFold(n_splits=5).split(np.zeros(N), y, groups)):
+    assert not (set(groups[tr]) &amp; set(groups[te]))
+    print(f"fold {k}: {len(set(groups[te]))} test subjects, {len(te)} windows")
+</code></pre>
+<div class="code-caption">Subject-disjoint splitting with scikit-learn. <code>GroupShuffleSplit</code> makes one held-out partition; <code>GroupKFold</code> rotates disjoint subject sets through the test fold. The explicit set-intersection check and the assertion are the point: they turn "I think this is clean" into a proof that no group crosses the boundary.</div>
+
+<p>Two refinements matter for honest numbers. First, groups are rarely balanced (one subject may contribute ten times the windows of another), so a group-disjoint split can accidentally load all of one class onto one side; use stratified-grouped variants or report per-group performance to catch it. Second, with few groups the estimate is high-variance: leaving out one of five machines makes the score swing wildly, so prefer leave-one-group-out cross-validation and report the spread, not a single fold. This ties directly to the small-sample uncertainty tools from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: grouped splitters replace a folder of bookkeeping</h3>
+<p>Rolling your own group-disjoint, class-stratified, K-fold rotation with balance checks and leakage assertions is roughly 60 to 90 lines of index juggling that is easy to get subtly wrong (the off-by-one that lets one group slip across is exactly the bug that inflated the seizure detector). Scikit-learn's <code>GroupKFold</code>, <code>StratifiedGroupKFold</code>, <code>GroupShuffleSplit</code>, and <code>LeaveOneGroupOut</code> reduce it to one constructor plus a <code>groups=</code> argument, about 2 lines, and they guarantee the disjointness invariant for you. Your only remaining job is to build the correct group vector, which is where the real thinking lives.</p>
+</div>
+
+<h2>When a pure entity split is not enough</h2>
+
+<p><strong>When to go further.</strong> Group-disjoint splitting removes identity leakage, but two related traps survive it. If your data has a strong <em>temporal</em> structure (a machine degrades over months), you may also need the test period to come <em>after</em> the training period so you do not train on the future, combining a machine split with a temporal cutoff. And if the label is correlated with the group (all positive cases came from one site), even a clean split can hand the model a spurious site-equals-label shortcut. The defense is to check that each class is represented across multiple groups on both sides, and to prefer coarser or composite grouping when a nuisance variable and the label are confounded. These distribution-shift concerns are the running theme of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, and the leakage-safe benchmarking discipline is formalized in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a human-activity dataset with columns for subject, device, session, and label. (a) Report accuracy under a random window split, a session-disjoint split, and a subject-disjoint split, and rank the three numbers before you run them. (b) One subject in your data wore two devices; construct a device-disjoint split and prove, with a set intersection, whether any subject leaks across it. (c) In two sentences, state which of the three splits you would put in a product datasheet claiming "works for new users", and why the other two would overstate the claim.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Your deployment claim is "detects faults on pumps we have never serviced". Name the grouping unit, and explain why a session-disjoint split would not support that claim.</li>
+<li>You split cleanly by device, but every device belongs to one of three subjects and two subjects appear on both sides. What kind of leakage remains, and how do you remove it?</li>
+<li>Why does leave-one-group-out cross-validation give a more trustworthy estimate than a single held-out group when you only have five machines, and what should you report alongside the mean?</li>
+</ol>
+</div>
+
+<p>Group-aware splitting is deceptively simple to implement and decisive in effect: the same model and the same data can post a triumphant or a sober number depending only on where you draw the boundary. Draw it at the entity your deployment must generalize across, prove the groups are disjoint, and your accuracy finally means what it says.</p>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-5.5.html">Section 5.5</a>, we tackle the nuisance that made device and subject splits necessary in the first place: per-unit variation. We will see how normalization and per-device calibration remove sensor-specific bias and scale so the model learns the signal rather than the serial number, and, crucially, how to fit those transforms inside the training fold only, so the cure for one leak does not quietly open another.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

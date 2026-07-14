@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.1: Formats for telemetry, waveforms, event streams, and point clouds. Building Sensory AI." name="description"/>
+<title>Section 5.1: Formats for telemetry, waveforms, event streams, and point clouds | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Formats for telemetry, waveforms, event streams, and point clouds</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They handed me a folder of float32 arrays with no sample rate, no units, and no timezone. I did not have a dataset. I had a rumor."</p>
+        <cite>A Disillusioned AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes basic Python and the ideas of sampling rate, timestamps, and clock synchronization introduced in <a class="cross-ref" href="../module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. It leans lightly on the notions of quantization and dynamic range from <a class="cross-ref" href="../module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. No storage-engine background is needed; the columnar and chunked-array ideas are built from scratch here, and the full toolchain (Parquet, HDF5, Zarr, MCAP) is catalogued in Appendix D. Everything you store here is what later sections in this chapter window, split, and normalize.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Before you can model a sensor, you have to store what it produced without quietly destroying it. Sensor data is not one shape: a temperature log, a vibration waveform, a CAN-bus trace, and a lidar sweep have almost nothing structurally in common, and forcing all four into the same CSV is how datasets die. This section names the four canonical shapes, matches each to the storage layout that fits its physics, and insists on one non-negotiable rule: a format must be <em>self-describing</em>. A file of numbers with no sample rate, units, device identity, or time base is not a compact dataset. It is a guess waiting to be misread.</p>
+    </div>
+
+    <h2>Four shapes, not one</h2>
+    <p>Almost every sensor stream you will meet falls into one of four structural families, distinguished by three questions: are the samples uniformly spaced in time, is the data dense or sparse, and does each record hold a fixed or variable number of values? Get the family right and the storage decision nearly makes itself.</p>
+    <p><strong>Telemetry</strong> is low-rate, multivariate, timestamped scalars: engine RPM, battery voltage, GPS latitude, cabin temperature, each a named channel sampled from a fraction of a hertz up to roughly a hundred. It is naturally a wide table, one row per timestamp, one column per channel. <strong>Waveforms</strong> are dense, uniformly sampled continuous signals: audio at 44.1 kHz, an ECG trace at 500 Hz, a bearing accelerometer at 25.6 kHz. Here the sample rate is not data to store per row; it is a single number that, together with a start time, lets you reconstruct every timestamp implicitly. <strong>Event streams</strong> are asynchronous: things happen at irregular instants and you record a tuple when they do. A CAN message, a syslog line, a keystroke, or an event-camera pixel firing \((x, y, \text{polarity}, t)\) all share the trait that time between records is itself information. <strong>Point clouds</strong> are unordered sets: a single lidar sweep is a variable-size bag of points, each carrying \((x, y, z)\) plus intensity and often a per-point timestamp, with no meaningful row order and a different cardinality every frame.</p>
+    <p>Table 5.1.1 lays these four side by side. The reason this taxonomy matters is that each shape breaks a different default. Telemetry punishes row-major storage when you only need two of two hundred channels. Waveforms punish any format that stores a timestamp per sample. Event streams punish fixed-rate assumptions. Point clouds punish anything that expects a rectangular array. Choosing the layout is choosing which of these mistakes you refuse to make.</p>
+
+    <div class="table-container">
+    <table>
+      <caption><strong>Table 5.1.1.</strong> The four canonical sensor-data shapes and the storage layout each one wants.</caption>
+      <thead>
+        <tr><th>Shape</th><th>Timing</th><th>Density</th><th>Record</th><th>Typical rate</th><th>Fitting layout</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Telemetry</td><td>regular or irregular</td><td>sparse channels</td><td>fixed width</td><td>0.1&#8211;100 Hz</td><td>columnar table (Parquet)</td></tr>
+        <tr><td>Waveform</td><td>uniform</td><td>dense</td><td>scalar per tick</td><td>0.1&#8211;100 kHz</td><td>chunked array (HDF5, Zarr, WAV, EDF)</td></tr>
+        <tr><td>Event stream</td><td>asynchronous</td><td>sparse in time</td><td>fixed-width tuple</td><td>bursty</td><td>row log (Parquet, MCAP, AEDAT)</td></tr>
+        <tr><td>Point cloud</td><td>per-frame</td><td>sparse in space</td><td>variable count</td><td>10&#8211;20 Hz frames</td><td>packed binary (PCD, LAS/LAZ, .bin)</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A storage format is not a neutral container; it is a claim about what your data <em>is</em>. Store a 25 kHz vibration waveform as a CSV with a timestamp column and you have inflated the file tenfold, thrown away the guarantee of uniform spacing, and invited floating-point timestamps that drift out of step with reality. Match the layout to the shape and the format enforces the physics for you. Mismatch them and every downstream tool inherits a lie about the signal.</p>
+    </div>
+
+    <h2>Rows, columns, and chunks: why layout is destiny</h2>
+    <p>The deepest split in sensor storage is <strong>row-major</strong> versus <strong>columnar</strong>. A row-major file (CSV, JSON lines, a naive database table) stores all fields of record 1, then all fields of record 2, and so on. A columnar file (Parquet, Arrow, ORC) stores all values of channel A contiguously, then all of channel B. For telemetry the columnar layout is transformative for three concrete reasons. First, <em>selective reads</em>: an analyst who wants only <code>rpm</code> and <code>oil_temp</code> from a two-hundred-channel truck log reads two columns off disk and skips the rest, instead of parsing every byte of every row. Second, <em>compression</em>: values within one channel are similar (temperature changes slowly), so a column of them compresses far better than interleaved heterogeneous rows; run-length and dictionary encoding routinely shrink telemetry by five to twenty times. Third, <em>predicate pushdown</em>: column statistics stored per block let a reader skip entire chunks whose value range cannot match a filter, so "give me the rows where RPM exceeded 6000" touches only the blocks that could contain them.</p>
+    <p>Waveforms want a different discipline. A dense uniform signal has no per-sample metadata worth storing, so the right structure is a <strong>chunked array</strong>: a long contiguous block of one dtype, split into fixed-size chunks along the time axis, with the sample rate, units, dtype, start time, and device identity held once as attributes. HDF5 and Zarr do exactly this; the venerable WAV and biosignal EDF (European Data Format) containers do a domain-specific version of the same idea. Chunking is what makes a multi-hour recording streamable: you read the ten-second window you need without materializing the whole file, which is precisely the access pattern <a class="cross-ref" href="section-5.2.html">Section 5.2</a> builds windows on. The recurring principle across both cases is that <em>timestamps for a uniform signal are computed, never stored</em>: sample \(n\) sits at time \(t_0 + n/f_s\), so persisting a timestamp column would waste space and, worse, let rounding error desynchronize the axis. Getting \(t_0\) and \(f_s\) right ties directly back to the synchronization discipline of <a class="cross-ref" href="../module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a wind-turbine fleet drowning in CSV</h3>
+        <p>An industrial monitoring team streamed vibration and SCADA telemetry from three hundred wind turbines into hourly CSV files, one folder per turbine. Each accelerometer channel ran at 25.6 kHz, so a single ten-minute record was over fifteen million rows, and every row redundantly carried a text timestamp. Storage ballooned past a petabyte and a simple query, "pull the gearbox axial channel for turbine 44 last Tuesday," took twenty minutes because the reader parsed every column of every row. Re-engineering split the two shapes apart: high-rate vibration went into chunked HDF5 with <code>sample_rate_hz</code>, <code>units</code>, and <code>turbine_id</code> as dataset attributes, while the slow SCADA telemetry (power, wind speed, nacelle temperature) went into daily Parquet partitioned by turbine. The same query dropped to under two seconds and on-disk size fell by roughly eight times, purely from matching layout to shape. Not one bit of physics changed; the <em>description</em> of the data did. This is the raw material <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a> later turns into remaining-useful-life models.</p>
+    </div>
+
+    <h2>Event streams and point clouds: the irregular families</h2>
+    <p>Event streams and point clouds resist the tidy rectangle, and pretending otherwise is where naive pipelines quietly corrupt data. An <strong>event stream</strong> carries its meaning in the gaps: a burst of CAN messages during hard braking and silence during cruise are both signal. Store events as a row log where the timestamp is a first-class column, never resample them onto a fixed grid at ingestion time (that decision belongs downstream and destroys information if baked in), and keep them monotonically ordered by time. Robotics leans on MCAP and the older rosbag containers precisely because they log heterogeneous, asynchronous messages with per-message timestamps and typed schemas; neuromorphic vision uses AEDAT and EVT to pack millions of \((x, y, p, t)\) tuples per second, the format that <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a> builds event-camera perception on. A columnar log such as Parquet also serves general event data well, since the timestamp and payload columns compress and filter efficiently.</p>
+    <p>A <strong>point cloud</strong> is a set, and sets have two properties that break array-shaped storage: variable cardinality (each sweep has a different point count) and permutation invariance (no canonical order). You cannot stack frames into one rectangular tensor without padding, and you must never let a tool assume row order carries meaning. Automotive lidar pipelines commonly store each frame as a packed little-endian binary blob of \(N \times 4\) float32 values \((x, y, z, \text{intensity})\) with \(N\) recorded in a sidecar index; geospatial workflows use LAS and its compressed cousin LAZ; general 3D tooling uses PCD and PLY. Whatever the container, the metadata that must ride along is the sensor pose, the coordinate frame, and the per-point time offset, because a sweep is not instantaneous and the vehicle moved while it scanned. The models that consume these sets, and the reason their architectures must be permutation-invariant, are the subject of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>.</p>
+
+    <h2>Self-describing or worthless</h2>
+    <p>Across all four shapes, one property separates a dataset from a rumor: the file must carry enough metadata to reconstruct physical meaning without external knowledge. The minimum viable descriptor is the tuple in the code below, and its absence is the single most common way sensor data arrives broken. A bare <code>float32</code> array cannot be interpreted without its <em>dtype and endianness</em> (is that little-endian float or big-endian int?), its <em>sample rate and start time</em> (or the time axis is unknowable), its <em>units and scale</em> (millivolts or volts, raw ADC counts or calibrated), its <em>device and session identity</em> (or you cannot later build the device-disjoint splits that <a class="cross-ref" href="section-5.4.html">Section 5.4</a> requires), and its <em>timezone or an unambiguous epoch</em> (or midnight is a coin flip). Listing 5.1.1 writes a waveform to Parquet with exactly this descriptor attached as schema metadata, then reads it back and reconstructs the time axis from \(f_s\) and \(t_0\) alone.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np, pyarrow as pa, pyarrow.parquet as pq
+
+fs, t0 = 25600.0, 1_726_000_000.0          # Hz, and a UTC epoch second
+sig = np.random.randn(256_000).astype(np.float32)   # ~10 s of vibration
+
+# Attach the self-describing descriptor as column-schema metadata.
+table = pa.table({"accel_axial": sig})
+table = table.replace_schema_metadata({
+    b"sample_rate_hz": b"25600.0",
+    b"start_epoch_utc": b"1726000000.0",
+    b"units": b"m/s^2",
+    b"device_id": b"turbine-044-gearbox",
+    b"session_id": b"2026-07-14T09:00Z",
+})
+pq.write_table(table, "vib.parquet", compression="zstd")
+
+# A reader anywhere reconstructs the time axis with no side channel.
+back = pq.read_table("vib.parquet")
+meta = back.schema.metadata
+fs_r = float(meta[b"sample_rate_hz"])
+n    = back.num_rows
+t    = float(meta[b"start_epoch_utc"]) + np.arange(n) / fs_r   # implicit, exact</code></pre>
+    <div class="code-caption"><strong>Listing 5.1.1.</strong> A waveform stored so that any reader can recover its physical meaning. The signal is one contiguous column; the sample rate, epoch, units, and device and session identity travel with it as schema metadata. The time axis is <em>reconstructed</em> from \(f_s\) and \(t_0\), never stored per sample, which keeps the file small and the axis exact.</div>
+
+    <p>As Listing 5.1.1 shows, carrying <code>device_id</code> and <code>session_id</code> is not bookkeeping pedantry. Those fields are the hooks that make leakage-safe splitting possible at all; drop them at ingestion and no downstream care can recover a device-disjoint test set, which is why <a class="cross-ref" href="section-5.3.html">Section 5.3</a> treats missing provenance as a first-class dataset defect.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Rolling your own self-describing binary format (a header struct, a magic number, an offset index, per-column compression, endianness handling, and a reader that streams chunks) is a few hundred lines and a rich source of subtle bugs at the block boundaries. A mature columnar library collapses the whole thing to a single call:</p>
+        <pre class="language-python"><code class="language-python">import pandas as pd
+df.to_parquet("telemetry.parquet", compression="zstd")   # schema, stats,
+                                                          # chunking, all handled
+cols = pd.read_parquet("telemetry.parquet", columns=["rpm", "oil_temp"])</code></pre>
+        <div class="code-caption"><strong>Listing 5.1.2.</strong> The same job as a hand-rolled columnar writer plus reader, in two lines. Parquet handles per-column compression, block statistics for predicate pushdown, and selective column reads.</div>
+        <p>Listing 5.1.2 replaces roughly 300 lines of format engineering with 2, and hands you column statistics and predicate pushdown for free. What the library will not do is decide <em>which</em> shape your data is or <em>what</em> metadata it deserves; that judgment stays yours.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a dataset you have on hand (or download one accelerometer HAR recording). Classify each of its streams into one of the four shapes in Table 5.1.1, and for each, write down the storage layout it deserves and the minimum self-describing descriptor it needs. Then find one stream that is currently stored in a mismatched format (a waveform in CSV, or telemetry in row-major JSON) and estimate the size reduction from re-encoding it correctly. Keep the descriptors; you will attach them to windows in the next section.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is storing a per-sample timestamp column for a uniformly sampled waveform both wasteful and dangerous?</p>
+        <p class="quiz-question">2. Give two concrete reasons columnar storage beats row-major storage for wide, multi-channel telemetry.</p>
+        <p class="quiz-question">3. A point cloud and a telemetry table are both "sensor data." Name the two structural properties of a point cloud that forbid storing it as a fixed-width rectangular table.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-5.2.html">Section 5.2</a>, we take these correctly-stored streams and carve them into the windows a model actually trains on: how long a window should be, how much they overlap, and how a label gets attached to a slice of time without smearing across boundaries. The self-describing descriptors you built here are exactly what make that windowing reproducible instead of a pile of magic numbers.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

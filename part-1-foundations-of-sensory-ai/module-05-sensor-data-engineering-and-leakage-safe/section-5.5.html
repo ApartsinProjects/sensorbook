@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.5: Normalization and per-device calibration. Building Sensory AI." name="description"/>
+<title>Section 5.5: Normalization and per-device calibration | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Normalization and per-device calibration</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Two sensors reading the same world will still disagree. Normalization is how you argue them into a common language without whispering the test answers on the way."</p><cite>A Diplomatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Raw sensor numbers are almost never comparable across channels, across devices, or across days. An accelerometer axis with a small mounting offset, a gas sensor whose baseline drifts as it ages, a thermal camera that reads two degrees warm from the factory: each carries a private bias and a private scale that has nothing to do with the phenomenon you care about. Normalization rescales signals into a common range so a model can learn structure instead of memorizing units, and per-device calibration removes the sensor-specific distortion so that "the same input" produces "the same number" everywhere in your fleet. Done right, these two steps are the difference between a model that transfers to a new device and one that silently fails on it. Done wrong, they are one of the most common leakage vectors in the field, quietly inflating your test scores by letting statistics from the future leak into the past.</p>
+</div>
+
+<p>This section assumes you understand sensor bias, gain, and drift as physical quantities, developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and the leakage-safe split boundaries (device, user, site) from <a class="cross-ref" href="section-5.4.html">Section 5.4</a>. Here we take windowed, split data and ask how to scale and calibrate it so that a model trained on one set of devices behaves on another. We deliberately treat model-output calibration (making predicted probabilities match observed frequencies) as a separate topic, covered in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>; the word "calibration" here means the hardware sense.</p>
+
+<h2>Why raw units mislead a model</h2>
+
+<p><strong>What.</strong> Most sensor channels arrive in physical or raw-count units that mix three things: the signal, a per-device offset, and a per-device scale. A single reading can be modeled as \(x = g\,(s + b) + \varepsilon\), where \(s\) is the true stimulus, \(b\) is a bias, \(g\) is a gain, and \(\varepsilon\) is noise. <strong>Why it matters.</strong> Gradient-based models converge poorly when channels span wildly different magnitudes: an accelerometer in \(\pm 20\ \text{m/s}^2\) and a barometer in \(\sim 10^5\ \text{Pa}\) fed into the same network will let the barometer dominate every dot product until the optimizer painfully rescales its own weights. Worse, if \(b\) and \(g\) differ per device, a model that learned "class A sits near value 3.1" on the training devices will be wrong on a test device whose baseline sits at 3.4. <strong>How.</strong> Normalization fixes the magnitude problem; calibration fixes the per-device offset-and-gain problem. They are related but not the same operation, and conflating them is where subtle bugs live.</p>
+
+<h2>Normalization schemes and where the statistics come from</h2>
+
+<p><strong>What.</strong> The workhorses are per-channel z-score (subtract mean, divide by standard deviation), min-max (rescale to \([0,1]\)), and robust scaling (subtract median, divide by interquartile range). For a channel \(c\), z-scoring is</p>
+$$ \tilde{x}_{c} = \frac{x_{c} - \mu_{c}}{\sigma_{c}}, $$
+<p>where \(\mu_c\) and \(\sigma_c\) are estimated statistics. <strong>When to prefer which.</strong> Use z-score as the default for roughly symmetric signals; use robust scaling when outliers and spikes are common (vibration, EMG bursts), because a single clipping event can wreck a standard deviation; use min-max only when a signal has hard physical bounds and you truly want to preserve them. <strong>How, and the part everyone gets wrong.</strong> The statistics \(\mu_c, \sigma_c\) are learned parameters of your pipeline, so they must be estimated on the training split alone and then applied unchanged to validation and test. Estimating them over the full dataset lets the test set's mean and variance leak backward into training, which is exactly the failure <a class="cross-ref" href="section-5.3.html">Section 5.3</a> warns against.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A normalizer is a model. It has parameters (\(\mu\), \(\sigma\), min, max) that you <em>fit</em>, and fitting on data you later evaluate on is leakage, plain and simple. The tell-tale symptom is a small but stubborn gap: your leakage-free pipeline scores a point or two lower than the "fit-on-everything" version, and the difference is precisely the free information you leaked. The discipline is one sentence: <em>fit the scaler inside the training fold, freeze it, transform everything else.</em> In cross-validation this means re-fitting the scaler on each fold's training portion, never once over the whole array.</p>
+</div>
+
+<h2>Per-device calibration: making devices speak the same units</h2>
+
+<p><strong>What.</strong> Calibration removes the sensor-specific transfer function so that a known input maps to a known output on every unit. The classic two-point linear calibration solves for gain and offset from two reference stimuli \(s_1, s_2\) with measured responses \(x_1, x_2\): \(g = (x_2 - x_1)/(s_2 - s_1)\) and \(b = x_1 - g\,s_1\), then recovers \(\hat{s} = (x - b)/g\). <strong>Why it is separate from normalization.</strong> Normalization uses statistics of your data; calibration uses references from the physical world (a level surface for an IMU, ice and boiling water for a thermistor, a zero-gas purge for a chemical sensor). Calibration can be done per device with no labels at all, which is powerful, because it attacks device shift at its source rather than hoping the model averages it out. <strong>When you lack references.</strong> If you cannot bench-calibrate, per-device normalization is the pragmatic stand-in: compute each device's own baseline statistics (from a resting period, or a rolling window) and normalize each device by its own numbers. This does not need the true \(g, b\), only that each device is made internally consistent.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an air-quality fleet that aged out of its own model</h3>
+<p>A city deployed a few hundred low-cost electrochemical NO\(_2\) sensors on lampposts. The first model, trained on three months of data referenced against a regulatory-grade station, performed beautifully in validation. Six months later, accuracy had collapsed on half the fleet. The cause was baseline drift: each electrochemical cell's zero-offset creeps as the electrolyte ages, at a rate unique to each unit. The single global normalizer, fit once at deployment, had frozen a baseline that every sensor had since wandered away from. The fix was a per-device rolling baseline: each unit subtracts its own recent low-percentile reading (its estimated zero) before normalization, so the model sees drift-corrected concentrations regardless of a cell's age. Accuracy recovered without retraining. The lesson: when the offset is per-device and time-varying, the correction must be per-device and time-varying too, and this is squarely a distribution-shift problem of the kind <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> treats in depth.</p>
+</div>
+
+<h2>Instance normalization and the shift it defends against</h2>
+
+<p><strong>What.</strong> Instead of (or in addition to) a fixed dataset scaler, you can normalize each window by its own statistics at inference time: subtract the window mean and divide by its standard deviation per channel. This is instance normalization, and its reversible form (normalize the input, then add the statistics back to the output) is known in the forecasting literature as reversible instance normalization. <strong>Why.</strong> It removes slow per-window offset and scale shifts that a global scaler cannot track, which is exactly the drift that breaks cross-device and cross-day generalization. <strong>When.</strong> Prefer instance normalization when the absolute level carries little class information and the shape does the work (activity recognition, many fault-detection tasks); avoid it when the absolute level <em>is</em> the signal (a barometer for altitude, a thermometer for fever), because you would normalize away the very thing you want to predict. This is the same augmentation-and-normalization design space that <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> revisits for deep models.</p>
+
+<p>The code below shows the leakage-safe pattern end to end: fit a per-channel scaler on the training devices only, then apply a per-device baseline correction that each device computes from its own resting statistics. Note that nothing about the validation devices touches the fitted scaler's parameters.</p>
+
+<pre><code class="language-python">import numpy as np
+
+class LeakageSafeScaler:
+    """Per-channel z-score fit on TRAIN groups only, plus per-device debias."""
+    def fit(self, X_train):                    # X_train: (N, L, C) train windows
+        flat = X_train.reshape(-1, X_train.shape[-1])
+        self.mu = flat.mean(0)                  # (C,) learned on train ONLY
+        self.sigma = flat.std(0) + 1e-8
+        return self
+
+    def transform(self, X, device_baseline=None):
+        Xc = X.astype(np.float64)
+        if device_baseline is not None:         # per-device offset removal
+            Xc = Xc - device_baseline           # (C,) this device's own zero
+        return (Xc - self.mu) / self.sigma
+
+# Fit on training devices, freeze, then transform each device by ITS baseline.
+scaler = LeakageSafeScaler().fit(X_train)       # never sees val/test devices
+base_val = X_val_rest.mean((0, 1))              # this device's resting mean (C,)
+X_val_norm = scaler.transform(X_val, device_baseline=base_val)
+print(X_train.shape[-1], "channels; scaler frozen on train")
+</code></pre>
+<div class="code-caption">Leakage-safe normalization with per-device debiasing. The scaler's \(\mu, \sigma\) are estimated on training devices only and frozen; each held-out device supplies its own <code>device_baseline</code> from a resting period, so per-device offset is removed without leaking any test-set statistics into the fitted parameters.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let a pipeline object enforce the fit/transform boundary</h3>
+<p>Hand-rolling fold-safe scaling, remembering to fit only on training rows, and threading frozen statistics through cross-validation is roughly 30 to 50 lines of error-prone bookkeeping, and the errors are invisible (they only show up as inflated scores). <code>sklearn</code>'s <code>StandardScaler</code> or <code>RobustScaler</code> wrapped in a <code>Pipeline</code> and driven by <code>cross_val_score</code> with a grouped splitter collapses this to about 3 lines and makes leakage structurally hard: the pipeline re-fits the scaler inside each fold automatically. You still decide the scheme and the group key; the library guarantees the scaler never sees the fold it is scoring.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a multi-device IMU dataset with device-disjoint train/test splits from <a class="cross-ref" href="section-5.4.html">Section 5.4</a>. (a) Train a small classifier twice: once with a scaler fit on the full dataset, once with a scaler fit on the training devices only. Report the test-accuracy gap and explain which number is honest. (b) Add a synthetic per-device offset of \(0.3\ \text{m/s}^2\) to one held-out device and measure the accuracy drop. (c) Apply per-device baseline debiasing and show it recovers most of the loss. Relate your findings to the bias term \(b\) in the measurement model from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is fitting a <code>StandardScaler</code> on your entire dataset before splitting a form of leakage, and roughly what does it do to your reported test score?</li>
+<li>Give one sensing task where instance (per-window) normalization would destroy the label, and explain why.</li>
+<li>Your fleet's sensors drift at different rates over months. Why can a single global normalizer fit at deployment not fix this, and what per-device correction can?</li>
+</ol>
+</div>
+
+<p>Normalization and calibration are the last preprocessing step before modeling and the one most likely to quietly corrupt an otherwise careful pipeline. Treat the scaler as a fitted model with a strict train-only fitting rule, keep hardware calibration distinct from data-statistics normalization, and push per-device corrections down to the device when its bias is private and time-varying. These habits are what let a model cross the gap from the devices it trained on to the ones it will actually run on.</p>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-5.6.html">Section 5.6</a>, we turn from the signal side to the label side: annotation quality, weak and noisy labels, and the label delay that shifts your ground truth in time. We will see why a perfectly normalized dataset with sloppy labels still trains a sloppy model, and how to reason about label noise as its own source of error.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

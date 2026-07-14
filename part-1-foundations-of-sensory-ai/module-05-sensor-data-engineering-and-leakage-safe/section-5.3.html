@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.3: Leakage in sensor datasets (the field's most common error). Building Sensory AI." name="description"/>
+<title>Section 5.3: Leakage in sensor datasets (the field's most common error) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Leakage in sensor datasets (the field's most common error)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The model did not learn the task. It learned who was holding the sensor, and I paid it a 99% accuracy for the trouble."</p><cite>A Chastened AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Data leakage is the single most common and most expensive error in applied sensory AI. It happens whenever information that will not be available at prediction time, or that belongs to the test set, sneaks into training and inflates your reported accuracy. On sensor data the leak is especially insidious because streams are continuous, highly autocorrelated, and tagged by identity: the same subject, device, or session appears in thousands of near-identical windows. A careless split scatters those windows across train and test, and the model quietly learns to recognize the <em>source</em> rather than the <em>phenomenon</em>. The result is a benchmark number that looks publishable and a deployed system that fails on the first new user or new machine. This section names the ways leakage enters a sensor dataset, shows why the inflated number is fiction, and gives you the diagnostic reflexes to catch it. The cures (entity-aware splits, per-device normalization) get their own sections; here we learn to see the disease.</p>
+</div>
+
+<p>This section builds directly on <a class="cross-ref" href="section-5.2.html">Section 5.2</a>, where we cut streams into overlapping windows, and it assumes you understand autocorrelation and the sampling model from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. It also foreshadows <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, which turns these ideas into full evaluation protocols. We stay out of the mechanics of building splits (that is <a class="cross-ref" href="section-5.4.html">Section 5.4</a>) and of normalization (<a class="cross-ref" href="section-5.5.html">Section 5.5</a>); our job is to define leakage precisely and make it visible.</p>
+
+<h2>What leakage is, formally</h2>
+
+<p><strong>What.</strong> Let a model be trained on \(\mathcal{D}_{\text{train}}\) and evaluated on \(\mathcal{D}_{\text{test}}\). Leakage is any dependency that makes the test estimate of generalization error optimistically biased: the measured performance overstates what the model will achieve on genuinely unseen data drawn from the deployment distribution. <strong>Why it matters.</strong> The entire point of a held-out test set is to be a stand-in for the future. If the test set shares information with training that the future will not share, the stand-in lies, and every decision that rests on it (model selection, go/no-go, a regulatory claim) rests on fiction. <strong>How it shows up.</strong> Formally, an honest evaluation requires that the train and test examples be independent given the label, so that</p>
+$$ \mathbb{E}\big[\,\hat{L}(\mathcal{D}_{\text{test}})\,\big] = L_{\text{deploy}}. $$
+<p>Leakage breaks the independence: some latent variable \(z\) (a subject's physiology, a device's calibration offset, a moment in time) is shared across the split, so the model can exploit \(z\) to answer test queries it should not be able to answer. On tabular data this independence is often easy to arrange. On sensor data it is the default that it is violated, which is why leakage is endemic here specifically.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Sensor leakage is almost always <em>identity leakage in disguise</em>. A raw waveform carries a fingerprint of everything that produced it: the wearer's gait idiosyncrasies, the accelerometer's fixed bias, the room's electrical hum, the exact minute a machine was recorded. These nuisance variables are far easier to memorize than the target concept, and they correlate with the label inside a recording. So whenever the same identity straddles the train/test boundary, gradient descent takes the shortcut: it learns the fingerprint. The tell is a spectacular in-distribution score that collapses the moment a new subject, device, or site arrives. If your accuracy is suspiciously high, suspect that the model found an identity it was allowed to see on both sides.</p>
+</div>
+
+<h2>A field guide to the leaks</h2>
+
+<p>Leakage in sensor pipelines is not one bug but a family. Learn to recognize each by where it enters.</p>
+
+<ul>
+<li><strong>Overlapping-window leakage.</strong> Adjacent windows from a sliding stride share raw samples (<a class="cross-ref" href="section-5.2.html">Section 5.2</a>). Split the windows at random and near-duplicate neighbors land on opposite sides; the test window is a lightly shifted copy of a training window. This alone can add tens of points of phantom accuracy.</li>
+<li><strong>Subject / entity leakage.</strong> The same person, patient, vehicle, or machine appears in both train and test. The model recognizes the entity's signature and rides its label correlation. This is the dominant leak in human activity recognition, biosignals, and predictive maintenance.</li>
+<li><strong>Temporal leakage.</strong> Training on data recorded <em>after</em> the test period, or shuffling a non-stationary stream so the future informs the past. Any deployed system only ever sees the past, so a random shuffle over time is a lie about causality.</li>
+<li><strong>Preprocessing leakage.</strong> Computing normalization statistics, PCA bases, resampling filters, or feature scalers on the <em>full</em> dataset before splitting, so test-set statistics flow into the training transform. Subtle, common, and fully preventable by fitting transforms on train only (<a class="cross-ref" href="section-5.5.html">Section 5.5</a>).</li>
+<li><strong>Target / feature leakage.</strong> A feature encodes the label by construction: a maintenance log field that is only populated after a failure, a filename that contains the class, a sensor that was added specifically because a fault was already known. The model reads the answer off the input.</li>
+</ul>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the human activity recognizer that could not meet a stranger</h3>
+<p>A wearables team trained a 6-axis IMU activity classifier on 30 volunteers and reported 96% accuracy on a random 80/20 window split. Shipped to a pilot cohort, field accuracy fell to the low 70s. The autopsy found two stacked leaks. First, windows were cut with 90% overlap and split at random, so most test windows had an almost-identical twin in training. Second, and worse, every one of the 30 subjects appeared in both partitions, so the network had learned each volunteer's personal gait fingerprint and used it as a shortcut to their most-frequent activity. When a genuinely new wearer arrived, both crutches vanished at once. Re-evaluated with a subject-disjoint split (<a class="cross-ref" href="section-5.4.html">Section 5.4</a>), the same architecture scored 74%, matching the field. The model had never been that good; the 96% was the measurement, not the model.</p>
+</div>
+
+<h2>Seeing the leak: the accuracy gap</h2>
+
+<p><strong>How to detect it.</strong> The most reliable diagnostic is a controlled comparison: evaluate the identical model and features under a naive random split and under an entity-disjoint split, and read the gap. A large drop is the leakage magnitude. The code below builds a tiny synthetic dataset where each subject has a strong personal offset that is predictive within a subject but useless across subjects, then measures both numbers.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+
+rng = np.random.default_rng(0)
+n_subj, per_subj = 20, 200
+# Each subject gets a private fingerprint offset; the TRUE label depends
+# only on a within-window feature, not on the offset.
+subj = np.repeat(np.arange(n_subj), per_subj)
+fingerprint = rng.normal(0, 3, n_subj)[subj]          # identity nuisance
+signal = rng.normal(0, 1, len(subj))                  # the real, learnable cue
+y = (signal > 0).astype(int)
+X = np.c_[signal + fingerprint, fingerprint + rng.normal(0, .1, len(subj))]
+
+# (1) Naive random split: subjects appear on both sides -> leakage
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=.3, random_state=0)
+leaky = RandomForestClassifier(random_state=0).fit(Xtr, ytr).score(Xte, yte)
+
+# (2) Subject-disjoint split: no subject crosses the boundary
+gtr, gte = next(GroupShuffleSplit(test_size=.3, random_state=0).split(X, y, subj))
+honest = RandomForestClassifier(random_state=0).fit(X[gtr], y[gtr]).score(X[gte], y[gte])
+
+print(f"random split:  {leaky:.3f}")   # optimistic, leaks identity
+print(f"group split:   {honest:.3f}")  # what deployment actually sees
+</code></pre>
+<div class="code-caption">A minimal leakage demonstration. The random split lets the classifier lean on each subject's fingerprint offset and reports an inflated score; the <code>GroupShuffleSplit</code> keeps every subject on one side, so the reported number reflects the only genuinely generalizable cue. The gap between the two lines is the leakage, and it is manufactured entirely by the split, not the model.</div>
+
+<p>Run it and the random-split score sits well above the group-split score, purely because the first evaluation let the forest read the identity offset it also saw in training. The group split forces the model to rely on <code>signal</code>, the only cue that transfers to a new subject. That gap is the number leakage costs you, quantified in one experiment. Beyond this comparison, three cheap reflexes catch most leaks: shuffle-test a suspiciously strong feature (if performance survives label shuffling, it is leaking), inspect what the model attends to (identity artifacts light up), and always ask whether each feature would be knowable at prediction time in production.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Watch Out: a passing test set is not a leak-free test set</h3>
+<p>Leakage does not announce itself with an error; it announces itself with a <em>good</em> number, which is exactly why it survives review. Cross-validation does not save you if the folds are drawn at random over correlated windows, because every fold inherits the same identity leak. Nested cross-validation, more data, and a bigger model all leave the bias untouched or make it worse. The only fix is structural: decide what entity must not cross the split (subject, device, site, session, machine), and enforce that boundary before a single number is computed. Treat any headline accuracy without a stated split policy as unverified.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: group-aware splitting in one call</h3>
+<p>Writing a correct entity-disjoint split by hand (grouping windows by subject, ensuring no group straddles the boundary, keeping class balance across sides, and repeating for cross-validation folds) is roughly 30 to 50 lines of careful, easy-to-botch bookkeeping. scikit-learn's <code>GroupShuffleSplit</code>, <code>GroupKFold</code>, and <code>StratifiedGroupKFold</code> reduce it to a single constructor plus a <code>groups=</code> argument, as shown above, and they guarantee the invariant that no group appears on both sides. You still must supply the right grouping key; the library only enforces the boundary you name. Section 5.4 covers choosing that key.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take any public human activity recognition set (for example one with per-subject IDs and 50 Hz IMU). (a) Window it with 50% overlap and train a simple classifier under a random 80/20 window split; record accuracy. (b) Re-split so no subject appears in both train and test, retrain, and record accuracy. (c) Now add a second leak on purpose: fit a global z-score normalizer on the whole dataset before splitting, and measure how much it lifts the random-split number. Report all three gaps in one table and write two sentences explaining which leak each column isolates. Cross-check your normalization reasoning against <a class="cross-ref" href="section-5.5.html">Section 5.5</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Your model scores 0.98 under 5-fold cross-validation but 0.71 on a new site. Name the two most likely leaks and the one experiment that would distinguish them.</li>
+<li>Why does computing normalization statistics before the train/test split leak information, even though normalization never touches the labels?</li>
+<li>A colleague shuffles a year-long non-stationary sensor stream and reports strong cross-validation results. What kind of leakage is this, and why is the number meaningless for a deployed forecaster?</li>
+</ol>
+</div>
+
+<p>Leakage is not an exotic failure; it is the default outcome of treating an autocorrelated, identity-tagged sensor stream like a bag of independent rows. The habit that protects you is to name, before any model runs, the entity that must never cross the split and the moment in time that separates past from future, then to enforce both mechanically. Do that and your test set goes back to doing its one job: telling you the truth. The same discipline reappears everywhere models are evaluated in this book, from <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-28-biosignal-foundations/index.html">patient-level biosignal splits</a> to leakage-safe benchmarking in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-5.4.html">Section 5.4</a>, we turn the diagnosis into a cure: how to construct device, user, site, session, and machine splits that hold the leakage boundary you identified here. We will see when each grouping key is the right one, how to keep class balance across disjoint groups, and how to layer grouping with time-based splits so both identity and causality are respected at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

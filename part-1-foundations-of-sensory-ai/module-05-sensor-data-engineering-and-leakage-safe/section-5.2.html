@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.2: Window construction and labeling. Building Sensory AI." name="description"/>
+<title>Section 5.2: Window construction and labeling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Window construction and labeling</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A sensor stream has no rows. You invent them, and then you spend the rest of the project living with the ones you chose."</p><cite>A Pragmatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Almost every model you will build in this book expects fixed-shape inputs: a tensor of \(L\) timesteps by \(C\) channels. But real sensors deliver an unending stream of samples with no natural row boundaries. Windowing is the act of cutting that stream into training examples, and labeling is the act of deciding what each cut means. These two choices are quietly the most consequential decisions in a sensor project. They set your effective sample size, your class balance, your latency budget, and (as the next section will show) whether your test accuracy is real or an illusion. Get windowing wrong and no amount of model tuning recovers it.</p>
+</div>
+
+<p>This section assumes you are comfortable with sampling rate, the sampling interval \(\Delta t = 1/f_s\), and timestamp alignment across channels, all covered in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Here we take a synchronized, uniformly sampled multichannel stream as the input and turn it into a labeled dataset that a model can consume. We stay deliberately out of the way of <a class="cross-ref" href="section-5.3.html">Section 5.3</a> (leakage) and <a class="cross-ref" href="section-5.4.html">Section 5.4</a> (splits); windowing decisions cause most leakage, so we flag the trap here and treat the cure there.</p>
+
+<h2>Why we cut streams into windows</h2>
+
+<p><strong>What.</strong> A window is a contiguous slice of the stream, \(x_{t:t+L}\), of fixed length \(L\) samples, treated as one example. <strong>Why.</strong> Three forces demand it. Models with fixed input tensors (CNNs, most transformers, classical feature extractors) need a fixed \(L\). Labels usually apply to spans of time, not to individual samples: "walking" is a property of a two-second stretch, not of one accelerometer reading. And decisions are made on a cadence: a fall detector must emit a verdict every fraction of a second, so it must consume the stream in bites of roughly that size.</p>
+
+<p><strong>How.</strong> You choose three numbers. The <em>window length</em> \(L\) (how much context each example holds), the <em>stride</em> or hop \(S\) (how far you advance between consecutive windows), and the <em>windowing policy</em> (fixed-rate sliding, non-overlapping tumbling, or event-triggered). The overlap fraction follows as \(1 - S/L\). When \(S = L\) the windows tile the stream with no overlap (tumbling); when \(S < L\) they overlap; when \(S > L\) you drop samples between windows.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Overlap is a data-augmentation knob and a leakage hazard wearing the same coat. Setting \(S \ll L\) multiplies your window count and smooths class boundaries, which flatters training. But two overlapping windows share raw samples, so if one lands in train and its neighbor in test, the model has effectively seen the answer. The rule that saves you: <em>choose overlap for the training signal you want, then split along time or entity boundaries so overlapping windows never straddle the split.</em> The augmentation is legitimate; the leakage is not, and the two are separable.</p>
+</div>
+
+<h2>Choosing window length and stride</h2>
+
+<p><strong>What drives \(L\).</strong> The window must be long enough to contain the phenomenon and short enough to stay homogeneous. Match it to the physical timescale of the signal: at least one full cycle of the slowest relevant component, and ideally a few. A human gait cycle is roughly 1 second, so 2 to 3 second windows are standard for activity recognition. A cardiac cycle is under a second; ECG beat classifiers often window a single beat plus margin. A bearing-fault signature repeats at the shaft rotation frequency, so the window must span several revolutions to resolve it (a theme picked up in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>).</p>
+
+<p><strong>When to go short vs long.</strong> Short windows react faster (lower detection latency) and stay purer (one label per window), but starve the model of context and inflate variance. Long windows are information-rich and stable but slow to react and prone to mixing two activities in one example. There is a genuine tradeoff between latency and context, and it is a design decision, not a default. <strong>What drives \(S\).</strong> Stride sets your deployment cadence and your dataset size. In production the model re-runs every \(S\) samples, so \(S\) is a latency and compute budget. In training you may use a smaller stride to harvest more (correlated) windows.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a wrist wearable that keeps missing the first few seconds</h3>
+<p>A team building a smartwatch activity classifier picked 10-second windows because longer context lifted validation F1. In the field, users complained the watch was slow to notice they had started running. The cause was structural: with a 10-second tumbling window, the model could not commit to "running" until a full 10 seconds of running had accumulated and closed a window, so the median detection delay approached 10 seconds. The fix was not a better model but a windowing change: keep the 10-second context but slide it with a 1-second stride, so a fresh verdict lands every second on a mostly-running window. Same \(L\), smaller \(S\), latency dropped roughly tenfold. The lesson: \(L\) buys accuracy, \(S\) buys responsiveness, and you tune them separately.</p>
+</div>
+
+<h2>Assigning labels to windows</h2>
+
+<p>Once a window is cut, what is its label? This is trivial only when the entire stream carries one class. In practice a window can span a label boundary, and you need an explicit policy. The common ones:</p>
+
+<ul>
+<li><strong>Majority / mode.</strong> Assign the label held by the plurality of samples in the window. Simple, robust, but blurs transitions and can invent a label the user never actually held for the full window.</li>
+<li><strong>Center (or last) sample.</strong> Take the label at the window's midpoint or trailing edge. The trailing edge matches causal deployment, where you only know the past; the center is better for offline analysis.</li>
+<li><strong>Purity threshold.</strong> Keep the window only if one label covers at least a fraction \(\tau\) (say 80%) of it; otherwise discard it as a transition window. This trades sample count for label cleanliness.</li>
+<li><strong>Dense / per-timestep.</strong> Do not collapse at all. Keep a label per sample and train a sequence-labeling model (segmentation). Richest, but demands per-sample annotations, which are expensive (see <a class="cross-ref" href="section-5.6.html">Section 5.6</a>).</li>
+</ul>
+
+<p>Formally, majority labeling of the window starting at \(t\) is</p>
+$$ y_t = \arg\max_{c}\ \sum_{i=t}^{t+L-1} \mathbb{1}[\,\ell_i = c\,], $$
+<p>where \(\ell_i\) is the per-sample annotation. Transition windows, where no class dominates, are exactly the ones this rule labels least reliably, which is why a purity threshold is often layered on top.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Watch Out: label delay and edge effects</h3>
+<p>Two subtle biases live at window edges. First, if annotations were recorded with a lag (a rater pressed a button a beat after the event began), your label boundaries are shifted, and short windows near transitions inherit the wrong class. Second, causal (trailing-edge) labeling means the window is labeled by its end, so an event only becomes visible once it has filled enough of the window to survive your policy. Budget for this delay explicitly rather than discovering it in the field, as the wearable team above did.</p>
+</div>
+
+<h2>From stream to array: the mechanics</h2>
+
+<p>Concretely, windowing a synchronized array is a strided view plus a label reduction. The code below turns a \((T, C)\) stream and a length-\(T\) label vector into \((N, L, C)\) windows with majority labels, using NumPy's zero-copy sliding-window view so you are not materializing \(N\) copies of overlapping data.</p>
+
+<pre><code class="language-python">import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy import stats
+
+def windowize(x, labels, L, S):
+    """x: (T, C) stream; labels: (T,) per-sample labels.
+    Returns windows (N, L, C) and majority label per window (N,)."""
+    # sliding_window_view gives (T-L+1, C, L) views with stride 1...
+    views = sliding_window_view(x, window_shape=L, axis=0)  # (T-L+1, C, L)
+    views = views.transpose(0, 2, 1)                        # (T-L+1, L, C)
+    starts = np.arange(0, len(views), S)                    # apply the hop
+    windows = views[starts]                                 # (N, L, C)
+
+    lbl_views = sliding_window_view(labels, L)[starts]      # (N, L)
+    y = stats.mode(lbl_views, axis=1, keepdims=False).mode  # majority vote
+    return windows, y
+
+# 3 s windows, 1 s hop on a 50 Hz stream: L=150, S=50
+X = np.random.randn(10_000, 6)              # 200 s of 6-axis IMU at 50 Hz
+lab = np.repeat([0, 1, 2, 1], 2500)         # 4 activity blocks
+W, y = windowize(X, lab, L=150, S=50)
+print(W.shape, y.shape)                     # (197, 150, 6) (197,)
+</code></pre>
+<div class="code-caption">Zero-copy sliding-window construction with majority labeling. <code>sliding_window_view</code> avoids copying overlapping samples until you index <code>starts</code>, so memory stays flat even at heavy overlap; the <code>stats.mode</code> reduction implements the majority policy from the previous section.</div>
+
+<p>The snippet above is deliberately explicit so the mechanics are visible: strided view, hop selection, label reduction. In a real pipeline you rarely write it by hand.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let a windowing library carry the bookkeeping</h3>
+<p>Purity thresholds, per-window timestamps, dropping partial trailing windows, and grouping by recording so windows never cross session boundaries add up to roughly 40 to 60 lines of fiddly, bug-prone code. Libraries such as <code>tsfresh</code>'s roll utilities, <code>sktime</code>'s sliding-window transformers, or a few lines of pandas <code>DataFrame.rolling</code> plus <code>groupby</code> collapse that to about 3 to 5 lines and, critically, keep windows inside their group so you do not accidentally splice two devices together. You still choose \(L\), \(S\), and the label policy; the library just stops the off-by-one and cross-boundary bugs.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a labeled 50 Hz IMU recording with four activity blocks. (a) Window it at \(L = 150\) with strides \(S \in \{150, 75, 15\}\) and report how many windows each produces and what fraction are "transition" windows (no label covering 80%). (b) Add a purity filter at \(\tau = 0.8\) and recount. (c) Explain in two sentences why the \(S = 15\) dataset will make a random train/test split look far more accurate than it truly is, and how you would split instead. Verify your reasoning against <a class="cross-ref" href="section-5.3.html">Section 5.3</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>You need a fall detector to respond within 0.5 s but a fall signature spans 2 s. Which knob do you change, \(L\) or \(S\), and why can you not simply shrink \(L\) to 0.5 s?</li>
+<li>Your dataset has 90% overlap between adjacent windows. Name one training benefit and one evaluation danger of that choice.</li>
+<li>Under trailing-edge (causal) labeling, why does a freshly started activity take a while to appear in the labels even with a small stride?</li>
+</ol>
+</div>
+
+<p>Windowing and labeling turn a formless stream into rows you can model, evaluate, and split. Because those rows are the atoms of everything downstream, from feature extraction to <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">human activity recognition</a> to leakage-safe benchmarking in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, the choices here propagate through the whole project. Decide them on purpose, write them down, and version them with the pipeline.</p>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-5.3.html">Section 5.3</a>, we confront the field's most common and most expensive error: leakage. We will see exactly how overlapping windows, shared subjects, and normalization computed on the full dataset let information from the test set bleed into training, why the resulting accuracy numbers are fiction, and the concrete disciplines that keep your evaluation honest.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

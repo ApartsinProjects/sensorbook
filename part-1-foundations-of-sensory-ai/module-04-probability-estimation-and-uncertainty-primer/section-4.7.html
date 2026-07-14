@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.7: Monte Carlo and sampling basics. Building Sensory AI." name="description"/>
+<title>Section 4.7: Monte Carlo and sampling basics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Probability, Estimation, and Uncertainty Primer</a></div>
+<h1>Monte Carlo and sampling basics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"When I cannot solve the integral, I ask ten thousand dice to vote on the answer, and I trust the average of their opinions."</p><cite>A Statistically Enfranchised AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Most of the probability we care about in sensing lives inside integrals that have no closed form. What is the expected localization error when an inertial-navigation drift, a GNSS multipath term, and a magnetometer bias all interact nonlinearly? What is the probability that a wearable's heart-rate estimate exceeds a clinical alarm threshold given all the noise sources upstream? You will almost never write these answers down analytically. Monte Carlo methods replace the pen-and-paper integral with a simple, brutal, and shockingly effective idea: draw samples, run them through your model, and average. This section teaches you how to turn a distribution into random draws, how to estimate quantities from those draws, how fast the error shrinks, and how to make the whole thing efficient enough for a battery-powered device. These techniques are the engine under particle filters, Bayesian posteriors, uncertainty propagation, and the synthetic-data pipelines you will meet later in the book.</p>
+</div>
+
+<p>This section assumes you are comfortable with random variables, distributions, and expectations from <a href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, sections 4.1 through 4.3, and it uses the aleatoric-versus-epistemic distinction of section 4.4 to decide what to sample. If you have not met the noise models that produce these distributions, section 2 of <a href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> supplies them. No measure theory is required; a working knowledge of the law of large numbers is enough.</p>
+
+<h2>The Monte Carlo estimator: averaging your way to an integral</h2>
+
+<p><strong>What.</strong> Monte Carlo estimation answers the question "what is \(\mathbb{E}_{x\sim p}[f(x)]\)?" by drawing \(N\) independent samples \(x_1,\dots,x_N\) from \(p\) and computing the sample mean</p>
+
+$$\hat{\mu}_N = \frac{1}{N}\sum_{i=1}^{N} f(x_i) \;\;\approx\;\; \mathbb{E}_{x\sim p}[f(x)] = \int f(x)\,p(x)\,dx.$$
+
+<p><strong>Why it works.</strong> The estimator \(\hat{\mu}_N\) is unbiased: its expectation equals the true integral for every \(N\). By the law of large numbers it converges to the true value as \(N\) grows, and by the central limit theorem its error is approximately Gaussian with standard deviation \(\sigma/\sqrt{N}\), where \(\sigma^2 = \operatorname{Var}_p[f(x)]\). That \(\sqrt{N}\) is the single most important fact in this section. To halve your error you must quadruple your samples. The error does not care how many dimensions \(x\) has, which is why Monte Carlo beats grid-based numerical integration the moment your state vector grows past three or four dimensions. A 12-dimensional IMU-plus-bias state would need a grid of astronomical size; the same accuracy from Monte Carlo needs only enough samples to tame the variance.</p>
+
+<p><strong>How you use it.</strong> Nearly every quantity you want is an expectation in disguise. A probability \(P(A)\) is \(\mathbb{E}[\mathbb{1}_A]\), the expected value of an indicator. A quantile is found by sampling and sorting. A predictive mean is \(\mathbb{E}[f(x)]\); a predictive variance is \(\mathbb{E}[f(x)^2]-\mathbb{E}[f(x)]^2\). Choose \(f\), draw from \(p\), average.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The Monte Carlo error \(\sigma/\sqrt{N}\) is independent of dimension. This is why sampling, not quadrature, is the default tool for propagating uncertainty through the high-dimensional models of sensor fusion. The curse of dimensionality that destroys grid methods barely touches Monte Carlo; what hurts instead is high variance \(\sigma\), and most of the craft in this section is about reducing it.</p>
+</div>
+
+<h2>Turning uniform noise into any distribution</h2>
+
+<p><strong>What.</strong> Your hardware random-number generator gives you one primitive: uniform draws on \([0,1)\). Everything else is built from that primitive by transformation.</p>
+
+<p><strong>How, method one: inverse transform.</strong> If \(F\) is the cumulative distribution function of a scalar random variable and \(U\sim\text{Uniform}(0,1)\), then \(X = F^{-1}(U)\) has exactly the distribution you wanted. This is why an exponential inter-arrival time for a Poisson event stream is generated as \(-\lambda^{-1}\ln(1-U)\): the log is the inverse CDF. Inverse transform is exact and cheap whenever you can invert \(F\).</p>
+
+<p><strong>How, method two: rejection sampling.</strong> When you cannot invert \(F\) but you can evaluate an unnormalized density \(\tilde{p}(x)\), wrap it in a proposal \(q(x)\) you can sample, scaled so that \(M\,q(x)\ge\tilde{p}(x)\) everywhere. Draw \(x\sim q\), accept it with probability \(\tilde{p}(x)/(M\,q(x))\), and repeat. Accepted samples are distributed exactly as \(p\). The catch is efficiency: the acceptance rate is \(1/M\), so a loose envelope in high dimensions wastes almost every draw.</p>
+
+<p><strong>How, method three: importance sampling.</strong> Sometimes you cannot or should not draw from \(p\) at all. Instead draw from a convenient \(q\) and reweight: \(\mathbb{E}_p[f] = \mathbb{E}_q[f(x)\,w(x)]\) with weights \(w(x)=p(x)/q(x)\). This is the mathematical heart of the particle filter you will build in <a href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, where \(q\) is the motion model and the weights carry the measurement likelihood. Importance sampling shines when you deliberately over-sample a rare but critical region, such as the tail where a fall-detection alarm should fire, then correct the bias with weights.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: sizing the battery budget for a wearable ECG patch</h3>
+<p>A cardiac-patch team needs to guarantee that 99% of devices survive a 14-day monitoring window on one charge. Battery life depends on how often the on-device arrhythmia detector wakes the radio, which depends on the ectopic-beat rate, the false-alarm rate of the detector, and the temperature-dependent leakage current. No closed form links these. The team samples 50,000 virtual patients: each draws a beat rate from a fitted Gamma, a detector false-alarm rate from its validation posterior, and a leakage curve from the datasheet tolerance band, then simulates 14 days of wake events. Counting how many virtual devices die early gives the failure probability directly, with a Monte Carlo confidence interval attached. When the first estimate said 4% would fail, they raised the wake-consolidation threshold and re-ran; sampling turned an intractable reliability integral into an overnight batch job. The clinical-validation obligations that sit on top of this appear in <a href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<h2>How many samples? Error bars on your error bars</h2>
+
+<p><strong>What.</strong> A Monte Carlo estimate without an uncertainty is half an answer. Because \(\hat{\mu}_N\) is itself a random variable, you can estimate its standard error from the very same samples: \(\widehat{\text{SE}} = \hat{\sigma}/\sqrt{N}\), where \(\hat{\sigma}\) is the sample standard deviation of the \(f(x_i)\) values. Report \(\hat{\mu}_N \pm 1.96\,\widehat{\text{SE}}\) for an approximate 95% interval.</p>
+
+<p><strong>Why it matters for sensing.</strong> When you estimate a rare-event probability such as a \(10^{-4}\) false-alarm rate, naive sampling needs on the order of \(10^6\) draws just to see a handful of events, and the relative error stays enormous until you do. This is exactly where importance sampling earns its keep: bias the proposal toward the tail, and the same accuracy arrives with orders of magnitude fewer draws. The estimator that turns raw draws into an answer with a defensible interval is the code below.</p>
+
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(42)
+
+def mc_estimate(f, sampler, n, batch=100_000):
+    """Streaming Monte Carlo mean with a 95% standard-error interval.
+    Batches keep memory flat, which matters on edge hardware."""
+    total, total_sq, count = 0.0, 0.0, 0
+    while count &lt; n:
+        m = min(batch, n - count)
+        vals = f(sampler(m))          # f applied to a batch of draws
+        total    += vals.sum()
+        total_sq += (vals ** 2).sum()
+        count    += m
+    mean = total / count
+    var  = total_sq / count - mean ** 2
+    se   = np.sqrt(max(var, 0.0) / count)
+    return mean, 1.96 * se
+
+# Estimate P(||accel bias|| &gt; 0.05 g) for a 3-axis IMU with correlated bias.
+cov = np.array([[4e-4, 1e-4, 0.0],
+                [1e-4, 4e-4, 0.0],
+                [0.0,  0.0,  9e-4]])   # units of g^2
+L = np.linalg.cholesky(cov)
+sample_bias = lambda m: (L @ rng.standard_normal((3, m))).T
+exceeds = lambda b: (np.linalg.norm(b, axis=1) &gt; 0.05).astype(float)
+
+p_hat, halfwidth = mc_estimate(exceeds, sample_bias, n=2_000_000)
+print(f"P(exceed) = {p_hat:.4f} +/- {halfwidth:.4f}")
+</code></pre>
+<div class="code-caption">A memory-flat, batched Monte Carlo estimator that returns both the mean and a 95% half-width. The worked case propagates a correlated three-axis accelerometer bias (drawn via a Cholesky factor of its covariance) through a norm-threshold event, the kind of specification check that precedes deploying an inertial pipeline. The batching pattern matters because the same loop runs on a workstation and on a memory-constrained gateway.</div>
+
+<p>The example applies the estimator to a real specification question: how often does an IMU's correlated bias vector exceed a magnitude limit? The Cholesky factor turns independent Gaussian draws into correlated ones, a trick you will reuse constantly when the noise channels of a sensor are coupled. The returned half-width tells you whether two million samples were enough or whether you should keep drawing.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let the sampler build correlated draws for you</h3>
+<p>The Cholesky-and-matrix-multiply dance above is instructive but unnecessary in production. <code>numpy.random.Generator.multivariate_normal(mean, cov, size=n)</code> replaces the factorization, the reshaping, and the transpose with a single call, and <code>scipy.stats</code> gives you inverse-transform and rejection sampling for dozens of named distributions through one <code>.rvs()</code> method. Roughly eight lines of hand-rolled sampling collapse to one, and the library handles numerical edge cases (near-singular covariance, tail underflow) that a naive Cholesky silently mishandles. Write the loop once to understand it, then reach for the library.</p>
+</div>
+
+<h2>Variance reduction and low-discrepancy sampling</h2>
+
+<p><strong>What.</strong> Since error scales as \(\sigma/\sqrt{N}\) and buying more \(N\) is expensive on an edge device, the smart move is to shrink \(\sigma\). Three techniques recur throughout sensing.</p>
+
+<p><strong>Antithetic variates.</strong> For every draw \(x\), also use its mirror image (for a symmetric distribution, \(-x\) after centering). Positively correlated errors cancel, and a symmetric integrand can see its variance drop sharply at zero extra sampling cost. <strong>Control variates</strong> subtract a correlated quantity whose expectation you know analytically, replacing part of the noisy estimate with an exact term. <strong>Stratified sampling</strong> partitions the domain and samples each stratum in proportion, guaranteeing coverage rather than trusting luck.</p>
+
+<p><strong>Quasi-Monte Carlo.</strong> Instead of pseudo-random points, use a deterministic low-discrepancy sequence such as Sobol or Halton that fills space more evenly than random draws ever do. For smooth integrands the error can improve toward \(1/N\) rather than \(1/\sqrt{N}\), a decisive speedup. This is the workhorse behind the digital-twin and synthetic-data sweeps of <a href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>, where you want to cover a parameter space of sensor placements or lighting conditions without wasting simulation budget on clumped points.</p>
+
+<p><strong>When to reach for each.</strong> Use antithetic and control variates when you have structure you can exploit and evaluations are cheap. Use quasi-Monte Carlo for smooth, moderate-dimensional integrals such as calibration sweeps. Fall back to plain pseudo-random sampling when the integrand is rough, discontinuous, or when you need the honest, well-understood \(\sqrt{N}\) error bars that the central limit theorem guarantees; low-discrepancy sequences complicate confidence-interval construction because their points are not independent.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You must estimate the probability that a lidar range gate misses a pedestrian, a target near \(2\times10^{-3}\). (a) Using the \(\sigma/\sqrt{N}\) rule, how many plain Monte Carlo samples are needed so the relative half-width of the 95% interval is below 10%? (b) Design an importance-sampling proposal that shifts mass into the miss region and write the weight function \(w(x)\). (c) Argue why antithetic variates might help little here while importance sampling helps a lot.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does the Monte Carlo error \(\sigma/\sqrt{N}\) not contain the dimension of \(x\), and what quantity does grow with dimension in practice? 2. Given only uniform draws, how would you generate samples from an exponential distribution, and which of the three sampling methods is that? 3. Your importance-sampling weights are almost all near zero except one enormous weight. What has gone wrong, and what does it say about your proposal \(q\)?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 4</h3>
+<p>estimate sensor noise models from data and propagate uncertainty through a simple pipeline.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Foundations of Monte Carlo</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.jstor.org/stable/2280232">Metropolis, N., and Ulam, S. (1949). The Monte Carlo Method. Journal of the American Statistical Association.</a></p>
+<p class="bib-annotation">The paper that named and framed the method, motivated by exactly the intractable multidimensional integrals that recur in sensor modeling.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://link.springer.com/book/10.1007/978-1-4757-4145-2">Robert, C. P., and Casella, G. (2004). Monte Carlo Statistical Methods, 2nd ed. Springer.</a></p>
+<p class="bib-annotation">The standard graduate reference on inverse transform, rejection, importance sampling, and MCMC, with the theory behind every estimator in this section.</p>
+</div>
+
+<p class="bib-category">Sampling and variance reduction</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://link.springer.com/book/10.1007/978-1-4757-2553-7">Ripley, B. D. (1987). Stochastic Simulation. Wiley.</a></p>
+<p class="bib-annotation">A compact, practical treatment of generating random variates and reducing variance, close to how an engineer actually implements samplers.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://epubs.siam.org/doi/book/10.1137/1.9781611970081">Niederreiter, H. (1992). Random Number Generation and Quasi-Monte Carlo Methods. SIAM.</a></p>
+<p class="bib-annotation">The definitive account of low-discrepancy sequences (Sobol, Halton) and why they can beat the \(\sqrt{N}\) rate for smooth integrands.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://artowen.su.domains/mc/">Owen, A. B. (2013). Monte Carlo Theory, Methods and Examples.</a></p>
+<p class="bib-annotation">A freely available, modern, and unusually clear book covering standard error estimation, importance sampling diagnostics, and quasi-Monte Carlo; excellent for self-study.</p>
+</div>
+
+<p class="bib-category">Sampling for estimation and filtering</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/978374">Arulampalam, M. S., Maskell, S., Gordon, N., and Clapp, T. (2002). A Tutorial on Particle Filters for Online Nonlinear/Non-Gaussian Bayesian Tracking. IEEE Transactions on Signal Processing.</a></p>
+<p class="bib-annotation">Shows importance sampling and resampling operating inside a recursive estimator, the bridge from this section to the particle filters of Chapter 10.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.nature.com/articles/s41586-020-2649-2">Harris, C. R., et al. (2020). Array Programming with NumPy. Nature.</a></p>
+<p class="bib-annotation">Documents the vectorized random-number and linear-algebra machinery (Generator, Cholesky, multivariate normal) that makes batched Monte Carlo practical on real hardware.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, we leave the world of clean synthetic draws and confront real recorded data: how to build datasets from sensor streams without leaking future information into the past, how to split by device and by time rather than at random, and how the sampling intuition from this section informs honest train-test protocols. The same law of large numbers that made our estimators trustworthy will now warn us about what happens when samples are correlated and not the independent draws Monte Carlo assumed.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

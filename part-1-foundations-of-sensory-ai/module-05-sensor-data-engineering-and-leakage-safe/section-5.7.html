@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.7: Reproducible, versioned sensor pipelines and data contracts. Building Sensory AI." name="description"/>
+<title>Section 5.7: Reproducible, versioned sensor pipelines and data contracts | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Sensory AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Sensor Data Engineering and Leakage-Safe Datasets</a></div>
+<h1>Reproducible, versioned sensor pipelines and data contracts</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A result you cannot reproduce is a rumor with a confidence interval."</p><cite>A Reproducible AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous six sections taught you to choose formats, cut windows, avoid leakage, build honest splits, calibrate per device, and reason about label quality. Each of those is a decision, and every decision is a place where a future teammate (or future you) can silently do something different and get a different number. This section is about freezing those decisions so the same raw bytes always produce the same dataset, and so a downstream consumer can detect the day your sensors start lying. Two ideas carry the weight: a <em>versioned pipeline</em> that makes the transformation from raw stream to training tensor deterministic and auditable, and a <em>data contract</em> that states, in machine-checkable form, what each stage promises about the data it emits. Together they turn "it worked on my laptop in March" into a build you can rerun in one command a year later.</p>
+</div>
+
+<p>This section assumes you are comfortable with the sensor formats and timestamping of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and with the windowing, split, and calibration choices from Sections 5.2 through 5.6. We treat that entire chain as the thing to be versioned. We stay out of the way of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a> (operating deployed models across a fleet) and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> (evaluation protocols); here the deliverable is a dataset build that anyone can regenerate byte-for-byte and trust on arrival.</p>
+
+<h2>Why sensor pipelines rot, and what reproducibility actually requires</h2>
+
+<p><strong>What.</strong> A sensor pipeline is the ordered sequence of transformations that turns raw device output into model-ready tensors: decode, resample, synchronize, filter, window, normalize, label, split. <strong>Why it rots.</strong> Every stage hides a moving part. A resampler pulls in a new SciPy release with a different default; a firmware update changes the accelerometer full-scale range; someone re-runs the split with a fresh random seed; a timezone assumption flips at a daylight-saving boundary. None of these throw an error. They just quietly change the dataset, and six weeks later a model that "regressed" is really a model trained on different data.</p>
+
+<p><strong>How reproducibility is achieved.</strong> Determinism is not one thing but four, and you need all four to actually hold. First, <em>fix the inputs</em>: content-address the raw data so a hash identifies the exact bytes, not a mutable path. Second, <em>fix the code</em>: pin the pipeline to a commit and pin every library version. Third, <em>fix the configuration</em>: put window length, stride, seed, filter cutoffs, and split policy in a versioned config file, never in a notebook cell. Fourth, <em>fix the environment and randomness</em>: seed every random operation and record the interpreter and OS. The output identity you want is a function of all four:</p>
+
+$$\text{dataset\_id} = H\big(\text{raw\_hash},\ \text{code\_commit},\ \text{config\_hash},\ \text{env\_hash}\big)$$
+
+<p>where \(H\) is a cryptographic hash. If any input changes, the id changes, and you have caught a silent mutation before it reached a model. If all four match, re-running the build is guaranteed to reproduce the same tensors, which is the whole game.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The reproducibility failure that actually bites sensor teams is almost never model randomness; it is <em>silent input drift</em>. A model retrain is loud and expected. A resampler that changed its interpolation default, or a raw-data directory someone quietly re-uploaded with a bug fix, changes your data with no signal at all. Content-addressing the raw bytes and hashing the config is worth more than a hundred fixed seeds, because it converts an undetectable change into a changed id that fails a check. Reproducibility is less about repeating success and more about making unrequested change impossible to hide.</p>
+</div>
+
+<h2>Data contracts: promises the pipeline must keep</h2>
+
+<p><strong>What.</strong> A data contract is an explicit, machine-checkable specification of what a dataset or a pipeline stage guarantees: the schema (channel names, dtypes, units), the physical ranges, the sampling rate and its allowed jitter, the null and gap policy, and the label vocabulary. It is the API of your data. <strong>Why.</strong> Without a contract, every consumer re-discovers the data's quirks by trial and error, and a producer can break a downstream model just by shipping a new sensor batch in millivolts instead of volts. A contract moves that failure to the boundary where it belongs: the moment bad data arrives, a validation gate rejects it with a specific reason, instead of a model degrading mysteriously a month later.</p>
+
+<p><strong>How.</strong> A contract has two halves. The <em>declarative schema</em> lists fields, types, and units and is checked cheaply on every batch. The <em>statistical expectations</em> assert distributional facts: the accelerometer magnitude at rest sits near \(9.81\ \mathrm{m/s^2}\), the fraction of missing samples per window stays below a threshold, the inter-sample interval clusters at \(\Delta t = 1/f_s\). These expectations connect directly to the sensor physics of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: a contract that knows gravity's magnitude can flag a mislabeled axis or a wrong full-scale setting automatically. <strong>When.</strong> Enforce the contract at three gates: at ingestion (raw data crossing into your system), between stages (each transform validates its output), and at the training boundary (the final tensor matches what the model expects). Contracts should fail closed: a violation halts the build rather than passing suspect data through.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the wind farm that shipped a unit change</h3>
+<p>An industrial team monitoring gearbox vibration on a fleet of wind turbines had a stable anomaly detector running for a year. One maintenance cycle, a vendor replaced a batch of accelerometers with a newer model that reported acceleration in \(g\) rather than \(\mathrm{m/s^2}\), a factor of about \(9.81\). No code changed, no error fired, and the ingestion path happily accepted the new files. The detector's false-alarm rate collapsed toward zero because every reading now looked nine times quieter than the trained baseline, so real faults slid under the threshold. A one-line data contract, "root-mean-square vibration on a healthy unit lies in \([2, 40]\ \mathrm{m/s^2}\)", would have rejected the very first file from the new sensors and named the reason. After the incident the team added unit and range checks at ingestion; the next hardware swap was caught in minutes, not quarters. This is the same class of failure the normalization discussion in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a> revisits under real drift.</p>
+</div>
+
+<h2>Building a versioned pipeline in practice</h2>
+
+<p><strong>How to structure it.</strong> Express the pipeline as a directed acyclic graph of stages, each a pure function from an input artifact to an output artifact, each tagged with the hash of its inputs plus its config. This buys you two things automatically: <em>caching</em> (a stage whose input hash is unchanged is skipped, so rebuilds are cheap) and <em>lineage</em> (every tensor can name the raw file, code commit, and config that produced it). When a reviewer asks "where did this training example come from", the answer is a lookup, not an archaeology project. <strong>When to version what.</strong> Version the raw data (immutably, content-addressed), the code (git commit), the config (in the repo), and the resulting dataset (a manifest recording the four-part id above). Do not version derived tensors by copying them everywhere; version the recipe that regenerates them and cache the output.</p>
+
+<p>The snippet below computes the dataset identity from its four inputs and writes a manifest. It is deliberately small; the point is that the identity is a deterministic function of pinned inputs, so two people running it on the same commit and config get the same id and can prove they built the same data.</p>
+
+<pre><code class="language-python">import hashlib, json, subprocess, sys, platform
+from pathlib import Path
+
+def sha256_file(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def hash_str(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def build_manifest(raw_files, config):
+    raw_hash   = hash_str("".join(sorted(sha256_file(p) for p in raw_files)))
+    code_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"]).decode().strip()
+    config_hash = hash_str(json.dumps(config, sort_keys=True))
+    env_hash    = hash_str(f"{sys.version}|{platform.platform()}")
+    dataset_id  = hash_str(raw_hash + code_commit + config_hash + env_hash)[:16]
+    return {
+        "dataset_id": dataset_id,
+        "raw_hash": raw_hash, "code_commit": code_commit,
+        "config_hash": config_hash, "env_hash": env_hash,
+        "config": config,
+    }
+
+if __name__ == "__main__":
+    cfg = {"window_len": 256, "stride": 64, "fs_hz": 50,
+           "split": "subject_disjoint", "seed": 7}
+    manifest = build_manifest(sorted(Path("raw").glob("*.parquet")), cfg)
+    Path("dataset_manifest.json").write_text(json.dumps(manifest, indent=2))
+    print("dataset_id:", manifest["dataset_id"])
+</code></pre>
+<div class="code-caption">Computing a reproducible <code>dataset_id</code> from raw-data hashes, the git commit, a sorted config hash, and an environment fingerprint. Re-running on the same inputs reproduces the id; any silent change to raw bytes, code, config, or interpreter flips it, which is exactly the alarm you want.</div>
+
+<p>Note the two subtle correctness moves in the code. Raw hashes are <em>sorted</em> before concatenation so file order does not affect the id, and the config is serialized with <code>sort_keys=True</code> so a reordered dictionary still hashes identically. Both prevent spurious id changes that would train teams to ignore the alarm. This same discipline underpins the leakage-safe benchmarking of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>: a benchmark is only fair if everyone provably built the same splits.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let a data-versioning stack carry the plumbing</h3>
+<p>The manifest above is instructive but it is roughly 30 lines you would then have to grow into caching, remote storage, and a lineage graph, easily a few hundred more. Purpose-built tools do this for you. DVC turns <code>dvc add raw/</code> plus a short <code>dvc.yaml</code> stage file into content-addressed raw data, cached deterministic stages, and a git-tracked lineage graph in under ten lines of config; a rebuild after an unchanged input is a no-op it detects automatically. For the contract half, Pandera or Great Expectations expresses a full schema-plus-range check as a short declarative object instead of dozens of hand-written asserts, and produces a readable failure report naming the offending column and rows. The rule of thumb: hand-roll the manifest once so you understand the four-part id, then adopt the tools so caching, storage, and validation reports are not your code to maintain.</p>
+</div>
+
+<h2>When reproducibility is worth the cost, and when it is not</h2>
+
+<p><strong>What it costs.</strong> Full versioning adds friction: hashing large raw archives takes time, pinned environments must be rebuilt, and a contract that fails closed will occasionally block a build at an inconvenient hour. <strong>When to pay it.</strong> Pay in full whenever a result will be published, audited, or shipped to a device you cannot easily update, and whenever more than one person touches the pipeline. A clinical study, a regulated wearable (the validation regime of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>), and any leaderboard submission all demand it, because the question "is this the same data" must have a provable answer. <strong>When to lighten up.</strong> A solo exploratory notebook that will be thrown away next week does not need a content-addressed remote; pin the seed and the library versions and move on. The skill is matching the ceremony to the stakes: enough determinism that you can trust and defend the number, not so much that exploration grinds to a halt.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a small human-activity dataset and build it twice through the same windowing and split code, but on the second run bump one library (say, change your resampling library's minor version) without touching your own code. Compute the <code>dataset_id</code> both times using the manifest approach above. Confirm the id changes even though your code did not, then write the two-line data contract (sampling interval and accelerometer-magnitude-at-rest range) that would have flagged whichever run produced physically wrong values. Report which of the four id components differed and why.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. A colleague says "I fixed all the random seeds, so my dataset is reproducible." Name one common way the dataset can still silently change, and how content-addressing would catch it.</p>
+<p>2. Why should a data contract be enforced at ingestion rather than only at the training boundary? Give a failure that only an ingestion-time check catches early.</p>
+<p>3. In the <code>dataset_id</code> formula, why are the raw file hashes sorted and the config serialized with sorted keys before hashing? What false alarm does each choice prevent?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 5</h3>
+<p>build leakage-safe subject- and device-disjoint splits for human activity recognition; measure the accuracy gap vs a naive random split.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Reproducibility and pipeline versioning</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://dvc.org/doc">Kuprieiev, R. et al. (2024). DVC: Data Version Control. Documentation and open-source project.</a></p>
+<p class="bib-annotation">The canonical tool for content-addressed data, cached deterministic pipeline stages, and git-tracked lineage; the practical realization of the four-part dataset id in this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.pnas.org/doi/10.1073/pnas.1708290115">Kitzes, J., Turek, D., Deniz, F. (2018). The Practice of Reproducible Research. University of California Press.</a></p>
+<p class="bib-annotation">A case-study survey of what makes computational workflows reproducible in practice; grounds the code, config, environment, and data pinning that this section formalizes.</p>
+</div>
+
+<p class="bib-category">Data contracts and validation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://greatexpectations.io/">Great Expectations (2024). An open-source framework for data validation and documentation.</a></p>
+<p class="bib-annotation">Expresses schema plus statistical expectations as declarative checks with human-readable failure reports; the tooling behind the fail-closed contract gates described here.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://pandera.readthedocs.io/">Bantilan, N. (2020). Pandera: Statistical Data Validation of Pandas Dataframes. Proceedings of the Python in Science Conference (SciPy).</a></p>
+<p class="bib-annotation">A lightweight schema-and-range validation library for tabular sensor data; a few lines replace dozens of hand-written asserts at each stage boundary.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://research.google/pubs/pub47967/">Polyzotis, N., Zinkevich, M., Roy, S., Breck, E., Whang, S. (2019). Data Validation for Machine Learning. Proceedings of Machine Learning and Systems (MLSys).</a></p>
+<p class="bib-annotation">Google's production data-validation system for ML; formalizes schema inference, anomaly detection, and the training-serving skew that data contracts are designed to prevent.</p>
+</div>
+
+<p class="bib-category">Experiment tracking and ML operations</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3399579.3399867">Zaharia, M. et al. (2018). Accelerating the Machine Learning Lifecycle with MLflow. IEEE Data Engineering Bulletin.</a></p>
+<p class="bib-annotation">Introduces run tracking, parameters, and artifact logging that pair with a versioned pipeline to make a training result auditable end to end.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley, D. et al. (2015). Hidden Technical Debt in Machine Learning Systems. Advances in Neural Information Processing Systems (NeurIPS).</a></p>
+<p class="bib-annotation">The classic account of how unstable data dependencies and undeclared consumers accumulate silent risk; the intellectual case for data contracts and versioned inputs.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2010.13561">Gebru, T. et al. (2021). Datasheets for Datasets. Communications of the ACM.</a></p>
+<p class="bib-annotation">Argues that every dataset should ship documented provenance, composition, and intended use; the human-readable companion to the machine-checkable contract.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, we open Part II and start turning clean, versioned streams into clean <em>signals</em>: moving averages, FIR and IIR filters, and the band-pass and notch designs that strip noise while preserving the phenomenon. Every filter you meet there is a pipeline stage in the sense of this section, with a cutoff and a design choice that belongs in your versioned config and under a data contract; reproducibility is not left behind when we move from data engineering to signal processing, it comes along as a habit.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
