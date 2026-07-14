@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.3: Gesture and prosthetic control. Building Sensory AI." name="description"/>
+<title>Section 32.3: Gesture and prosthetic control | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: EMG and Neuromuscular AI</a></div>
+<h1>Gesture and prosthetic control</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My classifier reached 98 percent accuracy on the held-out folds. Then someone with one hand asked me to grip a coffee cup, and I learned that accuracy is not the same as being controllable."</p>
+        <cite>A Newly Humbled AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>This is the section where EMG stops being a signal to analyze and becomes a signal to obey. When a person with a transradial amputation contracts the residual muscles of their forearm, no hand moves, but the electrical intent is still there on the skin. Myoelectric control is the discipline of turning that intent into commands for a prosthetic hand, a robotic gripper, or an on-body gesture interface. The stakes are different from a diagnosis: a mislabeled heartbeat is a bad number in a report, but a misfired grasp drops a glass or crushes a handshake. The core engineering tension is that offline classification accuracy, the metric every paper optimizes, correlates only weakly with whether a person can actually use the device to do something. This section builds the mapping from muscle activity to actuator command, and shows why usability, latency, and graceful failure matter as much as the confusion matrix.</p>
+    </div>
+
+    <p>This section assumes the muscle-activity envelopes and spectral descriptors built in <a class="cross-ref" href="section-32.2.html">Section 32.2</a>, which give us the per-channel amplitude and frequency features we will feed to a controller. It also builds on the feature and classifier machinery of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> and the gesture-and-neuromotor framing of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>, which approached hand intent from inertial and pose sensors rather than muscle electricity. Here we keep the control loop's real-time constraints in view but defer their full treatment to <a class="cross-ref" href="section-32.7.html">Section 32.7</a>; the durability of a decoder across days and users is the subject of <a class="cross-ref" href="section-32.5.html">Section 32.5</a>.</p>
+
+    <h2>Two philosophies: direct control and pattern recognition</h2>
+    <p>Commercial myoelectric prostheses were built for decades on <em>direct control</em>. Two antagonist muscle sites (say, wrist flexors and extensors) each drive one degree of freedom: flexor amplitude opens the hand, extensor amplitude closes it, and a fast co-contraction of both switches to the next joint (wrist rotation, then elbow). It is transparent, needs no training data, and the user's own effort sets the speed. Its ceiling is low: only one function moves at a time, mode switching is slow and conscious, and it wastes the rich, multi-muscle structure of the residual limb. A user who wants to rotate the wrist while closing the hand simply cannot, because the scheme is sequential by construction.</p>
+    <p><em>Pattern recognition</em> control is the alternative that machine learning unlocked. Instead of hard-wiring one electrode to one function, we place an array of electrodes around the forearm, extract a feature vector per short window across all channels, and train a classifier to recognize the <em>pattern</em> of activity that corresponds to each intended gesture. The intuition is that closing into a fist, pinching, and pointing each recruit a distinct spatial signature of muscles, and a classifier can separate those signatures even when no single channel is decisive. This is what lets an eight-channel armband distinguish six or more hand postures. The classic recipe, established by Hudgins and refined ever since, is a time-domain feature set (mean absolute value, waveform length, zero crossings, slope sign changes) per channel, fed to a linear discriminant analysis (LDA) classifier that runs in microseconds on a microcontroller.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Classification accuracy is a proxy, and a leaky one</h3>
+        <p>The literature ranks decoders by held-out classification accuracy, but the quantity a user feels is <em>controllability</em>: can they enter a class, hold it steadily, and modulate its speed on demand? A decoder that is 96 percent accurate but flickers between classes during a sustained grip is worse to use than a 92 percent decoder that stays locked once committed. Errors are not equal either: a brief misclassification into "rest" merely stalls the hand, while a misclassification into "open" during a grasp drops the object. Report accuracy, but also report the metrics that predict usability: transitions per second, time-to-first-correct-activation, and a class-weighted error cost. This is the same accuracy-is-not-utility trap that recurs whenever a model output drives a physical actuator.</p>
+    </div>
+
+    <h2>From class labels to proportional, simultaneous command</h2>
+    <p>A gesture label alone is a poor command, because a hand is not a light switch. Real manipulation needs <em>proportional</em> control: the harder the user contracts, the faster or more forcefully the actuator moves. The standard construction estimates speed from the overall activation level, typically a normalized mean absolute value summed across channels, and multiplies it by the class direction. If \(g\) is the predicted gesture and \(a \in [0,1]\) is the normalized activation, the actuator velocity is \(v = a \cdot d(g)\), where \(d(g)\) is the unit motion for that gesture. This decouples <em>what</em> to do (classification) from <em>how fast</em> (regression on amplitude), and it is why the envelope features of <a class="cross-ref" href="section-32.2.html">Section 32.2</a> matter so directly here.</p>
+    <p>The frontier moves beyond discrete classes toward continuous, <em>simultaneous</em> control of multiple degrees of freedom. Rather than picking one of six postures, a regression decoder maps the feature vector directly onto a continuous command vector, for example (wrist rotation, wrist flexion, hand aperture) all at once, so a user can pronate while closing. Linear regression and its regularized cousins are the workhorse, but recurrent and temporal-convolutional models (see <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) now dominate the research benchmarks by learning temporal context that a per-window classifier discards. The cost is data hunger and calibration burden, which is exactly the tension the next two sections resolve.</p>
+
+    <pre><code class="language-python">import numpy as np
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from scipy.stats import mode
+
+def td4_features(win):                 # win: (channels, samples) one analysis window
+    mav = np.mean(np.abs(win), axis=1)               # mean absolute value
+    wl  = np.sum(np.abs(np.diff(win, axis=1)), axis=1)  # waveform length
+    zc  = np.sum(np.diff(np.sign(win), axis=1) != 0, axis=1)  # zero crossings
+    ssc = np.sum(np.diff(np.sign(np.diff(win, axis=1)), axis=1) != 0, axis=1)
+    return np.concatenate([mav, wl, zc, ssc])        # 4 features x channels
+
+# X_train: (n_windows, 4*channels) features, y_train: gesture labels 0..K-1
+clf = LinearDiscriminantAnalysis().fit(X_train, y_train)
+
+def controlled_decision(feat_stream, k=5):
+    """Classify each window, then majority-vote over the last k to reject flicker."""
+    raw = clf.predict(feat_stream)                   # per-window labels
+    smoothed = np.array([mode(raw[max(0, i-k+1):i+1], keepdims=False).mode
+                         for i in range(len(raw))])
+    return smoothed
+</code></pre>
+    <div class="code-caption">The four-feature time-domain set feeds an LDA classifier that trains in milliseconds; the <code>controlled_decision</code> majority-vote pass turns a jittery per-window label stream into a stable command, trading a few tens of milliseconds of latency for the flicker rejection that makes the device usable.</div>
+
+    <p>The <code>controlled_decision</code> post-processor above is the unglamorous piece that separates a demo from a device. A raw per-window classifier changes its mind every 50 milliseconds; a person cannot hold a grip against that. Majority voting (or a hidden-Markov smoother, or a velocity ramp that refuses to reverse instantly) imposes the temporal inertia that muscles and motors both physically have. The price is latency, and there is a hard ceiling: total delay from intention to motion should stay under roughly 200 to 300 milliseconds, or the user perceives the hand as sluggish and disowned. Balancing smoothing against that budget is the real design act.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The Ninapro armband and the coffee-cup gap</h3>
+        <p>A prosthetics research group trained a hand-gesture decoder on the public Ninapro database (surface EMG from dozens of intact and amputee subjects performing standardized hand movements) and reported 89 percent offline accuracy on twelve grasps, competitive with the literature. In a take-home trial with three amputee participants using a physical hand, the same decoder frustrated everyone. The offline number had been computed on windows sampled uniformly across held movements, but real use is dominated by <em>transitions</em>: reaching, pre-shaping, contacting, and releasing, where the muscle pattern is ambiguous and the offline test set was sparse. The team recovered usability not by a better network but by three control-layer changes: a rest class with a raised activation threshold so the hand stopped cleanly, majority-vote smoothing over five windows, and proportional speed so gentle contractions produced gentle motion. Accuracy on the old test set barely moved; the object-handling success rate roughly doubled.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Feature extraction you should not hand-roll</h3>
+        <p>The time-domain and frequency-domain feature families for myoelectric control are standardized enough that reimplementing them per project is wasted effort and a bug surface. The <code>libemg</code> library packages the full canonical set, windowing, and an offline-to-online control harness behind a few calls:</p>
+        <pre><code class="language-python">from libemg.feature_extractor import FeatureExtractor
+fe = FeatureExtractor()
+# extract the standard Hudgins time-domain group across all channels at once
+feats = fe.extract_features(["MAV", "WL", "ZC", "SSC"], windows)
+</code></pre>
+        <div class="code-caption">One <code>extract_features</code> call replaces roughly 60 to 100 lines of per-feature, per-channel numpy and the accompanying unit tests, and it stays consistent with the definitions used across the myoelectric-control literature so your numbers are comparable.</div>
+        <p>The library gives you the features and a validated windowing scheme; your remaining judgment is the window length (a 150 to 250 millisecond window with 50 to 100 millisecond overlap is the usual sweet spot between class separability and latency) and what the control layer does with the labels. That is where the domain expertise lives.</p>
+    </div>
+
+    <h2>Targeted muscle reinnervation and richer command sources</h2>
+    <p>The information a decoder can extract is bounded by the muscles available to record. For high-level amputations (transhumeral, shoulder disarticulation), the residual limb offers too few independent sites for natural multi-function control. Targeted muscle reinnervation (TMR) is a surgical answer: the nerves that once drove the missing hand and arm are rerouted to spare chest or upper-arm muscles, which then contract when the user <em>intends</em> to close the missing hand. The skin over those reinnervated muscles now carries EMG that is naturally, intuitively linked to hand intent, dramatically expanding the control channels a pattern-recognition system can exploit. TMR turned pattern recognition from a laboratory curiosity into a clinically deployed control strategy, and it is why high-density surface arrays over reinnervated sites are a live research direction.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Where the field is now</h3>
+        <p>The current frontier decodes intent below the muscle, at the level of individual motor units. High-density surface EMG grids (64 to 256 electrodes) plus real-time blind source separation recover motor-unit spike trains non-invasively, and decoding the firing of specific units promises finer, more stable control than muscle-level envelopes. Meta's acquisition of CTRL-labs and its surface-EMG wristband for neuromotor typing and gesture input pushed this toward consumer scale, framing wrist EMG as a general human-computer interface rather than only a prosthetic controller. In parallel, deep regression decoders (temporal convolutional and transformer-based, per <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) are closing on simultaneous proportional control of four or more degrees of freedom, and conformal or calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) is being used to make the controller abstain into a safe rest state when the pattern is ambiguous rather than committing to a risky grasp. The open problem that gates all of it is robustness across days, electrode shifts, and users, which <a class="cross-ref" href="section-32.5.html">Section 32.5</a> takes up directly.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: design the control layer, not just the classifier</h3>
+        <p>You are given a trained six-gesture LDA decoder for an eight-channel forearm band and a physical gripper. (1) Add a rest state: propose an activation-threshold rule on summed mean absolute value that suppresses motion during low effort, and explain how you would set the threshold per user. (2) Add proportional speed and write the velocity command for gesture \(g\) at normalized activation \(a\). (3) Choose a smoothing window \(k\) for majority voting and justify it against a 250 millisecond end-to-end latency budget, given 200 millisecond analysis windows with 50 millisecond overlap. (4) State one error type your changes make rarer and one they might make more common, and argue whether the trade improves real object-handling.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why can a decoder with higher offline classification accuracy be worse to use than a lower-accuracy one? Name two control-layer metrics that predict usability better than accuracy alone.</li>
+            <li>Explain the difference between sequential direct control, discrete pattern-recognition control, and simultaneous regression control, and give one concrete task that only the last can perform.</li>
+            <li>What does targeted muscle reinnervation change about the <em>measurement</em> available to a pattern-recognition system, and why does that matter more for a transhumeral than a transradial amputation?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-32.4.html">Section 32.4</a>, we turn from decoding <em>what</em> a muscle intends to estimating <em>how tired</em> it is. Muscle fatigue shifts the EMG spectrum and inflates amplitude even as force falls, which both degrades the controllers built here and, framed differently, becomes a useful signal in its own right for ergonomics, rehabilitation, and effort-aware interfaces.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

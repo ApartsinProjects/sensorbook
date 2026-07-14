@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.2: Arrhythmia and AFib detection at scale. Building Sensory AI." name="description"/>
+<title>Section 29.2: Arrhythmia and AFib detection at scale | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: ECG and Cardiac AI</a></div>
+<h1>Arrhythmia and AFib detection at scale</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They told me the model was 99 percent accurate. Then they let it loose on a million healthy wrists and asked why every alert was a false alarm."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on the ECG morphology and lead vocabulary of <a class="cross-ref" href="section-29.1.html">Section 29.1</a>: you should recognize the P wave, QRS complex, and R-to-R interval. It leans on the base-rate reasoning and Bayes' rule from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and on the change-detection framing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. The distinction between labeling individual beats and labeling whole records is deferred to <a class="cross-ref" href="section-29.4.html">Section 29.4</a>; here we operate at the rhythm level.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Atrial fibrillation is the most common sustained arrhythmia and a leading cause of stroke, yet it is often silent: it comes and goes, and a person can carry it for years without a symptom. That combination, dangerous but hidden and intermittent, is exactly what machine perception is built to fix. Put an ECG or an optical pulse sensor on millions of wrists, watch continuously, and catch the rhythm no clinic visit would ever see. The catch is that "at scale" is not the same problem as "in the lab." When the condition is rare in the screened population, a classifier that looks excellent on a balanced benchmark can generate more false alarms than true findings. This section is about detecting arrhythmia, and about the arithmetic of doing it across a population without drowning cardiologists in noise.</p>
+    </div>
+
+    <h2>What counts as an arrhythmia, and which ones matter at scale</h2>
+    <p>An arrhythmia is any deviation from normal sinus rhythm: the heart beating too fast (tachycardia), too slow (bradycardia), or irregularly. The clinically urgent list is short. Ventricular fibrillation and ventricular tachycardia are immediately life-threatening and are the target of implanted defibrillators. Atrial fibrillation (AFib) and atrial flutter are rarely lethal in the moment but drive long-term stroke and heart-failure risk. Ectopic beats, premature atrial or ventricular contractions, are usually benign but pollute any automated pipeline because they look abnormal beat by beat.</p>
+    <p><strong>Why does AFib dominate the screening conversation?</strong> Three reasons. It is common, affecting a large and growing fraction of older adults. It is treatable once found, since anticoagulation sharply cuts stroke risk. And it leaves a fingerprint that is detectable without a cardiologist reading the tracing: in AFib the atria quiver rather than contract, the P wave vanishes, and the ventricles fire at irregular intervals. That last property, an "irregularly irregular" R-to-R series, is the feature that a wrist sensor with no clean P wave can still exploit. The whole enterprise of consumer cardiac screening, taken up for the optical case in <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, rests on this one statistical signature.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>AFib detection at scale is a rare-event problem, and rare-event problems are ruled by the base rate, not by sensitivity and specificity in isolation. If AFib prevalence in a young screened cohort is 0.5 percent, then even a test with 99 percent specificity produces, per 10,000 people, about 50 true positives and roughly 100 false positives, a positive predictive value near 33 percent. Two thirds of alerts are wrong before the algorithm makes a single mistake on a sick patient. Sensitivity sells the model; specificity times prevalence decides whether anyone can act on its output.</p>
+    </div>
+
+    <h2>The classical detector: irregularity of the R-to-R series</h2>
+    <p>Before any deep network, the workhorse AFib feature is the statistics of the R-to-R interval sequence, the gaps between successive heartbeats. In sinus rhythm those gaps are regular and change slowly. In AFib they scatter almost randomly. You can capture that scatter with a handful of measures: the root mean square of successive differences (RMSSD), the sample entropy of the interval series, or the density spread of a Poincare plot (each interval plotted against the next). None of these needs a visible P wave, which is why the same idea transfers from clinical ECG to the noisy pulse series of a watch. This is the anomaly-and-change-detection toolkit of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> pointed at a specific physiological target.</p>
+    <p>The listing below computes a normalized irregularity score on a window of R-to-R intervals and flags AFib-like segments. It contrasts a regular rhythm with a scattered one so you can see the score separate them.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def afib_irregularity(rr_ms):
+    """Normalized R-to-R irregularity: high in AFib, low in sinus rhythm."""
+    rr = np.asarray(rr_ms, dtype=float)
+    diffs = np.diff(rr)
+    rmssd = np.sqrt(np.mean(diffs ** 2))     # beat-to-beat variability
+    return rmssd / np.mean(rr)                # normalize out heart rate
+
+# Sinus rhythm: ~60 bpm, gentle variation
+sinus = 1000 + 15 * np.sin(np.linspace(0, 6, 40)) + np.random.default_rng(0).normal(0, 8, 40)
+# AFib: same mean rate, irregularly irregular intervals
+afib  = 1000 + np.random.default_rng(1).normal(0, 120, 40)
+
+for name, rr in [("sinus", sinus), ("afib", afib)]:
+    score = afib_irregularity(rr)
+    flag = "AFib-like" if score > 0.10 else "regular"
+    print(f"{name:6s}  irregularity={score:.3f}  -> {flag}")</code></pre>
+    <div class="code-caption"><strong>Listing 29.2.</strong> A twelve-line R-to-R irregularity detector. Normalizing RMSSD by the mean interval removes the confound of heart rate, so the score measures irregularity rather than speed. The synthetic sinus window scores well under the 0.10 threshold while the AFib window scores far above it, the same separation real detectors exploit at scale.</div>
+
+    <p>As Listing 29.2 shows, a single scalar already separates the two rhythms cleanly on tidy data. Production detectors add signal-quality gating (reject windows too noisy to trust), require the irregularity to persist across several windows before alerting, and combine the interval score with morphology when a clean ECG is available. But the core intuition, AFib is irregularity you can measure without reading the P wave, survives all the way up to the deep models of <a class="cross-ref" href="section-29.5.html">Section 29.5</a>.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling a full AFib screener, R-peak detection, artifact rejection, interval statistics, and a persistence rule, is roughly 150 to 200 lines and easy to get wrong around ectopic beats and dropped peaks. The <code>neurokit2</code> library gives you clean intervals and heart-rate-variability features in two calls:</p>
+        <pre class="language-python"><code class="language-python">import neurokit2 as nk
+signals, info = nk.ecg_process(ecg, sampling_rate=250)      # R peaks + cleaning
+hrv = nk.hrv_time(info["ECG_R_Peaks"], sampling_rate=250)   # RMSSD, pNN50, and more</code></pre>
+        <div class="code-caption"><strong>Listing 29.3.</strong> <code>neurokit2</code> replaces about 180 lines of peak detection and interval bookkeeping with two calls, returning a labeled feature frame (RMSSD, pNN50, entropy). It supplies the features; choosing the decision threshold and validating it on your own population and device remains your responsibility.</div>
+        <p>The library removes the plumbing, not the judgment: a threshold tuned on clean clinical ECG will misfire on a motion-corrupted wrist trace, so recalibrate on the deployment distribution, a leakage-safe discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+    </div>
+
+    <h2>Why "at scale" rewrites the evaluation</h2>
+    <p>Take a detector that scores 0.98 sensitivity and 0.99 specificity on the MIT-BIH Atrial Fibrillation benchmark and deploy it to a young, mostly healthy consumer population. Two things break. First, the base rate collapses. A benchmark curated to be roughly balanced hides the fact that in the wild AFib may be present in well under one percent of screened people, so positive predictive value plummets even though the model has not changed. Second, the unit of evaluation changes. On a benchmark you score per record; at scale you must score per person over weeks of monitoring, where a single patient contributes thousands of correlated windows. Reporting per-window accuracy inflates the numbers and, worse, leaks information if windows from one person land in both train and test splits, the exact failure the patient-level evaluation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> exists to prevent.</p>
+    <p>The right target metric shifts too. Clinicians rarely need "is there AFib right now" so much as "how much AFib does this person have," the AFib burden, meaning the fraction of monitored time in the rhythm. A screener optimized for a binary alert and a burden estimator optimized for a percentage are different objectives with different error costs, and calibrated probabilities (the conformal and calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) matter far more than a single accuracy number.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the notification-to-confirmation funnel</h3>
+        <p>A large consumer-wearable heart study enrolled roughly 419,000 participants and used an optical wrist sensor to flag irregular pulse. About half a percent received an irregular-pulse notification. Those flagged were mailed an ECG patch to wear for confirmation, and among the returned patches with simultaneous data, the wrist notification's positive predictive value against the reference ECG was high (around 0.84), yet only about a third of notified participants showed AFib on the patch over its wear window, partly because AFib is intermittent and the patch arrived days later. The engineering lesson is the whole funnel: a wrist sensor triages cheaply and at enormous scale, a gold-standard ECG confirms, and the system is designed so that a false wrist alert costs a patch and a clinic message, not a wrong prescription. No single device carries the full decision. Scale is achieved by chaining a cheap wide-net sensor to an expensive confirmatory one.</p>
+    </div>
+
+    <h2>Handling the imbalance without cheating</h2>
+    <p>Because AFib windows are rare, naive training lets the model win by always predicting "normal." The honest fixes are familiar from imbalanced learning: resample or reweight so the rare class carries its weight in the loss, evaluate with precision-recall rather than raw accuracy, and pick the operating threshold from the deployment prevalence rather than the training prevalence. The dishonest fix, oversampling before the train-test split so copies of the same beat appear on both sides, manufactures a benchmark triumph that evaporates in the field. Report the metric that matches the clinical action: for a triage screener, sensitivity at a fixed, tolerable alert rate; for a burden estimator, error on the time-in-AFib percentage. False-alarm control, the difference between a trusted device and one users mute, is the subject of <a class="cross-ref" href="section-29.6.html">Section 29.6</a>.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>State-of-the-art record-level rhythm classification uses deep one-dimensional convolutional and residual networks trained on very large labeled corpora; the widely cited Stanford model of Hannun and colleagues (Nature Medicine, 2019) reached cardiologist-level performance across a dozen rhythm classes on single-lead ambulatory ECG. The PhysioNet/Computing in Cardiology Challenges (2017 single-lead AFib, 2020/2021 twelve-lead multi-label) are the reference public benchmarks. The current direction is self-supervised ECG foundation models that pretrain on millions of unlabeled tracings and fine-tune for rhythm with far fewer labels, the subject of <a class="cross-ref" href="section-29.5.html">Section 29.5</a> and, more broadly, of the wearable foundation models in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>A vendor advertises an AFib screener with 95 percent sensitivity and 95 percent specificity. You plan to deploy it to a population with 1 percent AFib prevalence. Compute the positive predictive value per 10,000 screened people, then state in one sentence what the vendor could change (without touching the model) to make the alert more actionable, and name the cost of that change.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can an AFib detector work from R-to-R intervals alone, with no visible P wave, and what physiological fact makes those intervals irregular?</p>
+        <p class="quiz-question">2. A model reports 99 percent accuracy on a balanced benchmark but is useless in deployment. Give the two distinct reasons "at scale" breaks that number.</p>
+        <p class="quiz-question">3. What is AFib burden, and why might a burden estimator and a binary alert detector be optimized differently?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-29.3.html">Section 29.3</a>, we push past rhythm into the surprising territory of hidden-diagnosis ECG: models that read the same tracing and infer things a cardiologist cannot see by eye, from reduced ejection fraction to a person's age, sex, and even a dangerous potassium level, turning the humble electrocardiogram into a general-purpose physiological probe.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.5: Camera-based rPPG and privacy tradeoffs. Building Sensory AI." name="description"/>
+<title>Section 33.5: Camera-based rPPG and privacy tradeoffs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Continuous and Contactless Health Monitoring</a></div>
+<h1>Camera-based rPPG and privacy tradeoffs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every face on a video call is quietly broadcasting its pulse. I was asked to measure wellness; I have to remember I can also read the room's heartbeat without anyone's leave."</p>
+<cite>A Circumspect AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the optical principle of photoplethysmography from <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>: rPPG is contact PPG seen from a distance. It uses the light-transport and sensor-response physics of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, the band-pass and detrending tools of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, and the power-spectrum peak-picking of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. It is the camera-based sibling of the radar contactless vitals in Section 33.4, and it carries the biometric-leakage thread of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every heartbeat pushes a bolus of blood into the capillary bed of your face, and hemoglobin absorbs green light more strongly than the surrounding tissue. So with each pulse your skin darkens by a fraction of a percent, far below what an eye notices, but well within what a modern camera sensor can resolve when you average over thousands of skin pixels. Remote photoplethysmography (rPPG) recovers the cardiac pulse, and from it heart rate, heart-rate variability, and respiration, from ordinary RGB video of a face, with no electrode, no wristband, no contact at all. That is a gift for accessibility: a webcam becomes a vital-signs monitor for telehealth, driver drowsiness, or a neonatal cot where adhesive sensors damage fragile skin. It is also a quiet hazard, because the same webcam, surveillance feed, or video call that measures a consenting patient can extract a stranger's pulse and stress signature without their knowledge. This section teaches how the signal is pulled out of pixels, and why every deployment must treat that capability as a privacy liability by default.</p>
+</div>
+
+<h2>A pulse hiding in a fraction of a percent</h2>
+<p>The measurable quantity is tiny. The pulsatile (AC) component of the skin-color change is on the order of \( 10^{-2} \) to \( 10^{-3} \) of the baseline (DC) intensity, buried under a DC level set by skin tone, ambient light, and camera gain. Three physical facts make recovery possible. First, hemoglobin's absorption is wavelength-dependent, strongest in green (around 540 nm) and weak in the deep red and near-infrared, so the green channel carries the largest pulse and the red channel is a useful near-reference. Second, the pulse is spatially coherent across the whole face while sensor shot noise is independent per pixel, so averaging the green intensity over a region of interest of \( N \) skin pixels raises the pulse-to-noise ratio by roughly \( \sqrt{N} \); this is why rPPG works from an 8-bit consumer sensor whose per-pixel quantization is coarser than the signal itself. Third, the pulse is quasi-periodic in the 0.7 to 4 Hz band (about 42 to 240 beats per minute), so a band-pass filter and a spectral peak (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>) separate it from slow illumination drift and fast motion jitter.</p>
+<p>The villain is motion and light. Any head movement, expression change, or flicker in the ambient lighting modulates the reflected intensity by amounts that dwarf the pulse. A naive "average the green channel and take the FFT" pipeline works on a perfectly still subject under constant light and collapses the instant they speak or turn. Everything sophisticated in rPPG is about rejecting that shared illumination and motion interference while keeping the blood-volume component.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Motion and lighting corrupt all three color channels together, but the pulse lives in a specific direction in RGB space set by the optical absorption of blood, not in any single channel. The winning classical methods (CHROM, POS) do not track brightness; they project the normalized RGB trajectory onto a plane or axis chosen so that the shared, achromatic interference cancels and only the chromatic blood-volume signature survives. Reframing rPPG as "find the pulse's color direction and discard the intensity direction" is what turns a fragile demo into a method robust to a moving, talking face.</p>
+</div>
+
+<h2>From color algebra to deep networks</h2>
+<p>The classical workhorses are linear color transforms. CHROM (de Haan and Jeanne, 2013) forms two chrominance signals \( X = 3R - 2G \) and \( Y = 1.5R + G - 1.5B \) from normalized channels and combines them so that a standardized skin-reflection model cancels the specular, motion-driven term. POS (Wang et al., 2017), plane-orthogonal-to-skin, projects the temporally normalized RGB onto the plane orthogonal to the skin-tone direction, and is the strongest of the hand-designed family. Blind-source approaches (ICA, PCA) instead ask an unmixing algorithm to separate the pulse from interference without a physical prior, and tend to be less robust because they lack the color model. All of these are unsupervised: they need no training data, run in milliseconds, and are the right first tool.</p>
+<p>Supervised deep learning now leads on hard, in-the-wild video. DeepPhys and the temporal-shift MTTS-CAN introduced a two-branch design: an appearance branch learns an attention mask that finds skin and weights well-perfused regions (cheeks, forehead), while a motion branch consumes normalized frame differences so the network sees the pulse-induced change rather than the static face. PhysNet uses a 3D-CNN over the video volume to regress the waveform end to end. The most important recent shift is self-supervised training, because clean rPPG ground truth (a synchronized contact pulse oximeter) is scarce and hard to scale. Contrast-Phys and its successors exploit a physical prior for a contrastive objective (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>): pulse signals from different spatial patches of the same face at the same time must agree, while signals from different time windows must differ. That lets a network learn from unlabeled video and reduces the need for the expensive gold-standard recordings.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.signal import butter, filtfilt
+
+def pos_rppg(rgb, fs=30.0):
+    """POS (plane-orthogonal-to-skin) pulse from a T x 3 skin-mean RGB series."""
+    rgb = np.asarray(rgb, float)
+    T = rgb.shape[0]
+    win = int(1.6 * fs)                 # ~1.6 s sliding window
+    H = np.zeros(T)
+    P = np.array([[0, 1, -1], [-2, 1, 1]])   # POS projection matrix
+    for n in range(win, T):
+        C = rgb[n - win:n]
+        Cn = C / (C.mean(axis=0) + 1e-9)      # temporal normalization
+        S = Cn @ P.T                          # 2 projected signals
+        h = S[:, 0] + (S[:, 0].std() / (S[:, 1].std() + 1e-9)) * S[:, 1]
+        H[n - win:n] += h - h.mean()          # overlap-add
+    b, a = butter(3, [0.7 / (fs / 2), 4.0 / (fs / 2)], btype="band")
+    pulse = filtfilt(b, a, H)
+    spec = np.abs(np.fft.rfft(pulse * np.hanning(T)))
+    freqs = np.fft.rfftfreq(T, 1 / fs)
+    band = (freqs &gt;= 0.7) &amp; (freqs &lt;= 4.0)
+    hr_bpm = freqs[band][np.argmax(spec[band])] * 60.0
+    return pulse, hr_bpm
+</code></pre>
+<div class="code-caption">A complete POS pipeline in a dozen lines: temporally normalize the per-frame skin-mean RGB, project onto the pulse-bearing plane with the fixed matrix, overlap-add across sliding windows, band-pass to the cardiac band, and read heart rate from the dominant spectral peak. The only input is the mean R, G, B of a face region per frame; no training and no labels are involved.</div>
+
+<p>The snippet above is the honest core of classical rPPG. Feed it the mean color of a detected face region per frame and it returns a pulse waveform and a heart-rate estimate. Two upstream steps make it work in practice: a face detector plus skin-segmentation mask to define the region (so hair, eyes, and background are excluded), and a signal-quality gate that suppresses windows with large head motion, exactly the artifact discipline that governed contact PPG in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A neonatal ICU that traded electrodes for a camera</h3>
+<p>Preterm infants have skin so fragile that adhesive ECG electrodes cause tears and infection risk, yet they need continuous heart-rate and respiration monitoring. A hospital research group mounted an ordinary RGB camera over the incubator and ran a POS-then-CNN rPPG pipeline, recovering heart rate within a few beats per minute of the bedside monitor and respiration from the same video's slow intensity and motion envelope. The clinical win was real: fewer skin injuries and a monitor that works through the incubator wall. The design lesson was equally sharp. Because the camera also captured the infant's face and the clinicians moving around the cot, the team processed video on-device and streamed out only the pulse waveform and rate, never the raw frames, and logged access under the hospital's data-governance rules (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>). The vital sign left the room; the video never did.</p>
+</div>
+
+<h2>The privacy tradeoff is structural, not incidental</h2>
+<p>Here is the uncomfortable core of this section. A contact PPG sensor measures a pulse and nothing else. A camera measures a pulse and also a face, an expression, a gaze direction, a room, and the identities of everyone in frame. rPPG does not add a privacy risk to video; it reveals that any face video was always a covert physiological sensor. Three consequences follow. First, extraction is non-consensual by construction: a video call, a doorbell camera, or a stored surveillance clip can be reprocessed to recover pulse and, from heart-rate variability, a proxy for stress and arousal, with no cooperation from the subject and no visible change to the footage. Second, vitals are a biometric that can leak from archives: a dataset shared as "just video" carries recoverable cardiac signals, so de-identification that blurs names but keeps faces does not remove the physiological channel (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>). Third, the capability is dual-use: rPPG powers deepfake detection, because synthetic faces often lack a physiologically consistent pulse across the skin, while the same pulse-from-video is a channel for inferring emotion or deception in settings where the subject never agreed to be measured.</p>
+<p>The engineering response is to make privacy the default architecture, not a policy afterthought. Extract on-device and discard frames: compute the waveform where the video is captured and emit only the derived signal, as the neonatal system did. Restrict the region and the band: a pipeline that keeps only the cardiac-band chrominance signal, not the raw face, is far harder to misuse. Prefer federated or on-edge learning so raw video never pools in a central store (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>). And gate on affirmative consent for the physiological inference specifically, separate from any consent to be on camera, because agreeing to a video call is not agreeing to have your heart rate read. rPPG is the cleanest case in this book of a capability whose value and whose hazard are the identical measurement seen from two sides.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: rPPG-Toolbox</h3>
+<p>Building a full modern rPPG system from scratch, face detection and skin masking, CHROM and POS baselines, DeepPhys, PhysNet, TS-CAN and Contrast-Phys models, plus the standard datasets (UBFC-rPPG, PURE, MMSE-HR) with leakage-safe subject splits and MAE/RMSE/Pearson scoring, is well over a thousand lines. The open-source <code>rppg-toolbox</code> (Liu et al.) reduces a full train-and-evaluate run to a config file and one command: <code>python main.py --config configs/PURE_UBFC_TSCAN.yaml</code>. It handles the preprocessing pipeline, the neural and unsupervised methods, and the cross-dataset evaluation protocol so your work is choosing the method and reading the metrics, not re-deriving the color math or the data loaders.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Current SOTA on in-the-wild rPPG is set by self-supervised and contrastive video models, Contrast-Phys and its descendants, plus temporal-shift networks (TS-CAN, EfficientPhys) that hit heart-rate MAE around 1 to 2 bpm on clean benchmarks like UBFC-rPPG and PURE while degrading gracefully under motion. The hard frontier is not accuracy on clean video but robustness and fairness: performance drops on darker skin tones (a smaller green-channel pulse and camera pipelines tuned for lighter skin), under low light, and during exercise, and closing that equity gap is an active benchmark problem (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>). Two adjacent directions are moving fast: near-infrared rPPG for darkness and privacy-softer sensing, bridging to the thermal and multispectral methods of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-45-thermal-infrared-and-multispectral-sensing/index.html">Chapter 45</a>, and rPPG as a liveness and deepfake cue, where the presence or absence of a coherent facial pulse is a forensic signal.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using a public rPPG dataset (UBFC-rPPG or PURE, each with synchronized contact-oximeter ground truth): (1) Run a face detector, extract the mean RGB of a forehead-and-cheek skin region per frame, and implement the POS pipeline above; report heart-rate MAE and RMSE in bpm and the Pearson correlation of the recovered waveform against the reference. (2) Compare against CHROM and against a green-channel-only FFT baseline, and confirm POS wins under the subject's motion segments. (3) Corrupt the input by adding a slow global brightness ramp (simulated lighting drift) and a synthetic head-motion jitter, and show that the green-only baseline collapses while POS survives, quantifying the illumination-rejection claim. (4) Privacy audit: from the recovered pulse compute a short-window HRV feature and discuss what that leaks beyond heart rate, then re-run the pipeline emitting only the band-passed pulse (never frames) and confirm the metrics are unchanged.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>The pulsatile skin-color change is roughly \( 10^{-2} \) to \( 10^{-3} \) of the baseline, below an 8-bit sensor's per-pixel resolution. What two properties of the signal let rPPG recover it anyway?</li>
+<li>Why do CHROM and POS project the RGB trajectory onto a color plane instead of just averaging the green channel? What interference does that projection cancel?</li>
+<li>A colleague argues that publishing a face-video dataset is fine because they removed all names and metadata. Using rPPG, explain what physiological information is still recoverable and why this is a biometric-leakage problem.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-33.6.html">Section 33.6</a>, we move from optics to biochemistry: continuous glucose monitoring and the broader class of digital biomarkers, where a minimally invasive sensor streams a slow metabolic signal and the modeling challenge shifts from pulling a pulse out of noise to turning long, drifting physiological trends into clinically actionable, individualized measures.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

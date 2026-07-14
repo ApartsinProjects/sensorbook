@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.6: Explainability and false-alarm triage. Building Sensory AI." name="description"/>
+<title>Section 29.6: Explainability and false-alarm triage | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: ECG and Cardiac AI</a></div>
+<h1>Explainability and false-alarm triage</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The model was right about the arrhythmia and wrong about the loose electrode. The nurse could not tell which, so she stopped trusting both."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the beat morphology and lead geometry of <a class="cross-ref" href="index.html">Sections 29.1</a> and the beat-level versus record-level decision granularity of Section 29.4. It leans on calibration, confidence, and conformal prediction from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, on the general interpretability and root-cause toolkit for time series in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, and on the signal-quality and denoising vocabulary of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>. No cardiology background beyond Chapter 28 is required. Amplitude and rate figures are engineering anchors, not clinical thresholds.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A cardiac model that is accurate on a benchmark can still be useless, or dangerous, in a ward. The reason is almost never the accuracy number: it is trust and alarm burden. A critical-care monitor that fires hundreds of arrhythmia alerts per patient per day trains staff to ignore all of them, so the one true ventricular tachycardia is silenced by reflex. A watch that flags atrial fibrillation with no way for a clinician to see <em>why</em> sends its wearer to an emergency room with a screenshot and no context. This section is about the two engineering disciplines that decide whether an ECG model survives contact with real users. Explainability answers "on what evidence did the model decide?" so a human can accept or override it. False-alarm triage answers "which alerts deserve a human's attention?" so the true positives are not drowned. The two are the same problem viewed from two ends: an alarm you cannot explain is an alarm you cannot triage.</p>
+    </div>
+
+    <h2>Alarm fatigue is the real deployment failure</h2>
+    <p>The dominant clinical failure mode of cardiac monitoring is not the missed beat; it is the flood of false ones. Studies of intensive-care telemetry have repeatedly found that the large majority of arrhythmia alarms are false or clinically irrelevant, driven by a lead coming loose, a patient brushing teeth, muscle tremor, or a single premature beat that meets a rule but means nothing. When most alarms are noise, clinicians habituate: response times lengthen, volumes get turned down, and alarms get pre-emptively disabled. This is <strong>alarm fatigue</strong>, and it is a documented cause of patient harm. The lesson for a model builder is that the operating-point metric that matters is rarely sensitivity alone. In a low-prevalence stream, positive predictive value dominates the human experience.</p>
+    <p>The arithmetic is unforgiving. Suppose a detector runs on a continuous stream where a genuine actionable event occurs at prevalence \(\pi = 0.001\) per analysis window. With sensitivity \(0.99\) and a specificity that sounds excellent at \(0.99\), the positive predictive value is</p>
+    $$\text{PPV} = \frac{\pi\,\text{Sens}}{\pi\,\text{Sens} + (1-\pi)(1-\text{Spec})} = \frac{0.001\cdot0.99}{0.001\cdot0.99 + 0.999\cdot0.01} \approx 0.09.$$
+    <p>Nine in ten alerts are false at a specificity that would headline any paper. This is the same base-rate trap that governs any rare-event detector, and it is why the classical change-detection framing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> obsesses over false-alarm rate per hour rather than per-window specificity. The fix is not a better single classifier; it is a system that suppresses, defers, and explains.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>In a rare-event stream, halving the false-positive rate helps the human far more than adding another point of sensitivity. At \(\pi = 0.001\), moving specificity from \(0.99\) to \(0.999\) lifts PPV from about \(9\%\) to about \(50\%\): a tenfold reduction in wasted human attention for the same catch rate. Design the operating point around alarms-per-patient-per-day, then verify sensitivity is still adequate. The reverse order builds an accurate model that no one will keep switched on.</p>
+    </div>
+
+    <h2>Explaining an ECG decision: attribution that lands on P, QRS, and T</h2>
+    <p>Explainability for ECG has a rare advantage over most deep-learning interpretability: the ground-truth vocabulary already exists. A cardiologist reasons in terms of named landmarks (a widened QRS, a flattened P, ST-segment elevation, a prolonged QT), so a faithful explanation should point at those same regions of the trace. This turns a vague "which pixels mattered" question into a checkable one: does the model's evidence overlap the physiological feature a clinician would cite?</p>
+    <p>The workhorse tools are gradient-based attribution over the time axis. <strong>Grad-CAM</strong> adapted to 1D convolutions produces a per-sample importance curve you can overlay on the waveform; <strong>Integrated Gradients</strong> attributes the prediction to input samples relative to a baseline (a flat or median-beat reference) with the appealing completeness property that attributions sum to the score difference. For the transformer and state-space ECG models of Section 29.5, attention weights and attention-rollout give a complementary view of which beats and which intervals the model pooled over. The key discipline, developed generally in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, is to not trust a saliency map because it looks plausible. Validate it: perturb the QRS and confirm the attribution and the prediction both move; run a sanity check where randomizing the top layer's weights should destroy the map. A saliency method that survives neither test is decoration.</p>
+    <p>The highest-value explanation is often not a heatmap but a <strong>concept</strong>: report that the model's decision is driven by "QRS duration above threshold" or "irregular RR intervals," phrased in the clinician's ontology. Prototype and concept-based models learn this directly, matching a query beat against learned exemplars ("this looks like these three training beats labeled PVC"), which a human can inspect far faster than an abstract gradient field.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: the loose-electrode false positive</h3>
+        <p>A telemetry vendor deployed a deep arrhythmia model on step-down units and saw an asystole alert fire on a patient who was, per the bedside nurse, sitting up and talking. The record-level classifier had high confidence. The team added a 1D Grad-CAM overlay to the alert card. On the flagged strip, the importance mass sat not on any beat but on a flat, high-frequency-noise segment where a lead had partly detached: the model had learned that "flatline plus baseline wander equals asystole," a shortcut that is correct for true asystole and catastrophic for a detached electrode. The explanation did two things at once. It told the nurse this alert was an artifact, and it told the engineers to add a signal-quality gate upstream, described next. The fix cut asystole false alarms on that unit by a large margin without touching the classifier's weights.</p>
+    </div>
+
+    <h2>Triage as a pipeline: quality gates and confidence cascades</h2>
+    <p>False-alarm triage is best built as a cascade of cheap-to-expensive stages, each empowered to suppress or defer rather than to alarm. The first and most cost-effective stage is a <strong>signal-quality index (SQI)</strong>. Before any classifier runs, ask whether the window even contains an interpretable ECG. Cheap SQI features include the fraction of the window that is flat or railed, the power ratio between the QRS band (roughly 5 to 40 Hz) and out-of-band noise, kurtosis, and the agreement between two independent QRS detectors on the same strip. A window that fails SQI is not classified as normal or abnormal; it is labeled "uninterpretable" and either suppressed or routed for re-acquisition. Because most artifact-driven false alarms originate in low-quality windows, this single gate removes a large share of them before the model is even consulted, and it is exactly the kind of gating the wearable pipelines of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> apply to motion-corrupted PPG.</p>
+    <p>The second stage is a <strong>confidence and uncertainty gate</strong>. A well-calibrated probability (Chapter 18) lets you route the model's own low-confidence outputs to a human or to a second opinion instead of alarming automatically. Conformal prediction gives this a distribution-free guarantee: rather than emit a point label, emit a prediction set, and treat a window whose set contains more than one arrhythmia class as "ambiguous, escalate." A third stage can add temporal persistence, requiring an abnormal call to hold across several consecutive windows before it becomes an alarm, which trades a few seconds of latency for a large drop in one-off false triggers. The design question at each stage is the cost asymmetry: a suppressed true ventricular tachycardia is far more expensive than a suppressed premature beat, so persistence and confidence thresholds should be class-specific, not global.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def signal_quality_index(x, fs):
+    """Cheap SQI in [0,1]: high when the window looks like a clean ECG."""
+    # 1) fraction of samples that are flat (lead-off / saturation)
+    flat = np.mean(np.abs(np.diff(x)) &lt; 1e-4)
+    # 2) in-band (QRS, 5-40 Hz) vs total power via a crude spectral ratio
+    X = np.abs(np.fft.rfft(x - x.mean()))**2
+    f = np.fft.rfftfreq(len(x), 1/fs)
+    inband = X[(f &gt;= 5) &amp; (f &lt;= 40)].sum()
+    ratio = inband / (X.sum() + 1e-12)
+    return float(np.clip(ratio * (1 - flat), 0, 1))
+
+def triage(x, fs, model, sqi_min=0.5, p_high=0.9, p_low=0.6):
+    """Return an action, not just a label, for one analysis window."""
+    q = signal_quality_index(x, fs)
+    if q &lt; sqi_min:
+        return "SUPPRESS_UNINTERPRETABLE", q     # bad signal: re-acquire, do not alarm
+    p = model.predict_proba(x)                   # calibrated abnormal-class prob.
+    if p &gt;= p_high:
+        return "ALARM", p                        # confident and clean -> alert human
+    if p &gt;= p_low:
+        return "ESCALATE_REVIEW", p              # ambiguous -> queue for a second look
+    return "CLEAR", p                            # confident normal -> stay silent
+
+# Every abnormal-looking window is now sorted into alarm / review / suppress,
+# instead of every model positive becoming an alarm.
+</code></pre>
+    <div class="code-caption">A minimal three-way triage gate. The <code>signal_quality_index</code> catches artifact windows (the loose-electrode case above) before the model runs; the confidence bands then split model positives into confident alarms and human-reviewed ambiguities. In production the thresholds are class-specific and the SQI adds a second QRS-detector-agreement term.</div>
+
+    <p>The code above is deliberately spartan so the control flow is visible. Notice that the model is only one of four decisions: the SQI gate, the two confidence thresholds, and (omitted here) temporal persistence do most of the alarm reduction. This is the recurring shape of a trustworthy monitor: the classifier proposes, and the surrounding logic disposes.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>You do not hand-roll SQI or conformal gating in production. NeuroKit2 exposes <code>nk.ecg_quality()</code> for a validated per-beat quality score (multiple methods, physiologically grounded) in one call, replacing roughly 40 to 60 lines of spectral and detector-agreement code. For the confidence gate, MAPIE wraps any fitted classifier with <code>MapieClassifier</code> to emit conformal prediction sets at a target error rate in about five lines, instead of the ~100 lines of split-conformal calibration and quantile bookkeeping you would otherwise write and test. Both let you spend your effort on the class-specific cost thresholds, which are genuinely yours to choose, rather than on re-deriving standard machinery.</p>
+    </div>
+
+    <h2>From explanation to threshold: cost-sensitive operating points</h2>
+    <p>Explainability and triage meet at the operating point. Once explanations have let you audit <em>why</em> the model fires, you set thresholds by explicit cost rather than by a default \(0.5\). Let \(C_{\text{FN}}\) be the cost of a missed event and \(C_{\text{FP}}\) the cost of a false alarm (including its contribution to fatigue). The Bayes-optimal threshold on a calibrated probability is</p>
+    $$p^\star = \frac{C_{\text{FP}}}{C_{\text{FP}} + C_{\text{FN}}},$$
+    <p>so a class where a miss is catastrophic (ventricular tachycardia) gets a low threshold and fires readily, while a benign-but-noisy class (isolated ectopy) gets a high one. Because these thresholds only make sense on a calibrated score, the calibration work of Chapter 18 is not optional polish; it is what makes the cost model coherent. The final honesty check is evaluation design: alarm-reduction numbers must be measured at fixed sensitivity, patient-by-patient rather than beat-by-beat, so a system cannot look good by suppressing alarms on the easy patients while missing events on the hard ones. That patient-level, leakage-safe framing is the subject of the next section.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a single-lead arrhythmia model from Section 29.2 or the lab and wrap it in the three-way <code>triage</code> gate above, using <code>nk.ecg_quality()</code> for the SQI term. On a held-out patient-level split, plot alarms-per-hour and sensitivity as you sweep the SQI threshold from 0 to 1 with the confidence bands fixed. Identify the SQI value that halves the alarm rate, and report how much sensitivity (if any) you paid for it. Then repeat with class-specific confidence thresholds derived from a cost ratio \(C_{\text{FN}}/C_{\text{FP}} = 20\) for a life-threatening class. Which lever, quality gating or cost-aware thresholds, buys more alarm reduction on your data?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>A detector reports \(99\%\) specificity on a stream with event prevalence \(0.002\). Roughly what fraction of its alarms are false, and why does adding sensitivity barely change that number?</li>
+            <li>A 1D Grad-CAM map for a "normal" call places all its importance on the T wave and none on the QRS. Give one perturbation test that would tell you whether to trust this explanation.</li>
+            <li>Why must a signal-quality gate output a third label ("uninterpretable") rather than folding bad windows into either "normal" or "abnormal"?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-29.7.html">Section 29.7</a>, we turn the triage and calibration choices of this section into a defensible study. We cover clinical validation design: patient-level and site-level splits that respect the leakage traps, prospective versus retrospective evaluation, the reference-standard and adjudication problem, subgroup reporting, and the regulatory framing that decides whether a cardiac model is a research demo or a device a clinician is allowed to rely on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

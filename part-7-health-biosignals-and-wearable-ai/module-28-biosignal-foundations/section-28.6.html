@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.6: Patient-level splits and leakage. Building Sensory AI." name="description"/>
+<title>Section 28.6: Patient-level splits and leakage | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Biosignal Foundations</a></div>
+<h1>Patient-level splits and leakage</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I scored 0.98 on the held-out set. It turns out I had simply learned to recognize Mr. Patel's heartbeat, and Mr. Patel was in both piles."</p>
+<cite>An Overfitted AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the general leakage-safe dataset discipline introduced in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and specializes it to physiology. It assumes you have met the biosignals and their labels earlier in this chapter (Sections 28.1 and 28.5) and are comfortable with basic cross-validation. No new mathematics is required beyond counting groups.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A biosignal carries two things at once: the clinical event you want to detect, and an indelible signature of the person it was recorded from. A resting ECG identifies an individual almost as reliably as a fingerprint. If even one heartbeat from a patient lands in your training set and another lands in your test set, your model can score brilliantly by memorizing the person rather than learning the pathology. Patient-level splitting is the single cheapest, highest-leverage decision in biosignal machine learning, and getting it wrong is the most common way a paper's 0.97 AUC collapses to 0.71 in the clinic.</p>
+</div>
+
+<h2>Why a random split lies to you</h2>
+<p>The default in most tutorials is a random split: shuffle every window, deal 80 percent to train and 20 percent to test. For independent samples this is fine. Biosignal windows are not independent. Consecutive heartbeats from one Holter recording share the same lead placement, the same electrode-skin impedance, the same QRS morphology, the same baseline wander, and the same idiosyncratic physiology. Two windows one second apart are near-duplicates. A random split scatters these near-duplicates across train and test, so the test set is answered largely by lookup rather than by generalization.</p>
+<p>The consequence is a systematic <em>optimistic bias</em>. Formally, honest generalization asks how a model trained on patients \(P_{\text{train}}\) performs on a <em>new</em> patient \(p^\ast \notin P_{\text{train}}\). A random split instead estimates performance conditioned on having already seen \(p^\ast\), a quantity no deployment will ever enjoy. The gap between the two can be enormous. On arrhythmia and seizure benchmarks, moving from record-mixed to subject-disjoint evaluation routinely erases ten to thirty points of reported accuracy. The model was never that good; the protocol was that generous.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The correct unit of splitting is not the window, the beat, or the recording. It is the <strong>person</strong>. Every sample tied to one individual must live entirely on one side of the train/validation/test partition. Anything finer than the person leaks identity, and identity in physiology is a shortcut so predictive that gradient descent will always take it if you leave the door open.</p>
+</div>
+
+<h2>The taxonomy of biosignal leakage</h2>
+<p>Patient overlap is the headline offender, but several quieter leaks share the same signature: a validation score that will not survive contact with a new hospital. Naming them makes them checkable.</p>
+<p><strong>Identity leakage</strong> is the same person in two splits, the case above. <strong>Recording leakage</strong> is subtler: even with disjoint patients, overlapping sliding windows from a single recording can straddle a fold boundary, so a window centered at \(t\) and another at \(t+1\) share most of their samples. Enforce a guard gap so no two windows within a stride of the boundary are separated. <strong>Device and site leakage</strong> is the trap where a rare class was collected on one machine or at one clinic: the model learns the device's transfer function, not the disease, a failure mode we return to under distribution shift in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. <strong>Preprocessing leakage</strong> happens when you fit a normalizer, a filter's statistics, or a PCA basis on the full dataset before splitting, letting test-set statistics bleed into training; fit every transform on the training fold only. <strong>Label leakage</strong> occurs when the reference standard (Section 28.5) encodes a shortcut, for example a lead that was only connected when the annotating cardiologist already suspected the finding.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wearable that aced the lab and failed the wrist</h3>
+<p>A team building an atrial-fibrillation detector for a consumer smartwatch trained on a PPG corpus of 400 volunteers. They used a random 80/20 split of ten-second windows and reported 0.96 AUC. The regulatory reviewer asked a single question: were any volunteers in both sets? They were. Roughly 30 windows per person, scattered randomly, meant almost every test window had a sibling in training. Re-run with a patient-disjoint split, the AUC fell to 0.79, and the false-positive rate on healthy wrists tripled. The model had partly learned each volunteer's pulse-wave shape, which is stable within a person and useless across people. The fix cost three lines of code; discovering it after launch would have cost a recall. This is the same discipline that <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> treats as non-negotiable for any PPG cardiovascular claim.</p>
+</div>
+
+<h2>Grouped cross-validation, and its stratified cousin</h2>
+<p>The mechanism that prevents identity leakage is <strong>grouped</strong> cross-validation: attach a group label (the patient ID) to every sample and require that no group crosses a fold boundary. In scikit-learn this is <code>GroupKFold</code>. The complication is that clinical datasets are also severely imbalanced: a positive class may live in a handful of patients, and a naive grouped split can hand an entire fold zero positives, making its metric meaningless. <code>StratifiedGroupKFold</code> solves both at once, keeping groups intact <em>and</em> balancing class proportions across folds as far as the group structure allows.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(0)
+n_patients, beats = 60, 40
+# Each patient has an identity signature; label depends only on a weak clinical feature.
+pid   = np.repeat(np.arange(n_patients), beats)
+ident = rng.normal(size=n_patients)[pid]                 # strong per-person shortcut
+y     = np.repeat(rng.integers(0, 2, n_patients), beats) # label is a patient property
+clin  = 0.4 * y + rng.normal(scale=1.0, size=len(y))     # weak honest signal
+X     = np.column_stack([clin, ident + rng.normal(scale=0.05, size=len(y))])
+
+def cv_auc(splitter, groups=None):
+    scores = []
+    for tr, te in splitter.split(X, y, groups):
+        m = LogisticRegression().fit(X[tr], y[tr])
+        scores.append(roc_auc_score(y[te], m.predict_proba(X[te])[:, 1]))
+    return np.mean(scores)
+
+naive   = cv_auc(StratifiedKFold(5, shuffle=True, random_state=0))
+grouped = cv_auc(StratifiedGroupKFold(5), groups=pid)
+print(f"random (leaky) AUC : {naive:.3f}")
+print(f"patient-disjoint AUC: {grouped:.3f}")</code></pre>
+<div class="code-caption">The random split lets the model exploit the per-person <code>ident</code> feature and reports an inflated AUC; the patient-disjoint split forces it to rely on the weak honest <code>clin</code> signal and reveals the true, far lower score. The only change is passing <code>groups=pid</code> to a grouped splitter.</div>
+<p>Run this and the two numbers disagree sharply, and the disagreement is the entire lesson: the gap between them measures exactly how much your reported score depends on having seen the patient before. Report both during development and treat the gap as a leakage alarm, not a nuisance.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: StratifiedGroupKFold</h3>
+<p>Writing a correct stratified-and-grouped partitioner by hand (greedy group assignment that balances both class counts and fold sizes, with reproducible ordering) is roughly 60 to 80 lines and easy to get subtly wrong. Scikit-learn's <code>StratifiedGroupKFold</code> does it in one line and guarantees no group crosses a fold. Pair it with <code>sklearn.model_selection.GroupShuffleSplit</code> for a single held-out patient set. You supply the patient IDs; the library handles the combinatorics.</p>
+</div>
+
+<h2>Nested groups, and when the person is not enough</h2>
+<p>Sometimes the person is the wrong grouping key because a coarser correlation dominates. If each hospital used a different ECG cart, or each study site enrolled a different demographic, then even patient-disjoint folds can leak <em>site</em> identity. The principle generalizes: split on the coarsest unit that shares a nuisance signature. For a multi-site trial that often means leave-one-site-out evaluation nested inside patient-disjoint folds, which simultaneously stress-tests generalization to new hardware and new populations. This hierarchical view (person within device within site) connects to the broader benchmarking protocol developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+<p>A related caution belongs to privacy, not just accuracy. Because a physiological signal re-identifies its owner, a model that has memorized patients can leak who they are, an attack surface that <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> examines under biometric re-identification. Patient-disjoint splitting is thus doing double duty: it makes your metrics honest and it discourages the model from encoding identity in the first place.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take any public arrhythmia dataset with a patient ID column (MIT-BIH is a good choice). Train the same classifier twice: once with <code>StratifiedKFold</code> on shuffled beats, once with <code>StratifiedGroupKFold</code> grouped by patient. (1) Report both mean AUCs and the gap. (2) Add overlapping sliding windows with a 50 percent stride and confirm the gap widens. (3) Introduce a guard band that drops windows within one stride of a fold boundary and show the guard band shrinks the residual leak in the grouped split. Write one sentence stating which number you would put in a paper and why.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does splitting on individual windows, rather than on patients, produce an optimistically biased estimate of clinical performance?</li>
+<li>You have a positive class present in only 6 of 200 patients. Which splitter do you reach for, and what failure does plain <code>GroupKFold</code> risk here?</li>
+<li>Name two leaks that survive a correct patient-disjoint split, and give the one-line fix for each.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-28.7.html">Section 28.7</a>, we widen the lens from evaluation hygiene to the regulatory and safety context that surrounds any biosignal model destined for a real body, previewing the standards, risk classes, and clinical-validation expectations that later chapters in this part make concrete.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

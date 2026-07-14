@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.6: Artifact and crosstalk handling. Building Sensory AI." name="description"/>
+<title>Section 32.6: Artifact and crosstalk handling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: EMG and Neuromuscular AI</a></div>
+<h1>Artifact and crosstalk handling</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A clean muscle signal is a story about one muscle. Half of what reaches the electrode is a rumor from the neighbors and a complaint from the cable."</p>
+        <cite>A Skeptical AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the volume-conductor and crosstalk picture introduced in <a class="cross-ref" href="section-32.1.html">Section 32.1</a> and the envelope and spectral features of <a class="cross-ref" href="section-32.2.html">Section 32.2</a>. It leans on the filter-design vocabulary (high-pass, notch, adaptive filtering) from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, the spectral reasoning of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, and the change-detection idea from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. No new physiology is needed; every corruption below is treated as an engineering signal path from an unwanted source into your channel.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>An EMG electrode is a microphone in a crowded room. The voice you want, the target muscle, arrives mixed with four kinds of interference: <strong>powerline</strong> hum from the mains, <strong>motion and cable artifact</strong> from the electrode-skin interface flexing, <strong>physiological contamination</strong> such as the heartbeat leaking into trunk muscles, and <strong>crosstalk</strong> from adjacent muscles sharing the detection volume. Each corruption lives in a different part of the signal, so each needs a different tool, and the deepest one, crosstalk, cannot be removed by any frequency filter because it occupies the exact same band as the signal. This section is a field guide to knowing which corruption you have, removing what is removable, spatially suppressing what filtering cannot, and, above all, preventing your model from quietly learning the artifact as if it were physiology. That last failure is the one that passes every offline test and collapses in the field.</p>
+    </div>
+
+    <h2>The artifact zoo: name it before you fight it</h2>
+    <p>Mislabeling a corruption wastes the wrong tool on it, so start by locating each interferer in frequency and space. <strong>Powerline interference</strong> is a narrow, near-deterministic tone at 50 or 60 Hz plus harmonics, injected capacitively from nearby wiring; it sits squarely inside the 20 to 450 Hz EMG band, which is why you cannot simply band-pass it away. <strong>Motion and baseline-wander artifact</strong> is the opposite: mostly low-frequency energy (below roughly 20 Hz) from the electrode half-cell potential shifting as the skin stretches, plus abrupt steps when a cable tugs or an electrode partially lifts. <strong>Electrocardiographic (ECG) contamination</strong> is a quasi-periodic sharp complex around 1 Hz repetition that overlaps EMG spectrally and dominates recordings from trunk and proximal muscles. <strong>Saturation and contact loss</strong> are not additive noise at all but clipping and dropout, where the amplifier rails or the signal flatlines. And <strong>crosstalk</strong>, the corruption this chapter names its own section for, is genuine muscle voltage from the wrong muscle, identical in spectrum and statistics to the signal you want.</p>
+    <p>The practical consequence is a decision tree. Narrowband and stationary? Notch it. Low-frequency and slow? High-pass it. Periodic and cardiac? Template-subtract or gate it. Clipped or flat? Detect and mask the segment, never trust it. Spectrally identical but spatially separable? Only geometry, not filtering, will help. Getting this mapping right is most of the battle.</p>
+
+    <h2>Frequency-domain defenses and their honest limits</h2>
+    <p>Two filters handle the easy majority. A <strong>high-pass</strong> (or band-pass) filter with a corner near 20 Hz removes baseline wander and most motion artifact, at the cost of discarding the low-frequency EMG content that carries some force information; the 20 Hz corner is a compromise the surface-EMG community settled on precisely because it sacrifices little muscle energy while cutting most motion energy. A <strong>notch</strong> or narrow band-stop at the mains frequency and its harmonics suppresses powerline hum. But a naive fixed notch is blunt: it also deletes real EMG energy at that frequency and rings on transients. A <strong>spectral-interpolation</strong> or <strong>adaptive notch</strong> approach, which estimates the hum's amplitude and phase and subtracts exactly that sinusoid, preserves far more signal, and is the reason we lean on the adaptive-filtering ideas from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> rather than a hard band-stop.</p>
+    <p>ECG contamination is the interesting middle case. Its spectrum overlaps EMG, so filtering alone smears it, but its <em>timing</em> is exploitable: detect each R-peak, then subtract an averaged QRS template time-locked to those peaks, or gate the affected windows. This is a recurring pattern in biosignal cleaning, borrowing directly from the cardiac methods of <a class="cross-ref" href="../module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>: when a corruption is periodic, its period is a lever no additive-noise filter can match.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Crosstalk is spectrally invisible: the interfering muscle emits the same 20 to 450 Hz broadband signal as your target, so no band-pass, notch, or wavelet threshold can separate them. What differs is <strong>where</strong> the sources sit, not their frequency content. This is why crosstalk is defeated in the <em>spatial</em> domain, by combining multiple closely spaced electrodes so that a shared, distant source cancels while a local source survives. If you find yourself reaching for a sharper temporal filter to fix crosstalk, you are solving the wrong equation. Reach for another electrode instead.</p>
+    </div>
+
+    <h2>Spatial filtering: the real crosstalk remedy</h2>
+    <p>Recall from <a class="cross-ref" href="section-32.1.html">Section 32.1</a> that a distant source contributes to many electrodes almost equally, because its potential has spread and flattened by the time it reaches the skin, while a nearby source produces a sharp spatial peak under one electrode. That difference is a filter waiting to be built. A <strong>single-differential</strong> montage subtracts two adjacent electrodes, cancelling any voltage common to both (much of the far-field crosstalk and a good deal of powerline pickup) while keeping the local gradient of the target. A <strong>double-differential</strong> or <strong>Laplacian</strong> montage goes further, subtracting the second spatial derivative so that only sources tightly localized under the center electrode survive. Each step up sharpens selectivity, trading a wider, blurrier detection volume for a narrow one, which is exactly the surface-side lever toward the intramuscular selectivity of <a class="cross-ref" href="section-32.1.html">Section 32.1</a>. The listing below builds a three-electrode array over a target muscle with a neighbor bleeding in, and measures how single- and double-differential montages collapse the crosstalk.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(1)
+fs, T = 2000, 2.0
+t = np.arange(int(fs * T)) / fs
+
+# Two independent broadband "muscle" sources (band-limited noise bursts).
+def muscle(seed):
+    x = rng.standard_normal(t.size) if seed is None else np.random.default_rng(seed).standard_normal(t.size)
+    b = np.exp(-((np.arange(-40, 41)) ** 2) / (2 * 12 ** 2)); b /= b.sum()
+    return np.convolve(x, b, mode="same")
+
+target, neighbor = muscle(10), muscle(20)
+
+# Electrode line: target is local (steep falloff), neighbor is far (nearly common-mode).
+w_t = np.array([0.55, 1.00, 0.55])     # target peaks under the center electrode
+w_n = np.array([0.90, 0.95, 0.90])     # neighbor arrives almost equally on all three
+E = np.outer(target, w_t) + np.outer(neighbor, w_n)   # shape (samples, 3 electrodes)
+
+def crosstalk_ratio(sig, tgt, ngh):
+    # Least-squares energy share attributable to the neighbor source.
+    A = np.vstack([tgt, ngh]).T
+    a_t, a_n = np.linalg.lstsq(A, sig, rcond=None)[0]
+    return (a_n ** 2 * ngh.var()) / (a_t ** 2 * tgt.var() + a_n ** 2 * ngh.var())
+
+mono = E[:, 1]                         # single electrode (monopolar)
+sd   = E[:, 1] - E[:, 0]               # single differential
+dd   = E[:, 0] - 2 * E[:, 1] + E[:, 2] # double differential (spatial Laplacian)
+
+for name, s in [("monopolar", mono), ("single-diff", sd), ("double-diff", dd)]:
+    print(f"{name:12s} crosstalk share: {crosstalk_ratio(s, target, neighbor):.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 32.6.</strong> A spatial-filter crosstalk demo. Three electrodes see a local target source and a near-common-mode neighbor. The monopolar channel carries a large crosstalk share; the single-differential montage cancels most of the common neighbor; the double-differential (Laplacian) montage nearly eliminates it, because differencing rejects the spatially flat far-field. The cost, unshown here, is a smaller detection volume and lower signal amplitude. Sweep <code>w_n</code> toward <code>w_t</code> to see selectivity fail as the neighbor stops behaving like a common-mode source.</div>
+
+    <p>As Listing 32.6 shows numerically, the crosstalk share drops sharply from the monopolar channel to the double-differential montage, with no temporal filter touched. This is the whole argument of the key-insight callout made quantitative: geometry, not frequency, is the crosstalk lever.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a prosthetic wrist that fought the road</h3>
+        <p>A myoelectric hand for a transradial user worked flawlessly in the fitting clinic and misfired constantly on the drive home. Logging the raw channels revealed the culprit: every time the residual limb pressed against the socket over a bump, the electrode-skin interface flexed and threw a low-frequency step that the envelope detector read as a contraction, triggering an unwanted grasp. The vibration also modulated the baseline in the motion band. The fix layered three defenses: a 20 Hz high-pass to kill the baseline steps, a single-differential montage to reject the common-mode powerline and much of the socket-wide motion, and a small accelerometer on the socket used as a <strong>reference channel</strong> for an adaptive filter, subtracting the correlated motion component (the inertial-sensing tools of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> earning their keep here). False grasps dropped by an order of magnitude. The lesson: the clinic bench is a clean room, and artifact robustness is a road-test property, not a bench property.</p>
+    </div>
+
+    <h2>Reference-based and data-driven removal</h2>
+    <p>When an artifact has a measurable cause, measure it. An <strong>adaptive filter</strong> takes a reference correlated with the interferer (an accelerometer for motion, a dedicated electrode for the mains, an ECG lead for cardiac) and subtracts the part of the EMG that the reference predicts, leaving the muscle signal that the reference cannot explain. This is the single most powerful non-spatial tool, because it removes exactly the corrupted component and nothing else. When you have many electrodes but no clean reference, <strong>blind source separation</strong> such as independent component analysis can unmix the recording into statistically independent sources, letting you discard the components that look like powerline, motion, or a wandering baseline; the same machinery that decomposes high-density surface EMG in <a class="cross-ref" href="section-32.1.html">Section 32.1</a> doubles as an artifact separator. Both approaches share a caution: an over-eager filter that removes any component correlated with movement will also remove the very muscle activity you are trying to measure, because in EMG the signal and the motion artifact are both caused by the same movement.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling a full clean-and-artifact pipeline (band-pass, adaptive mains removal, rectification, envelope, plus onset-based quality checks) is roughly 60 to 90 lines that are easy to misorder. <code>neurokit2</code> collapses the standard path to two lines and returns a labeled envelope you can gate on:</p>
+        <pre class="language-python"><code class="language-python">import neurokit2 as nk
+clean = nk.emg_clean(emg, sampling_rate=2000)             # band-pass + mains handling
+signals, info = nk.emg_process(clean, sampling_rate=2000) # envelope + activation onsets</code></pre>
+        <div class="code-caption"><strong>Listing 32.7.</strong> <code>neurokit2.emg_clean</code> plus <code>emg_process</code> replace about 70 lines of temporal preprocessing with one call each. What no library does for you is spatial crosstalk suppression (that needs your multi-electrode montage from Listing 32.6) or deciding which segments to discard. Match the tool to the corruption: libraries handle the temporal filters; geometry and gating are yours.</div>
+    </div>
+
+    <h2>Do not let the model learn the artifact</h2>
+    <p>The failure that survives every offline benchmark is <strong>artifact leakage</strong>: a model that scores well by keying on a corruption that happens to correlate with the label in your dataset. If every "grasp" trial in training was recorded with the arm moving, a network can classify grasps by reading motion artifact instead of muscle activity, then fail the instant the artifact statistics shift, exactly the distribution-shift trap of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. The defenses are threefold. First, <strong>quality gating</strong>: compute a signal-quality index per window (saturation flags, powerline-to-signal ratio, baseline-wander energy) using the change-detection tooling of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and mask or down-weight bad windows rather than feeding them in. Second, <strong>artifact-aware augmentation</strong>: inject synthetic powerline, motion steps, and electrode-shift into training so the model learns invariance rather than dependence. Third, <strong>leakage-safe splits</strong>: as <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and <a class="cross-ref" href="section-32.5.html">Section 32.5</a> insist, split by subject and session so that no recording condition is shared across train and test, which is the only way to catch a model that has quietly learned the room instead of the muscle.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current direction is to fold artifact handling into the model rather than bolting it on upstream. Self-supervised pretraining on large unlabeled EMG corpora (the wearable-foundation-model program of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) learns representations that are naturally robust to electrode shift and motion, and domain-adversarial training explicitly penalizes any feature that predicts the recording session, forcing the network off artifact shortcuts. Meta's surface-EMG wristband work has pushed generalized, out-of-the-box decoding that tolerates day-to-day electrode variation without per-user recalibration, a robustness bar that classical per-session cleaning never reached. The open problem is evaluation: robustness claims are only credible under the leakage-safe, cross-subject, cross-session protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, and a model that has never seen a truly novel artifact distribution has not yet been tested.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 32.6 by adding a 60 Hz powerline sinusoid, identical on all three electrodes (pure common mode), plus a low-frequency baseline drift unique to the center electrode. Confirm numerically that the single-differential montage removes the powerline (because it is common mode) but does not remove the drift (because it is not shared), then add a 20 Hz high-pass and show the drift falls away. In three sentences, explain why the two corruptions needed two different tools and which domain (spatial or temporal) each attack lived in.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can a notch filter remove 50 Hz powerline hum but never remove crosstalk, even though both fall inside the EMG band?</p>
+        <p class="quiz-question">2. An accelerometer-referenced adaptive filter is tuned aggressively and the classifier's accuracy drops. Give the most likely reason, given that EMG and motion artifact are often driven by the same movement.</p>
+        <p class="quiz-question">3. A model reaches 98% grasp-classification accuracy offline and fails in deployment. Describe the artifact-leakage mechanism that produces exactly this pattern, and name the single evaluation change from Chapter 5 that would have exposed it.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-32.7.html">Section 32.7</a>, we close the loop: the cleaned, crosstalk-suppressed signal must now drive a device in real time, under tens of milliseconds of latency, where every filter and gate you added here becomes a budget item competing against responsiveness. We turn artifact handling into a streaming control problem.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

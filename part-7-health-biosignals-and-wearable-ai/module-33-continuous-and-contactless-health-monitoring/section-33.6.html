@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.6: Continuous glucose monitoring and digital biomarkers. Building Sensory AI." name="description"/>
+<title>Section 33.6: Continuous glucose monitoring and digital biomarkers | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Continuous and Contactless Health Monitoring</a></div>
+<h1>Continuous glucose monitoring and digital biomarkers</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They asked me for the blood sugar. I measured the fluid between the cells, five minutes late, and called it close enough. The honest part was saying how close."</p>
+        <cite>A Forthright AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on the electrochemical transducer and measurement-model thinking of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, the calibration and prediction-interval machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the change-detection ideas of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Glucose values, sensor lags, and accuracy figures below are order-of-magnitude anchors from the published literature, not clinical thresholds for any individual.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A continuous glucose monitor (CGM) is a coin-sized biochemical factory worn on the arm. A hair-thin filament sits in the interstitial fluid under the skin, an enzyme on it reacts with glucose, and the reaction produces a tiny current the device reads every one to five minutes for up to two weeks. That turns a quantity people used to sample four times a day with a finger-stick into a dense waveform of roughly three hundred readings per day. The signal-processing story is unusual for this book: the sensor does not measure the thing clinicians care about (blood glucose) but a delayed, lower-amplitude proxy (interstitial glucose), and the hardest engineering is quantifying and correcting that gap. Once you have the corrected stream, the same trick generalizes. A <em>digital biomarker</em> is any clinically meaningful measure computed from continuous sensor data, and glucose is the cleanest worked example of turning a raw physiological stream into numbers a doctor will prescribe against.</p>
+    </div>
+
+    <h2>What the sensor actually measures, and why it lags</h2>
+    <p>Almost every commercial CGM is an amperometric enzyme electrode. The filament is coated with glucose oxidase; glucose diffusing in from the interstitial fluid is oxidized, and the byproduct is detected as a current at the working electrode. To first order the current is proportional to the local glucose concentration, so the device is really an ammeter with a chemistry problem in front of it, exactly the transducer-plus-measurement-model framing of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Two facts dominate downstream. First, the measurement is in <em>interstitial</em> fluid, and glucose must diffuse across the capillary wall to get there, so the interstitial signal trails blood glucose by roughly five to fifteen minutes and is smoothed relative to it: when blood sugar rises fast after a meal the CGM reads low, and when it falls fast the CGM reads high. Second, the enzyme layer and the surrounding tissue drift over the wear period, so a current-to-glucose gain calibrated on day one is wrong by day ten.</p>
+    <p>Modeling this is a small state-estimation problem. A common description writes interstitial glucose \(I(t)\) as a low-pass, delayed version of blood glucose \(B(t)\):</p>
+    $$\frac{dI(t)}{dt} = -\frac{1}{\tau}\,\big(I(t) - B(t)\big),$$
+    <p>where \(\tau\) is the diffusion time constant of a few minutes. Modern sensors invert an estimate of this relationship internally and apply a factory calibration so the displayed number is already an estimate of blood glucose. That inversion is why a good CGM can skip finger-stick calibration, and why a bad one amplifies noise when it tries to undo the lag during rapid excursions.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The accuracy metric for a CGM is not RMSE in the usual sense; it is <strong>MARD</strong>, the mean absolute relative difference against reference blood glucose, \(\text{MARD}=\frac{1}{N}\sum_i \frac{|c_i - r_i|}{r_i}\), reported as a percentage. Relative error matters because a 10 mg/dL error is trivial at 250 mg/dL but life-changing at 55 mg/dL. Current factory-calibrated sensors reach roughly 8 to 10 percent MARD. But MARD alone hides the failure that matters: errors during fast falls near the hypoglycemic range, exactly where the interstitial lag is worst. This is why the field also grades sensors on the Clarke error grid, which weights errors by clinical consequence rather than magnitude.</p>
+    </div>
+
+    <h2>From waveform to digital biomarkers</h2>
+    <p>A single glucose number is a lab test; a two-week glucose <em>waveform</em> is a metabolic portrait. The consensus set of digital biomarkers distilled from it (Battelino et al., 2019) is now standard in diabetes care. <strong>Time in range</strong> (TIR) is the fraction of readings inside 70 to 180 mg/dL, target above 70 percent; <strong>time below range</strong> and <strong>time above range</strong> split out the dangerous tails. <strong>Glycemic variability</strong> is captured by the coefficient of variation \(\text{CV}=\sigma/\mu\), with roughly 36 percent as the line between stable and unstable control, and by excursion metrics such as MAGE (mean amplitude of glycemic excursions). The <strong>glucose management indicator</strong> estimates long-term average control from the mean CGM value, replacing a blood draw with arithmetic. Rendered together as the ambulatory glucose profile, a single-page overlay of many days onto one 24-hour axis, these biomarkers surface the meal spikes and overnight lows that a quarterly lab test averages away.</p>
+    <p>These are digital biomarkers in the precise sense used across wearable health: features computed from a continuous sensor stream that stand in for a clinical endpoint. The same recipe produces resting heart rate and heart-rate variability from the PPG of <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, sleep-stage fractions from the multimodal fusion of Section 33.3, and gait cadence from the inertial signals of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>. Glucose is simply the biomarker with the clearest regulatory acceptance, which makes it the template everyone else copies.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: Abbott FreeStyle Libre and Dexcom G7</h3>
+        <p>The Abbott FreeStyle Libre and Dexcom G7 made CGM mainstream, and they embody two philosophies. The Libre began as an intermittently scanned sensor: it logged glucose every minute internally but reported only when the user waved a phone over it, trading real-time alarms for low cost. Dexcom committed to true continuous streaming with a Bluetooth reading roughly every five minutes and predictive low-glucose alerts that warn before a hypoglycemic event. Both are factory-calibrated, both publish MARD in the 8 to 10 percent band, and both feed the same biomarker pipeline. The engineering divergence is instructive: the predictive alert is a short-horizon forecast plus a change-detector on the glucose stream, precisely the online change-detection problem of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and getting its false-alarm rate low enough that people do not disable it is the whole product.</p>
+    </div>
+
+    <h2>Computing the core biomarkers</h2>
+    <p>The listing below takes a raw five-minute CGM series and emits the biomarkers a clinician reads first: time in range, time below range, the coefficient of variation, and the glucose management indicator. It is deliberately plain arithmetic, because the value is in the definitions being exactly the consensus ones, not in any modeling cleverness.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def cgm_biomarkers(glucose_mgdl, interval_min=5):
+    """Consensus CGM metrics from a raw glucose series (mg/dL)."""
+    g = np.asarray(glucose_mgdl, dtype=float)
+    g = g[~np.isnan(g)]                      # gaps are missing, not zero
+    n = len(g)
+    tir  = np.mean((g >= 70) & (g <= 180))   # time in range, target > 0.70
+    tbr  = np.mean(g < 70)                    # time below range, the danger tail
+    tar  = np.mean(g > 180)                   # time above range
+    cv   = g.std(ddof=1) / g.mean()           # glycemic variability, ~0.36 cutoff
+    gmi  = 3.31 + 0.02392 * g.mean()          # glucose management indicator (%)
+    return {
+        "days_covered": n * interval_min / 1440,
+        "time_in_range": round(float(tir), 3),
+        "time_below_range": round(float(tbr), 3),
+        "time_above_range": round(float(tar), 3),
+        "cv": round(float(cv), 3),
+        "gmi_percent": round(float(gmi), 2),
+    }
+
+rng = np.random.default_rng(0)
+day = 120 + 40 * np.sin(np.linspace(0, 6 * np.pi, 288)) + rng.normal(0, 12, 288)
+print(cgm_biomarkers(day))</code></pre>
+    <div class="code-caption">Turning a raw five-minute CGM stream into the consensus digital biomarkers. Note that gaps are dropped as missing (the missingness-as-signal concern of Section 33.2), and every metric maps to a published clinical target rather than an ad-hoc threshold.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: iglu</h3>
+        <p>The hand-rolled function above covers four metrics in about twenty lines. The <code>iglu</code> package (available in R and as a Python port) computes the full consensus panel, over forty validated metrics including MAGE, CONGA, J-index, and the ambulatory glucose profile percentiles, from a tidy dataframe in a single call, and handles the multi-sensor gap-stitching and unit conversions that the snippet ignores. Reaching for it collapses several hundred lines of careful metric definitions and edge cases into roughly five, and it keeps you aligned with the exact formulas regulators and clinicians expect rather than a subtly different reimplementation.</p>
+    </div>
+
+    <h2>Validating a digital biomarker before anyone trusts it</h2>
+    <p>A biomarker is only useful once it passes the three-part bar the field calls V3: <strong>verification</strong> (does the sensor measure the raw quantity correctly, the ammeter-and-chemistry check), <strong>analytical validation</strong> (does the algorithm compute the metric correctly from that raw signal), and <strong>clinical validation</strong> (does the metric track the health outcome it claims to). MARD and the Clarke grid live in the first two layers; showing that time in range predicts complications lives in the third. Skipping the middle layer is the classic wearable failure: a resting-heart-rate biomarker can be verified against an ECG yet be analytically wrong because the algorithm averaged across motion artifacts it should have rejected. Calibrating the sensor's own uncertainty, so a CGM reports not just 62 mg/dL but 62 with a wide interval during a rapid fall, is the conformal work of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and it separates a number on a screen from a number a clinician will dose insulin against. The regulatory scaffolding that turns this evidence into an approved device is the subject of <a class="cross-ref" href="../module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is non-invasive and multi-analyte sensing. Optical and radiofrequency approaches to glucose without a filament have been claimed for two decades and repeatedly failed the MARD bar, but wearable spectroscopy and interstitial microneedle arrays are narrowing the gap. In parallel, the same electrochemical platform is being extended to lactate, ketones, cortisol, and alcohol in sweat and interstitial fluid, pointing toward a continuous multi-biomarker patch. The machine-learning frontier is the closed loop: pairing CGM with an insulin pump into an artificial pancreas, where a short-horizon glucose forecast drives automated dosing. That turns a passive digital biomarker into a control signal, and raises the safety-critical forecasting and drift questions that Section 33.7 takes up next.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the interstitial-lag model \(\dot I = -(I-B)/\tau\) with \(\tau = 8\) minutes. Simulate a post-meal blood-glucose rise \(B(t)\) that ramps from 90 to 200 mg/dL over 30 minutes and then decays, generate the lagged interstitial signal \(I(t)\), and add Gaussian noise. (a) Compute MARD between \(I\) and \(B\) separately during the fast-rise window and during a flat overnight window; confirm the error concentrates in the excursion. (b) Implement a simple lag-compensation by extrapolating \(I\) forward with its own slope, and report whether it lowers MARD or amplifies noise. (c) Discuss why the Clarke error grid would score your two error regimes differently.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why does a CGM read low during a fast post-meal rise and high during a fast fall, and which clinical range makes that lag most dangerous?</li>
+            <li>MARD is a relative error. Give a concrete pair of readings where a lower MARD is actually the more clinically dangerous sensor, and explain what metric catches it.</li>
+            <li>Name the three layers of V3 evidence and say which one a sensor that is perfectly calibrated against blood glucose but averages across motion artifacts would fail.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-33.7.html">Section 33.7</a>, we confront what happens to all of these biomarkers over months: sensors age, bodies change, populations shift, and a model that was well calibrated at deployment silently drifts. We turn from computing digital biomarkers to deploying them responsibly, with the monitoring, recalibration, and safety guardrails that continuous health sensing demands.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

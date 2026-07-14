@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.5: Deep ECG models and ECG foundation models. Building Sensory AI." name="description"/>
+<title>Section 29.5: Deep ECG models and ECG foundation models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: ECG and Cardiac AI</a></div>
+<h1>Deep ECG models and ECG foundation models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You labeled ten thousand ECGs. The hospital archive holds ten million unlabeled ones. Guess which pile taught me more about what a heart looks like."</p>
+<cite>A Self-Supervised AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous sections asked <em>what</em> we want the ECG model to say: is this atrial fibrillation, what is the ejection fraction, is this a single abnormal beat or a whole abnormal record. This section is about the machine that says it. For a decade the answer was a deep 1D convolutional network trained end to end on a labeled corpus, and that recipe still wins many benchmarks. But labels for ECG are expensive, rare diagnoses are rare by definition, and every hospital and every wristband records the same voltage in a slightly different way. The field's response is the same shift that reshaped vision and language: pretrain one large encoder on millions of <em>unlabeled</em> ECGs, then adapt it to each task with a handful of labels. Understanding both the supervised architectures and the foundation-model recipe, and knowing which to reach for when, is what separates a model that memorizes a benchmark from one that generalizes to a patient it has never seen.</p>
+</div>
+
+<p>This section assumes the deep-learning building blocks of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> and the CNN, recurrent, and transformer families of Chapters <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">14</a> and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">15</a>. It leans hard on the self-supervised and contrastive machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, both of which are load-bearing here. We stay on architecture and pretraining; the tasks themselves live in Sections 29.1 through 29.4.</p>
+
+<h2>The supervised workhorse: deep 1D CNNs</h2>
+<p>A 12-lead ECG at 500 Hz for 10 seconds is a \(12 \times 5000\) array: a short, wide, multi-channel 1D signal. The dominant supervised architecture treats it exactly that way, stacking 1D convolutions with residual connections, a direct transplant of the ResNet idea into the time axis. The <em>what</em> is a network of perhaps 30 to 100 convolutional layers whose early filters learn QRS-like and P-wave-like shapes and whose deeper layers compose them into rhythm and morphology features. The <em>why</em> is inductive bias: convolution is translation-equivariant, so a premature beat is recognized wherever it lands in the window, and weight sharing keeps the parameter count modest against limited labels. The <em>how</em> is receptive field. To see rhythm you need a layer whose field spans several seconds, which you buy through strided downsampling or dilation so the effective field grows geometrically with depth. The canonical results, a rhythm classifier reaching cardiologist-level agreement on single-lead recordings and a 12-lead network flagging multiple diagnoses at once, are both residual 1D CNNs of this shape. Recurrent and temporal-convolutional variants exist, but pure CNNs remain the reliable baseline you should build first.</p>
+
+<p>Two design pressures push beyond the plain CNN. First, long context: capturing beat-to-beat variability over minutes exceeds a comfortable convolutional field, which invites transformers (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) or the linear-time state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>. Second, the twelve leads are not independent channels; they are eight degrees of freedom projected onto twelve axes, so architectures that mix leads with attention or that patchify each lead and let a transformer relate them (the tokenization idea from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) often edge out lead-agnostic stacks. The practical hybrid, a CNN stem that turns raw samples into patch embeddings followed by a transformer encoder, is now a common backbone for both supervised heads and the foundation models below.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The bottleneck is labels, not layers</h3>
+<p>Adding depth to a supervised ECG CNN yields diminishing returns once you are past a few dozen residual blocks, because the ceiling is set by how many <em>labeled</em> records you have and how many rare conditions they contain, not by model capacity. A hospital may hold millions of ECGs but only tens of thousands with a confirmed, adjudicated label, and a dangerous arrhythmia might appear a few hundred times. This asymmetry, oceans of raw signal against a puddle of labels, is precisely the setting where self-supervised pretraining pays off, and it is why ECG became one of the first biosignals to get its own foundation models.</p>
+</div>
+
+<h2>ECG foundation models: pretrain once, adapt anywhere</h2>
+<p>An ECG foundation model is a large encoder pretrained on unlabeled recordings with a self-supervised objective, then reused across downstream tasks by attaching a small head and either fine-tuning or freezing the encoder (linear probing). Three pretraining recipes dominate, all borrowed from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> and specialized to cardiac signals. <em>Contrastive</em> methods pull representations of two views of the same recording together and push different recordings apart; the ECG-specific twist, used by CLOCS and its successors, is to treat different leads or different time segments <em>from the same patient</em> as positive pairs, which teaches the encoder patient-invariant physiology rather than incidental noise. <em>Masked reconstruction</em>, the ECG analogue of a masked autoencoder, hides random patches of the trace and trains the model to fill them in, forcing it to learn the grammar of a heartbeat; ST-MEM and similar spatio-temporal masked encoders take this route. <em>Multimodal</em> pretraining pairs each ECG with its free-text clinical report and aligns the two with a contrastive loss, the approach MERL uses, which yields a bonus we return to below.</p>
+
+<p>Why does this help beyond the obvious label savings? A pretrained encoder has already seen the full diversity of morphologies, so it transfers to a rare diagnosis from a few dozen examples where a from-scratch CNN would overfit. It transfers across acquisition conditions, a model pretrained on clinical 12-lead data can be adapted to a single-lead wristband trace, a bridge that matters for the wearable pipelines of <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>. And its embeddings are reusable features: freeze the encoder and a linear probe often matches a fully fine-tuned network at a fraction of the compute. These ECG-specific models sit inside the broader family of wearable biosignal foundation models surveyed in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>; here the encoder is cardiac-specialized rather than pan-sensor.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A cardiology group bootstraps a rare-disease detector</h3>
+<p>A hospital cardiology group wants to flag cardiac amyloidosis, a condition that appears in fewer than 400 of their 2.3 million archived ECGs. Training a 1D ResNet from scratch on 400 positives collapses: it memorizes the handful of source machines and dates rather than the disease. Instead they pretrain a CNN-transformer encoder with masked-patch reconstruction on the full unlabeled archive over a weekend of GPU time, then fine-tune it on the 400 positives against a matched control set, holding out entire patients so no patient appears in both train and test (the leakage rule from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The pretrained model reaches usable sensitivity where the scratch model was at chance, because the encoder already knew what a normal heartbeat looks like and only had to learn the small deviation that signals the disease. A linear probe on the frozen encoder gets most of the way there in minutes, which they use as a fast sanity check before committing to full fine-tuning.</p>
+</div>
+
+<h2>Language-aligned and zero-shot ECG</h2>
+<p>The multimodal recipe deserves its own note because it changes what the model can do at inference. When an encoder is trained to align each ECG with its report text, the shared embedding space supports <em>zero-shot</em> classification: describe a new condition in words, embed the description, and rank ECGs by similarity, no labeled examples required. This is the ECG instance of the sensor-language alignment covered in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, and it is how a model can flag a diagnosis it was never explicitly trained to label. It also opens report generation and question answering over a trace, though those outputs demand the clinical-validation rigor of Section 29.7 before anyone trusts them at the bedside.</p>
+
+<p>The snippet below shows the mechanics that make all of this practical: load a pretrained ECG encoder, extract a fixed embedding, and either probe it linearly or fine-tune it. The point is that the same frozen representation feeds many downstream heads.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+# A pretrained ECG encoder maps a 12-lead window to a d-dim embedding.
+# In practice you load published weights (e.g. an ECG-FM / MERL checkpoint).
+encoder = load_pretrained_ecg_encoder()   # returns (B, 12, 5000) -> (B, d)
+d = encoder.embed_dim
+
+ecg = torch.randn(8, 12, 5000)            # a batch of 10 s, 500 Hz, 12-lead windows
+
+# 1) Linear probe: freeze the encoder, train only a small head.
+for p in encoder.parameters():
+    p.requires_grad = False
+probe = nn.Linear(d, n_classes)
+with torch.no_grad():
+    z = encoder(ecg)                      # (8, d) reusable features
+logits = probe(z)                         # cheap, fast, strong baseline
+
+# 2) Fine-tune: unfreeze and train encoder + head jointly for the last few points.
+for p in encoder.parameters():
+    p.requires_grad = True
+</code></pre>
+<div class="code-caption">Two ways to adapt one pretrained ECG encoder: a frozen linear probe (fast, leakage-resistant, a strong baseline) and full fine-tuning (higher ceiling, more data and compute). The embedding <code>z</code> is the same object a zero-shot text query would be compared against.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Pretrained encoders instead of a training run</h3>
+<p>Building and pretraining an ECG foundation model from scratch is hundreds of lines plus GPU-days on a large corpus. Published checkpoints collapse that to a load call: libraries such as the <code>fairseq-signals</code> ECG toolkit and released ECG-FM, MERL, and ST-MEM weights give you a ready encoder in roughly five lines, and the Hugging Face <code>transformers</code> loading pattern handles the rest. You supply only the small task head. The library owns the pretraining loop, the masking or contrastive objective, and the checkpoint plumbing; you own the leakage-safe split and the evaluation.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is moving</h3>
+<p>ECG foundation models are a fast-moving frontier as of 2025 and 2026. Contrastive lead- and patient-aware pretraining (CLOCS, PCLR), spatio-temporal masked autoencoding (ST-MEM), report-aligned multimodal models (MERL) enabling zero-shot diagnosis, and generalist encoders such as ECG-FM pretrained on hundreds of thousands to millions of recordings now define the state of the art, frequently beating supervised CNNs in the low-label regime. Open questions the community is actively chasing: fair, leakage-free benchmarking across the many public corpora (PTB-XL, CODE, MIMIC-IV-ECG); transfer from clinical 12-lead pretraining to single-lead wearable deployment; and whether patient-level or record-level self-supervision produces the more clinically robust representation. Expect the wearable foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a> and ECG-specific encoders to converge.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using PTB-XL (or any public 12-lead corpus), compare three models on a diagnostic-superclass task at three label budgets (100, 1000, and all training records): (1) a residual 1D CNN trained from scratch, (2) a linear probe on a frozen pretrained ECG encoder, and (3) that same encoder fully fine-tuned. Enforce patient-level splits throughout. Plot accuracy versus label budget for all three and identify the crossover point below which pretraining wins. Explain the shape of the curves with reference to the "bottleneck is labels" insight.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why do residual 1D CNNs remain the default supervised ECG backbone, and what specifically limits how far added depth helps?</p>
+<p>2. In patient-contrastive pretraining, what are the positive pairs, and why does that choice teach patient-invariant physiology rather than sensor noise?</p>
+<p>3. How does report-aligned multimodal pretraining make zero-shot classification of an unseen condition possible, and what must still be validated before clinical use?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-29.6.html">Section 29.6</a>, we open these models up: a deep or foundation ECG classifier that fires an alarm is useless (or dangerous) if a clinician cannot see why, and if it drowns the ward in false alerts. We turn to explainability, attribution over the trace, and the false-alarm triage that decides whether an accurate model is actually deployable.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

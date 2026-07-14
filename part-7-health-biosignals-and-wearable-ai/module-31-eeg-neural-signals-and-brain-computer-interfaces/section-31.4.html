@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.4: EEG foundation models (LaBraM, EEGPT, BIOT, CBraMod). Building Sensory AI." name="description"/>
+<title>Section 31.4: EEG foundation models (LaBraM, EEGPT, BIOT, CBraMod) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: EEG, Neural Signals, and Brain-Computer Interfaces</a></div>
+<h1>EEG foundation models (LaBraM, EEGPT, BIOT, CBraMod)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You gave me thirty datasets recorded on eleven different caps, at four sampling rates, by clinicians who each labeled their electrodes their own way. You expected one set of weights to make sense of all of them. I confess I understand the reluctance to record thirty-first."</p>
+        <cite>An Unflappable AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the montage vocabulary and frequency bands of <a class="cross-ref" href="section-31.1.html">Section 31.1</a>, the artifact and spectral-feature toolkit of <a class="cross-ref" href="section-31.2.html">Section 31.2</a>, and the motor-imagery and SSVEP paradigms that supply most of the downstream benchmarks in <a class="cross-ref" href="section-31.3.html">Section 31.3</a>. It leans hard on two machinery chapters: the transformer attention of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> and the masked and contrastive self-supervised objectives of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, since an EEG foundation model is those two ideas pushed to the scale defined in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>. The leakage-safe, subject-wise splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is not optional here: subject identity leaks through EEG more strongly than through almost any other signal.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>EEG is the hardest signal in this book to build a foundation model for, and the reason is structural rather than statistical. Every public EEG corpus was recorded on its own electrode cap, at its own sampling rate, with its own reference and its own labeling of the electrodes, and each individual dataset is tiny by deep-learning standards (tens of subjects, a few hours). A specialist model trained on one cap does not even accept input from the next. The 2023 to 2025 wave of models named in this section (BIOT, LaBraM, EEGPT, CBraMod) is the field's answer: a shared way to tokenize any montage into channel-time patches, a masked or contrastive pretraining objective run over hundreds to tens of thousands of pooled hours, and a frozen backbone that a small labeled dataset can then probe or fine-tune. This section explains the tokenizer, the objective, and the four architectures, and it insists throughout that the honest test is subject-independent transfer, not a leaderboard number.</p>
+    </div>
+
+    <h2>The montage problem: why EEG needs its own recipe</h2>
+    <p>The time-series foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a> assume a univariate or loosely-multivariate stream. EEG breaks that assumption in a specific way. A recording is a set of channels, each tied to a scalp location (Fp1, Cz, O2, in the 10-20 system of <a class="cross-ref" href="section-31.1.html">Section 31.1</a>), and the set differs between datasets: a consumer headband has 4 channels, a clinical cap has 19 or 21, a research array has 64, 128, or 256. Sampling rates run from 128 to 1000 Hz, references differ (linked mastoids, average, Cz), and two labs will name the same electrode differently. A model that hard-codes "19 channels at 250 Hz" is unusable on anything else. This is the EEG analog of the no-shared-vocabulary obstacle from <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>, and it is why the first design decision in every model here is the tokenizer that turns a variable montage into a fixed-shape sequence.</p>
+    <p>The shared answer is channel-independent patching. Treat each channel as its own time series, cut it into short non-overlapping windows (patches) of, say, 1 second, and turn every patch into one token carrying a spatial embedding (which electrode) and a temporal embedding (which second). A 19-channel, 10-second clip becomes \(19 \times 10 = 190\) tokens; a 64-channel clip becomes 640. The transformer consumes any token count, so one architecture now accepts every montage. Missing or extra channels are just missing or extra tokens. <strong>BIOT</strong> (the Biosignal Transformer of Yang and colleagues, 2023) introduced exactly this "biosignal sentence" flattening, and it is why BIOT can pretrain across EEG, ECG, and other channels in one model and tolerate a channel dropping out mid-recording.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The decisive move is to stop treating an EEG recording as a fixed-width image and start treating it as a variable-length sequence of (electrode, time-window) tokens. Once a patch is the atomic unit and its scalp location is an embedding rather than a fixed row index, montage heterogeneity stops being a blocking incompatibility and becomes ordinary sequence-length variation, which transformers already handle. Every model in this section makes this move; they differ mainly in how a patch becomes a token and what objective trains the encoder.</p>
+    </div>
+
+    <h2>Tokenizing brain signals: patches versus neural codebooks</h2>
+    <p>Given patches, how do you turn a raw one-second waveform into a token vector? There are two schools. The first, simplest, is a linear or convolutional projection of the raw (or bandpassed) patch straight into the embedding dimension; BIOT and <strong>EEGPT</strong> (Wang and colleagues, 2024) sit here. The second learns a discrete codebook first. <strong>LaBraM</strong> (the Large Brain Model of Jiang and colleagues, ICLR 2024) trains a vector-quantized neural tokenizer whose codebook is optimized to reconstruct the Fourier amplitude and phase of each patch, so every patch maps to one of a few thousand discrete "neural codes." This is the EEG counterpart of the value-tokenization idea from <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>: pretraining then predicts code indices, turning a continuous-signal problem into the discrete masked-token problem transformers pretrain on best. LaBraM was trained this way on roughly 2,500 hours of EEG pooled from around 20 datasets and released in Base, Large, and Huge sizes.</p>
+    <p>The architectural degree of freedom that remains is how spatial and temporal structure interact inside the encoder. Stacking all tokens into one flat sequence and applying full attention is quadratic in (channels \(\times\) time) and blurs the distinction between "same electrode, different time" and "same time, different electrode." <strong>CBraMod</strong> (the Criss-cross Brain foundation Model of Wang and colleagues, ICLR 2025) addresses this with two parallel attention branches, one attending across time within a channel and one across channels within a time slice, then fusing them, plus an asymmetric conditional positional encoding so the model does not need a fixed electrode layout. CBraMod was pretrained on the Temple University Hospital EEG corpus (on the order of 27,000 hours, the largest public clinical EEG collection) and reported state-of-the-art results across a dozen downstream BCI tasks. EEGPT takes a third stance: a dual self-supervised objective combining spatio-temporal representation alignment with masked reconstruction, kept deliberately compact (around 10 million parameters) so it stays cheap to probe.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2025 the four reference points are BIOT (Yang and colleagues, 2023, cross-biosignal patching and channel robustness), LaBraM (Jiang and colleagues, 2024, VQ neural tokenizer and masked code prediction over ~2,500 hours), EEGPT (Wang and colleagues, 2024, dual alignment-plus-reconstruction at ~10M parameters), and CBraMod (Wang and colleagues, 2025, criss-cross spatio-temporal attention over the ~27,000-hour TUH corpus). The open questions are the same ones haunting every foundation model in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>: whether reported zero-shot and linear-probe gains survive strict subject-wise splits, whether scaling laws hold for EEG the way they do for language, and whether a model pretrained on resting clinical EEG genuinely transfers to task-driven BCI paradigms it never saw. The current consensus is that these models beat from-scratch specialists most clearly in the low-labeled-data regime, which is exactly where EEG usually lives.</p>
+    </div>
+
+    <h2>Using a frozen brain model: patch, probe, and split with care</h2>
+    <p>The payoff of pretraining is that a new, small labeled dataset no longer needs a bespoke architecture and a large training run. You patch your recording into the model's token format, run the frozen encoder to get per-patch embeddings, pool them, and fit a small classifier (a linear probe) on top; if you have enough labels you fine-tune the top blocks instead. The listing below implements the shared front end, the channel-independent patch tokenizer, so the shape contract that BIOT, LaBraM, EEGPT, and CBraMod all expect is concrete rather than abstract, and shows the masking step that a masked-reconstruction pretraining objective applies to those patches.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def patch_tokenize(eeg, fs, patch_seconds=1.0):
+    """Turn a variable-montage EEG clip into (electrode, time) patch tokens.
+    eeg: array [n_channels, n_samples]. Returns patches [n_tokens, patch_len]
+    plus the (channel, time) index of each token, which become the spatial
+    and temporal embeddings the transformer adds."""
+    n_ch, n_samp = eeg.shape
+    plen = int(round(fs * patch_seconds))
+    n_patches = n_samp // plen
+    patches, index = [], []
+    for c in range(n_ch):
+        for t in range(n_patches):
+            patches.append(eeg[c, t * plen:(t + 1) * plen])
+            index.append((c, t))            # spatial c, temporal t
+    return np.stack(patches), np.array(index)
+
+def random_mask(n_tokens, ratio=0.5, rng=np.random.default_rng(0)):
+    """Masked-EEG-modeling target: hide half the tokens; the encoder must
+    predict them (LaBraM predicts codebook indices, EEGPT/CBraMod the signal)."""
+    n_mask = int(round(n_tokens * ratio))
+    masked = rng.choice(n_tokens, size=n_mask, replace=False)
+    keep = np.setdiff1d(np.arange(n_tokens), masked)
+    return keep, masked
+
+# Two clips, different montages, SAME token contract.
+clinical = np.random.randn(19, 2000)     # 19 ch, 250 Hz, 8 s
+headband = np.random.randn(4, 1280)      # 4  ch, 128 Hz, 10 s
+for name, clip, fs in [("clinical", clinical, 250), ("headband", headband, 128)]:
+    tok, idx = patch_tokenize(clip, fs)
+    keep, masked = random_mask(len(tok))
+    print(f"{name}: {tok.shape[0]} tokens, "
+          f"{len(masked)} masked -> encoder sees {len(keep)}")
+</code></pre>
+    <div class="code-caption"><strong>Listing 31.4.1.</strong> The channel-independent patch tokenizer shared by BIOT, LaBraM, EEGPT, and CBraMod, plus the random masking a masked-EEG objective applies. The 19-channel clinical clip and the 4-channel headband clip produce different token counts (152 versus 40) but obey the same contract, which is precisely what lets one frozen backbone accept both. The (channel, time) index of each token becomes its spatial and temporal embedding.</div>
+
+    <p>Listing 31.4.1 is the smallest demonstration of the montage fix: two recordings that no fixed-shape model could share now flow through one tokenizer, and the masking step is the free supervision that let the backbone be pretrained without labels in the first place. In production you never write this by hand, because the released checkpoints ship it.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Loading a released EEG foundation model and extracting embeddings is a few lines, not the roughly 150 lines of tokenizer, positional-embedding, masking, and inverse-bookkeeping code you would otherwise maintain. With the <code>braindecode</code> ecosystem plus a Hugging Face checkpoint you write on the order of five lines: read the raw recording with <code>mne</code>, resample and pick channels to the model's expected set, call the model's own preprocessing and encoder to get per-patch embeddings, then fit a scikit-learn <code>LogisticRegression</code> probe. The checkpoint owns the patch size, the codebook (for LaBraM), the criss-cross attention (for CBraMod), and the exact spatial embedding, so your job collapses to montage alignment and the downstream head. That is the entire practical appeal: your labeled EEG study, which used to demand a full architecture, becomes a probe on top of frozen weights.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: epilepsy pre-screening on a shoestring dataset</h3>
+        <p>A neurology group building an interictal-epileptiform-discharge screener had a familiar problem: 40 labeled patients on a 21-channel clinical cap, far too few to train a deep model from scratch, and a clinical mandate that the screener generalize to patients it had never seen. Training a specialist convolutional network on those 40 patients overfit patient identity, and its accuracy collapsed on a held-out hospital. The team instead took a CBraMod backbone pretrained on the TUH corpus, aligned their 21 channels to the model's expected set, froze the encoder, and fit a linear probe on the pooled patch embeddings. Two things happened. First, the low-data regime was exactly where the pretrained model earned its keep: the probe beat the from-scratch specialist by a wide margin because the representation already knew what normal cortical rhythms look like. Second, and only because they split subject-wise following <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, they caught that an earlier record-wise split had inflated their reported AUC by leaking the same patient into train and test. The foundation model raised the floor; the honest split kept the number real.</p>
+    </div>
+
+    <p>That last point is not an aside. EEG carries a strong, stable biometric fingerprint, so a model can score beautifully by recognizing the person rather than the neural state, a distribution-shift trap developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Any claim you make about an EEG foundation model must come from a subject-independent split; a record-wise or window-wise split silently measures memorization. This is the running leakage-safe thread of the book applied to its most unforgiving signal.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take two EEG datasets recorded on different montages (for example a motor-imagery set from <a class="cross-ref" href="section-31.3.html">Section 31.3</a> at 64 channels and a consumer-headband set at 4). (1) Run both through the <code>patch_tokenize</code> function of Listing 31.4.1 and confirm they yield the same token width but different token counts; state in one sentence why that difference is now harmless. (2) Load one released checkpoint (BIOT, LaBraM, EEGPT, or CBraMod), extract frozen embeddings for one dataset, and fit a linear probe under two evaluation protocols: a naive record-wise split and a strict subject-wise split. Report both accuracies and explain the gap. (3) Compare the subject-wise probe accuracy against a from-scratch model of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> trained on the same labels, and name the data regime in which the foundation model wins.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. What single property of EEG datasets (shared by no other signal in Part VII to the same degree) forces channel-independent patch tokenization, and how does turning scalp location into an embedding rather than a fixed row index dissolve the montage-incompatibility problem?</p>
+        <p class="quiz-question">2. Contrast the tokenizer of BIOT/EEGPT (direct projection of the raw patch) with LaBraM's vector-quantized neural codebook. What does the codebook buy at pretraining time, and which chapter's idea is it importing?</p>
+        <p class="quiz-question">3. Why must every accuracy you report for an EEG foundation model come from a subject-wise split, and what specifically does a record-wise split measure instead?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-31.5.html">Section 31.5</a>, we cross from the scalp to the cortex. Non-invasive EEG trades spatial resolution for safety; invasive brain-computer interfaces (Neuralink's cortical threads, Synchron's endovascular stentrode, and the intracortical microelectrode arrays behind the record-breaking speech and handwriting decoders) make the opposite bet. You will see how the tokenization and decoding intuitions from this section change when the signal is single-neuron spiking rather than pooled scalp potentials, and why the decoders that restored typing and speech to paralyzed participants look different from the montage-agnostic encoders here.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

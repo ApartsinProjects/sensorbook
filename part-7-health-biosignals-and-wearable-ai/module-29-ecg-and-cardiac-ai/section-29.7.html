@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.7: Clinical validation design. Building Sensory AI." name="description"/>
+<title>Section 29.7: Clinical validation design | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: ECG and Cardiac AI</a></div>
+<h1>Clinical validation design</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My AUC was 0.94 on the held-out set. Then a real clinic ran me at a real prevalence, and I learned that nine out of ten alarms I raised were wrong. The test set never told me that."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>Everything earlier in this chapter built cardiac models and measured them on curated datasets. This section asks the question that decides whether any of that reaches a patient: does the model actually help, in the setting where it will run, on the people it will run on? Clinical validation design is the discipline of answering that with a study you can defend to a regulator, a hospital committee, and a skeptical cardiologist. It is not a bigger test set. It is a sequence of study designs, each answering a different question: does the model discriminate, does it discriminate here, does it change what clinicians do, and does changing what clinicians do change patient outcomes. Getting the design right is the difference between a paper with an impressive area under the curve and a tool that survives contact with a real emergency department.</p>
+    </div>
+
+    <p>This section assumes the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the general evaluation-protocol machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, and it leans on the calibration and uncertainty ideas from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. It is the cardiac-specific complement to <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>, which covers the regulatory pathway and biometric-privacy law in full; here we stay on study design. We do not re-cover the false-alarm triage of <a class="cross-ref" href="section-29.6.html">Section 29.6</a> or the models of <a class="cross-ref" href="section-29.5.html">Section 29.5</a>; we assume a model exists and ask how to prove it is worth deploying.</p>
+
+    <h2>The validation ladder: from discrimination to outcomes</h2>
+    <p>Clinical validation is not one study but a ladder, and each rung answers a strictly harder question than the one below it. <strong>Rung one, retrospective internal validation</strong>, holds out records from the development database and reports discrimination (AUROC, sensitivity, specificity). It is cheap, fast, and almost worthless as evidence of real-world value, because the held-out records share the same recruitment, hardware, and labeling pipeline as training. <strong>Rung two, external validation</strong>, runs the frozen model on data from institutions, devices, and populations that never touched development. This is where most impressive numbers deflate: an ECG model trained in one health system routinely loses several points of AUROC and, worse, loses calibration when it meets a new patient mix, a topic treated generally under distribution shift in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. <strong>Rung three, prospective silent evaluation</strong>, deploys the model live but hides its output from clinicians, so you measure performance on the true incoming stream without letting the model affect care. <strong>Rung four, the pragmatic randomized trial</strong>, finally shows the output to clinicians in one arm and not the other, and measures a clinical outcome. Only rung four proves the model changes what happens to patients. The mistake that sinks products is stopping at rung one and reporting it as if it were rung four.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Discrimination is necessary and nearly meaningless alone</h3>
+        <p>A high AUROC says the model can rank a sick patient above a healthy one. It says nothing about the operating threshold you will actually use, the prevalence you will actually face, or whether acting on the alarm helps. AUROC is prevalence-independent by construction, which is exactly why it hides the deployment problem: the same 0.94 curve yields a wonderful positive predictive value in a cardiology clinic and a useless one in a healthy screening population. Validation design exists to surface everything AUROC conceals.</p>
+    </div>
+
+    <h2>Metrics that survive deployment: prevalence, PPV, and net benefit</h2>
+    <p>The single most common failure in cardiac-AI validation is reporting sensitivity and specificity, which are properties of the model, and forgetting positive predictive value, which is a property of the model <em>and the population</em>. By Bayes' rule, at prevalence \(\pi\), sensitivity \(\text{Se}\), and specificity \(\text{Sp}\),</p>
+    $$\text{PPV} = \frac{\pi\,\text{Se}}{\pi\,\text{Se} + (1-\pi)(1-\text{Sp})}.$$
+    <p>For a low-ejection-fraction screen with \(\text{Se}=0.90\), \(\text{Sp}=0.90\), the PPV is a healthy \(0.89\) at \(\pi=0.5\) but collapses to \(0.08\) at a screening prevalence of \(\pi=0.01\). Nine of ten positive alarms are false, and every one triggers a downstream echocardiogram. This is the number a hospital committee cares about, and it is why validation must be run and reported at the <em>deployment</em> prevalence, not the enriched case-control prevalence of the development set. Beyond raw predictive values, <strong>decision-curve analysis</strong> (Vickers and Elkin, 2006) plots net benefit against the threshold probability a clinician would accept, folding the relative cost of a missed case versus a false alarm into a single curve; it answers "is acting on this model better than treat-all or treat-none" across the plausible range of clinical preferences. Report calibration too: a model can rank perfectly (high AUROC) yet systematically over-predict risk, and a miscalibrated probability is dangerous the moment a clinician reads it as a real chance.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def ppv_npv(sens, spec, prevalence):
+    """Predictive values at a target deployment prevalence."""
+    tp = prevalence * sens
+    fn = prevalence * (1 - sens)
+    tn = (1 - prevalence) * spec
+    fp = (1 - prevalence) * (1 - spec)
+    return tp / (tp + fp), tn / (tn + fn)
+
+def net_benefit(sens, spec, prevalence, threshold):
+    """Decision-curve net benefit of the model at one threshold prob."""
+    tp = prevalence * sens
+    fp = (1 - prevalence) * (1 - spec)
+    w = threshold / (1 - threshold)          # odds of the decision threshold
+    return tp - fp * w                       # per-patient net benefit
+
+for pi in (0.50, 0.05, 0.01):
+    ppv, npv = ppv_npv(0.90, 0.90, pi)
+    nb = net_benefit(0.90, 0.90, pi, threshold=0.05)
+    print(f"prev={pi:>4}: PPV={ppv:0.2f}  NPV={npv:0.3f}  net_benefit={nb:+0.4f}")
+</code></pre>
+    <div class="code-caption">Predictive values and decision-curve net benefit for a fixed-quality model (Se = Sp = 0.90) as deployment prevalence falls. The PPV column is the reality check the ROC curve hides: it drops from 0.89 to 0.08 while sensitivity and specificity never move. Referenced in the metrics discussion above.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right tool: decision curves and DeLong intervals</h3>
+        <p>The hand-rolled net-benefit loop above teaches the mechanics, but for a publication you want threshold-swept curves with confidence bands and correct handling of censoring. The <code>dcurves</code> package produces a full decision-curve analysis, including treat-all and treat-none reference lines, in about three lines, replacing roughly 40 lines of bootstrap and plotting glue. For the paired AUROC comparison that reviewers demand (model versus clinician, or model-plus-clinician versus clinician), <code>sklearn.metrics.roc_auc_score</code> plus a DeLong-test implementation gives correlated-ROC confidence intervals without writing the covariance algebra by hand. The library handles the statistics; you own the study design.</p>
+    </div>
+
+    <h2>Splits that mirror the real generalization gap</h2>
+    <p>A validation split is a hypothesis about how the model will be challenged in the world, and the split must match the challenge. <strong>Patient-level splitting</strong> is non-negotiable: multiple ECGs from one patient sharing training and test sets leaks identity and inflates every metric, the same beat-versus-record leakage warned about in <a class="cross-ref" href="section-29.4.html">Section 29.4</a>. Beyond that floor, three stratified splits probe three real shifts. A <strong>temporal split</strong> (train on 2018 to 2021, test on 2023) exposes drift in acquisition hardware, coding practice, and patient case-mix over time. A <strong>site or geographic split</strong> (train on hospitals A and B, test on hospital C) exposes the institution-specific confounds that make single-site AUROC a fiction. A <strong>subgroup-stratified report</strong> breaks performance down by age, sex, and device type, because an aggregate number can hide that the model fails on exactly the group the confound was correlated with; fairness auditing across such subgroups returns in force for wearables in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>. The prospective validation cohort should be defined the way a clinical trial defines its population: with pre-registered inclusion and exclusion criteria and a locked analysis plan, so you cannot fish for the split that flatters the model.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The EAGLE trial: from AUROC to a randomized outcome</h3>
+        <p>The low-ejection-fraction ECG screen from <a class="cross-ref" href="section-29.3.html">Section 29.3</a> reached rung one with an AUROC near 0.93 on held-out records. That number, alone, changes no care. So the Mayo Clinic team climbed the ladder. They ran the EAGLE trial (Yao and colleagues, Nature Medicine 2021): a pragmatic, cluster-randomized trial across dozens of primary-care sites and thousands of clinicians. In intervention clinics the AI result surfaced in the electronic record; in control clinics it stayed hidden. The pre-registered outcome was not AUROC but the rate of new low-ejection-fraction diagnosis, and the intervention arm found significantly more genuine cases of undiagnosed cardiac dysfunction. That is the whole point of the ladder: the trial converted a discrimination statistic into evidence that clinicians, prompted by the model, diagnosed real disease they would otherwise have missed. No held-out test set could have produced that claim.</p>
+    </div>
+
+    <h2>Reader studies: standalone, assistive, and the human in the loop</h2>
+    <p>A cardiac model is rarely deployed alone; it is deployed alongside a clinician, so the validation must measure the human-model team, not just the model. Three designs answer different questions. A <strong>standalone study</strong> compares the model against a reference standard (an adjudicated panel, an echocardiogram, a serum result) and reports how the algorithm does by itself. A <strong>reader study</strong> compares unaided clinicians against the model on the same cases. The design that actually predicts deployment is the <strong>multi-reader, multi-case (MRMC) assistive study</strong>: the same readers interpret the same cases twice, once unaided and once with the model's output, and the analysis isolates the incremental effect of the assistance while accounting for both reader and case variability. MRMC is the design regulators expect for assistive tools precisely because it answers the deployment question: does showing the output make clinicians better, worse (via automation bias or alarm fatigue), or unchanged? An assistive tool can have a superb standalone AUROC and still harm care if clinicians defer to its false positives, which is why the human-in-the-loop measurement, not the standalone number, is the one that governs the label.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Where the field is moving</h3>
+        <p>Reporting is being standardized: the TRIPOD+AI statement (2024) for prediction-model studies, DECIDE-AI (2023) for early live-clinical evaluation, and SPIRIT-AI / CONSORT-AI for AI trial protocols and reports now define what a defensible cardiac-AI validation must contain. In parallel, the rise of ECG foundation models from <a class="cross-ref" href="section-29.5.html">Section 29.5</a> is reshaping validation itself: a single pre-trained encoder now spawns dozens of downstream heads, so the frontier question is how to validate a shared representation whose failure modes and subgroup biases are inherited, not learned fresh, by every task built on top of it. Continuous post-market surveillance of a live model's calibration, rather than one-time approval, is becoming the expected standard.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You have a frozen AFib-detection model with sensitivity 0.95 and specificity 0.92, validated on an enriched dataset at 40% prevalence. It will be deployed for opportunistic screening in a general-practice population where true AFib prevalence is 2%. (a) Compute the deployed PPV and the number of false alarms per 1000 patients screened. (b) Sketch which rung of the validation ladder your enriched study reached, and design the next rung: state the split, the population definition, and the primary endpoint you would pre-register. (c) Explain why reporting only sensitivity and specificity would mislead the deploying clinic.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why is AUROC unchanged when deployment prevalence drops, and which metric moves instead?</li>
+            <li>What real-world shift does a site split probe that a random patient-level split cannot?</li>
+            <li>In an MRMC assistive study, what is being estimated that a standalone AUROC study cannot estimate?</li>
+        </ol>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 29</h3>
+        <p>train an arrhythmia classifier with patient-level evaluation; probe an ECG foundation-model embedding.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Landmark cardiac-AI validation studies</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nature.com/articles/s41591-018-0240-2">Attia, Z. I., et al. (2019). Screening for cardiac contractile dysfunction using an artificial intelligence-enabled electrocardiogram. Nature Medicine.</a></p>
+            <p class="bib-annotation">The retrospective rung-one and external-validation study for the low-EF ECG screen; the AUROC that everything downstream had to justify.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nature.com/articles/s41591-021-01335-4">Yao, X., et al. (2021). Artificial intelligence-enabled electrocardiograms for identification of patients with low ejection fraction: a pragmatic, randomized clinical trial (EAGLE). Nature Medicine.</a></p>
+            <p class="bib-annotation">The rung-four cluster-randomized trial that turned a discrimination statistic into a measured increase in real diagnoses; the model for how cardiac AI proves clinical value.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nejm.org/doi/full/10.1056/NEJMoa1901183">Perez, M. V., et al. (2019). Large-scale assessment of a smartwatch to identify atrial fibrillation (Apple Heart Study). New England Journal of Medicine.</a></p>
+            <p class="bib-annotation">A prospective, low-prevalence screening study whose PPV realities illustrate exactly why deployment prevalence, not enriched prevalence, must drive validation.</p>
+        </div>
+
+        <p class="bib-category">Metrics and study methodology</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://journals.sagepub.com/doi/10.1177/0272989X06295361">Vickers, A. J., &amp; Elkin, E. B. (2006). Decision curve analysis: a novel method for evaluating prediction models. Medical Decision Making.</a></p>
+            <p class="bib-annotation">Introduces net benefit and the decision curve, the tool that folds clinical cost tradeoffs into model evaluation beyond AUROC.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://journals.lww.com/epidem/Fulltext/2010/01000/Assessing_the_Performance_of_Prediction_Models__A.22.aspx">Steyerberg, E. W., et al. (2010). Assessing the performance of prediction models: a framework for traditional and novel measures. Epidemiology.</a></p>
+            <p class="bib-annotation">The reference framework separating discrimination, calibration, and clinical usefulness; explains why a well-ranking model can still be dangerously miscalibrated.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.jstor.org/stable/2531595">DeLong, E. R., DeLong, D. M., &amp; Clarke-Pearson, D. L. (1988). Comparing the areas under two or more correlated ROC curves. Biometrics.</a></p>
+            <p class="bib-annotation">The correlated-ROC test used to compare a model against a clinician or a model-plus-clinician team on the same cases.</p>
+        </div>
+
+        <p class="bib-category">Reporting standards for clinical AI</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.bmj.com/content/385/bmj-2023-078378">Collins, G. S., et al. (2024). TRIPOD+AI statement: updated guidance for reporting clinical prediction models that use regression or machine learning methods. BMJ.</a></p>
+            <p class="bib-annotation">The current checklist for what a defensible prediction-model validation report must contain, machine learning included.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nature.com/articles/s41591-022-01772-9">Vasey, B., et al. (2022). Reporting guideline for the early-stage clinical evaluation of decision support systems driven by artificial intelligence: DECIDE-AI. Nature Medicine.</a></p>
+            <p class="bib-annotation">Guidance for the live, human-in-the-loop rung between silent evaluation and full trials, where automation bias and workflow effects first appear.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nature.com/articles/s41591-020-1034-x">Liu, X., et al. (2020). Reporting guidelines for clinical trial reports for interventions involving artificial intelligence: the CONSORT-AI extension. Nature Medicine.</a></p>
+            <p class="bib-annotation">The trial-reporting standard for the randomized rung, defining how an AI intervention and its human-model interaction must be described.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, we leave the twelve-lead clinical ECG for the photoplethysmogram on your wrist, where the validation problems of this section get harder: prevalence is lower, signal quality is worse, and the population screened is everyone with a watch, which is where PPV, subgroup fairness, and prospective design stop being academic and start deciding whether a consumer alert helps or terrifies.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.7: Subject adaptation, safety, and interpretability. Building Sensory AI." name="description"/>
+<title>Section 31.7: Subject adaptation, safety, and interpretability | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: EEG, Neural Signals, and Brain-Computer Interfaces</a></div>
+<h1>Subject adaptation, safety, and interpretability</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I achieved ninety-nine percent accuracy on a new user in under a minute. Then someone checked, and I had learned to detect eye blinks, jaw clenches, and the exact moment the coffee kicked in. Not one of them was a thought."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section closes Chapter 31 by asking three questions the earlier sections deferred: how do we make a decoder work on a <em>new</em> brain, how do we know it is reading brains and not artifacts, and how do we deploy it without harm. It assumes the covariance and Riemannian machinery of <a class="cross-ref" href="section-31.3.html">Section 31.3</a>, the EEG foundation models of <a class="cross-ref" href="section-31.4.html">Section 31.4</a>, and the invasive systems of <a class="cross-ref" href="section-31.5.html">Section 31.5</a>. The adaptation methods are a domain-specific instance of the distribution-shift and test-time-adaptation toolkit in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>; the abstention machinery comes from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Everything up to here trained and tested on the same brains. Deployment breaks that assumption three ways. First, every skull is a different volume conductor and every session a different montage, alertness, and impedance profile, so a decoder fit on you barely works on me and only half-works on you tomorrow: this is the <em>non-stationarity problem</em>, the single largest obstacle to consumer and clinical BCIs. Second, a brain-computer interface is a medical actuator, sometimes wired into cortex and sometimes driving a wheelchair or a stimulator, so a wrong decode is not a mislabeled photo but a physical action, which makes abstention, fail-safe design, and neurosecurity first-class requirements rather than afterthoughts. Third, EEG is a swamp of confounds, and a model that scores well may be reading eye movement, muscle tension, or a stimulus artifact instead of neural intent, so <em>interpretability is a validity check, not a nicety</em>. This section builds the three defenses: adapt, verify, and constrain.</p>
+    </div>
+
+    <h2>Non-stationarity and subject adaptation</h2>
+    <p><strong>Why does EEG refuse to transfer?</strong> The scalp signal that reaches an electrode is a cortical source smeared by the skull, the cerebrospinal fluid, and the exact cap placement, all of which differ between people and drift within a session. The practical consequence is a covariate shift: the feature distribution \(p(x)\) moves between subjects and sessions even when the mapping from intent to cortex, \(p(y \mid \text{cortex})\), is roughly shared. A classifier trained on source subjects sees the target subject as out-of-distribution and collapses. The historical fix was a long per-user calibration session, tens of minutes of labeled trials before the interface does anything useful, which is exactly the burden that keeps BCIs in the lab.</p>
+    <p><strong>How do we cut the calibration?</strong> The dominant idea is <em>alignment</em>: transform each subject's data so their distributions overlap before any classifier touches them. The cheapest effective version is <em>Euclidean Alignment</em> (EA). Compute the mean spatial covariance across a subject's trials, \(\bar{R} = \frac{1}{N}\sum_i x_i x_i^\top\), then whiten every trial of that subject by \(\bar{R}^{-1/2}\). After this each subject's mean covariance becomes the identity, so their clouds sit on top of each other and a decoder trained on the pool transfers with little or no target labels. Its Riemannian cousin recenters covariances on the manifold of symmetric positive-definite matrices (the Riemannian Procrustes and covariance-recentering methods from <a class="cross-ref" href="section-31.3.html">Section 31.3</a>) and typically wins by a few points. Both are <em>unsupervised</em> on the target: they need only unlabeled target trials to estimate \(\bar{R}\), which is why they qualify as <em>test-time adaptation</em> in the sense of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. The foundation-model route (<a class="cross-ref" href="section-31.4.html">Section 31.4</a>) attacks the same problem differently: pretrain a backbone on thousands of unlabeled hours so its features are already subject-robust, then fine-tune a tiny head on a handful of target trials.</p>
+
+    <p>The listing below implements Euclidean Alignment on synthetic two-subject data and shows the recentering directly: after alignment each subject's mean covariance is the identity, so a decoder no longer has to relearn per-subject scale and rotation.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from scipy.linalg import fractional_matrix_power
+
+rng = np.random.default_rng(0)
+
+def make_subject(n_trials=60, n_ch=8, mix=None):
+    """Synthetic band-passed trials; `mix` is a per-subject channel mixing."""
+    src = rng.standard_normal((n_trials, n_ch, 256))      # latent sources
+    if mix is None:
+        mix = np.eye(n_ch)
+    return np.einsum('ij,tjk->tik', mix, src)             # subject-specific smear
+
+def euclidean_align(trials):
+    """Whiten every trial by the subject's mean covariance R^{-1/2}."""
+    covs = np.einsum('tik,tjk->tij', trials, trials) / trials.shape[2]
+    R = covs.mean(axis=0)                                  # reference covariance
+    R_inv_sqrt = fractional_matrix_power(R, -0.5).real
+    return np.einsum('ij,tjk->tik', R_inv_sqrt, trials)
+
+# Two subjects with different volume-conduction "smear" matrices
+A = make_subject(mix=rng.standard_normal((8, 8)))
+B = make_subject(mix=rng.standard_normal((8, 8)))
+
+def mean_cov(trials):
+    return (np.einsum('tik,tjk->tij', trials, trials) / trials.shape[2]).mean(0)
+
+print("Before EA, ||mean_cov(A) - mean_cov(B)||:",
+      round(np.linalg.norm(mean_cov(A) - mean_cov(B)), 2))
+print("After  EA, ||mean_cov(A) - mean_cov(B)||:",
+      round(np.linalg.norm(mean_cov(euclidean_align(A)) - mean_cov(euclidean_align(B))), 4))
+</code></pre>
+    <div class="code-caption">Euclidean Alignment recenters each subject's trials so their mean spatial covariances coincide at the identity; the printed norm collapses toward zero, which is why a pooled decoder transfers across subjects with no target labels.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: alignment in three lines</h3>
+        <p>The hand-rolled Euclidean and Riemannian recentering above, mean-covariance estimation, matrix square roots, per-subject whitening, and the leakage-safe bookkeeping to fit the reference on target-unlabeled data only, is a one-liner transformer in <code>pyriemann</code>: <code>TLCenter(target_domain).fit_transform(X, y_enc)</code> inside a <code>make_pipeline</code>, roughly forty lines down to one. Pair it with <code>MOABB</code> and the whole cross-subject transfer benchmark, download, alignment, Riemannian classifier, and leave-one-subject-out scoring, becomes a config object, standardizing the split so a claimed transfer gain is actually comparable across papers.</p>
+    </div>
+
+    <h2>Interpretability: is it reading brains or blinks?</h2>
+    <p><strong>Why is a good score not enough?</strong> EEG confounds correlate with the label far too easily. If the "imagine right hand" cue appears on the right of the screen, gaze and micro-saccades track it; if one class is more effortful, jaw and neck muscle (EMG) tension rises; alertness drifts with block order. A model can hit high accuracy by decoding any of these and never touch motor cortex, and the failure is invisible until the interface meets a user who blinks differently. Interpretability here is a <em>validity audit</em>: it asks whether the evidence the model uses is neurophysiologically plausible, the same root-cause discipline developed for time series in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>.</p>
+    <p><strong>How do we read a linear decoder correctly?</strong> The trap is to plot the classifier's weight vector as a brain map. For any backward (discriminative) model the weights are optimized to <em>cancel</em> noise, so a large weight can sit on a channel that carries no signal but helps subtract a shared artifact. The fix is the <em>Haufe transformation</em>: to visualize what the model actually responds to, convert the weight vector \(\mathbf{w}\) into the corresponding activation pattern</p>
+    $$\mathbf{a} = \Sigma_x\,\mathbf{w}\,\big/\,\sigma_s^2,$$
+    <p>where \(\Sigma_x\) is the data covariance and \(\sigma_s^2\) the variance of the decoder output. The pattern \(\mathbf{a}\), not \(\mathbf{w}\), is the map you can interpret physiologically: a genuine motor-imagery decoder should light up over central electrodes (C3/C4), while one that lights up over the frontal pole or the temporalis muscles is decoding eye movement or EMG and must be rejected. For deep EEG models the analogue is gradient saliency and occlusion over the channel-by-time input, always read spatially and spectrally against known neuroanatomy rather than trusted at face value.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A classifier weight answers "how do I combine channels to separate the classes"; an activation pattern answers "what does the brain actually do when the class occurs". They are different objects, and only the second is interpretable as neural evidence. Publishing decoder weights as scalp maps has produced a long trail of BCIs that were quietly decoding ocular or muscular artifacts. Run the Haufe transform, then sanity-check the pattern against physiology before you believe your own accuracy.</p>
+    </div>
+
+    <h2>Safety: an actuator wired to a nervous system</h2>
+    <p><strong>What makes a wrong decode dangerous?</strong> A BCI output moves something: a cursor, a wheelchair, a robotic arm, a communication prosthesis, or, in closed-loop neuromodulation, an electrical stimulus delivered back into the brain. The safe design pattern is to make the interface <em>fail-operational</em>, not merely accurate. Decisions carry calibrated confidence and the system abstains, holding the last safe state, when confidence is low; the conformal-prediction and abstention tools of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> give provable coverage on the "issue a command" event so error rate stays bounded. Shared control is the second pillar: the brain supplies discrete intent while onboard perception (lidar, inertial, obstacle avoidance) guarantees that a noisy or missed command degrades to "keep going straight" rather than a collision, the same layering used for the assistive wheelchair in <a class="cross-ref" href="section-31.3.html">Section 31.3</a>.</p>
+    <p><strong>What about the signal being attacked?</strong> Neural interfaces inherit the spoofing and functional-safety concerns of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>. An SSVEP speller can be hijacked by an injected flicker in the environment; a photic or acoustic stimulus can be tuned to bias an evoked-potential decoder; and the neural data itself is a biometric that can leak identity and health state, which is why <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> treats brain data under the strictest privacy tier. Invasive systems (<a class="cross-ref" href="section-31.5.html">Section 31.5</a>) add hardware failure modes: electrode migration, gliosis-driven signal decay, and the charge-density limits that bound safe stimulation. All of this is why implanted BCIs ship as regulated medical devices under FDA and equivalent oversight rather than app-store software.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: a home speller that abstains</h3>
+        <p>A clinical team fields a home communication BCI for a locked-in user with an implanted electrocorticography array decoding attempted handwriting. The decoder never emits a character on a bare argmax. Each attempted stroke produces a conformal prediction set; if the set is not a singleton at the target coverage, the interface shows a "please repeat" prompt instead of guessing, because a wrong word in a medical or legal message is worse than a slow one. A drift monitor watches the array's spectral profile daily and triggers a lightweight recalibration, a few minutes of the alignment recentering above, whenever impedance shift moves the feature distribution. Over months the raw per-stroke accuracy sagged as tissue encapsulated the electrodes, yet the <em>delivered</em> message error rate stayed flat because the abstention threshold absorbed the drift and the caregiver was never handed a confident wrong sentence.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is zero-calibration, self-verifying decoding. On adaptation, EEG foundation models such as LaBraM, EEGPT, BIOT, and CBraMod (<a class="cross-ref" href="section-31.4.html">Section 31.4</a>) combined with online Riemannian recentering are pushing toward "cap on, decode now" with no labeled calibration, and continual-learning heads let the decoder track within-session drift. On safety, the emerging discipline of <em>neurorights</em> and neural-data governance, alongside the NeuroML and OpenNeuro reproducibility push, is formalizing consent, mental-privacy, and agency protections specific to brain data. On interpretability, concept-level and causal probing of self-supervised EEG embeddings (built on the pretraining recipes of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) is starting to test whether a foundation model's features encode genuine oscillatory neurophysiology or merely dataset-specific artifacts, which is the validity question of this section at population scale.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the motor-imagery pipeline from Lab 31 and run a confound audit. (1) Fit a linear decoder, then apply the Haufe transform to its weights and plot the activation pattern; is the peak over C3/C4 or over frontal/temporal sites? (2) Deliberately leak: add a synthetic per-trial "blink" component whose amplitude correlates with the label, refit, and watch accuracy jump while the Haufe pattern migrates frontally, the fingerprint of an artifact decoder. (3) Add Euclidean Alignment and evaluate leave-one-subject-out with and without it; report the transfer gain and the number of target calibration trials each setting needs. Which change, alignment or artifact rejection, moves the honest deployment number more?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ul>
+            <li>Why is Euclidean Alignment usable as test-time adaptation, that is, what does it need from the target subject, and what does it not need?</li>
+            <li>You plot a linear decoder's weight vector and see a huge value at a frontal electrode. Why is that not yet evidence the model reads frontal activity, and what transform makes the map interpretable?</li>
+            <li>A closed-loop BCI reports 88 percent decode accuracy. What two design mechanisms let you deploy it while keeping the rate of <em>acted-on</em> errors far below 12 percent?</li>
+        </ul>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 31</h3>
+        <p>build a motor-imagery classifier with subject-independent evaluation; probe an EEG foundation model.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Subject adaptation and transfer</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TBME.2019.2913914">He, H., and Wu, D. (2020). Transfer Learning for Brain-Computer Interfaces: A Euclidean Space Data Alignment Approach. IEEE Transactions on Biomedical Engineering.</a></p>
+            <p class="bib-annotation">Introduces Euclidean Alignment, the cheap unsupervised recentering implemented in this section; the reference for label-free cross-subject transfer.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TBME.2017.2742541">Zanini, P., Congedo, M., Jutten, C., et al. (2018). Transfer Learning: A Riemannian Geometry Framework With Applications to Brain-Computer Interfaces. IEEE Transactions on Biomedical Engineering.</a></p>
+            <p class="bib-annotation">Formalizes covariance recentering on the SPD manifold; the Riemannian counterpart to EA that tops cross-subject leaderboards.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2552/aadea0">Jayaram, V., and Barachant, A. (2018). MOABB: Trustworthy Algorithm Benchmarking for BCIs. Journal of Neural Engineering.</a></p>
+            <p class="bib-annotation">The leakage-safe cross-subject benchmark that makes claimed transfer gains comparable across papers; standardizes the evaluation split.</p>
+        </div>
+
+        <p class="bib-category">Interpretability and validity</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1016/j.neuroimage.2013.10.067">Haufe, S., Meinecke, F., Goergen, K., et al. (2014). On the interpretation of weight vectors of linear models in multivariate neuroimaging. NeuroImage.</a></p>
+            <p class="bib-annotation">The paper behind the weight-versus-pattern distinction; explains why decoder weights are not brain maps and gives the transform that fixes it.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2552/aace8c">Lawhern, V. J., Solon, A. J., Waytowich, N. R., et al. (2018). EEGNet: a compact convolutional neural network for EEG-based brain-computer interfaces. Journal of Neural Engineering.</a></p>
+            <p class="bib-annotation">A widely used deep EEG backbone whose learned spatial and temporal filters are explicitly designed to be inspected against neurophysiology.</p>
+        </div>
+
+        <p class="bib-category">Safety, privacy, and governance</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1038/551159a">Yuste, R., Goering, S., Arcas, B. A. y, et al. (2017). Four ethical priorities for neurotechnologies and AI. Nature.</a></p>
+            <p class="bib-annotation">The founding statement of neurorights: agency, identity, privacy, and fairness for brain data; frames why neural signals need the strictest safeguards.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2552/ac1add">Ienca, M., and Haselager, P. (2016). Hacking the brain: brain-computer interfaces security and the ethics of neurosecurity. Ethics and Information Technology.</a></p>
+            <p class="bib-annotation">Lays out the threat model for BCI spoofing and neural-data exfiltration; the neurosecurity reference behind this section's safety framing.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2552/abfa86">Gramfort, A., Luessi, M., Larson, E., et al. (2013). MEG and EEG data analysis with MNE-Python. Frontiers in Neuroscience.</a></p>
+            <p class="bib-annotation">The open toolkit for reproducible EEG pipelines, artifact rejection, and pattern visualization; the practical substrate for the audits this section demands.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-32-emg-and-neuromuscular-ai/index.html">Chapter 32</a>, we drop from cortex to muscle. EMG shares this chapter's cross-subject and cross-session transfer problem and its real-time-control-loop safety demands, but the signal is larger, faster, and far more separable, which is exactly why it powers today's practical prosthetic and gesture interfaces while non-invasive brain decoding is still fighting the calibration and validity battles laid out here.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

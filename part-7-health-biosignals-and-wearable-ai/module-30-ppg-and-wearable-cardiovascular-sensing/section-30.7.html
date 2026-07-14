@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.7: Fairness across skin tones and the calibration problem. Building Sensory AI." name="description"/>
+<title>Section 30.7: Fairness across skin tones and the calibration problem | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: PPG and Wearable Cardiovascular Sensing</a></div>
+<h1>Fairness across skin tones and the calibration problem</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They calibrated the light against the volunteers they could find. The volunteers they could find were the reason the numbers only worked for some of us."</p>
+        <cite>A Chromatically Honest AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>A photoplethysmograph reads the pulse by shining light into the skin and measuring what comes back. Melanin, the pigment that darkens skin, absorbs that same light, most greedily at the green wavelengths most wearables use. So the identical device, worn identically, returns a weaker, noisier signal on darker skin. That is not an opinion or an edge case: it is optics, and it propagates straight into the numbers the device reports. In 2020 a hospital study showed that pulse oximeters, the red-and-infrared cousins of the wrist PPG, missed dangerously low blood oxygen nearly three times as often in Black patients as in white patients, and the finding reshaped an entire regulatory agenda. This section explains the physics of why skin tone biases optical sensing, why the historical calibration process baked that bias in, how to audit a pipeline for it, and what hardware, data, and algorithmic fixes actually move the needle. It is the ethical and the engineering core of the chapter at once.</p>
+    </div>
+
+    <p>This section assumes the pulse-waveform optics of <a class="cross-ref" href="section-30.1.html">Section 30.1</a> and the SpO2 ratio-of-ratios of <a class="cross-ref" href="section-30.3.html">Section 30.3</a>, and it treats the PPG as a physical measurement \(x = h(s;\theta) + \eta\) whose response \(h\) and noise \(\eta\) both depend on skin optics, the sensor-model view of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. The subgroup-auditing discipline draws on the leakage-safe evaluation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, the calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the regulatory framing of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>. Signal-quality gating (<a class="cross-ref" href="section-30.6.html">Section 30.6</a>) is the first and cheapest fairness tool, so it recurs here.</p>
+
+    <h2>The optics: why melanin dims the signal</h2>
+    <p>Melanin lives in the epidermis, the outermost skin layer, above the dermal capillary bed whose pulsing blood volume the PPG is trying to see. Light must cross the epidermis twice, on the way in and on the way back, so its intensity is attenuated by the Beer-Lambert factor \(e^{-2\,\mu_a d}\), where \(\mu_a\) is the epidermal absorption coefficient and \(d\) its thickness. Melanin dominates \(\mu_a\) across the visible band, and its absorption falls steeply with wavelength: it is strong in the green (around 530 nm, the workhorse LED of wrist wearables), weaker in the red (660 nm), and weakest in the near-infrared (940 nm). The pulsatile part of the signal, the small AC component riding on a large DC offset, carries the heartbeat. Roughly doubling epidermal melanin can cut that AC amplitude by a large factor while leaving the electronic noise floor unchanged, so the pulse-to-noise ratio collapses. The device is not broken; it is simply photon-starved.</p>
+
+    <p>Two engineering consequences follow directly. First, wavelength choice is a fairness choice: green maximizes pulsatile contrast on light skin but penalizes dark skin most, whereas red and infrared penetrate deeper and are far less melanin-sensitive, which is one reason SpO2 sensors use them. Second, the same missing photons that raise heart-rate error on dark skin also perturb the SpO2 ratio, because any wavelength-dependent attenuation that the calibration did not anticipate shifts the estimate. The bias is not random noise that averages out; it is a systematic offset tied to a protected characteristic, and averaging over a mostly light-skinned population simply hides it.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Calibration is where the bias entered, not the physics</h3>
+        <p>Pulse oximeters do not compute oxygen saturation from first principles. They read the ratio of pulsatile absorbances at two wavelengths, \(R=(\mathrm{AC}/\mathrm{DC})_{660}/(\mathrm{AC}/\mathrm{DC})_{940}\), and map \(R\) to SpO2 through an empirical curve fitted on human volunteers desaturated under controlled conditions. If that calibration cohort was overwhelmingly light-skinned, as most historical cohorts were, the fitted curve encodes the optics of light skin and mispredicts on skin it never saw. The device then reads high on darker skin, reporting a reassuring 94% when arterial blood gas says 88%. This is "occult hypoxemia": low oxygen hidden behind a normal-looking number. The fix is not a better clip; it is a calibration set that spans the population, plus a curve that carries honest per-subgroup uncertainty. Skin tone is a textbook case of the distribution shift of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>: the calibration distribution and the deployment distribution simply differ.</p>
+    </div>
+
+    <h2>Measuring skin tone properly, and auditing the gap</h2>
+    <p>You cannot fix a disparity you refuse to measure, and you cannot measure it well with a bad ruler. The Fitzpatrick scale, a six-point dermatology classification built to predict sunburn, is the most common label, but it was designed around burning propensity in lighter skin, self-report is unreliable, and its upper categories compress most darker tones together. The measurement-grade alternative is the individual typology angle (ITA), a continuous quantity derived from colorimeter readings in the CIE L\*a\*b\* color space, \(\mathrm{ITA}=\arctan\!\big((L^{*}-50)/b^{*}\big)\cdot 180/\pi\), which correlates with objectively measured melanin content. When you build or consume a wearable dataset, prefer an objective melanin or ITA reading, record it as first-class metadata, and never let skin-tone labels leak through a per-recording split (Chapter 5): a model that learns "this individual" learns their skin along the way, and the disparity then hides inside memorization.</p>
+
+    <p>Auditing itself is disaggregation, not a single scalar. Compute your metric (heart-rate mean absolute error, occult-hypoxemia rate, AFib sensitivity) separately within each skin-tone stratum, report the worst-group value alongside the average, and treat the largest between-group gap as a headline number rather than a footnote. An aggregate that looks excellent can hide a group for whom the device barely works, because the well-served majority dominates the mean. The code below simulates this audit on an SpO2-style pipeline and shows how a globally modest bias decomposes into a benign light-skin residual and a clinically serious dark-skin offset.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+n = 6000
+# Skin-tone group: 0 = light, 1 = intermediate, 2 = dark
+group = rng.choice([0, 1, 2], size=n, p=[0.55, 0.30, 0.15])
+true_spo2 = rng.uniform(82, 99, size=n)            # arterial ground truth
+
+# Device reads high on darker skin: a group-dependent positive bias
+bias_by_group = np.array([0.2, 1.1, 3.3])          # percentage points
+noise = rng.normal(0, 1.2, size=n)
+device_spo2 = true_spo2 + bias_by_group[group] + noise
+
+def occult_rate(true_s, dev_s):
+    # 'Occult hypoxemia': truly hypoxemic (<= 88) but device reassures (>= 92)
+    hypoxemic = true_s &lt;= 88
+    return np.mean(dev_s[hypoxemic] &gt;= 92) if hypoxemic.any() else float("nan")
+
+names = ["light", "intermediate", "dark"]
+print(f"{'group':13s}{'mean bias':>10s}{'occult %':>10s}")
+for g in (0, 1, 2):
+    m = group == g
+    print(f"{names[g]:13s}{device_spo2[m].mean()-true_spo2[m].mean():10.2f}"
+          f"{100*occult_rate(true_spo2[m], device_spo2[m]):10.1f}")
+
+overall = 100 * occult_rate(true_spo2, device_spo2)
+print(f"\nOverall occult rate: {overall:.1f}%  "
+      f"; the dark-skin row is what that patient experiences")</code></pre>
+    <div class="code-caption">A disaggregated fairness audit for an SpO2-style estimator. The overall occult-hypoxemia rate looks tolerable, yet stratifying by skin tone exposes a dark-skin bias of over three points that hides low oxygen behind a normal-looking reading. Reporting the worst group, not the average, is the whole discipline.</div>
+
+    <h2>Mitigation: hardware, data, and the calibration you keep</h2>
+    <p>The fixes span the stack. In <strong>hardware</strong>, longer wavelengths (red and infrared rather than green alone), higher LED drive current with adaptive gain, multiple emitter-detector spacings, and denser diode arrays all recover photons on dark skin; a transmittance fingertip site sees more pulsatile signal than a reflectance wrist site. In <strong>data</strong>, the calibration and validation cohorts must span the full range of ITA, which historically they did not, and the split must be leakage-safe so a diverse-looking dataset cannot pass a per-subject shortcut. In <strong>algorithms</strong>, signal-quality gating (<a class="cross-ref" href="section-30.6.html">Section 30.6</a>) is the honest first move: if the pulse-to-noise ratio is too low to trust, the device should abstain rather than emit a confident wrong number, and abstention rate then itself becomes a fairness metric you must equalize. Calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) lets the model widen its interval on hard-to-read skin instead of staying falsely narrow, and group-conditional conformal prediction can guarantee coverage within each stratum rather than only on average.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The pulse oximeter that reassured the wrong patients</h3>
+        <p>During the COVID-19 pandemic, home and hospital pulse oximeters became triage instruments: an SpO2 threshold decided who got supplemental oxygen, antivirals, and a bed. A large retrospective study across intensive-care units found that oximeters overestimated true arterial saturation more often in Black than in white patients, so Black patients with genuinely low oxygen were more likely to read as fine and were therefore identified late for treatment they qualified for. The device had not failed a bench test; it passed its historical accuracy spec, which had been fitted and validated on a cohort that underrepresented darker skin. The consequence pushed the FDA to overhaul its pulse-oximeter guidance, requiring premarket studies to enroll participants across the full range of skin pigmentation and to report accuracy by pigmentation subgroup. The lesson generalizes to every optical wearable: a metric that is not disaggregated is a metric that can be biased and still look clean.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right tool: disaggregated metrics in a few lines</h3>
+        <p>Hand-rolling per-group means, worst-group selection, and bootstrap confidence intervals for a fairness audit runs to roughly 60 to 80 lines and is easy to get subtly wrong. Fairlearn's <code>MetricFrame</code> does it in about five: pass your metric function, the true and predicted labels, and a <code>sensitive_features=skin_tone</code> column, then read <code>.by_group</code>, <code>.group_min()</code>, and <code>.difference()</code>. The library handles the grouping, the per-stratum aggregation, and the worst-group and gap summaries, so your code states the fairness question instead of re-implementing the bookkeeping. It composes with any scikit-learn-style metric, including the occult-hypoxemia rate above wrapped as a callable.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the audit code with a signal-quality gate: draw a per-sample pulse-to-noise ratio whose mean falls with darker skin, and let the device abstain (emit no reading) when the ratio is below a threshold. Report, per group, the abstention rate and the occult-hypoxemia rate among the readings that survive. Then answer: does gating equalize the error, and at what cost in coverage for the dark-skin group? Discuss why "we simply refuse to answer more often for one group" is itself a fairness problem that a single accuracy number would never surface.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why does green-light PPG show a larger skin-tone disparity than infrared, and what does that imply about the wavelengths you would choose for an equity-first wearable?</li>
+            <li>A vendor reports a 1.5% overall SpO2 error and calls the device fair. What single reframing of that number would you demand before believing the claim?</li>
+            <li>Explain how a per-recording (rather than per-subject) train-test split can make a skin-tone bias disappear from your metrics while leaving it fully present in deployment.</li>
+        </ol>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 30</h3>
+        <p>build a PPG heart-rate/AFib pipeline with signal-quality gating; audit performance across subgroups.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+    <h2 class="bibliography-title">Bibliography</h2>
+
+    <p class="bib-category">Pulse oximetry bias and clinical consequences</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1056/NEJMc2029240">Sjoding, Dickson, Iwashyna, Gay &amp; Valley (2020). Racial Bias in Pulse Oximetry Measurement. New England Journal of Medicine.</a></p>
+        <p class="bib-annotation">The landmark retrospective showing occult hypoxemia occurred roughly three times more often in Black than white patients; it launched the modern regulatory reckoning.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1001/jamainternmed.2022.1906">Fawzy, Wu, Yang et al. (2022). Racial and Ethnic Discrepancy in Pulse Oximetry and Delayed Identification of Treatment Eligibility. JAMA Internal Medicine.</a></p>
+        <p class="bib-annotation">Links oximeter overestimation directly to delayed recognition of treatment eligibility during COVID-19, making the harm concrete and downstream.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1097/00000542-200504000-00004">Bickler, Feiner &amp; Severinghaus (2005). Effects of Skin Pigmentation on Pulse Oximeter Accuracy at Low Saturation. Anesthesiology.</a></p>
+        <p class="bib-annotation">Controlled desaturation study establishing that pigmentation-related bias grows precisely where it matters most, at low true saturation.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1088/1361-6579/acd51a">Al-Halawani, Charlton, Qassem &amp; Kyriacou (2023). A Review of the Effect of Skin Pigmentation on Pulse Oximeter Accuracy. Physiological Measurement.</a></p>
+        <p class="bib-annotation">A current synthesis of the optics, the evidence, and the proposed hardware and calibration remedies.</p>
+    </div>
+
+    <p class="bib-category">Wearable heart rate and skin tone</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1038/s41746-020-0226-6">Bent, Goldstein, Kibbe &amp; Dunn (2020). Investigating Sources of Inaccuracy in Wearable Optical Heart Rate Sensors. npj Digital Medicine.</a></p>
+        <p class="bib-annotation">Quantifies how skin tone, motion, and device interact to degrade consumer wrist heart-rate accuracy, the wearable analogue of the oximeter story.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.3390/jpm7020003">Shcherbina, Mattsson, Waggott et al. (2017). Accuracy in Wrist-Worn, Sensor-Based Measurements of Heart Rate and Energy Expenditure. Journal of Personalized Medicine.</a></p>
+        <p class="bib-annotation">Early multi-device benchmark noting skin-tone and body-mass effects on optical heart-rate error.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1109/JPROC.2022.3149785">Charlton, Kyriacou, Mant et al. (2022). Wearable Photoplethysmography for Cardiovascular Monitoring. Proceedings of the IEEE.</a></p>
+        <p class="bib-annotation">Broad review of wrist PPG physiology, artifact sources, and the fairness and validation gaps that remain.</p>
+    </div>
+
+    <p class="bib-category">Skin classification and regulation</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://doi.org/10.1001/archderm.1988.01670060015008">Fitzpatrick (1988). The Validity and Practicality of Sun-Reactive Skin Types I Through VI. Archives of Dermatology.</a></p>
+        <p class="bib-annotation">The origin of the six-point scale, useful mainly to understand why it is a poor pigmentation ruler for optical sensing.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://www.fda.gov/regulatory-information/search-fda-guidance-documents/pulse-oximeters-premarket-notification-submissions-510k-guidance-industry-and-food-and-drug">U.S. FDA (2025). Pulse Oximeters for Medical Purposes: Nonclinical and Clinical Performance Testing (Draft Guidance).</a></p>
+        <p class="bib-annotation">The regulatory response requiring pigmentation-diverse cohorts and subgroup accuracy reporting for oximeter clearance.</p>
+    </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-31-eeg-neural-signals-and-brain-computer-interfaces/index.html">Chapter 31</a>, we leave the pulsing capillary bed for the electrical storm of the brain. EEG, neural signals, and brain-computer interfaces bring their own version of the fairness-and-calibration problem, where hair, electrode contact, and inter-subject variability play the role melanin plays here, and where a signal even fainter than the PPG's must be pulled from noise before any inference is trusted.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.3: Multimodal wearable fusion (PPG + accel + temp + EDA). Building Sensory AI." name="description"/>
+<title>Section 33.3: Multimodal wearable fusion (PPG + accel + temp + EDA) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Continuous and Contactless Health Monitoring</a></div>
+<h1>Multimodal wearable fusion (PPG + accel + temp + EDA)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Four sensors, four clocks, four opinions about what the wrist is doing. My job is to make them agree without inventing a fifth story."</p>
+        <cite>A Diplomatic AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you know how a photoplethysmogram encodes the pulse from <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> and how accelerometers report motion from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>. It builds directly on the alignment and resampling discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and the fusion taxonomy (early, feature, late) introduced in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>. Sampling rates and amplitudes here are order-of-magnitude device anchors, not clinical thresholds.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A modern health wristband is not one sensor but four transducers pressed against the same patch of skin, each reporting a different physical quantity on its own clock. Green light (PPG) tracks the arterial pulse, a three-axis accelerometer tracks movement, a thermistor tracks skin temperature, and two dry electrodes track electrodermal activity (EDA). Individually each is easy to fool: PPG mistakes stride cadence for heartbeat, EDA mistakes a warm room for arousal, temperature drifts when the strap loosens. Fused correctly, they cover for one another. The accelerometer tells the pulse channel when to distrust itself; temperature tells the EDA channel whether a conductance rise is stress or sweat from exertion. This section is about turning four noisy, asynchronous streams into one estimate that is more trustworthy than any channel alone, and about the specific engineering that fusion on a wrist demands.</p>
+    </div>
+
+    <h2>Why these four, and what each one covers for</h2>
+    <p>The four modalities are not an arbitrary bundle; they are chosen because their strengths and failure modes are complementary. <strong>PPG</strong> is the primary physiological channel, carrying heart rate, heart-rate variability, and (through pulse morphology) respiration and vascular tone. Its weakness is motion: the same wrist motion that shakes the optical path also injects energy at stride and arm-swing frequencies that overlap the heart-rate band, exactly the collision <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> studied. <strong>Accelerometer</strong> data is the antidote: it is a direct, high-fidelity measurement of the very motion that corrupts PPG, so its spectrum can be used to identify and null the artifact rather than guess at it. Accelerometry also supplies context, whether the wearer is still, walking, or sleeping, which conditions how every other channel should be read.</p>
+    <p><strong>Skin temperature</strong> is the slow physiological channel. It moves over minutes, tracking circadian phase, ambient conditions, and peripheral vasoconstriction, and it doubles as a contact-quality sensor: a sudden temperature drop usually means the band has lifted off the skin, which invalidates the PPG and EDA readings taken at the same instant. <strong>EDA</strong> is the sympathetic-arousal channel, a near-direct readout of stress and emotional activation through sweat-gland conductance. But EDA cannot, on its own, distinguish arousal-driven sweat from thermal sweat during exercise. Temperature and accelerometer together disambiguate it. This mutual coverage is the whole argument for fusion: each channel's blind spot is another channel's specialty.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>On a wearable, the accelerometer is not just a motion classifier; it is the reference signal for cleaning every other channel. Formally, if the corrupted PPG is \(y(t) = s(t) + h\!\left(a(t)\right) + n(t)\), where \(s\) is the clean pulse, \(a\) is acceleration, and \(h\) is an unknown motion-to-artifact transfer, then having \(a(t)\) measured lets you estimate and subtract \(h(a)\) with adaptive filtering rather than blindly band-passing. This reframes fusion: the extra sensor's highest value is often not a new label but a cleaner version of the sensor you already had.</p>
+    </div>
+
+    <h2>Three places to fuse, and the alignment problem underneath all of them</h2>
+    <p>Following the taxonomy of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, you can combine the streams at three depths. <strong>Signal-level (early) fusion</strong> operates on the raw waveforms, for example using the accelerometer as the reference input to an adaptive noise canceller that scrubs motion from PPG before any feature is computed. It is the most powerful and the most fragile, because it demands tight time alignment. <strong>Feature-level fusion</strong> computes per-channel features (PPG heart rate, accel activity intensity, EDA phasic peak rate, temperature slope) over a shared window and concatenates them into one vector for a downstream model; this is the workhorse of wearable affect and health classifiers. <strong>Decision-level (late) fusion</strong> lets each channel produce its own estimate and combines them, typically weighting by a per-channel signal-quality index so a motion-corrupted PPG estimate is down-weighted rather than trusted.</p>
+    <p>Underneath all three sits the same hard problem: the channels do not share a clock. On a typical research wristband the streams arrive at wildly different rates, and their timestamps drift. Before any fusion you must resample every channel onto a common timeline and window it consistently, the sampling-and-synchronization discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> applied to four sources at once. Get the alignment wrong by even a few hundred milliseconds and signal-level fusion will subtract the artifact from the wrong place, injecting noise instead of removing it.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the Empatica E4 and the WESAD stress benchmark</h3>
+        <p>The Empatica E4 wristband, widely used in affective-computing research, is a clean case study because it streams exactly these four modalities at four different rates: blood-volume pulse (PPG) at 64 Hz, three-axis acceleration at 32 Hz, EDA at 4 Hz, and skin temperature at 4 Hz. The WESAD dataset (Schmidt et al., 2018) recorded these channels while participants sat through baseline, amusement, and stress conditions. A recurring finding across WESAD studies is that PPG-only stress classifiers degrade the moment the participant moves, while EDA-plus-temperature fusion stays robust because arousal sweat and thermal sweat separate once temperature context is available. Teams that fuse all four at the feature level, and gate the PPG features on an accelerometer-derived motion score, consistently beat any single-channel model on the three-class task. The device makes the multi-rate alignment problem unavoidable: you cannot concatenate 64 Hz pulse features with 4 Hz EDA features until both live on the same window grid.</p>
+    </div>
+
+    <h2>A concrete multi-rate fusion window</h2>
+    <p>The listing below implements the unglamorous but decisive first step: taking the four E4 streams at their native rates and producing aligned, per-window feature rows, with the accelerometer supplying a motion-based quality weight for the pulse channel. This is the substrate on which every downstream model in this chapter's lab is built.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# Native Empatica E4 sampling rates (Hz)
+FS = {"bvp": 64, "acc": 32, "eda": 4, "temp": 4}
+
+def window_features(bvp, acc, eda, temp, win_s=60, step_s=1):
+    """Align four streams onto a common window grid and emit fused features.
+    acc is shape (N_acc, 3); all streams share the same start time t0."""
+    rows = []
+    n_windows = int((len(temp) / FS["temp"] - win_s) / step_s) + 1
+    for w in range(n_windows):
+        t0, t1 = w * step_s, w * step_s + win_s
+        seg = lambda x, fs: x[int(t0 * fs): int(t1 * fs)]
+        bvp_w = seg(bvp, FS["bvp"]); acc_w = seg(acc, FS["acc"])
+        eda_w = seg(eda, FS["eda"]); temp_w = seg(temp, FS["temp"])
+
+        motion = float(np.std(np.linalg.norm(acc_w, axis=1)))  # activity intensity
+        ppg_weight = 1.0 / (1.0 + motion)                      # trust: 1 still, ~0 moving
+        rows.append({
+            "hr_proxy":   FS["bvp"] * 60.0 / _peak_spacing(bvp_w),  # beats per minute
+            "ppg_weight": ppg_weight,                              # 0..1 quality gate
+            "motion":     motion,
+            "eda_phasic": float(np.ptp(eda_w)),                    # arousal bump size
+            "temp_slope": float(np.polyfit(np.arange(len(temp_w)), temp_w, 1)[0]),
+        })
+    return rows
+
+def _peak_spacing(x):
+    peaks = np.where((x[1:-1] > x[:-2]) & (x[1:-1] > x[2:]))[0]
+    return float(np.mean(np.diff(peaks))) if len(peaks) > 1 else np.inf</code></pre>
+    <div class="code-caption"><strong>Listing 33.3.</strong> Multi-rate window alignment for the four E4 channels. Each 60-second window is sliced from every stream at its native rate (64, 32, 4, 4 Hz) so the features stay on one grid, and the accelerometer's norm-standard-deviation becomes a motion score that gates PPG trust through <code>ppg_weight</code>. The heart-rate proxy is deliberately crude; the point is the fusion scaffolding, not the peak detector.</div>
+
+    <p>As Listing 33.3 shows, the accelerometer earns its place twice: once as a feature (<code>motion</code>) and once as a weight that tells the downstream model how far to trust the pulse estimate in that window. A late-fusion heart-rate tracker uses that weight directly, blending the current PPG estimate with a motion-driven prior when <code>ppg_weight</code> is low:</p>
+    <p>$$\hat{r}_t = w_t \, r_t^{\text{ppg}} + (1 - w_t)\, \hat{r}_{t-1},\qquad w_t = \frac{1}{1 + \sigma_{\text{acc}}(t)}$$</p>
+    <p>When the wrist is still, \(w_t \to 1\) and the optical estimate dominates; when it thrashes, \(w_t \to 0\) and the tracker coasts on its previous value rather than locking onto stride cadence. This is the quality-weighted decision fusion of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> in one line.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-writing the per-channel feature extractors, the EDA tonic/phasic decomposition, the accelerometer activity metrics, and the windowing loop is easily 150 to 200 lines, and the EDA decomposition alone is error-prone. The <code>flirt</code> library, built for wrist wearables, collapses the whole per-channel feature stage to a few calls:</p>
+        <pre class="language-python"><code class="language-python">import flirt
+hrv   = flirt.get_hrv_features(ibi_series, window_length=60)     # PPG-derived
+eda   = flirt.get_eda_features(eda_series, window_length=60)     # tonic + phasic
+acc   = flirt.get_acc_features(acc_df, window_length=60)         # activity metrics
+feats = hrv.join(eda).join(acc)                                  # aligned, fused table</code></pre>
+        <div class="code-caption"><strong>Listing 33.4.</strong> <code>flirt</code> computes windowed HRV, EDA (with cvxEDA-style phasic decomposition), and accelerometer features and returns time-aligned dataframes, replacing roughly 180 lines of hand-rolled extraction. It removes the drudgery; choosing the window length and validating the decomposition on your own device remain your calls.</div>
+        <p>The convenience is real, and so is the caveat that recurs throughout this book: a library's default window and filter were tuned on someone else's population and device, so confirm they suit yours before trusting the fused features.</p>
+    </div>
+
+    <h2>Missing modalities and asynchronous dropout</h2>
+    <p>Fusion on a real wrist must survive channels vanishing at runtime. EDA electrodes lose contact, the optical sensor saturates in bright sun, a loose strap kills the temperature reading. A fusion model that assumes all four channels are always present will fail silently the first time one drops. The robust design treats missingness as an expected input state rather than an error, which is precisely the missing-modality problem developed in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. Practical tactics include modality dropout during training (randomly zeroing channels so the model learns to lean on whichever survive), attention-based fusion that reweights channels by availability, and the quality gate from Listing 33.3, which naturally down-weights a channel toward zero as its signal degrades. Note the connection to <a class="cross-ref" href="section-33.2.html">Section 33.2</a>: the pattern of which channel drops, and when, is itself informative, so missingness should feed the model, not just be imputed away.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current frontier replaces hand-designed fusion with self-supervised wearable foundation models pretrained on massive unlabeled multimodal streams. Google's Large Sensor Model work (Narayanswamy et al., 2024, "Scaling Wearable Foundation Models") trained on hundreds of thousands of participant-days of PPG, accelerometer, EDA, and temperature from Fitbit and Pixel Watch devices, showing that a single pretrained encoder transfers across heart-rate, activity, and metabolic tasks. Open PPG-centric models such as PaPaGei (2024) push the same idea for the optical channel specifically. These models learn cross-modal structure (that a PPG artifact co-occurs with an accelerometer spike, that EDA and temperature move together during exertion) directly from data, absorbing the fusion logic this section hand-codes. The open questions are calibration under distribution shift and fair performance across skin tones and wrist sizes, themes returned to in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using the E4 rates in Listing 33.3, you receive a one-minute segment in which the accelerometer norm is nearly flat but skin temperature drops by 3 degrees over ten seconds and EDA falls to a near-constant floor. In three or four sentences, argue whether this window is a genuine physiological event or a sensor-contact failure, name which channel is the decisive tie-breaker, and state how your <code>window_features</code> output should be adjusted so a downstream classifier does not treat the flat EDA as calm.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Give one reason the accelerometer improves a PPG heart-rate estimate that has nothing to do with classifying the wearer's activity.</p>
+        <p class="quiz-question">2. EDA rises during a stressful meeting and also during a jog. Which two of the other three channels let you tell those apart, and how?</p>
+        <p class="quiz-question">3. Why does signal-level (early) fusion demand tighter time synchronization than decision-level (late) fusion, and what goes wrong if the clocks drift by half a second?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-33.4.html">Section 33.4</a>, we leave the skin entirely. Instead of pressing four transducers against the wrist, we ask what a millimeter-wave radar across the room can recover, extracting heartbeat, respiration, and sleep-apnea events from tiny chest-wall displacements with no contact at all, and we weigh the accuracy that contactless sensing gives up against the comfort and continuity it buys.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

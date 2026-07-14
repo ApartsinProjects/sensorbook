@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.5: Cross-session and cross-subject transfer. Building Sensory AI." name="description"/>
+<title>Section 32.5: Cross-session and cross-subject transfer | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: EMG and Neuromuscular AI</a></div>
+<h1>Cross-session and cross-subject transfer</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I scored 98 percent yesterday. Then you took the armband off, slept, put it back on two millimeters to the left, and now I think every gesture is a fist. I did not forget your muscles. I memorized your electrodes."</p>
+<cite>An Overfitted AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The gesture and prosthetic decoders of <a class="cross-ref" href="section-32.3.html">Section 32.3</a> and the fatigue estimators of <a class="cross-ref" href="section-32.4.html">Section 32.4</a> all reach impressive accuracy under one silent assumption: that the model is tested on the same person, wearing the same electrodes, in the same sitting where it was trained. Break any of those and performance falls off a cliff. Re-don an armband and the electrodes land on slightly different muscle; come back tomorrow and skin impedance, hydration, and posture have all shifted; hand the device to a new user and the muscle geometry itself is different. EMG is one of the least stationary biosignals we work with, and this non-stationarity is the single largest obstacle between a lab demo and a product someone actually wears. This section is about making a model survive contact with a new session and a new body: what shifts, why, and the ladder of techniques (normalization, calibration, domain adaptation, subject-independent pretraining) that buys back the lost accuracy.</p>
+</div>
+
+<p>This section builds directly on the feature representations of <a class="cross-ref" href="section-32.2.html">Section 32.2</a> and the classifiers of <a class="cross-ref" href="section-32.3.html">Section 32.3</a>. It is, at heart, a domain-shift problem, so it leans on the distribution-shift and test-time adaptation machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Both are load-bearing here. We stay on transfer; the underlying decoding tasks live elsewhere in the chapter.</p>
+
+<h2>What actually shifts, and why</h2>
+<p>Frame the problem as covariate shift: the mapping from muscle intent to gesture label is roughly stable, but the distribution of the <em>input</em> features \(p(x)\) drifts between the training domain and the deployment domain while the conditional \(p(y \mid x)\) we want stays fixed. Three drivers dominate. <em>Electrode shift</em> is geometric: donning an sEMG array a few millimeters rotated or translated changes which motor units sit under each channel, permuting and rescaling the channel pattern for a given gesture. <em>Physiological session drift</em> is electrical: overnight changes in skin-electrode impedance, hydration, temperature, sweat, and the slow onset of fatigue (<a class="cross-ref" href="section-32.4.html">Section 32.4</a>) all scale amplitudes and tilt spectra even for the same electrode placement. <em>Cross-subject variation</em> is anatomical and the harshest of the three: subcutaneous fat thickness attenuates and blurs the signal, muscle size and fiber orientation set the baseline amplitude, and limb circumference changes the spacing between a fixed array and the active tissue. A model that latched onto one person's absolute channel amplitudes has learned a fingerprint, not a physiology.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Within-session accuracy is a vanity metric</h3>
+<p>The number that gets quoted, train and test on windows from one recording session of one subject, is nearly always inflated because adjacent windows leak shared electrode placement, skin state, and posture across the split. The honest questions are cross-session (same person, new donning) and cross-subject (a person the model never saw), and the gap between them and the within-session figure <em>is</em> the transfer problem quantified. If you report only within-session accuracy you have measured memorization, not generalization. Report all three, and treat the cross-subject number as the one that predicts field behavior.</p>
+</div>
+
+<h2>The cheap first line: normalization and calibration</h2>
+<p>Before any learned adaptation, remove the shifts you can remove by construction. The most effective single step is amplitude normalization: rather than feeding raw envelope magnitudes, normalize each channel so that its scale is comparable across sessions and people. Classic clinical practice normalizes to a maximum voluntary contraction (MVC), but a lighter and label-free alternative is to standardize each channel by its per-session mean and standard deviation, or by the RMS of a short reference contraction. This directly cancels the multiplicative part of both session drift and cross-subject amplitude difference. Pair it with features that are already scale-robust or that emphasize spectral <em>shape</em> over absolute power (the frequency-domain descriptors of <a class="cross-ref" href="section-32.2.html">Section 32.2</a> and the reductions of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>).</p>
+
+<p>When normalization is not enough, add a short per-session <em>calibration</em>: ask the user to perform each gesture briefly at setup, then update the decoder. Even a few seconds per class lets you refit a lightweight classifier head or recenter the feature space, which is why nearly every commercial myoelectric armband ships with a guided calibration ritual. The design tension is user burden: every second of calibration is friction, so the research goal is to push calibration toward zero while keeping cross-session accuracy high.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def per_channel_standardize(X, stats=None):
+    """Cancel multiplicative session/subject amplitude shift.
+    X: (n_windows, n_channels) feature magnitudes for one session."""
+    if stats is None:                       # fit on this session (calibration data)
+        mu = X.mean(axis=0)
+        sd = X.std(axis=0) + 1e-8
+        stats = (mu, sd)
+    mu, sd = stats
+    return (X - mu) / sd, stats             # reuse stats on later windows
+
+def coral_align(Xs, Xt):
+    """CORAL: recolor source features to match target covariance.
+    Xs = source (training subjects), Xt = target (new subject) features."""
+    Cs = np.cov(Xs, rowvar=False) + np.eye(Xs.shape[1])
+    Ct = np.cov(Xt, rowvar=False) + np.eye(Xt.shape[1])
+    Ws = np.linalg.cholesky(np.linalg.inv(Cs))     # whiten source
+    Wt = np.linalg.cholesky(Ct)                    # recolor to target
+    return (Xs - Xs.mean(0)) @ Ws @ Wt.T + Xt.mean(0)
+</code></pre>
+<div class="code-caption">Two label-free alignment steps applied before the classifier. <code>per_channel_standardize</code> removes multiplicative amplitude shift using unlabeled data from the new session; <code>coral_align</code> matches the source feature covariance to the target's second-order statistics, a training-free domain-adaptation baseline that often recovers a large slice of the cross-subject gap.</div>
+
+<p>The <code>coral_align</code> function above is the bridge from hand normalization to genuine domain adaptation: it needs no labels from the new user, only a handful of unlabeled windows, and it aligns second-order statistics rather than just per-channel scale.</p>
+
+<h2>Learned transfer: adaptation and pretraining</h2>
+<p>When cheap alignment plateaus, three learned strategies climb higher. <em>Domain adaptation</em> makes the model's internal features invariant to which session or subject produced them: adversarial methods (a domain-adversarial network, DANN) add a discriminator that tries to guess the source domain from the features while the encoder is trained to fool it, so the surviving representation encodes gesture but not identity; statistical methods (CORAL, maximum-mean-discrepancy alignment) match feature distributions directly. These need unlabeled target data but no target labels, which fits the deployment reality where a new user will not hand-label their own gestures. <em>Transfer learning</em> pretrains a decoder on many subjects, then fine-tunes on a few calibration examples from the target: the shared backbone learns cross-subject physiology and the small head absorbs the individual's idiosyncrasy, exactly the recipe that made rare-diagnosis ECG models work in <a class="cross-ref" href="../module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>. <em>Self-supervised pretraining</em> (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) goes further, learning representations from large pools of unlabeled EMG so that a new user needs only a linear probe. A complementary trick specific to array EMG is <em>electrode-shift augmentation</em>: synthetically rotate or translate the channel grid during training so the model sees many virtual placements and stops depending on any one. At inference, the streaming test-time adaptation of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> can keep recentering the decoder as the session drifts under fatigue.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A transradial prosthesis that survives re-donning</h3>
+<p>A rehabilitation lab fits a transradial (below-elbow) amputee with an eight-channel sEMG socket driving a myoelectric hand. In the clinic the pattern classifier hits 95 percent across six grips. The patient takes it home, removes the socket at night, and by day three the hand is misreading half of all grasps: the liner reseats a few millimeters proximal each morning and sweat has changed the impedance. The team switches from raw amplitudes to per-channel standardized features, adds electrode-shift augmentation during training so the model has already seen rotated placements, and replaces the daily full recalibration with a ten-second single-grip refit that CORAL-aligns the rest. Cross-session accuracy stabilizes in the high 80s with almost no daily burden, and the socket becomes something the patient will actually keep wearing. The lesson generalizes to any wearable neuromotor interface (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>): the model that ships is the one that tolerates re-donning, not the one with the best lab number.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Domain adaptation without writing the training loop</h3>
+<p>Hand-rolling a domain-adversarial trainer (gradient reversal layer, discriminator, alternating optimization) is 150 to 250 lines and easy to get subtly wrong. Libraries such as <code>skorch</code>-based domain-adaptation toolkits and <code>ADAPT</code> expose CORAL, DANN, and MMD alignment as a handful of calls: instantiate the estimator with your backbone, pass source and unlabeled target features, and call <code>fit</code>. That is roughly five lines versus a couple hundred, and the library owns the reversal-layer plumbing and the covariance math while you own the leakage-safe subject splits and the evaluation.</p>
+</div>
+
+<h2>Evaluating transfer without fooling yourself</h2>
+<p>None of the above is trustworthy without the right split. The gold standard for cross-subject claims is <em>leave-one-subject-out</em> (LOSO): hold every window from one subject entirely out of training, evaluate on that subject, rotate through all subjects, and report the distribution not just the mean. For cross-session claims, split by <em>recording session</em> so no window from a test session ever appears in training, mirroring the re-donning that happens in the field. The cardinal sin, splitting windows randomly, lets adjacent overlapping windows and shared electrode placement leak across the boundary and inflates accuracy by tens of points; it is the EMG face of the leakage discipline in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the benchmarking protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. Report calibration cost alongside accuracy: a decoder that needs thirty seconds of per-class calibration to reach 90 percent is a different product from one that reaches 85 percent with zero calibration, and the tradeoff is the design decision.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is moving</h3>
+<p>As of 2025 and 2026 the frontier is calibration-free, subject-independent EMG. Meta's public release of the emg2qwerty dataset and its surface-EMG wristband work has pushed large-scale cross-subject models, and EMG-specific foundation and self-supervised encoders (contrastive and masked-reconstruction pretraining over pooled multi-subject corpora, echoing the wearable foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) increasingly let a new user reach usable accuracy from a linear probe or a few seconds of calibration. Open problems the community is chasing: truly zero-calibration high-density decoding that survives arbitrary array rotation, principled leakage-free cross-subject benchmarks across the fragmented public EMG corpora (Ninapro and its successors), and adaptation that runs on-device under the power budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-62-on-device-continual-learning/index.html">Chapter 62</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using a public multi-subject sEMG gesture corpus (for example Ninapro), evaluate one classifier under three protocols: (a) random-window split, (b) leave-one-session-out, and (c) leave-one-subject-out. Then add per-channel standardization and CORAL alignment and re-run (c). Report accuracy for every setting and quantify two gaps: the inflation from random splitting versus LOSO, and the recovery that alignment buys back on the cross-subject task. Explain each number with reference to which shift (geometric, physiological, anatomical) it targets.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Name the three dominant drivers of EMG non-stationarity and state whether each is primarily geometric, electrical, or anatomical.</p>
+<p>2. Why does per-channel standardization cancel a large part of both session drift and cross-subject variation, and what kind of shift does it fail to remove?</p>
+<p>3. What distinguishes domain adaptation (for example CORAL or DANN) from transfer learning by fine-tuning, in terms of what data each needs from the new user?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-32.6.html">Section 32.6</a>, we confront the noise that transfer cannot fix by normalization alone: motion artifacts, power-line interference, ECG contamination of trunk EMG, and crosstalk between neighboring muscles. Clean signals make every transfer method in this section work harder for you, so we turn to detecting and suppressing the artifacts that corrupt EMG at the source.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.4: Event detection in biosignals. Building Sensory AI." name="description"/>
+<title>Section 28.4: Event detection in biosignals | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Biosignal Foundations</a></div>
+<h1>Event detection in biosignals</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A heartbeat detected 40 milliseconds late is still a heartbeat. A seizure declared a second early is a lie the clock will expose."</p><cite>A Punctual AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Most biosignal intelligence begins with a question of <em>when</em>, not <em>what</em>. When did this heartbeat occur? When did breathing stop? When did the seizure start and end? An <strong>event</strong> is a localized, clinically meaningful pattern in an otherwise continuous stream, and detecting it converts a wall of samples into a sparse, interpretable timeline that everything downstream depends on. Heart rate variability is nothing but the spacing of detected R-peaks; a sleep apnea index is nothing but a count of detected respiratory pauses per hour. This section is about how we find events reliably, and, just as importantly, how we score whether we found them, because a detector that "works" on paper can be clinically useless if it is judged with the wrong ruler. This builds directly on the modality tour and the noise realities from the earlier sections of this chapter; here we assume the waveform is already in hand and ask what structure lives inside it.</p>
+</div>
+
+<p>You should be comfortable with sampling, timestamps, and jitter from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and with the vocabulary of change points and residual thresholds from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Event detection is a specialization of that machinery under a hard constraint: the ground truth is a set of time-stamped labels, not a per-sample mask, and the timing tolerance is set by physiology.</p>
+
+<h2>What counts as an event, and what shape it has</h2>
+<p>Events come in two geometries, and confusing them is the most common modeling error in this space. A <strong>point event</strong> has a single canonical instant: the R-peak of a QRS complex, the systolic foot of a PPG pulse, a footstep-driven motion spike. An <strong>interval event</strong> has an onset and an offset that both matter: an apnea lasting eleven seconds, an epileptic seizure lasting ninety, an atrial-fibrillation episode lasting minutes. Point events are scored on <em>localization</em> error; interval events are scored on <em>overlap</em>. If you treat a seizure as a point ("it happened somewhere in this minute") you throw away the onset timing a neurologist needs; if you treat every apnea as an interval to be perfectly bounded you will be punished for a half-second of offset ambiguity that no scorer actually cares about.</p>
+
+<p>The physiological time constant sets the tolerance. R-peaks must be localized to roughly \(\pm 50\) ms because the inter-beat interval itself carries the signal, and a 50 ms error is already a few percent of a typical 800 ms beat. Apnea offsets, by contrast, are comfortable with a tolerance of a second or more. Always ask "what does the downstream metric integrate over?" before choosing a representation.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Event detection is a <em>set-matching</em> problem, not a per-sample classification problem. The output is a set of time-stamped predictions; the label is a set of time-stamped references; and quality is defined by how well the two sets align within a physiological tolerance window. Every design decision, from the loss function to the post-processing to the metric, should serve that matching, not the per-sample accuracy that a naive frame classifier optimizes.</p>
+</div>
+
+<h2>Detection paradigms: from transforms to learned models</h2>
+<p>The classical workhorse for point events is the <strong>transform-and-threshold</strong> pipeline, and the canonical example is the Pan-Tompkins QRS detector. It bandpass filters to isolate QRS energy (roughly 5 to 15 Hz), differentiates to emphasize the steep slope of the R-wave, squares to make everything positive and to amplify large slopes, integrates over a moving window to capture waveform width, and then applies an <em>adaptive</em> threshold with physiological refractory logic (no two beats within 200 ms). Its enduring value is that it is interpretable, runs in a handful of arithmetic operations per sample, and degrades gracefully. The relatives of this idea live throughout: matched filters and template correlation for stereotyped morphologies, and the CUSUM and residual-threshold detectors from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> for onset detection when the event is defined by a change in signal statistics.</p>
+
+<p>Learned detectors take over when morphology is variable or context matters. Sequence models that emit a per-sample probability, then post-process peaks, are the modern default: temporal convolutional networks and recurrent models from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> map a raw or lightly filtered window to a dense "eventness" curve. The key subtlety is that the network output is not the answer; it is an intermediate density that still needs peak-picking or interval-thresholding with the same refractory and tolerance logic the classical detector used. The deep model buys robustness to morphology and noise; it does not free you from the timing post-processor.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: apnea events on a wrist wearable</h3>
+<p>A sleep-tech startup ships a wrist device that estimates the apnea-hypopnea index (AHI) from PPG and accelerometer channels. Their first model was a per-30-second frame classifier reporting 91% accuracy, and it failed clinical review. The reason: apnea occupies a small fraction of the night, so a detector that predicts "no event" everywhere scores about 90% by default while catching nothing. Reframing as interval-event detection changed everything. They emitted a per-second respiratory-disturbance probability, merged adjacent above-threshold runs shorter than a 10-second gap, discarded intervals under 10 seconds (the clinical minimum apnea duration), and scored with overlap-based matching against the polysomnography reference. The headline metric became event-level sensitivity and false events per hour, which correlate with the AHI the sleep physician actually reads. Accuracy never appeared in the final report because it was never the right ruler.</p>
+</div>
+
+<h2>Scoring: matching, tolerance, and the imbalance trap</h2>
+<p>To score point events, you match each reference instant to at most one prediction within a tolerance \(\tau\). A matched pair is a true positive; an unmatched reference is a false negative (a miss); an unmatched prediction is a false positive. From these you compute sensitivity and positive predictive value, and their harmonic mean, the event-level \(F_1\):</p>
+
+$$F_1 = \frac{2\,\mathrm{TP}}{2\,\mathrm{TP} + \mathrm{FP} + \mathrm{FN}}.$$
+
+<p>Two rules keep this honest. First, matching must be one-to-one; a greedy nearest-neighbor assignment (or, for the strict case, a Hungarian assignment) prevents one lucky prediction from claiming credit for several nearby references. Second, tolerance must be justified by physiology, stated explicitly, and held constant across systems you compare. For interval events, replace the point tolerance with an overlap criterion, typically that predicted and reference intervals share at least some minimum fraction of their union, echoing the intersection-over-union idea used elsewhere in the book.</p>
+
+<p>Because events are rare, per-sample metrics lie by omission. Accuracy and even per-sample AUC are dominated by the vast "nothing happening" background and can look excellent while the detector misses most events. Report event-level sensitivity and false events per hour (or per night), never bare accuracy. And remember from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> that windows from the same patient must not straddle the train and test split; the very next section, on patient-level splits, makes this failure mode concrete.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def match_events(ref, pred, tol):
+    """One-to-one greedy matching of point events within tolerance `tol`.
+    ref, pred: sorted 1-D arrays of event times (same units as tol)."""
+    ref, pred = np.sort(ref), np.sort(pred)
+    used = np.zeros(len(pred), dtype=bool)
+    tp = 0
+    for t in ref:
+        # nearest unused prediction
+        cand = np.where(~used)[0]
+        if cand.size == 0:
+            break
+        j = cand[np.argmin(np.abs(pred[cand] - t))]
+        if abs(pred[j] - t) <= tol:
+            used[j] = True
+            tp += 1
+    fn = len(ref) - tp
+    fp = len(pred) - tp
+    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+    return dict(tp=tp, fp=fp, fn=fn, f1=round(f1, 3))
+
+ref  = np.array([1.00, 2.00, 3.00, 4.00])   # reference R-peaks (s)
+pred = np.array([1.03, 2.05, 3.60, 4.02])   # detector output (s)
+print(match_events(ref, pred, tol=0.050))   # 3.60 is a miss + a false event
+</code></pre>
+<div class="code-caption">Event-level scoring with a physiological tolerance. The prediction at 3.60 s is more than 50 ms from any reference, so it counts as both a false negative (the 3.00 s beat is missed) and a false positive, yielding TP=3, FP=1, FN=1 and \(F_1 = 0.75\). This is the scoring routine the apnea example replaced accuracy with.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>Hand-rolling the QRS front end plus peak logic is roughly 120 lines and a week of tuning refractory constants. <code>neurokit2</code> collapses beat detection to two lines: <code>signals, info = nk.ecg_process(ecg, sampling_rate=fs)</code> then <code>info["ECG_R_Peaks"]</code>, with several validated detector algorithms selectable by name and cleaning built in. For scoring, <code>sed_eval</code> and <code>mir_eval</code> provide tolerance-based event matching (the greedy loop above, hardened for edge cases) in a single call. Reach for the library for the plumbing; keep the tolerance and refractory choices under your own control, because those encode the physiology no library can guess.</p>
+</div>
+
+<h2>Streaming, latency, and the causal constraint</h2>
+<p>An offline detector may look at the whole recording; a wearable or a bedside monitor cannot. Online detection is <em>causal</em>: at time \(t\) you may use only samples up to \(t\), and you often must declare the event within a bounded latency to be useful (a fall alarm two minutes late is worthless). This forces three compromises. You lose the smoothing benefit of future context, so causal detectors are noisier at onset. You must fix a decision latency budget and accept that longer budgets buy accuracy. And you must handle the artifacts from the previous sections online, because a motion spike that a human would ignore will trigger a false alarm at 3 a.m. Streaming inference and the online-update machinery in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> are the natural home for these detectors once they leave the research notebook.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a 10-minute single-lead ECG record (for example from the MIT-BIH Arrhythmia Database) and run a detector to obtain R-peaks. (1) Score against the reference annotations at \(\tau = 25, 50, 100\) ms and plot \(F_1\) versus \(\tau\); explain the shape. (2) Inject a 3-second burst of simulated motion artifact and re-score; report the change in false events per minute. (3) Convert your detector to strictly causal (no future samples) and measure the median onset latency and its effect on \(F_1\). Write two sentences on the tolerance-versus-latency tradeoff you observe.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does a per-sample accuracy of 95% tell you almost nothing about an apnea detector, and what pair of numbers should you report instead?</li>
+<li>You detect R-peaks and want heart rate variability. Would a 60 ms systematic timing bias in your detector distort HRV? Would a 60 ms random jitter? Explain the difference.</li>
+<li>A reviewer compares two seizure detectors, one scored with a 2-second tolerance and one with a 10-second tolerance, and declares the second "better." What is wrong with the comparison?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-28.5.html">Section 28.5</a>, we turn to where the reference events themselves come from: clinical labels and reference standards. Every tolerance and every matched-pair count in this section quietly assumed a trustworthy ground truth, and the next section confronts how that truth is made, how much annotators disagree, and what a "gold standard" is actually worth.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

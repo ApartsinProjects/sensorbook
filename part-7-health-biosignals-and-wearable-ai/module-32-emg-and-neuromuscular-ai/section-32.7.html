@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.7: Real-time control loops. Building Sensory AI." name="description"/>
+<title>Section 32.7: Real-time control loops | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: EMG and Neuromuscular AI</a></div>
+<h1>Real-time control loops</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I shaved eight milliseconds off my inference time and celebrated. Then I measured the whole loop and found the operating system had been sitting on my buffer for forty milliseconds the entire time, humming to itself."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>Everything earlier in this chapter produced a decoder: a function from a window of muscle activity to a command. This section is about the machinery that runs that function forty times a second, forever, while a human is physically depending on the answer. A myoelectric controller is not a batch job; it is a closed loop that includes the person. They contract, the electrodes sample, the model decides, the actuator moves, and the person <em>sees and feels</em> the result and contracts again. The properties that decide whether this loop is usable are not accuracy or model size but timing: total delay from intention to motion, the jitter around that delay, and whether the loop degrades gracefully when a deadline is missed. Get the loop wrong and a decoder that scores beautifully offline feels sluggish, twitchy, or untrustworthy, and the person disowns the limb. This section treats the control loop as the real deliverable and the model as one stage inside it.</p>
+    </div>
+
+    <p>This section closes the chapter by assembling the pieces built earlier into a running system. It assumes the envelope and spectral features of <a class="cross-ref" href="section-32.2.html">Section 32.2</a>, the decoders and command mapping of <a class="cross-ref" href="section-32.3.html">Section 32.3</a>, and the artifact rejection of <a class="cross-ref" href="section-32.6.html">Section 32.6</a>, and it leans on the sampling, timestamping, and synchronization foundations from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. The streaming and online-inference mechanics here are the biosignal instance of the general patterns in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, run under the edge-deployment constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+    <h2>The loop and its latency budget</h2>
+    <p>A myoelectric control loop is a fixed sequence of stages, each contributing delay. Raw samples accumulate into an analysis window; the window is turned into features; the decoder produces a label or a continuous command; a control layer smooths and rate-limits it; the command travels to the actuator; and the actuator has its own mechanical rise time. The end-to-end delay a user perceives is the sum:</p>
+    \[ d_{\text{loop}} = t_{\text{win}} + t_{\text{feat}} + t_{\text{infer}} + t_{\text{ctrl}} + t_{\text{comm}} + t_{\text{act}} \]
+    <p>The term that surprises most newcomers is \(t_{\text{win}}\). A decision made from a window of length \(L\) cannot reflect an intention until enough of that window has filled with post-intention samples, so a window contributes on the order of \(L/2\) to \(L\) of delay before inference even starts. A generous 250 millisecond window already spends most of the usable budget. The total controllable delay, the part under \(d_{\text{loop}}\) that the engineer can move, should stay below roughly 100 to 125 milliseconds, and the whole loop below about 200 to 300 milliseconds, above which users report the device as laggy and stop trusting it. That single constraint drives almost every design choice: window length trades class separability against \(t_{\text{win}}\), and heavier models buy accuracy with \(t_{\text{infer}}\) you may not have.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Jitter hurts more than mean latency</h3>
+        <p>Two loops can share the same average delay yet feel completely different. A loop that always responds in 180 milliseconds is predictable, and the human motor system adapts to a constant delay the way it adapts to the weight of a tool. A loop that responds in 120 milliseconds on average but occasionally in 350 when the operating system schedules something else is <em>unpredictable</em>, and the person cannot form a stable internal model of it. Report the distribution, not the mean: the 95th and 99th percentile of loop time are the numbers that predict a bad user experience. The engineering target is not just a low mean but a tight tail, which is why bounded, deterministic execution matters more here than raw speed. This is the same tail-latency discipline that governs any real-time inference system in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>.</p>
+    </div>
+
+    <h2>Engineering a deterministic loop</h2>
+    <p>The loop is best structured as a fixed-rate scheduler: a decision cadence (say every 40 milliseconds, matching the window hop) that must complete each cycle before the next tick. Meeting this reliably on a wearable or embedded controller is a systems problem, not a modeling one. Sample acquisition should be interrupt or DMA driven so the CPU is never busy-waiting on the ADC; features and inference should run in a bounded-work path with no dynamic memory allocation and no unbounded loops, so worst-case execution time is predictable; and the model should be quantized and pruned (per <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>) until its worst-case inference time, not its average, fits inside the cycle. A ring buffer decouples the constant-rate producer (the ADC) from the periodic consumer (the decoder) so that neither blocks the other. The code below sketches the timing skeleton and, crucially, instruments its own loop time so the tail is measurable rather than assumed.</p>
+
+    <pre><code class="language-python">import time, numpy as np
+from collections import deque
+
+FS, HOP, WIN = 1000, 40, 200          # Hz, hop ms, window ms
+BUF = deque(maxlen=WIN * 8 // 1000 * FS // 8 or WIN * FS // 1000)  # ring of WIN samples/ch
+period = HOP / 1000.0                  # target 40 ms decision cadence
+loop_ms = []                           # instrumentation: measured cycle time
+
+def step(window, decoder, controller):
+    """One decision cycle: features -> inference -> rate-limited command."""
+    t0 = time.perf_counter()
+    feat = np.concatenate([np.mean(np.abs(window), 1),          # MAV per channel
+                           np.sum(np.abs(np.diff(window, 1)), 1)])  # waveform length
+    cmd  = decoder(feat)               # bounded-work model call
+    cmd  = controller.rate_limit(cmd)  # slew-limit + rest-threshold gate
+    loop_ms.append((time.perf_counter() - t0) * 1e3)
+    return cmd
+
+def run(source, decoder, controller):
+    next_tick = time.perf_counter()
+    for chunk in source:               # DMA/interrupt-fed sample chunks
+        BUF.extend(chunk)
+        now = time.perf_counter()
+        if now >= next_tick and len(BUF) >= WIN * FS // 1000:
+            win = np.array(BUF).reshape(-1, WIN * FS // 1000)  # (channels, samples)
+            emit(step(win, decoder, controller))
+            next_tick += period        # fixed cadence: no drift accumulation
+            if now - next_tick > period:      # missed a deadline
+                next_tick = now + period      # resync, and log the overrun
+</code></pre>
+    <div class="code-caption">A fixed-cadence control loop: <code>next_tick += period</code> keeps the decision rate drift-free, the ring buffer <code>BUF</code> absorbs jitter between acquisition and inference, and <code>loop_ms</code> records per-cycle time so the 99th-percentile tail can be checked rather than hoped for. The deadline-miss branch resynchronizes instead of trying to catch up, which prevents a backlog spiral.</div>
+
+    <p>Two details in that skeleton matter disproportionately. First, advancing <code>next_tick</code> by a fixed <code>period</code> rather than sleeping a fixed duration prevents slow drift of the decision rate. Second, when a deadline is missed the loop resynchronizes to the present rather than firing a burst of catch-up decisions, because a backlog of stale commands is worse than a skipped one. The <code>loop_ms</code> list is not decoration: it is the only way to know whether the tail is safe on the actual target hardware, which never behaves like your development laptop.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Do not hand-roll the online harness</h3>
+        <p>Building the acquisition, ring-buffering, windowing, and real-time control-and-feedback plumbing from scratch is hundreds of lines of fiddly, platform-specific code and the place most bugs hide. The <code>libemg</code> toolkit ships an online controller that wires a live device stream to a trained decoder and emits commands over a socket in a few lines:</p>
+        <pre><code class="language-python">from libemg.emg_predictor import OnlineEMGClassifier
+oc = OnlineEMGClassifier(offline_classifier=clf, window_size=200, window_increment=40,
+                         online_data_handler=odh, features=["MAV", "WL"])
+oc.run(block=False)     # starts the real-time acquire->feature->predict->emit loop
+</code></pre>
+        <div class="code-caption">One <code>OnlineEMGClassifier</code> replaces roughly 200 to 300 lines of buffering, threading, windowing, and socket code, and it keeps the online windowing identical to what was used offline, closing the train-serve skew that otherwise silently degrades accuracy.</div>
+        <p>The library handles the mechanics; your judgment stays where it belongs, on window and hop length, the rate-limiting policy, and how the loop fails safe. Note the second benefit: using the same windowing offline and online removes a subtle leakage-and-skew bug where a model trained on one windowing is served under another.</p>
+    </div>
+
+    <h2>The human closes the loop</h2>
+    <p>The most important feedback path in a myoelectric system is not in your code; it is the person. They watch the hand and feel its contact and adjust their next contraction accordingly. This makes the controller half of a two-learner system, and it has three consequences. First, closed-loop performance can diverge sharply from open-loop, offline numbers: a person compensates for a mediocre decoder if its errors are consistent and observable, and is defeated by a good decoder whose errors are erratic. Evaluate in the loop, with a human doing a real task, not only on a held-out set. Second, adding an explicit artificial feedback channel, most often vibrotactile or electrotactile stimulation encoding grip force or aperture, gives the person information the visual channel lacks and tightens their half of the loop, which is a live topic in prosthetics because commercial hands still return almost no sensation. Third, because the person keeps adapting, the decoder can adapt too: <em>closed-loop decoder adaptation</em> updates the model online from the stream the user is generating, so machine and human co-adapt toward a shared control strategy. That online-learning path is exactly the streaming, non-stationary setting of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, and its uncertainty gating draws on the calibration tools of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">A powered exoskeleton and the deadline it cannot miss</h3>
+        <p>An industrial-robotics team built an EMG-driven arm exoskeleton to assist overhead assembly workers, using shoulder and upper-arm muscle activity to anticipate lifting intent and add motor torque. Their first prototype ran the decoder on a general-purpose Linux thread at nominal 25 hertz and worked flawlessly in demos. On the line it occasionally lurched: every few minutes a background task stole the CPU, a decision cycle overran by 200 milliseconds, and the assist torque arrived late and mistimed against the worker's motion, which felt like the suit fighting them. The fix was entirely in the loop, not the model. They moved acquisition to a DMA path, pinned the control thread to an isolated core with a real-time scheduling priority, quantized the decoder so its worst-case inference fit the cycle with margin, and added a watchdog that zeroed assist torque whenever a deadline was missed rather than delivering a stale command. Mean latency barely changed; the 99th-percentile latency dropped from 340 to 55 milliseconds, and the lurching stopped. The lesson, echoing the functional-safety framing of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>, is that a physical-assist loop is judged by its worst cycle, not its average.</p>
+    </div>
+
+    <h2>Failing safe and staying stable</h2>
+    <p>Because a human and an actuator are in the loop, the controller needs an explicit safe state and rules for entering it. A raised-threshold rest class stops motion cleanly during low effort; a slew rate limit forbids instantaneous reversals that no muscle or motor could physically command and that usually signal a decode error; a watchdog forces the safe state when a deadline is missed, a sensor drops out, or an artifact detector from <a class="cross-ref" href="section-32.6.html">Section 32.6</a> fires; and an uncertainty gate lets the decoder abstain into rest when its confidence is low rather than committing to a risky action. Stability is the other concern: because the person reacts to the device and the device reacts to the person, a high-gain, low-latency loop with an over-eager decoder can oscillate, the user and controller chasing each other. The classic remedies are the control engineer's, not the machine learner's: add damping through rate limiting, keep loop gain modest, and prefer a slightly slower, steadier response over a twitchy fast one. A controllable loop beats an accurate one every time it matters.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Where the field is now</h3>
+        <p>The current frontier pushes real-time control toward motor-unit resolution and continuous, adaptive loops. Real-time blind source separation on high-density surface grids (64 to 256 electrodes) now recovers individual motor-unit spike trains within the tens-of-milliseconds budget, so the loop can be driven by neural firing rather than muscle envelopes, promising finer and more stable control. Meta's surface-EMG wristband, from its CTRL-labs acquisition, has pushed a consumer-scale neuromotor interface with sub-100-millisecond loops for typing and gesture input, and its 2024 to 2025 work reports generic, cross-user decoders that run out of the box, attacking the calibration burden that <a class="cross-ref" href="section-32.5.html">Section 32.5</a> details. In parallel, closed-loop co-adaptive decoders that update online while the user learns, paired with calibrated abstention (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) so the loop fails to a safe rest under ambiguity, are moving from lab studies toward deployable prosthetic and exoskeleton controllers.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: budget and instrument a loop</h3>
+        <p>You are deploying an eight-channel gesture controller on an embedded board with a 200 millisecond window, 40 millisecond hop, and a target total loop delay under 250 milliseconds. (1) Write out \(d_{\text{loop}}\) with a plausible number for each stage, including the windowing term, and identify which stage you would cut first if you are 60 milliseconds over budget. (2) Instrument the loop as in the code above and describe what you would measure and which percentile you would gate the release on, and why the mean is insufficient. (3) Design the deadline-miss policy: what does the controller emit when a cycle overruns, and argue why a stale command or a burst of catch-up decisions would be worse. (4) Add one artificial-feedback channel and explain how it changes the human's half of the loop.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why does the analysis-window length \(t_{\text{win}}\) contribute to end-to-end delay, and why can it dominate the latency budget even when inference is fast?</li>
+            <li>Explain why the 99th-percentile loop time can matter more to usability than the mean, and give one systems change that lowers the tail without lowering the mean.</li>
+            <li>What does it mean that "the human closes the loop," and name one way this makes closed-loop evaluation differ from an offline held-out accuracy number?</li>
+        </ol>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 32</h3>
+        <p>build an sEMG gesture model with subject-independent evaluation and a real-time control demo.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Real-time myoelectric control and latency</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TBME.2011.2113182">Farrell, T. R., &amp; Weir, R. F. (2007). The Optimal Controller Delay for Myoelectric Prostheses. IEEE Transactions on Neural Systems and Rehabilitation Engineering.</a></p>
+            <p class="bib-annotation">The foundational study establishing the roughly 100 to 125 millisecond controllable-delay budget below which added latency does not help and above which it degrades control; the empirical basis for this section's timing constraint.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TBME.2003.813539">Englehart, K., &amp; Hudgins, B. (2003). A Robust, Real-Time Control Scheme for Multifunction Myoelectric Control. IEEE Transactions on Biomedical Engineering.</a></p>
+            <p class="bib-annotation">The canonical real-time pattern-recognition control pipeline: continuous windowing, majority-vote smoothing, and the online-decision cadence that this section's loop skeleton generalizes.</p>
+        </div>
+
+        <p class="bib-category">Closed-loop and co-adaptive control</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2560/8/3/036003">Hahne, J. M., et al. (2015). Linear and Nonlinear Regression Techniques for Simultaneous and Proportional Myoelectric Control. IEEE Transactions on Neural Systems and Rehabilitation Engineering.</a></p>
+            <p class="bib-annotation">Shows that closed-loop, in-the-loop performance can diverge from offline metrics, motivating evaluation with a human performing a task rather than on held-out windows alone.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TNSRE.2013.2247421">Jiang, N., Dosen, S., Muller, K.-R., &amp; Farina, D. (2012). Myoelectric Control of Artificial Limbs: Is There a Need to Change Focus? IEEE Signal Processing Magazine.</a></p>
+            <p class="bib-annotation">A widely cited argument that the human-in-the-loop and closed-loop adaptation, not raw offline accuracy, determine usable control; frames the co-adaptation theme of this section.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1126/scirobotics.aat3630">Dosen, S., et al. (2018). Sensory Feedback in Prosthetics: A Standardized Test Bench. Science Robotics / IEEE TNSRE.</a></p>
+            <p class="bib-annotation">Reviews vibrotactile and electrotactile feedback that tightens the human half of the loop, the artificial-feedback channel discussed in this section.</p>
+        </div>
+
+        <p class="bib-category">Motor-unit decoding and consumer neuromotor interfaces</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1088/1741-2560/13/2/026027">Farina, D., et al. (2016). Man/Machine Interface Based on the Discharge Timings of Spinal Motor Neurons after Targeted Muscle Reinnervation. Nature Biomedical Engineering.</a></p>
+            <p class="bib-annotation">Demonstrates real-time motor-unit decoding from high-density surface EMG for control, the neural-resolution frontier for the loops in this section.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.nature.com/articles/s41586-025-09255-w">CTRL-labs at Reality Labs, Meta (2025). A Generic Non-Invasive Neuromotor Interface for Human-Computer Interaction. Nature.</a></p>
+            <p class="bib-annotation">Reports a surface-EMG wristband with cross-user decoders and low-latency loops for gesture and typing, pushing real-time neuromotor control to consumer scale.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://doi.org/10.1109/TNSRE.2023.3272308">Eddy, E., et al. (2023). LibEMG: An Open Source Library to Facilitate the Exploration of Myoelectric Control. IEEE Access / TNSRE.</a></p>
+            <p class="bib-annotation">Documents the open-source online control harness used in this section's library-shortcut, unifying offline feature extraction with the real-time acquire-predict-emit loop.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>, we step back from the tight, second-by-second control loop to the opposite time scale: continuous and contactless health monitoring, where signals are sparse, irregular, and measured over weeks, where missingness is itself informative, and where the question shifts from "what does the muscle intend right now" to "how is this person's physiology drifting over time."</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

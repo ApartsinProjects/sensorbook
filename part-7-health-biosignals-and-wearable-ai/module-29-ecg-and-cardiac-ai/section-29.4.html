@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.4: Beat-level vs record-level classification. Building Sensory AI." name="description"/>
+<title>Section 29.4: Beat-level vs record-level classification | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: ECG and Cardiac AI</a></div>
+<h1>Beat-level vs record-level classification</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You asked me whether the patient has an arrhythmia. I answered by grading all eighty thousand of their heartbeats individually. We are both, technically, correct."</p>
+<cite>A Pedantic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you have met ECG morphology and the QRS complex in Section 29.1, and that you understand why physiology must be split by person rather than by window, developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and specialized to biosignals in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-28-biosignal-foundations/index.html">Chapter 28</a>. A working familiarity with precision, recall, and F1 is enough; the one new idea, aggregating many local predictions into one global one, is built up from scratch here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An ECG has two natural units of meaning, and a model must commit to one. A single heartbeat is a self-contained object with a shape you can label: this QRS is a premature ventricular contraction, that one is normal. A whole recording is a different object entirely: a ten-second strip or a twenty-four-hour Holter tape whose diagnosis (atrial fibrillation, first-degree block, "sinus rhythm, unremarkable") is a property of the sequence, not of any one beat. Choosing beat-level or record-level classification decides your label source, your architecture, your evaluation metric, and whether your reported number means anything to a cardiologist. Most costly ECG-AI mistakes are not modeling failures; they are a silent mismatch between the granularity you trained on and the granularity the clinic actually cares about.</p>
+</div>
+
+<h2>Two problems wearing the same electrodes</h2>
+<p>Beat-level classification treats the QRS complex as the atom. You detect each R-peak (Section 29.1), window a fixed span around it, and assign a morphology class. The field's reference taxonomy comes from the AAMI EC57 standard, which collapses the messy zoo of annotations in the MIT-BIH Arrhythmia Database into five superclasses: N (normal and bundle-branch beats), S (supraventricular ectopic), V (ventricular ectopic), F (fusion), and Q (unknown or paced). The output is a label <em>per beat</em>, so a single recording produces a long ribbon of predictions.</p>
+<p>Record-level classification treats the whole strip as the atom. The label is a rhythm or diagnosis attached to the entire signal: the PhysioNet/CinC 2017 Challenge asked for one of four classes (normal, AFib, other rhythm, noisy) from a single short lead; PTB-XL and CPSC2018 ask for multi-label diagnostic statements over a full twelve-lead resting ECG. Here the model must integrate evidence across many beats, because the very definition of a rhythm, an irregular RR interval with no organized P-wave for AFib, only exists at the level of a beat <em>sequence</em>.</p>
+<p>The distinction is not academic. Atrial fibrillation is invisible in any single beat; a run of three ventricular beats (a salvo) is invisible to a classifier that scores beats independently and forgets their neighbors. Conversely, a beat-level model that flags one premature ventricular contraction per hour is clinically boring, while a record-level model that says "frequent PVCs, more than 10 percent burden" changes management. What you can express is bounded by the unit you chose.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Granularity is a modeling decision with a clinical consequence, not a preprocessing detail. A beat-level model answers <em>what is this heartbeat</em>; a record-level model answers <em>what is wrong with this patient</em>. The two are related by an aggregation function, and the choice of that function, count, max, mean, or learned attention, encodes a clinical definition. Picking the wrong aggregation is picking the wrong definition of the disease.</p>
+</div>
+
+<h2>The label-granularity mismatch, and how to bridge it</h2>
+<p>The practical headache is that labels rarely arrive at the granularity you want. MIT-BIH is beat-annotated by cardiologists, an extraordinarily expensive resource; almost every large modern corpus (PTB-XL, hospital archives, wearable exports) is labeled only at the record level, because that is what a clinical report contains. So the common situation is: coarse labels, fine-grained ambition. You know the recording contains AFib somewhere, but not which beats.</p>
+<p>This is exactly the setting of <strong>multiple-instance learning</strong> (MIL). Treat the record as a <em>bag</em> of beat instances. The bag carries a label; the instances do not. Under the standard MIL assumption, a bag is positive if at least one instance is positive. A classifier scores each beat, and an aggregation function pools those scores into a bag prediction. The aggregation you pick is the assumption you make about the disease:</p>
+<p>A <strong>max</strong> (or noisy-OR) pool says "one bad beat condemns the record," which matches presence-detection tasks like "is there any ectopy here." A <strong>mean</strong> pool says "the record's label reflects the average beat," which matches burden-style questions but dilutes rare events into invisibility. A learned <strong>attention</strong> pool, \( z = \sum_i a_i h_i \) with weights \( a_i = \mathrm{softmax}(w^\top \tanh(V h_i)) \), lets the model decide which beats matter and, as a bonus, hands you \( a_i \) as a free localization heatmap over the strip. The following experiment makes the stakes of that choice concrete.</p>
+
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+# 400 records, each a "bag" of 60 beats. A record is ABNORMAL if it contains
+# at least one ectopic beat. Ectopy is RARE: ~2 percent of beats.
+n_records, beats_per = 400, 60
+beat_is_ectopic = rng.random((n_records, beats_per)) < 0.02
+record_label = beat_is_ectopic.any(axis=1).astype(int)      # noisy-OR truth
+
+# A per-beat detector emits a score; higher for true ectopic beats, but noisy.
+score = rng.normal(0.2, 0.3, (n_records, beats_per))
+score += 0.9 * beat_is_ectopic                              # weak, overlapping signal
+
+def auc(y, s):                                              # rank-based AUC, no sklearn
+    order = np.argsort(s); r = np.empty_like(order, float)
+    r[order] = np.arange(len(s))
+    pos, neg = y == 1, y == 0
+    return (r[pos].mean() - r[neg].mean()) / len(s) + 0.5
+
+mean_pool = score.mean(axis=1)                              # dilutes the rare beat
+max_pool  = score.max(axis=1)                               # keeps the strongest beat
+print(f"record AUC, mean pooling: {auc(record_label, mean_pool):.3f}")
+print(f"record AUC, max  pooling: {auc(record_label, max_pool):.3f}")</code></pre>
+<div class="code-caption">A record is abnormal when any of its 60 beats is ectopic, but ectopy is rare. Mean pooling averages the one informative beat against 59 distractors and scores near chance; max pooling preserves the strongest beat and recovers the label. The aggregation function, not the detector, decides the outcome.</div>
+<p>Run it and the two AUCs diverge sharply: mean pooling drowns the single decisive beat, while max pooling surfaces it. The lesson generalizes past this toy. When the clinical target is "does this event ever occur," any averaging aggregator is structurally wrong no matter how good the per-beat detector is. When the target is "how much of this occurs," averaging is right and max is noisy. Match the pool to the question before you tune a single weight.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A Holter service that counted the wrong thing</h3>
+<p>A remote-monitoring company ran a 14-day patch ECG. Their pipeline scored every beat with a strong per-beat V-detector, then reported a record as "PVC-positive" using the <em>mean</em> ectopy probability across the two-week tape. Patients with a genuine but sparse burden, a few hundred PVCs among a million sinus beats, came back negative, because a few hundred flagged beats averaged against a million normals rounds to zero. Cardiologists reading the same tapes flagged those patients immediately. The model was excellent; the aggregation encoded "the average beat is abnormal," a definition no electrophysiologist uses. Switching to a counting aggregator (report the PVC <em>count</em> and burden fraction, threshold on count) aligned the machine with the clinic overnight, with zero change to the underlying network. The failure lived entirely in the pooling step.</p>
+</div>
+
+<h2>Two evaluations that must not be confused</h2>
+<p>Because there are two units, there are two ways to count errors, and reporting the wrong one is a classic way to publish an inflated number. <strong>Beat-level metrics</strong> tally true and false positives per heartbeat, then compute per-class sensitivity, positive predictive value, and F1. The AAMI EC57 protocol, followed by de Chazal's influential inter-patient split (train on records DS1, test on the disjoint patients in DS2), is the canonical harness here. <strong>Record-level metrics</strong> tally errors per recording, often as a macro-averaged multi-label F1 across diagnostic classes.</p>
+<p>The trap is that a model can look brilliant at one granularity and useless at the other. Because normal beats vastly outnumber abnormal ones, a beat-level accuracy of 99 percent can coexist with missing half the patients who have any ectopy at all. Beat-level accuracy is dominated by the majority class; the clinically meaningful question is a record-level, per-patient one. Always report the metric at the granularity of the decision the system actually drives, and never let a favorable beat-count stand in for a patient-count you did not measure. When you do aggregate, the patient-disjoint discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> still governs: the split is on the person, whichever unit you score.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: attention MIL pooling</h3>
+<p>Writing a numerically stable gated-attention pooling layer by hand, the \( \tanh \)-and-sigmoid gate, the softmax over a variable number of beats per bag, masked padding for ragged bags, and the reduction to a bag embedding, is roughly 40 to 60 lines and easy to get wrong on the masking. In PyTorch the whole pool is about 6 lines using <code>nn.Linear</code> plus a masked <code>softmax</code>, and libraries such as <code>torchmil</code> expose <code>AttentionPool</code> as a single module that also returns the per-instance weights for localization. You provide beat embeddings and a bag index; the library handles the ragged-bag bookkeeping.</p>
+</div>
+
+<h2>Choosing a granularity, and the middle path</h2>
+<p>The decision reduces to a few questions. Do you have beat annotations, or only record labels? Is the clinical target a morphology (a beat property) or a rhythm (a sequence property)? Does the downstream user need localization ("show me the abnormal beats") or just a verdict? Beat-level models excel when annotations exist and morphology is the target, and they give interpretable, time-stamped outputs that clinicians trust. Record-level models are unavoidable for rhythm diagnosis and scale to the cheap, abundant labels that real archives contain.</p>
+<p>In practice the strongest systems refuse the binary and take the middle path: a shared encoder produces a beat-or-segment embedding, a sequence model (a temporal convolution or transformer, developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) mixes information across neighbors, and a learned pool produces the record verdict while the attention weights recover beat-level evidence. You train with whatever labels you have (record-level supervision if that is all there is) and still read out where the model is looking. This is the architecture Section 29.5 builds toward.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current direction is to make the two granularities cooperate rather than compete. Attention-based deep MIL (Ilse and colleagues' gated-attention pooling) is now standard for turning record-only labels into beat-level localization without any beat annotations. On record-level benchmarks, PTB-XL (21,837 twelve-lead ECGs with multi-label diagnostic statements) is the reference corpus, and self-supervised beat and segment encoders (see <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) increasingly supply the per-beat representations that get pooled. The open problem is calibrated, per-beat <em>uncertainty</em> that survives aggregation, so a record-level confidence reflects genuine ambiguity in the underlying beats rather than an overconfident pool; the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> is the natural tool, and applying it across the beat-to-record boundary is not yet solved.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the MIT-BIH Arrhythmia Database (beat-annotated) collapsed to AAMI classes: (1) Train a beat-level V-vs-rest classifier with the de Chazal inter-patient split (DS1 train, DS2 test) and report per-class beat F1. (2) Derive a record-level label "any V beat present" for each recording and evaluate three aggregators, mean, max, and a count threshold, on the DS2 records. (3) Report both the beat-level F1 and the record-level F1 for each aggregator and write one sentence explaining why a high beat F1 did not guarantee a high record F1. (4) Bonus: replace the fixed aggregator with a one-layer attention pool trained on record labels only, and check whether its attention weights fall on the truly ectopic beats.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is atrial fibrillation fundamentally a record-level (sequence) property that a per-beat morphology classifier cannot express?</li>
+<li>A per-beat detector is excellent, yet the record-level recall for sparse ectopy is near zero. Which aggregation function is almost certainly to blame, and what would you switch to?</li>
+<li>A paper reports 99.2 percent beat-level accuracy on an arrhythmia task. What single follow-up question exposes whether this number is clinically meaningful?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-29.5.html">Section 29.5</a>, we turn the shared-encoder-plus-pooling sketch into real architectures: the deep convolutional and transformer models that dominate ECG benchmarks, and the emerging ECG foundation models that learn beat and segment representations once and then serve both beat-level and record-level tasks from the same embedding.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

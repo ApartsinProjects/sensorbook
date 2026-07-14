@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.2: Missingness-as-signal and personalized baselines. Building Sensory AI." name="description"/>
+<title>Section 33.2: Missingness-as-signal and personalized baselines | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Continuous and Contactless Health Monitoring</a></div>
+<h1>Missingness-as-signal and personalized baselines</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The user has not worn the ring for three nights. I have logged this as missing data. My physician colleague logged it as the flu."</p>
+        <cite>An Over-Literal Sleep Tracker</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why the gaps and the person both matter</h3>
+        <p>Two assumptions quietly wreck most continuous health models. The first is that gaps in a wearable stream are just missing data to be imputed away, when in reality the <em>reason</em> the data is missing (the person took the watch off, the battery died during a hospital stay, the skin contact failed during a fever) is frequently the most predictive thing in the record. The second is that "abnormal" can be read off a population chart, when a resting heart rate of 48 is alarming for one person and a Tuesday for an endurance athlete. This section attacks both. We treat missingness as an informative channel to be encoded rather than erased, and we replace the population yardstick with a per-person baseline that says what is normal <em>for you</em>. Together they turn a noisy, hole-riddled stream into a personalized deviation detector, which is exactly the machinery <a class="cross-ref" href="index.html">Chapter 33</a>'s lab asks you to build.</p>
+    </div>
+
+    <p><a class="cross-ref" href="section-33.1.html">Section 33.1</a> established that longitudinal wearable data is irregular and sparse, and showed how to represent an unevenly-sampled stream. Here we ask the two questions that irregular sampling forces on you but does not answer: what does a gap <em>mean</em>, and what should we compare a present value <em>against</em>? The probabilistic vocabulary comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the change-detection instinct from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>; this section specializes both to the peculiar economics of a body that generates its own noise and wears its own sensor on its own schedule.</p>
+
+    <h2>Missingness is rarely random</h2>
+    <p><strong>What the three regimes are.</strong> Statisticians sort missingness into three mechanisms, and the distinction is not academic here because it decides whether you may safely ignore a gap. Data is <em>missing completely at random</em> (MCAR) when the gap is independent of everything (a cosmic-ray bit flip). It is <em>missing at random</em> (MAR) when the gap depends only on observed variables (a sensor that drops out above a known temperature you also record). It is <em>missing not at random</em> (MNAR) when the probability of the gap depends on the unobserved value itself or on the hidden state you care about. Wearable health data is overwhelmingly MNAR: people stop wearing devices precisely when they are sick, hospitalized, depressed, or traveling, and optical contact fails precisely during the vigorous motion or vasoconstriction that also shifts the vital sign.</p>
+    <p><strong>Why MNAR forbids naive imputation.</strong> The standard reflex (fill the hole with the last value, the mean, or a spline) silently assumes MCAR or MAR. Under MNAR that reflex destroys the signal: imputing a "normal" resting heart rate across the three nights a user stopped wearing their ring because they had influenza erases the very episode a health model exists to catch. The correct move is to stop treating the gap as an absence and start treating its <em>pattern</em> (its timing, duration, and co-occurrence) as an observed feature in its own right. Non-wear time, charging gaps, and quality-gated dropouts are data.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">The mask is a channel, not a nuisance</h3>
+        <p>Whenever missingness may be informative (and in health it almost always is), give the model three streams instead of one: the (possibly imputed) value \(x_t\), a binary <em>mask</em> \(m_t \in \{0,1\}\) marking whether \(x_t\) was actually observed, and the <em>time since last observation</em> \(\delta_t\). The mask lets the model learn that a gap at 3 a.m. means something different from a gap at noon; \(\delta_t\) lets it decay its confidence in a stale value the longer that value goes unrefreshed. Erasing the gap throws away a feature that is often more predictive than the values around it. This is the same missing-as-information principle that <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a> raises to the level of whole missing modalities.</p>
+    </div>
+
+    <h2>Encoding the gap: masks, deltas, and decay</h2>
+    <p><strong>The core mechanism.</strong> The cleanest way to feed missingness to a sequence model is the GRU-D decay trick: rather than carrying a stale observation forward unchanged, decay it toward the person's running mean at a rate the network learns per feature. Concretely, define an exponential decay weight from the elapsed time,</p>
+    $$ \gamma_t = \exp\!\big(-\max(0,\; w\,\delta_t + b)\big), \qquad \hat{x}_t = m_t\, x_t + (1-m_t)\,\big(\gamma_t\, x_{t'} + (1-\gamma_t)\,\bar{x}\big), $$
+    <p>where \(x_{t'}\) is the last observed value, \(\bar{x}\) is the empirical (ideally per-person) mean, \(\delta_t\) is the time since that last observation, and \(w,b\) are learned. When a value is fresh (\(\delta_t\) small) \(\gamma_t \to 1\) and the model trusts the carried value; when the gap is long \(\gamma_t \to 0\) and the estimate relaxes to the baseline while the mask still tells the model this was a guess. This gives the recurrent and temporal-convolutional models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> a principled, differentiable way to consume irregular health streams without pretending the holes are not there.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+# One user's hourly resting-HR stream; NaN = not worn / quality-gated out.
+x = np.array([58, 57, np.nan, np.nan, np.nan, 61, 63, np.nan, 72, 74, 73])
+mask  = (~np.isnan(x)).astype(float)                 # 1 = observed, 0 = gap
+# time since last observation (delta), in samples
+delta = np.zeros_like(x)
+for k in range(1, len(x)):
+    delta[k] = 0 if mask[k] else delta[k-1] + 1
+
+def gru_d_impute(x, mask, delta, x_bar, w=0.5, b=0.0):
+    x_hat, last = np.empty_like(x), x_bar
+    for k in range(len(x)):
+        if mask[k]:                                  # observed: use it, refresh memory
+            x_hat[k] = x[k]; last = x[k]
+        else:                                        # gap: decay last toward baseline
+            gamma = np.exp(-max(0.0, w*delta[k] + b))
+            x_hat[k] = gamma*last + (1-gamma)*x_bar
+    return x_hat
+
+x_bar = np.nanmean(x[:6])                             # personal early-window mean
+print(np.round(gru_d_impute(x, mask, delta, x_bar), 1))
+print("mask :", mask.astype(int))
+print("delta:", delta.astype(int))</code></pre>
+    <div class="code-caption">A GRU-D-style decay imputation over one user's gappy resting-heart-rate stream. The mask and delta rows are kept as explicit input channels: notice the long gap decays the carried 57 back toward the personal mean instead of freezing it, while the mask still flags those hours as unobserved so a downstream model can weight them.</div>
+
+    <p>The printout shows the decay in action: the three-hour gap after the 57 does not freeze at 57, it drifts toward the person's mean, and the mask and delta rows remain available so the model never confuses a decayed guess with a real measurement. Crucially, we never delete the fact that a gap happened, we feature-ize it.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Mask, delta, and decay without the loops</h3>
+        <p>Hand-rolling the mask, delta accumulator, and decayed imputation across a fleet of users is roughly 25 to 40 lines once you handle multi-feature arrays, batching, and per-user means. <code>PyPOTS</code> (Python toolbox for partially-observed time series) ships GRU-D, BRITS, and SAITS with the masking and delta bookkeeping built in:</p>
+        <pre><code class="language-python">from pypots.imputation import SAITS
+model = SAITS(n_steps=48, n_features=6, n_layers=2, d_model=128, epochs=10)
+model.fit({"X": X_with_nans})                 # NaNs are the mask; deltas handled internally
+X_imputed = model.impute({"X": X_with_nans})  # missingness-aware, not mean-fill</code></pre>
+        <div class="code-caption">Replacing the from-scratch decay loop with <code>pypots.imputation.SAITS</code>, which infers masks and time-deltas from the NaN pattern and imputes with a missingness-aware attention model, cutting tens of lines of bookkeeping to three.</div>
+        <p>The library handles the sliding masks, per-feature decay, and batching, so your attention goes to whether the imputation is even appropriate (under strong MNAR you may prefer to keep the gap as a feature and <em>not</em> impute at all).</p>
+    </div>
+
+    <h2>Personalized baselines: the individual is the yardstick</h2>
+    <p><strong>Why population norms fail.</strong> Between-person physiological variation dwarfs the within-person deviations that signal a health event. A resting heart rate of 50 is an alarm for a sedentary 70-year-old and a resting norm for a cyclist; a nocturnal skin temperature of 36.2 degrees Celsius is a person's baseline or a half-degree elevation depending entirely on their own history. A model that flags departures from a population mean will drown in false positives for the tails of the distribution and miss real events for people whose baseline sits far from the crowd. The fix is to make each person their own control.</p>
+    <p><strong>How to build one.</strong> The workhorse is a per-person robust standardization: maintain a rolling estimate of the individual's location and scale, then score new samples as deviations from <em>their</em> center. Using the median and the median absolute deviation (MAD) rather than mean and standard deviation keeps the baseline from being dragged by the very anomalies you want to detect,</p>
+    $$ z_t^{(u)} = \frac{x_t - \tilde{\mu}^{(u)}_t}{1.4826\,\cdot\,\mathrm{MAD}^{(u)}_t}, $$
+    <p>where \(\tilde{\mu}^{(u)}_t\) is user \(u\)'s rolling median and the constant rescales MAD to match a standard deviation under normality. A large \(|z_t^{(u)}|\) means "unusual for this person," which is what an elevated resting heart rate over a personal baseline (a widely used early-illness signal) actually is. The change-point and control-chart tools of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> then operate on \(z_t^{(u)}\) instead of the raw stream.</p>
+    <p><strong>The cold-start problem, and why hierarchy solves it.</strong> A brand-new user has no personal history, so their baseline is undefined for days or weeks. The principled remedy is a hierarchical (partial-pooling) estimator: start each user's baseline at the population prior and shrink toward their own accumulating data as evidence arrives, \(\hat{\mu}^{(u)} = \lambda_u\,\bar{x}^{(u)} + (1-\lambda_u)\,\mu_{\text{pop}}\), with the personal weight \(\lambda_u\) growing as the user logs more valid samples. Early on you borrow strength from the population; later the person speaks for themselves. This is the empirical-Bayes shrinkage of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> applied to onboarding, and it is why good wearables show conservative insights in week one and sharper ones by month two.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Personalized baselines at population scale</h3>
+        <p>The state of the art fuses both ideas of this section. Large wearable studies (the Stanford early-COVID work using resting heart rate and steps, Fitbit's and Oura's illness-onset detectors, the Empatica and Whoop deviation scores) show that <em>personal</em> resting-heart-rate elevation over a rolling individual baseline detects infection onset days before symptoms, and that the missingness pattern (a drop in wear time) is itself a complementary signal. Wearable foundation models (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) push this further by pretraining across millions of users so a new person inherits a strong prior baseline on day one, collapsing the cold-start window. The open frontier is doing this with calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) so a personal alert carries an honest false-alarm rate rather than a bare threshold crossing.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The smart ring that reads a fever before the thermometer</h3>
+        <p>A consumer smart ring markets an "illness onset" insight built precisely on the two mechanisms of this section. Each night it estimates the wearer's resting heart rate, heart-rate variability, and skin temperature during sleep, and it scores them not against a population table but against that individual's own trailing baseline computed over the previous two to three weeks. When a user incubates a viral infection, resting heart rate and skin temperature typically rise one to two nights before the person feels sick; against a population chart a 3-beat rise is invisible, but against the wearer's own tight nocturnal baseline it is a clear multi-sigma excursion. The system also watches the mask: a user who suddenly stops wearing the ring, or whose contact quality degrades, is treated as a distinct informative state rather than as clean "no change." The result is a gentle "your body is working hard, consider resting" nudge that lands, for many users, a day before symptoms. The engineering lesson is that neither piece works alone: the personal baseline supplies the sensitivity, and the missingness handling supplies the trust.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: baseline that survives the anomaly</h3>
+        <p>(1) Take the resting-HR stream from the code above, extend it to 60 days with a slow seasonal drift plus a 4-day illness bump, and implement the per-person MAD z-score with a 14-day rolling window; show that a mean/standard-deviation baseline is dragged upward by the bump while the median/MAD baseline is not. (2) Add a hierarchical cold-start: for the first 10 days shrink the personal baseline toward a population mean of 62 bpm with weight \(\lambda_u = n/(n+k)\), and pick \(k\) so the personal estimate dominates by day 14. (3) Now inject a 5-day non-wear gap that coincides with the illness; show that imputing the gap with the personal mean hides the event, whereas keeping the mask as a feature preserves it. Report the detection delay for both.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Classify each as MCAR, MAR, or MNAR: a watch battery dying during a hospital admission; a random Bluetooth packet drop; an optical sensor that fails whenever wrist temperature exceeds a value you also log. Which one makes mean-imputation dangerous, and why?</li>
+            <li>Why do we prefer median and MAD over mean and standard deviation when building a personal baseline that must detect anomalies? Give the failure mode of the mean-based version in one sentence.</li>
+            <li>State the two roles the mask \(m_t\) and the delta \(\delta_t\) play in a GRU-D-style model, and explain what information is lost if you impute the gap and drop both.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-33.3.html">Section 33.3</a>, we stop treating the wearable as a single gappy channel and start fusing several at once: PPG, accelerometer, skin temperature, and electrodermal activity together. Multimodal fusion both sharpens the personal baseline (motion context explains away a heart-rate spike) and complicates the missingness picture (now different modalities drop out at different times), setting up the missing-modality robustness that becomes a central theme later in the book.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

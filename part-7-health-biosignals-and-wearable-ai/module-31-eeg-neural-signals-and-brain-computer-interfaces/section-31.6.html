@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.6: Non-invasive language/speech decoding. Building Sensory AI." name="description"/>
+<title>Section 31.6: Non-invasive language/speech decoding | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: EEG, Neural Signals, and Brain-Computer Interfaces</a></div>
+<h1>Non-invasive language/speech decoding</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me a scalp electrode and enough teacher forcing, and I will reconstruct Hamlet from a coin flip."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous section put electrodes inside the skull and read speech at conversational rates. This section keeps the sensors outside: EEG on the scalp, MEG in a magnetically shielded room, fNIRS or fMRI measuring hemodynamics. The prize is a language interface with no surgery, no infection risk, and no informed-consent asymmetry. The physics fights back. Scalp signals are spatially blurred, noise dominated, and lag the underlying neural events. The honest state of the art decodes <em>perceived</em> and <em>imagined</em> language into constrained outputs, not fluent open telepathy. This section teaches what genuinely works, why the strongest published claims collapsed under scrutiny, and how to evaluate a decoder so you do not fool yourself.</p>
+</div>
+
+<p>This section assumes the montage, band, and artifact material from <a class="cross-ref" href="section-31.1.html">Section 31.1</a> and <a class="cross-ref" href="section-31.2.html">Section 31.2</a>, the foundation-model encoders from <a class="cross-ref" href="section-31.4.html">Section 31.4</a>, and the contrastive-learning machinery from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. If any of those are unfamiliar, read them first; the decoders below are thin heads on top of exactly that stack.</p>
+
+<h2>Three problems that all get called "mind reading"</h2>
+<p>Vague press coverage collapses three very different tasks. Separating them is the single most useful thing you can do before reading any paper. <strong>Speech perception decoding</strong> asks: while a subject listens to audio, can we identify which speech segment they heard? <strong>Imagined or inner-speech decoding</strong> asks: while a subject silently rehearses words, can we recover them? <strong>Semantic reconstruction</strong> asks: can we produce text whose <em>meaning</em> tracks a story the subject is hearing or watching, without word-for-word fidelity? These differ in difficulty by orders of magnitude. Perception decoding has a strong, time-locked stimulus and is the easiest. Inner speech has no external anchor, weak and idiosyncratic signals, and is the hardest. Semantic reconstruction sits between, and crucially it is evaluated on meaning overlap, not exact strings, which changes what counts as success.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: classification into a closed set, not generation</h3>
+<p>The robust non-invasive results are <em>retrieval</em> results. Meta's 2023 work (Defossez and colleagues, published in <em>Nature Machine Intelligence</em>) did not generate free text from MEG or EEG. It learned a joint embedding and, given a brain segment, ranked which of a fixed candidate set of audio clips was heard, reaching roughly 40 percent top-10 accuracy from MEG against large candidate pools. That is a genuine, reproducible signal, and it is a closed-set classification metric. The moment a system claims open-vocabulary sentence generation from scalp EEG, ask whether the decoder was ever run without the ground-truth text fed into it. Usually it was not.</p>
+</div>
+
+<h2>Contrastive brain-to-speech alignment</h2>
+<p>The workhorse architecture borrows directly from CLIP-style multimodal learning (see <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>). A brain encoder maps a windowed multichannel recording \(x \in \mathbb{R}^{C \times T}\) to an embedding \(z_b\); a frozen self-supervised speech model such as wav2vec 2.0 maps the concurrent audio to \(z_a\). Both are L2-normalized and trained so that matching brain-audio pairs align while mismatched pairs repel, using the symmetric InfoNCE objective</p>
+$$ \mathcal{L} = -\frac{1}{2N}\sum_{i=1}^{N}\left[\log\frac{e^{\,s(z_b^i, z_a^i)/\tau}}{\sum_j e^{\,s(z_b^i, z_a^j)/\tau}} + \log\frac{e^{\,s(z_b^i, z_a^i)/\tau}}{\sum_j e^{\,s(z_b^j, z_a^i)/\tau}}\right], $$
+<p>where \(s\) is cosine similarity and \(\tau\) a learned temperature. The brain encoder is a subject-conditioned convolutional or transformer stack: a per-subject spatial layer absorbs individual electrode geometry and skull anatomy, then a shared backbone does the temporal work. This subject-embedding trick is what lets one model pool many people despite each brain being wired slightly differently, and it connects directly to the adaptation methods in <a class="cross-ref" href="section-31.7.html">Section 31.7</a>. At inference you embed the brain segment and retrieve the nearest audio candidate. No text is generated, and there is nothing to leak.</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def clip_brain_speech_loss(z_brain, z_audio, temperature=0.07):
+    # z_brain, z_audio: (N, D) segment embeddings from the same time windows
+    zb = F.normalize(z_brain, dim=-1)
+    za = F.normalize(z_audio, dim=-1)
+    logits = (zb @ za.t()) / temperature      # (N, N) similarity matrix
+    targets = torch.arange(z_brain.size(0), device=z_brain.device)
+    # symmetric: brain->audio and audio->brain both classify the diagonal
+    return 0.5 * (F.cross_entropy(logits, targets) +
+                  F.cross_entropy(logits.t(), targets))
+
+# retrieval eval: does the true clip rank in the top-k for each brain window?
+@torch.no_grad()
+def topk_retrieval(z_brain, z_audio, k=10):
+    sims = F.normalize(z_brain, -1) @ F.normalize(z_audio, -1).t()
+    ranks = sims.argsort(dim=-1, descending=True)[:, :k]
+    hit = (ranks == torch.arange(len(z_brain))[:, None]).any(-1)
+    return hit.float().mean().item()
+</code></pre>
+<div class="code-caption">A complete contrastive brain-to-speech head: the same symmetric InfoNCE loss used by Meta's MEG/EEG decoder, plus the top-k retrieval metric that is the honest way to report it. The diagonal of the similarity matrix is the matching pair.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: the encoders are pretrained already</h3>
+<p>You do not implement the speech tower. <code>transformers</code> loads a frozen wav2vec 2.0 in three lines (<code>Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")</code>), turning raw audio into aligned embeddings; <code>braindecode</code> supplies the subject-conditioned EEG/MEG backbones (ShallowConvNet, EEGConformer) with standard windowing. Together they replace roughly 500 lines of dataloaders, spatial layers, and augmentation with about 20, so the only bespoke code you own is the loss above and the evaluation split.</p>
+</div>
+
+<h2>Why EEG-to-text papers overclaimed</h2>
+<p>A wave of 2022 to 2023 papers reported fluent open-vocabulary sentence generation from EEG (the DeWave line and its relatives), with BLEU and ROUGE scores that looked transformative. In 2024 the results were shown to be an evaluation artifact. The sequence-to-sequence decoders were trained and, critically, <em>tested</em> with <strong>teacher forcing</strong>: at each step the model received the previous ground-truth token as input. A language decoder with teacher forcing produces fluent, on-topic text from noise, because it is really doing next-token prediction conditioned on the reference. Replace the EEG input with zeros or random values and the scores barely move. The lesson is a leakage lesson, the same family of failure catalogued in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: if a control condition with the signal removed still "works," the signal was never the source of performance.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: the noise-control probe that saved a clinical review</h3>
+<p>A neurotechnology startup pitched a rehabilitation console that "reconstructs intended sentences" for stroke patients with aphasia, showing a demo video of clean generated text scrolling beside a patient in an EEG cap. The clinical reviewer, having read the 2024 critiques, asked one question: run the exact pipeline with the EEG channels shuffled across time, on stage, live. BLEU dropped by two points out of a reported forty. The output was almost entirely the language model's prior, not the patient's brain. The console was not fraudulent; the team had simply inherited a teacher-forced benchmark and never run the ablation. They pivoted to a closed-set retrieval interface with a 30-word functional vocabulary that survived the same probe, shipped it as an assistive-communication aid, and reported free-running (not teacher-forced) accuracy with conformal coverage per <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+</div>
+
+<h2>Modalities, and the semantic-reconstruction frontier</h2>
+<p>Modality choice sets the ceiling. <strong>EEG</strong> is portable and cheap but spatially smeared and artifact prone; it supports small closed vocabularies and coarse category decoding. <strong>MEG</strong> has far cleaner spatiotemporal structure and drives the best perception-retrieval numbers, but the machine is room sized and non-portable. <strong>fNIRS</strong> measures slow hemodynamics, useful for detecting speech intent or answering binary questions, not for word-rate decoding. <strong>fMRI</strong> is the outlier: Tang and colleagues (2023, <em>Nature Neuroscience</em>) reconstructed the <em>gist</em> of heard and imagined stories by pairing a GPT-class language model with a per-subject encoding model and beam search over candidate continuations, scored by predicted BOLD response. It reconstructs meaning, not words, requires roughly 16 hours of per-subject scanner training, and, notably, failed when the subject actively performed a distractor task, an inadvertent demonstration of mental privacy.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: where the field actually stands (2025-2026)</h3>
+<p>Current SOTA for portable non-invasive language BCIs is honest and modest: subject-pooled contrastive models (Meta's MEG/EEG line) for closed-set perception retrieval; the fMRI semantic decoder (Tang et al.) for non-portable gist reconstruction; and inner-speech classification over small vocabularies from EEG datasets such as Thinking Out Loud, where subject-independent accuracy still hovers near chance for open sets. The live questions are (1) whether EEG foundation models from <a class="cross-ref" href="section-31.4.html">Section 31.4</a> transfer to language tasks, (2) whether OPM-MEG wearable magnetometers can bring MEG-grade signals out of the shielded room, and (3) leakage-proof benchmarks that mandate free-running, signal-ablated evaluation by construction. No published, replicated system produces open-vocabulary inner speech from scalp EEG.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the retrieval head above and build the ablation that catches teacher-forcing-style leakage for a contrastive decoder. Train on a public MEG or EEG listening dataset (for example MEG-MASC), report top-10 retrieval, then re-run three controls: (a) temporally shuffle each brain window before embedding, (b) swap in Gaussian noise of matched variance, (c) evaluate across held-out <em>subjects</em> rather than held-out segments of trained subjects. Any accuracy that survives (a) and (b) is your leakage floor; the drop from within-subject to cross-subject in (c) is your generalization gap. Report all four numbers together, co-computed on one split.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is closed-set retrieval a more defensible claim for scalp EEG than open-vocabulary text generation, and what metric belongs with each?</li>
+<li>Explain in one sentence how teacher forcing lets a decoder produce fluent sentences that owe almost nothing to the brain signal.</li>
+<li>The fMRI semantic decoder fails when the subject counts backwards during scanning. Why is that failure a feature rather than a bug, and what does it tell you about consent?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-31.7.html">Section 31.7</a>, we turn from decoding accuracy to the surrounding obligations: subject adaptation so a model built on many brains works on a new one with minutes of calibration, safety and mental-privacy safeguards for signals that (as the distractor result showed) can be withheld by the user, and interpretability methods that tell you which cortical sources and frequency bands a decoder actually relies on before anyone trusts it in the clinic.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

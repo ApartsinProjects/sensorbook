@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.6: Motion robustness and signal-quality gating. Building Sensory AI." name="description"/>
+<title>Section 30.6: Motion robustness and signal-quality gating | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: PPG and Wearable Cardiovascular Sensing</a></div>
+<h1>Motion robustness and signal-quality gating</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A doctor who knew when to say 'I did not hear that clearly' would be trusted more, not less. I try to be that doctor. When your wrist is thrashing, I would rather report nothing than report a lie with a decimal point."</p>
+        <cite>A Self-Doubting AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>Every number in the previous five sections, the heart rate, the SpO2, the overnight RMSSD, the cuffless pressure estimate, assumed a clean-enough pulse. On a real wrist, on a real arm, during a real run, that assumption fails constantly. Motion is the single largest source of error in wrist PPG, and it does not fail gracefully: an arm swing at a steady cadence produces a clean periodic artifact that a naive heart-rate estimator will happily lock onto and report with total confidence. The engineering answer has two halves. First, <em>remove</em> what motion you can, usually by fusing an accelerometer that sees the corruption directly. Second, and more important, <em>gate</em> what you cannot fix: score the quality of every window and refuse to emit a value the device did not actually measure. A wearable biomarker is only as trustworthy as the quality gate in front of it, and this section builds that gate.</p>
+    </div>
+
+    <p>This section assumes the pulse-waveform physics and the AC/DC decomposition of <a class="cross-ref" href="section-30.1.html">Section 30.1</a>, and the heart-rate and PRV estimators of <a class="cross-ref" href="section-30.3.html">Section 30.3</a> whose failures we are now defending against. The adaptive-filtering machinery comes from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, the spectral view of periodic artifacts from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, and the accelerometer that supplies the motion reference is the subject of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>. The decision to withhold or widen a low-confidence value builds directly on the calibration and conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+    <h2>What motion actually does to the optical signal</h2>
+    <p>Motion corrupts PPG through three distinct physical channels, and knowing which one you are fighting decides the fix. First, <em>optical coupling</em> changes: relative sliding between the sensor and skin varies the path light travels, so the DC baseline wanders and the pulsatile AC amplitude modulates. Second, <em>blood displacement</em>: acceleration physically pushes venous and capillary blood around, adding a hemodynamic signal that has nothing to do with the cardiac cycle but sits squarely in the same frequency band. Third, <em>ambient light leakage</em>: a shifting skin gap lets external light reach the photodiode, which is why sensors sample a "dark" reading with the LED off and subtract it. The cruel property of the second channel is that rhythmic exercise produces rhythmic artifact. A cyclist pedaling at 90 revolutions per minute injects energy at \(1.5\,\text{Hz}\), indistinguishable in the spectrum from a genuine \(90\,\text{bpm}\) heart rate. No amount of bandpass filtering separates two sinusoids that share a frequency; you need a second sensor that sees the motion but not the pulse.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">The accelerometer is your ground-truth for the corruption</h3>
+        <p>An inertial measurement unit sitting next to the optical sensor observes the motion directly and is blind to blood flow. That makes it a reference channel for the artifact: whatever spectral peaks the accelerometer shows are candidate contaminants in the PPG. Two strategies follow. In <em>adaptive noise cancellation</em>, the accelerometer axes drive an adaptive filter (LMS, NLMS, or RLS from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>) that learns, sample by sample, the transfer from motion to artifact and subtracts its estimate. In <em>spectral exclusion</em>, used by the classic TROIKA and JOSS trackers, you compute both spectra, mask out the frequencies the accelerometer occupies, and pick the heart rate from what survives, with a tracking prior that forbids implausible beat-to-beat jumps. Both turn an unsolvable single-channel problem into a solvable two-channel one, the same fusion logic that runs through <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+    </div>
+
+    <h2>Scoring signal quality: the SQI toolbox</h2>
+    <p>Before you trust any estimate, you score the window it came from. A <em>signal-quality index</em> (SQI) is a scalar (often several, fused) that predicts whether the pulse is real enough to use. The workhorses are cheap and complementary. <em>Perfusion index</em>, the ratio of pulsatile AC to steady DC amplitude, catches poor skin contact and low blood flow. <em>Template matching</em> correlates each detected beat against an average pulse shape; a clean pulse has a characteristic foot-upstroke-dicrotic-notch morphology, and correlation below a threshold flags a distorted beat. <em>Skewness</em> is a surprisingly strong single feature: a good PPG pulse is right-skewed, and studies on the MIMIC and Capnobase corpora found skewness SQI ranked among the best individual quality metrics. <em>Spectral entropy</em> and the fraction of power inside the physiological band catch noise that spreads energy everywhere instead of concentrating it at the heart rate. In practice you compute a handful, then either threshold them or feed them to a small classifier trained on beats a human annotator labeled clean or corrupt, which sits comfortably in the change-and-anomaly-detection framing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>.</p>
+
+    <p>The function below scores a PPG window with three complementary indices and returns a single gate decision. It is deliberately transparent so you can see which failure each index catches; production systems fuse more features but the logic is identical.</p>
+
+    <pre><code class="language-python">import numpy as np
+from scipy import signal, stats
+
+def ppg_quality_gate(ppg, fs, accel=None, thr=(0.6, -0.1, 0.5)):
+    """Return (accept: bool, indices: dict) for one PPG window."""
+    x = signal.detrend(np.asarray(ppg, float))
+    # 1) Perfusion / SNR proxy: pulsatile amplitude vs residual noise
+    band = signal.butter(3, [0.5, 4.0], "bandpass", fs=fs, output="sos")
+    pulse = signal.sosfiltfilt(band, x)
+    perfusion = pulse.std() / (x.std() + 1e-9)
+    # 2) Skewness: clean PPG pulses are right-skewed
+    skew = float(stats.skew(pulse))
+    # 3) Spectral concentration in the cardiac band (0.7-3.5 Hz)
+    f, pxx = signal.welch(pulse, fs=fs, nperseg=min(len(pulse), 256))
+    card = (f >= 0.7) & (f <= 3.5)
+    concentration = pxx[card].sum() / (pxx.sum() + 1e-9)
+    # 4) Motion veto: reject if accel spectral peak coincides with PPG peak
+    motion_conflict = False
+    if accel is not None:
+        fa, pa = signal.welch(signal.detrend(accel), fs=fs,
+                              nperseg=min(len(accel), 256))
+        f_ppg = f[card][np.argmax(pxx[card])]
+        f_mot = fa[np.argmax(pa)]
+        motion_conflict = abs(f_ppg - f_mot) < 0.1  # within ~6 bpm
+    idx = {"perfusion": perfusion, "skew": skew,
+           "concentration": concentration, "motion_conflict": motion_conflict}
+    accept = (concentration > thr[0] and skew > thr[1]
+              and perfusion > thr[2] and not motion_conflict)
+    return accept, idx
+</code></pre>
+    <div class="code-caption">A three-index quality gate with an accelerometer motion veto: the veto is the load-bearing part, because it is the only check that distinguishes a genuine pulse from a clean, periodic, high-quality-looking exercise artifact at the same frequency.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right tool: NeuroKit2 and heartpy for turnkey SQI</h3>
+        <p>The gate above is about 30 lines and still hand-rolls detrending, band selection, and index fusion. Established libraries ship validated versions: <code>neurokit2.ppg_quality()</code> returns a per-sample template-matching quality trace, and <code>heartpy</code> flags rejected beats automatically inside its peak-detection pass. Swapping the hand-rolled block for <code>quality = nk.ppg_quality(ppg, sampling_rate=fs)</code> is a single line, roughly a 30-to-1 reduction, and it handles the parts naive code gets wrong: baseline-wander removal before scoring, an adaptive rather than fixed correlation template, and beat-level rather than window-level granularity so one bad second does not veto a good minute.</p>
+    </div>
+
+    <h2>Gating policy: withhold, widen, or impute</h2>
+    <p>Scoring quality is half the job; the other half is what you do with a low score. There are three defensible policies and one indefensible one. You may <em>withhold</em>: emit no value and show the user a gap, which is what overnight-recovery devices do during restless periods. You may <em>widen</em>: emit the value but attach a larger uncertainty interval, the disciplined move when downstream consumers can handle error bars, and exactly what the conformal-prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> produces automatically as a function of input quality. You may <em>impute</em>: hold the last trusted value or interpolate across a short gap, acceptable for a smooth quantity like heart rate over a few seconds but dangerous for anything a clinician reads as an event. The indefensible policy is to print a full-precision number from a window you know is corrupt, which is precisely how a fitness tracker ends up reporting a runner's cadence as their heart rate. Gating is also a fairness lever: quality failures are not uniform across users, and thresholds tuned on one population can silently gate out another, a problem <a class="cross-ref" href="section-30.7.html">Section 30.7</a> takes head-on.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The apnea study that trusted its gaps</h3>
+        <p>A clinical-research team deployed wrist wearables in a home sleep-apnea study, using overnight PPG to estimate oxygen-desaturation events. Their first pilot over-reported desaturations: motion artifacts during position changes produced brief SpO2 dropouts that the algorithm scored as clinical events. The fix was not a better desaturation detector but a stricter gate. They required three consecutive seconds of high perfusion index and template-correlation above 0.8, vetoed any window where the accelerometer showed a motion burst, and marked gated periods as "not assessed" rather than "no event." Sensitivity against the reference polysomnography barely moved; specificity jumped, because the false events had all lived in the motion windows the gate now discarded. The clinicians trusted the device more once it admitted what it could not see, and the regulator accepted a device that quantified its own coverage. The lesson repeats across wearables: an honest gap beats a confident fabrication.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Frontier: learning robustness instead of engineering it</h3>
+        <p>The classical pipeline (adaptive filter plus hand-crafted SQI) is being displaced by end-to-end deep models that ingest raw PPG and accelerometer channels and regress heart rate directly, learning the motion-rejection and quality-weighting implicitly. <em>CorNET</em> and <em>Deep PPG</em> established the convolutional-recurrent template, and the <em>PPG-DaLiA</em> dataset (activities of daily living with synchronized ECG) is the standard motion benchmark, alongside the older <em>IEEE Signal Processing Cup 2015</em> exercise set that TROIKA introduced. More recent work attaches uncertainty heads that emit a per-window confidence, turning the SQI from a separate stage into a learned output, and self-supervised wearable foundation models (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) pre-trained on unlabeled PPG are beginning to transfer motion-robust representations across devices. The open problem is generalization: a model tuned on treadmill data still degrades on the unstructured motion of daily life, a distribution-shift failure that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> studies directly.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: build a gate and measure what it saves</h3>
+        <p>Using PPG-DaLiA (synchronized wrist PPG, three-axis accelerometer, and chest ECG ground truth): (1) Estimate heart rate per eight-second window with a simple spectral-peak method and report mean absolute error against the ECG, separately for the sitting and the walking/cycling segments. (2) Add the accelerometer motion veto from the code above and re-report, noting how many windows are now gated out and how the error on the surviving windows changes. (3) Replace the hard veto with an accelerometer-referenced NLMS adaptive filter that cleans rather than rejects, and compare coverage-versus-accuracy against pure gating. (4) Plot an accuracy-versus-coverage curve by sweeping the SQI threshold, and pick the operating point you would ship for a consumer versus a clinical product.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why can no single-channel bandpass filter separate a genuine \(90\,\text{bpm}\) heart rate from a \(1.5\,\text{Hz}\) pedaling artifact, and what second signal breaks the tie?</li>
+            <li>Name the three physical channels through which motion corrupts a PPG waveform, and state which one a "dark" LED-off reading is designed to counter.</li>
+            <li>A window scores low on your SQI. Give the three defensible gating policies and one situation where each is the right choice.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-30.7.html">Section 30.7</a>, we confront the uncomfortable truth that both the SpO2 calibration curve of Section 30.3 and the quality thresholds of this section were tuned on populations that under-sampled darker skin, turning a signal-processing choice into a fairness problem, and we build the subgroup audits and recalibration that a responsible wearable owes every user.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

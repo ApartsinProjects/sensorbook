@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.2: Physiological noise and motion artifacts. Building Sensory AI." name="description"/>
+<title>Section 28.2: Physiological noise and motion artifacts | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Biosignal Foundations</a></div>
+<h1>Physiological noise and motion artifacts</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I detected a heartbeat of 214 beats per minute. On closer inspection, the patient was jogging and swinging the arm I live on."</p>
+        <cite>A Well-Meaning Wrist Sensor</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why the corruption deserves its own section</h3>
+        <p>In most of this book, noise is a nuisance you filter out on the way to the signal. Biosignals invert that comfortable picture. The largest interference in a wearable recording is often another biological signal (muscle activity riding on an EEG trace, breathing pushing an ECG baseline up and down), so one person's noise is literally another person's signal. And the single most destructive corruption, motion, arrives in the same frequency band as the thing you want to measure, at amplitudes many times larger, exactly when the measurement matters most (during exercise, during a seizure, during transport). You cannot design a heartbeat detector, a sleep stager, or an arrhythmia classifier that survives contact with a real body until you understand what these artifacts are, where they come from, and why the tidy fixed filter you learned in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> is not enough on its own.</p>
+    </div>
+
+    <p><a class="cross-ref" href="section-28.1.html">Section 28.1</a> introduced the clean textbook morphology of ECG, PPG, EEG, EMG, respiration, and EDA: the P-QRS-T complex, the dicrotic pulse, the alpha rhythm. This section is about everything that sits on top of that morphology in a real recording. We keep the additive-corruption model from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: the measured trace is \(y(t) = s(t) + n(t) + m(t)\), where \(s(t)\) is the physiological signal of interest, \(n(t)\) is stationary or slowly varying interference, and \(m(t)\) is the non-stationary motion term that breaks most assumptions. The plan is to name the sources, quantify how badly they hurt, and then show the one idea (a reference channel plus an adaptive filter) that turns an intractable overlap into a solvable one.</p>
+
+    <h2>A taxonomy of biosignal corruption</h2>
+    <p><strong>What the sources are.</strong> Biosignal interference falls into a small number of recurring families, and naming them is the first practical step because each family has a different cure.</p>
+    <ul>
+        <li><strong>Powerline interference.</strong> A narrow spike at 50 Hz or 60 Hz (plus harmonics) coupled capacitively from mains wiring into high-impedance electrode leads. Deterministic frequency, so a notch filter kills it cleanly. This is the easy one.</li>
+        <li><strong>Baseline wander.</strong> A slow drift below about 1 Hz from electrode-skin potential changes, respiration, and body movement. It shifts the DC level of an ECG so that R-peaks wander across the display. A high-pass filter handles the mild case.</li>
+        <li><strong>Physiological cross-talk.</strong> One biosignal contaminating another. Muscle activity (EMG) smears broadband energy across an EEG or a resting ECG; the heartbeat injects a pulse artifact into an EEG (the ballistocardiogram); respiration amplitude-modulates both ECG and PPG. This interference <em>is</em> a signal, which is why you cannot simply band-stop it away without deleting information some other application wants.</li>
+        <li><strong>Motion artifact.</strong> Relative movement between sensor and tissue. In an electrode this changes the contact potential and impedance; in an optical PPG it changes how much ambient and back-scattered light reaches the photodiode. Broadband, non-stationary, and frequently larger than the signal itself.</li>
+    </ul>
+    <p><strong>Why motion is the hard one.</strong> The first three families are either narrowband (notch them) or slow (high-pass them) or at least statistically stable. Motion is none of these. During running, the dominant PPG frequency component can be the arm-swing cadence rather than the pulse, and cadence and heart rate can be nearly equal, so a naive peak-picker locks onto the wrong periodicity and reports a confidently wrong heart rate. The corruption and the signal share a band, share a time, and the corruption wins on amplitude. That is the problem the rest of this section attacks.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Noise is signal wearing a different label</h3>
+        <p>The defining feature of biosignal processing is that the "noise" term is usually a legitimate physiological process, just an inconvenient one for your current task. Respiration is baseline wander to a cardiologist reading an ECG and the target measurement to a sleep-apnea monitor. EMG is contamination on an EEG and the whole point in <a class="cross-ref" href="../module-32-emg-and-neuromuscular-ai/index.html">Chapter 32</a>. This has a direct engineering consequence: prefer <em>source separation and reference-based cancellation</em> over blunt band rejection, because a filter that deletes the interfering source often deletes information a downstream model, or a different product feature, still needs.</p>
+    </div>
+
+    <h2>Quantifying artifact: SNR and signal-quality indices</h2>
+    <p><strong>Why you must measure it.</strong> You cannot gate, weight, or reject what you have not quantified. The blunt instrument is signal-to-noise ratio, \(\mathrm{SNR} = 10\log_{10}\!\big(P_s / P_n\big)\) in decibels, but SNR presupposes you can separate \(s\) from \(n\), which during motion is exactly what you lack. The field's practical answer is the <em>signal-quality index</em> (SQI): a cheap scalar in \([0,1]\) computed directly from the raw trace that correlates with usability without needing ground truth.</p>
+    <p><strong>How SQIs work.</strong> Useful SQIs exploit structure the artifact lacks. A physiological pulse or QRS complex is quasi-periodic and template-like; motion is not. So template-matching SQI correlates each detected beat against an average beat template and reports the mean correlation. Spectral SQI measures the fraction of power sitting in the physiological band (roughly 0.5 to 8 Hz for a pulse) versus outside it. Skewness and kurtosis SQIs exploit that a clean PPG pulse is strongly skewed while motion tends toward Gaussian. When several cheap indices agree that a window is bad, you drop it rather than trusting a downstream estimate built on rubble. This is the same signal-quality-gating discipline that <a class="cross-ref" href="../module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> makes central to consumer PPG, and it pairs naturally with the confidence and calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: a low SQI is a principled trigger to widen an uncertainty interval or abstain.</p>
+
+    <h2>Adaptive cancellation: use a reference for the motion</h2>
+    <p><strong>The core idea.</strong> If motion is what corrupts the optical or electrical signal, then measure the motion directly and subtract its influence. A wrist wearable already carries an accelerometer (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>), and its output \(r(t)\) is correlated with the artifact \(m(t)\) but uncorrelated with the pulse \(s(t)\). That is precisely the setup for an <em>adaptive noise canceller</em>: an adaptive filter reshapes the reference \(r(t)\) into an estimate \(\hat{m}(t)\) of the artifact as it appears in the primary channel, and you subtract it. Because the artifact statistics drift as the person changes activity, the filter coefficients must adapt online rather than being fixed once. The least-mean-squares (LMS) update does this with one line of arithmetic per sample:</p>
+    $$ e[k] = y[k] - \mathbf{w}[k]^\top \mathbf{r}[k], \qquad \mathbf{w}[k+1] = \mathbf{w}[k] + \mu\, e[k]\, \mathbf{r}[k]. $$
+    <p>Here \(y[k]\) is the corrupted primary sample, \(\mathbf{r}[k]\) is a short window of recent reference samples, \(\mathbf{w}\) are the adaptive weights, \(\mu\) is a step size trading convergence speed against stability, and the residual \(e[k]\) is the cleaned output. Nothing about the pulse leaks into the weights because the pulse is not present in the reference to cancel. The snippet below runs this canceller on a synthetic PPG-plus-arm-swing trace.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+fs, T = 100, 20                      # 100 Hz, 20 seconds
+t = np.arange(0, T, 1/fs)
+pulse  = np.sin(2*np.pi*1.2*t)                    # ~72 bpm heart rate
+swing  = 2.0*np.sin(2*np.pi*1.6*t + 0.7)          # arm swing, larger, nearby freq
+accel  = swing + 0.05*np.random.randn(t.size)     # accelerometer reference
+ppg    = pulse + swing + 0.1*np.random.randn(t.size)   # corrupted primary
+
+def lms_cancel(primary, reference, taps=8, mu=0.01):
+    w = np.zeros(taps)
+    out = np.empty_like(primary)
+    for k in range(taps, len(primary)):
+        r = reference[k-taps:k][::-1]             # recent reference window
+        out[k] = primary[k] - w @ r               # residual = cleaned sample
+        w += mu * out[k] * r                      # LMS weight update
+    return out
+
+clean = lms_cancel(ppg, accel)
+# Compare pulse-band power before vs after at the true 1.2 Hz component.
+def band_power(x, f0, bw=0.1):
+    f = np.fft.rfftfreq(x.size, 1/fs); X = np.abs(np.fft.rfft(x))**2
+    return X[(f > f0-bw) & (f < f0+bw)].sum()
+print("swing/pulse power ratio  raw:", round(band_power(ppg,1.6)/band_power(ppg,1.2), 1))
+print("swing/pulse power ratio clean:", round(band_power(clean,1.6)/band_power(clean,1.2), 1))</code></pre>
+    <div class="code-caption">An LMS adaptive noise canceller removing arm-swing motion from a synthetic PPG using the accelerometer as a motion reference. The printout shows the arm-swing-to-pulse power ratio collapsing after cancellation, so a downstream peak-picker locks onto the true 1.2 Hz pulse instead of the larger 1.6 Hz swing.</div>
+
+    <p>Run it and the swing-to-pulse power ratio drops sharply: before cancellation the arm swing dominates and any heart-rate estimator built on peak-picking chases the cadence, and after cancellation the true pulse component stands clear. The reference channel is what made an in-band, larger-than-signal artifact removable at all, which no fixed band filter from Chapter 6 could have done.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The adaptive filter in three lines</h3>
+        <p>The hand-written LMS loop above is about 8 lines and easy to get subtly wrong (tap ordering, the sign of the update, normalization for stability). The <code>padasip</code> library ships a normalized-LMS filter that is numerically stabilized and lets you swap update rules (NLMS, RLS, sign-error) by changing one string:</p>
+        <pre><code class="language-python">import padasip as pa
+f = pa.filters.FilterNLMS(n=8, mu=0.1)        # normalized LMS, n taps
+y_hat, error, w = f.run(ppg, pa.input_from_history(accel, 8))
+clean = error                                  # residual is the cleaned signal</code></pre>
+        <div class="code-caption">Replacing the from-scratch LMS canceller with <code>padasip.filters.FilterNLMS</code>, cutting the loop plus stability handling to three lines and making the update rule a one-word swap.</div>
+        <p>The library handles the sliding-history construction, the per-step normalization that keeps \(\mu\) safe, and the bookkeeping, so you spend your attention on choosing the reference channel rather than debugging index arithmetic.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The wrist heart-rate monitor on a treadmill</h3>
+        <p>An optical heart-rate feature on a running watch faced a notorious failure: during steady treadmill running, the reported heart rate would "lock" onto the runner's step cadence instead of the pulse. The physics was unforgiving. Each footfall jostled the watch against the wrist, modulating the green-LED back-scatter, and at a typical running cadence near 160 to 180 steps per minute the cadence sat squarely inside the plausible heart-rate range, so a spectral peak-picker had no way to tell them apart from the PPG alone. The fix was structural, not a better filter on the optical channel: feed the onboard accelerometer as a motion reference into an adaptive canceller (in practice a spectral-domain variant of the LMS idea above), subtract the cadence harmonics the accelerometer confirmed were motion, and gate the output on an SQI so that when both channels were hopeless the watch briefly held the last confident estimate rather than displaying a fabricated one. Accuracy during running went from unusable to within a few beats per minute of a chest strap. The lesson generalizes: the accelerometer was not extra data, it was the key that made an otherwise unsolvable in-band separation solvable.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: when the reference is not enough</h3>
+        <p>Adaptive cancellation assumes the reference \(r(t)\) is correlated with the artifact and uncorrelated with the signal. (1) Describe a realistic motion (for example, an isometric grip with no gross arm movement) where a wrist accelerometer is a <em>poor</em> reference for PPG motion artifact, and explain why cancellation would then fail. (2) Modify the code above so that the swing frequency drifts linearly from 1.4 Hz to 1.9 Hz over the 20 seconds; report how the LMS step size \(\mu\) must change to keep tracking, and what goes wrong if \(\mu\) is too large. (3) Propose one additional reference channel (beyond a single-axis accelerometer) that would improve cancellation, and justify it physically.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Powerline interference, baseline wander, and motion artifact each call for a different mitigation. Match each to notch filtering, high-pass filtering, or adaptive cancellation, and say why the third cannot use either of the first two.</li>
+            <li>Explain in one sentence why respiration is simultaneously "noise" and "signal," and give a concrete task for each interpretation.</li>
+            <li>An SQI reports a value near zero for a 10-second window. Name two actions a well-designed pipeline can take instead of passing the window to a heart-rate estimator anyway.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-28.3.html">Section 28.3</a>, we go one layer deeper into where much of this corruption is born: the electrode-skin interface and the optical light path themselves. Contact impedance, gel drying, ambient-light leakage, and skin-tone-dependent absorption are not abstract noise sources but concrete hardware realities, and understanding them is what lets you tell a fixable measurement problem from an artifact you must live with.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

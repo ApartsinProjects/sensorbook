@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.4: Fatigue and effort estimation. Building Sensory AI." name="description"/>
+<title>Section 32.4: Fatigue and effort estimation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: EMG and Neuromuscular AI</a></div>
+<h1>Fatigue and effort estimation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The muscle told me the same story twice: it is trying harder, and it is getting slower. I only had to notice that both sentences pointed at the word tired."</p>
+<cite>A Perceptive AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the spectral and envelope features of Section 32.2, so you should already know how to compute a power spectral density and an RMS envelope from a surface EMG window. The core tools are the frequency-domain and time-frequency methods of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> and the slope-and-drift detection ideas of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. The one new physiological idea, why a tiring muscle shifts its spectrum downward, is built up from scratch here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Fatigue and effort are the two questions a muscle answers with the same wires. Effort asks <em>how hard is this muscle working right now</em>, a nearly instantaneous quantity you read mostly from EMG amplitude. Fatigue asks <em>how much has this muscle deteriorated over the last minutes</em>, a slow trend you read mostly from EMG spectrum. The beautiful and dangerous fact is that they move together: as a muscle fatigues during a sustained contraction, its amplitude rises even though its force output is falling, and its spectrum compresses toward lower frequencies. Reading either one correctly means separating the fast effort signal from the slow fatigue drift riding on top of it. Get that separation wrong and your ergonomic risk score, your prosthesis controller, or your rehab dashboard will confuse a tired muscle for a strong one.</p>
+</div>
+
+<h2>Why a tiring muscle changes its electrical signature</h2>
+<p>Surface EMG is the summed electrical activity of many motor units firing under the electrode. Two physiological changes during sustained effort reshape that sum in opposite frequency directions, and both are exploitable. First, as metabolic byproducts accumulate and muscle-fiber membranes acidify, the <strong>conduction velocity</strong> of the action potentials propagating along the fibers slows down. A slower-traveling waveform is a stretched-in-time waveform, and stretching in time compresses in frequency: the whole power spectrum slides toward lower frequencies. Second, to keep producing force as individual fibers weaken, the nervous system recruits additional motor units and increases firing rates, so the summed <strong>amplitude climbs</strong>. The signature of fatigue during a constant-force hold is therefore unmistakable and paradoxical: amplitude up, frequency down, force flat or dropping.</p>
+<p>This is why a single number is never enough. Amplitude alone cannot distinguish "working harder" from "fatiguing," because both raise it. Spectrum alone cannot measure effort level, because a light and a heavy contraction can share a median frequency early on. You need the joint motion of the two, and the classic way to visualize it is the <strong>JASA plane</strong> (joint analysis of spectrum and amplitude): plot amplitude change against spectral change, and the quadrant you land in separates increased force (both up), decreased force (both down), fatigue (amplitude up, spectrum down), and recovery (amplitude down, spectrum up). One scalar hides the diagnosis; the two-dimensional motion reveals it.</p>
+
+<h2>Measuring the spectral slide</h2>
+<p>The workhorse fatigue indices summarize where the power sits. The <strong>mean frequency</strong> and <strong>median frequency</strong> of the power spectral density \( P(f) \) are</p>
+$$ \mathrm{MNF} = \frac{\sum_k f_k P(f_k)}{\sum_k P(f_k)}, \qquad \sum_{k:\,f_k \le \mathrm{MDF}} P(f_k) = \tfrac{1}{2}\sum_k P(f_k). $$
+<p>During a fatiguing isometric contraction both fall roughly linearly, and the <em>slope</em> of that decline (in Hz per second, or normalized as percent per minute) is the single most used fatigue rate. Median frequency is preferred over mean frequency in practice because it is more robust to additive noise and to the power-line and movement artifacts that plague field recordings. For higher sensitivity, the <strong>Dimitrov spectral fatigue index</strong> weights the spectrum toward low frequencies by taking the ratio of a negative-order spectral moment to a high-order one, amplifying exactly the low-frequency accumulation that early fatigue produces. The code below fits a fatigue rate to a simulated sustained hold.</p>
+
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+fs, dur = 1000, 30.0                      # 1 kHz sEMG, 30 s sustained hold
+t = np.arange(int(fs * dur)) / fs
+# Fatigue model: dominant frequency slides 90 Hz -> 60 Hz, amplitude rises 1.0 -> 1.6
+f_inst = 90 - 30 * (t / dur)
+amp    = 1.0 + 0.6 * (t / dur)
+emg = amp * np.sin(2 * np.pi * np.cumsum(f_inst) / fs)
+emg += 0.15 * rng.standard_normal(emg.size)          # measurement noise
+
+def median_freq(x, fs):
+    f = np.fft.rfftfreq(x.size, 1 / fs)
+    p = np.abs(np.fft.rfft(x * np.hanning(x.size))) ** 2
+    c = np.cumsum(p)
+    return f[np.searchsorted(c, c[-1] / 2)]
+
+win = fs                                              # 1 s windows, no overlap
+mdf = np.array([median_freq(emg[i:i + win], fs)
+                for i in range(0, emg.size - win, win)])
+rms = np.array([np.sqrt(np.mean(emg[i:i + win] ** 2))
+                for i in range(0, emg.size - win, win)])
+tw = np.arange(mdf.size)                              # window index in seconds
+slope = np.polyfit(tw, mdf, 1)[0]                     # Hz per second
+print(f"MDF fatigue slope: {slope:+.2f} Hz/s   (negative = fatiguing)")
+print(f"RMS trend:         {np.polyfit(tw, rms, 1)[0]:+.3f} /s (positive = amplitude rising)")</code></pre>
+<div class="code-caption">A 30-second isometric hold with a downward-sliding dominant frequency and rising amplitude. Per-window median frequency and RMS are extracted, then linear fits give a fatigue rate (negative MDF slope) and the paradoxical amplitude rise. The two signs together, not either alone, identify fatigue.</div>
+
+<p>Run it and the median-frequency slope comes out clearly negative while the RMS trend is positive: the JASA fatigue quadrant, recovered from raw samples. In a real study you would regress MDF against time per subject and report the slope, because the absolute frequency depends on electrode placement, subcutaneous fat, and muscle, none of which are comparable across people. The <em>rate of change within a recording</em> travels better than any absolute value, a theme that returns in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> and again for cross-subject transfer in Section 32.5.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Effort lives in amplitude; fatigue lives in the spectrum; and the two are coupled, not independent. During a constant-force contraction the amplitude rises precisely because the muscle is fatiguing, so an amplitude-only effort estimate will silently drift upward and overstate how hard the muscle is working. Any honest effort estimator must be conditioned on, or corrected for, the fatigue state. Treating the amplitude-force relationship as fixed over a long task is the single most common fatigue-estimation bug.</p>
+</div>
+
+<h2>From EMG to effort and force</h2>
+<p>Effort estimation maps EMG amplitude to a percentage of maximal capacity or to an absolute force. The starting point is normalization: raw millivolts are meaningless across sessions and people, so you express amplitude as a fraction of a <strong>maximum voluntary contraction</strong> (%MVC) recorded for that muscle and placement. Even normalized, the amplitude-to-force relation is not a straight line: it is roughly linear for small muscles and distinctly nonlinear for large ones, it depends on muscle length and contraction speed, and it saturates near maximal effort. This is why serious effort models learn a regression rather than assume proportionality, using the amplitude, spectral, and envelope features of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> as inputs and a measured force or perceived-exertion rating as the target.</p>
+<p>The uncertainty of that map matters as much as its point estimate. A prosthesis that reports "40 percent effort, plus or minus 5" behaves very differently from one that reports "40, plus or minus 30," and the difference should gate how aggressively a downstream controller acts. The calibrated-uncertainty machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> applies directly: an effort estimate without a trustworthy interval is a number no safety-critical loop should act on.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The assembly line that watched its own shoulders</h3>
+<p>An automotive plant instrumented overhead-assembly workers with textile-electrode sleeves over the deltoid and trapezius. The goal was not to diagnose anyone but to catch <em>cumulative</em> fatigue across a shift, the slow-building overload that precedes musculoskeletal injury. A per-worker median-frequency slope was tracked window by window; a light-duty station showed a flat slope, while a poorly designed overhead station showed the deltoid median frequency sliding down within twenty minutes and never fully recovering across breaks. Crucially, the amplitude signal alone had looked fine, even reassuring, because it rose as the muscle compensated. Only the joint amplitude-up, frequency-down pattern flagged the station as a redesign target. Rotating workers off that station before the spectral slope steepened turned an ergonomics score into a scheduling decision, the same predictive-maintenance logic that <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a> applies to machines, here applied to people.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: fatigue features in a few lines</h3>
+<p>Hand-writing a full fatigue feature set, windowed median and mean frequency, the Dimitrov index, RMS and ARV envelopes, plus the linear-slope regression over windows, is roughly 60 to 80 lines with easy-to-miss details in the spectral moment definitions and the windowing. Libraries such as <code>NeuroKit2</code> and the EMG utilities in <code>biosppy</code> expose these as a couple of calls: <code>nk.emg_process</code> plus <code>nk.emg_analyze</code> returns amplitude and frequency features on windowed EMG, and the median-frequency helper handles the PSD estimation, moment integration, and edge cases for you. You supply the signal and sampling rate; the library returns the fatigue-relevant features ready to regress.</p>
+</div>
+
+<h2>Dynamic contractions and cumulative fatigue</h2>
+<p>The clean spectral-compression story assumes a stationary signal: a fixed-force isometric hold where the spectrum is well defined and slides slowly. Real movement violates that assumption constantly. During a dynamic contraction the muscle length, the electrode-to-fiber geometry, and the force all change within a second, so a single windowed PSD mixes several physiological states and the median-frequency estimate becomes unreliable. The remedy is the time-frequency toolkit of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>: an instantaneous median frequency tracked with short-time or wavelet analysis, or a model that conditions the fatigue read on the current joint angle and load so that like is compared with like. Comparing the spectrum at the top of a lift against the spectrum at the bottom is comparing two different muscles.</p>
+<p>Over a long shift or a rehabilitation session, fatigue is a slow-drift detection problem, not a snapshot. A robust monitor does not threshold an instantaneous median frequency; it estimates the <em>trend</em> and raises a flag when the downward slope steepens or fails to recover during rest, which is exactly the change-detection framing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Framing fatigue as change detection on a slope, rather than classification on a window, is what makes it survive the noise of real recordings.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current direction moves past hand-crafted spectral indices toward learned fatigue representations that stay valid under movement. High-density surface EMG (grids of 64 or more electrodes) lets researchers estimate muscle-fiber conduction velocity directly rather than inferring it from the spectrum, giving a cleaner and more physiological fatigue marker; conduction-velocity tracking on HD-sEMG is a leading benchmark. In parallel, deep sequence models (the temporal convolutions and transformers of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) and self-supervised EMG encoders are learning effort and fatigue jointly from raw multichannel signals, aiming to disentangle the coupled amplitude and spectral trends automatically instead of by the JASA quadrant rule. The open problem is a fatigue estimate that is both calibrated and transferable, one whose uncertainty is trustworthy and whose meaning survives a new electrode placement, which is where this section hands off to Section 32.5.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Record or download a sustained submaximal isometric contraction of the biceps at a fixed load until the subject can no longer hold it (or use a public fatiguing-contraction dataset). (1) Compute per-second median frequency and RMS and plot both against time. (2) Fit a line to each and report the median-frequency slope in Hz per second and the RMS slope. (3) Place each one-second window on a JASA plane (amplitude change versus spectral change) and confirm the trajectory walks into the fatigue quadrant. (4) Replace median frequency with the Dimitrov spectral index and compare which detects the onset of fatigue earlier. Write one sentence on why the absolute median frequency should not be compared against another person's recording.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>During a constant-force fatiguing hold, EMG amplitude rises while force output falls. What physiological mechanism produces the rising amplitude, and why does it make amplitude-only effort estimation unreliable?</li>
+<li>Why is a fatigue rate reported as a within-recording slope more transferable across subjects than an absolute median-frequency value?</li>
+<li>You must monitor fatigue during a dynamic lifting task rather than an isometric hold. Name one reason a single windowed median frequency is misleading and one method from an earlier chapter that addresses it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-32.5.html">Section 32.5</a>, we confront the reason absolute EMG features never travel: electrode placement, skin, and anatomy differ across sessions and people, so a model trained on you rarely works on me. We build the calibration, normalization, and domain-adaptation strategies that let fatigue and gesture models survive a new day and a new body.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

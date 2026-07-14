@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.2: Artifact removal and spectral features. Building Sensory AI." name="description"/>
+<title>Section 31.2: Artifact removal and spectral features | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Health, Biosignals, and Wearable AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: EEG, Neural Signals, and Brain-Computer Interfaces</a></div>
+<h1>Artifact removal and spectral features</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked why my seizure detector fired at 8:03 every morning. It was the patient brushing their teeth. The brain was fine; the toothbrush was the signal."</p>
+<cite>A Chastened AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the montages and frequency bands of <a class="cross-ref" href="section-31.1.html">Section 31.1</a>: you should know that scalp EEG is measured in microvolts against a reference, and that the delta, theta, alpha, beta, and gamma bands carve up roughly 0.5 to 45 Hz. It leans heavily on the linear filtering of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> and the Welch periodogram and time-frequency machinery of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, which we specialize here to brain signals. Blind source separation reappears from the feature-engineering toolkit of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The cortical signals a brain-computer interface actually cares about arrive at the scalp at a few to a few tens of microvolts. Sitting on top of them are contaminants ten to a hundred times larger: an eye blink swings the frontal electrodes by 100 microvolts or more, a clenched jaw injects broadband muscle noise across the whole spectrum, and mains hum plants a razor-sharp spike at 50 or 60 Hz. If you compute band power on raw EEG, you are mostly measuring eyes, muscles, and the power grid. Artifact removal is therefore not preprocessing hygiene you can skip; it is the step that decides whether the features downstream describe a brain or a face. This section covers the artifact taxonomy, the two families of removal (reject versus repair), and the spectral features (band power, ratios, and the periodic/aperiodic decomposition) that turn cleaned EEG into a compact vector a classifier can use.</p>
+</div>
+
+<h2>Know your enemy: the artifact taxonomy</h2>
+<p>Artifacts are anything in the recording that is not neural. They split cleanly by physiological source, and the source dictates the cure. <strong>Ocular</strong> artifacts (EOG) come from the corneo-retinal dipole: blinks are large slow deflections concentrated at frontal sites (Fp1, Fp2), saccades are step-like. <strong>Muscular</strong> artifacts (EMG) from jaw, neck, and temporalis muscles are high-frequency and broadband, overwhelming the beta and gamma bands where interesting cognitive activity also lives. <strong>Cardiac</strong> artifacts inject the ECG QRS complex or a pulse wave, locked to the heartbeat. <strong>Instrumental</strong> artifacts include mains line noise (a fixed 50/60 Hz tone plus harmonics), electrode "pop" from a failing gel contact, slow drift from sweat and impedance change, and motion in a wearable dry-electrode headset. The single most useful fact for cleaning is that each of these has a distinct signature in space, time, or frequency, and good pipelines exploit whichever axis separates the artifact from the brain most sharply.</p>
+
+<p><strong>Why not just band-pass it all away?</strong> Because the artifacts overlap the signal you want. A high-pass at 1 Hz removes drift cheaply, and a narrow notch or spectral-interpolation filter kills line noise, and both are genuinely free lunches. But blink energy lives at 0.5 to 5 Hz, squarely on top of delta and theta, and EMG blankets beta and gamma. You cannot filter in frequency what you need in frequency. This is exactly the frequency-domain-overlap problem from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, and it is why EEG cleaning reaches for a spatial decomposition rather than a spectral one.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Blink and muscle artifacts are large and spectrally entangled with the brain, so they cannot be filtered out in frequency. But they are spatially structured: a blink is one dipole projecting to fixed frontal electrodes with a fixed topography. Independent Component Analysis (ICA) rotates the multichannel EEG into a basis of maximally independent sources; the blink collapses into a single component you can zero out and project back, subtracting the artifact while leaving overlapping neural frequencies at other electrodes intact. Artifact removal in EEG is a spatial-unmixing problem wearing a temporal disguise.</p>
+</div>
+
+<h2>Reject versus repair</h2>
+<p>Two philosophies handle contaminated data. <strong>Rejection</strong> throws away corrupted epochs or channels: mark any window whose peak-to-peak amplitude exceeds, say, 150 microvolts as bad and drop it. It is simple and safe, but on a wearable in the field it can discard most of the session. <strong>Repair</strong> keeps the epoch and subtracts the artifact. The workhorse for repair is ICA: fit \(n\) components on \(n\) channels, identify which components are ocular or muscular (by topography, time course, and spectrum), zero those, and reconstruct. For a linear mixing model \(X = A\,S\) with sources \(S\), removing component \(k\) means
+
+\[ \hat{X} = A\,(\mathbf{I} - \mathbf{e}_k\mathbf{e}_k^\top)\,W X, \qquad W = A^{-1}, \]
+
+which nulls only the artifact subspace and leaves the rest of the recording untouched. A lighter alternative, <strong>Artifact Subspace Reconstruction</strong> (ASR), learns a clean-data covariance from calm segments and, sample by sample, projects out any high-variance subspace that exceeds a threshold; it runs online and is the standard cleaner for mobile and dry-electrode EEG. In practice you combine them: filter for the free wins (drift, line noise), ASR or reject the gross bursts, then ICA for the stereotyped blink and muscle sources.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Manual "click the blink component" ICA does not scale to fleets of recordings, so component labeling has been automated. <strong>ICLabel</strong> (Pion-Tonachini et al., 2019), a classifier trained on thousands of expert-labeled components, tags each ICA component as brain, eye, muscle, heart, line noise, channel noise, or other, enabling fully unsupervised artifact rejection in MNE and EEGLAB. <strong>Autoreject</strong> (Jas et al., 2017) learns per-channel rejection thresholds by cross-validation instead of a hand-picked microvolt cutoff, and interpolates rather than drops bad channels. On mobile EEG, ASR (Chang et al., 2020) remains the real-time standard, and deep denoisers such as <strong>ICUNet</strong> and diffusion-based EEG restorers are an active frontier for single-channel consumer headsets where ICA has too few channels to work.</p>
+</div>
+
+<h2>Spectral features: from cleaned trace to a vector</h2>
+<p>Once the trace is clean, the dominant EEG feature family is spectral, because the frequency bands themselves are the physiologically meaningful coordinates (<a class="cross-ref" href="section-31.1.html">Section 31.1</a>). You estimate the power spectral density \(P(f)\) with Welch's method (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>): split the epoch into overlapping windows, taper each, FFT, and average the squared magnitudes to trade frequency resolution for a lower-variance estimate. <strong>Absolute band power</strong> integrates \(P(f)\) over a band, for example alpha power \(=\int_{8}^{12} P(f)\,df\). <strong>Relative band power</strong> divides by total power, which normalizes out the electrode-impedance and skull-thickness scale factors that make absolute microvolts uncomparable across subjects. Ratios such as the theta/beta ratio, band-power asymmetries between hemispheres, and spectral entropy round out the classic vector. These few numbers per channel are what drive sleep stagers, depth-of-anesthesia monitors, and the SSVEP decoders of <a class="cross-ref" href="section-31.3.html">Section 31.3</a>.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+from scipy.signal import welch
+
+def band_powers(x, fs=250.0):
+    """Relative EEG band power for one cleaned channel."""
+    f, psd = welch(x, fs=fs, nperseg=int(2 * fs))        # 2 s windows
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12),
+             "beta": (12, 30), "gamma": (30, 45)}
+    total = np.trapz(psd[(f >= 0.5) & (f <= 45)], f[(f >= 0.5) & (f <= 45)])
+    out = {}
+    for name, (lo, hi) in bands.items():
+        m = (f >= lo) & (f < hi)
+        out[name] = np.trapz(psd[m], f[m]) / total        # relative power
+    return out
+
+rng = np.random.default_rng(0)
+t = np.arange(0, 8, 1 / 250.0)
+eyes_closed = np.sin(2 * np.pi * 10 * t) + 0.3 * rng.standard_normal(t.size)
+print({k: round(v, 3) for k, v in band_powers(eyes_closed).items()})
+# alpha dominates: the 10 Hz posterior rhythm of a resting, eyes-closed brain</code></pre>
+<div class="code-caption"><strong>Listing 31.2.</strong> Welch PSD to relative band power for one cleaned EEG channel. Normalizing each band by total in-band power removes the per-subject amplitude scale, so the resulting vector is comparable across people, which raw microvolts never are. Run this on <em>uncleaned</em> data and the frontal channels report huge delta and gamma that are really blinks and jaw tension.</div>
+
+<p>As Listing 31.2 shows, the simulated eyes-closed trace lights up alpha, reproducing the posterior alpha rhythm that appears the moment a subject shuts their eyes. One caveat now dominates modern practice: the EEG spectrum is a periodic peak (the actual oscillation) sitting on a \(1/f^{\chi}\) aperiodic background, and shifts in that background masquerade as band-power changes. Fitting and removing the aperiodic slope before reading band peaks (the FOOOF / specparam decomposition of Donoghue et al., 2020) is now the recommended way to compare oscillatory power across conditions or subjects, and it connects EEG features to the broader feature-engineering discipline of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: an ICU seizure monitor that cried toothbrush</h3>
+<p>A neuro-ICU deployed a continuous EEG seizure detector that scored rhythmic high-amplitude activity. In the first week it fired reliably at 8:03 each morning on one patient. The waveform was a clean 6 to 10 Hz rhythmic burst at frontal and temporal electrodes, exactly the shape a seizure classifier is trained to catch. It was the patient brushing their teeth: temporalis EMG plus the periodic mechanical motion of the arm produced a rhythmic, seizure-like artifact. The fix was not a bigger model. An ASR pass to knock down the high-variance EMG bursts, plus a rule that suppressed detections when broadband 30 to 100 Hz power (a muscle fingerprint) spiked, cut the false-alarm rate by an order of magnitude. The lesson generalizes across every deployment in this book: the cleaning stage is where clinical trust is won or lost, and a spectral feature computed on a dirty trace faithfully measures the wrong thing.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>A from-scratch pipeline (filtering, epoching, ICA, component classification, band power) is several hundred lines of fiddly array bookkeeping. <code>MNE-Python</code> with <code>mne-icalabel</code> collapses the full clean-and-featurize path to a handful of calls:</p>
+<pre class="language-python"><code class="language-python">import mne
+from mne.preprocessing import ICA
+from mne_icalabel import label_components
+
+raw.filter(1., 45.).notch_filter(50.)          # drift + line noise
+ica = ICA(n_components=20, random_state=0).fit(raw)
+labels = label_components(raw, ica, method="iclabel")["labels"]
+ica.exclude = [i for i, l in enumerate(labels) if l in ("eye blink", "muscle artifact")]
+clean = ica.apply(raw.copy())
+psd = clean.compute_psd(fmin=0.5, fmax=45.)     # band power ready to read</code></pre>
+<div class="code-caption"><strong>Listing 31.3.</strong> <code>MNE-Python</code> plus <code>mne-icalabel</code> replace roughly 300 lines of filtering, ICA, manual component review, and PSD code with about eight lines, and the automated ICLabel step removes the human-in-the-loop that made hand-cleaned pipelines unscalable. The library supplies the mechanics; choosing the notch frequency and validating on held-out subjects stays your job.</div>
+<p>The tooling removes the plumbing, not the judgment. ICA on a 4-channel consumer headband has too few sensors to isolate a blink cleanly, and leakage-safe evaluation still requires that artifact statistics be estimated without peeking at your test subjects, a discipline shared with every biosignal model in <a class="cross-ref" href="../module-28-biosignal-foundations/index.html">Chapter 28</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public resting-state EEG recording (for example an EEGBCI subject in MNE's dataset fetcher). Compute relative alpha power at an occipital channel (O1/O2) for eyes-open versus eyes-closed segments, first on raw data and then after a 1 to 45 Hz filter plus ICA blink removal. Report the alpha eyes-closed-minus-eyes-open difference in both cases. Then repeat at a frontal channel (Fp1) and explain, using the blink topography, why cleaning changes the frontal result far more than the occipital one.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. A blink and the delta band both live below 5 Hz. Why does a high-pass filter fail to remove the blink, and what property of the blink does ICA exploit instead?</p>
+<p>2. You report absolute alpha power of 4.2 microvolts-squared for subject A and 9.8 for subject B. Why is this comparison nearly meaningless, and what single normalization fixes it?</p>
+<p>3. A seizure detector fires during tooth-brushing. Which artifact class is responsible, in which bands does its energy sit, and why does a simple 45 Hz low-pass not fully solve it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-31.3.html">Section 31.3</a>, we put these cleaned spectral features to work in real brain-computer interfaces: the sensorimotor-rhythm changes of motor imagery, where imagining a hand movement suppresses band power over motor cortex, and the frequency-tagged responses of SSVEP, where a flickering stimulus plants a decodable peak at exactly its own frequency in the very spectrum this section taught you to compute.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
