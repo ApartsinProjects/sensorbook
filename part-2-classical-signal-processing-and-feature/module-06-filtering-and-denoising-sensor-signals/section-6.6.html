@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.6: Filter design for real-time, low-latency systems. Building Sensory AI." name="description"/>
+<title>Section 6.6: Filter design for real-time, low-latency systems | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Filtering and Denoising Sensor Signals</a></div>
+<h1>Filter design for real-time, low-latency systems</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The filter had a beautiful frequency response. It also needed the next 200 samples to compute the current one, which is a problem when the current one is what triggers the airbag."</p>
+<cite>A Suddenly Practical AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the FIR and IIR structures from <a class="cross-ref" href="section-6.2.html">Section 6.2</a>, the notion of a filter's frequency response and cutoff from <a class="cross-ref" href="section-6.3.html">Section 6.3</a>, and the sampling clock and sample period \(T_s = 1/f_s\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. You do not need the quantitative delay-versus-noise analysis of <a class="cross-ref" href="section-6.7.html">Section 6.7</a>; here we treat latency as a hard budget the implementation must respect, not a knob to optimize.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a filter that works offline can fail online</h3>
+<p>Every filter you have met so far was, implicitly, a batch operation: you handed it an array and it handed one back. A real sensor gives you one sample at a time, forever, and something downstream is waiting on the output before the next sample arrives. That single change of setting reshapes the whole design problem. A filter for a real-time system must be <em>causal</em> (it may use past and present samples but never future ones), it must finish computing each output inside one sample period, it must survive on bounded memory, and it must remain numerically stable after millions of updates on a device with no float unit. The most elegant frequency response is worthless if it cannot honor those four constraints. This section is about designing filters that meet a deadline, because on a brake controller, a pacemaker, or a drone's attitude loop, a late answer is a wrong answer.</p>
+</div>
+
+<h2>The real-time contract: causal, bounded, on time</h2>
+<p><strong>What</strong> a real-time filter signs up for is a contract with three clauses. It must be causal, so the output at sample \(n\) depends only on inputs up to and including \(n\); a zero-phase filter that runs the data forwards and backwards, or a symmetric FIR that centers its window, both peek into the future and are therefore offline-only. It must be bounded in state, keeping a fixed, small number of past values rather than the whole history. And it must be bounded in time: the work per sample must complete before the next sample lands, which at \(f_s = 1\) kHz means every output is due in one millisecond, no exceptions.</p>
+<p><strong>Why</strong> the deadline dominates is that sensor loops are usually closed. In a robot's attitude controller (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>) the filtered gyro drives a motor command that changes the very quantity being measured. A filter that is even one sample late injects extra phase lag into that loop, and phase lag is what turns a stable controller into an oscillating one. <strong>How</strong> you honor the contract begins with picking a structure whose cost per sample is a small, fixed number of multiply-accumulate operations, and whose latency you can state in samples before you write a line of code.</p>
+
+<p>Latency here has two parts. <em>Algorithmic latency</em> is the group delay the filter imposes by construction: a length-\(M\) linear-phase FIR delays everything by \((M-1)/2\) samples no matter how fast your processor is. <em>Computational latency</em> is the wall-clock time to evaluate the filter each sample. The first is a property of the math and is the subject of <a class="cross-ref" href="section-6.7.html">Section 6.7</a>; the second is a property of your implementation and hardware, and is what the rest of this section attacks.</p>
+
+<h2>Streaming implementations that carry their state</h2>
+<p>The idea that makes online filtering possible is that both FIR and IIR filters are <em>recursive</em> in their memory: the only thing an output needs from the past is a short vector of previous inputs and outputs, not the samples themselves. A direct-form IIR filter of order \(N\) computes</p>
+$$y[n] = \sum_{k=0}^{N} b_k\, x[n-k] \;-\; \sum_{k=1}^{N} a_k\, y[n-k],$$
+<p>so its entire dependence on history is \(2N\) stored numbers. Between calls you save that state; on the next sample you use it and update it. This is exactly what lets a batch routine and a sample-by-sample loop produce identical output: you split the stream into blocks and thread the filter's internal state from the end of one block into the start of the next. Skip that threading and you get an audible click or a spurious spike at every block boundary, because the filter silently restarts from zero.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Block size is a latency dial, not a correctness dial</h3>
+<p>Given carried state, processing one sample at a time and processing a block of 256 give <em>identical</em> outputs; the filter math does not know or care about the boundaries. What the block size changes is latency and efficiency. Big blocks amortize per-call overhead and vectorize well, but you cannot emit the first output of a block until the whole block has arrived, so a 256-sample block at 1 kHz adds up to 256 ms of buffering delay before the filter's own group delay is even counted. Real-time low-latency systems therefore favor small blocks, often a single sample, and pay for it in per-call overhead. The delay you buy with buffering is pure dead time, worse than group delay because it cannot be design-tuned away.</p>
+</div>
+
+<h2>The compute and memory budget</h2>
+<p>Once the structure is fixed, cost is countable. A direct-form IIR filter of order \(N\) costs about \(2N+1\) multiply-accumulate operations (MACs) per sample; an FIR of length \(M\) costs \(M\). This is the central reason IIR filters dominate low-latency embedded work: an elliptic IIR of order 6 can match the stopband of an FIR of length 100 or more, so it does a twentieth of the arithmetic and stores a handful of state values instead of a hundred. On a microcontroller running your filter at \(f_s\) samples per second, the arithmetic budget is simply \(\text{MACs per sample} \times f_s\), and it competes with everything else the <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a> workload wants to do on the same core.</p>
+<p>Two further budgets bite on real hardware. Memory: FIR length \(M\) needs an \(M\)-tap delay line, which for sharp low-frequency filters can dwarf the IIR alternative. Numerics: many embedded targets have no floating-point unit, so filters run in fixed-point integer arithmetic, where a high-order direct-form IIR is dangerously sensitive to coefficient rounding and can drift or even go unstable. The fix is not to abandon IIR but to factor it, which we come to next.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The wrist that noticed a heartbeat in nine milliseconds</h3>
+<p>A wearable team building a PPG-based heart-rate watch (the sensing of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>) needed a bandpass filter around 0.5 to 4 Hz to isolate the pulse from motion and ambient-light drift, running on a Cortex-M0 with no FPU at 100 Hz. Their first prototype used a length-201 linear-phase FIR designed in a notebook. It looked perfect offline and was hopeless on device: 201 MACs per sample plus a 201-word delay line blew the RAM budget, and its one-second group delay meant the displayed rate lagged reality by a full beat during exercise. They replaced it with a fourth-order Butterworth IIR realized as two cascaded biquads: 9 MACs per sample, 8 words of state, integer coefficients, and a group delay under 200 ms. The output met the per-sample deadline with the core mostly idle, leaving headroom for the peak detector. Same passband, one twentieth of the cost, and it shipped.</p>
+</div>
+
+<h2>Numerical stability: cascade the filter into biquads</h2>
+<p>The professional way to implement any IIR filter of order above two is not one big direct-form section but a <em>cascade of second-order sections</em> (SOS), each a biquad handling one pole pair and one zero pair. Mathematically the product of the sections equals the original transfer function; numerically it is a different world. In a single high-order direct form, the poles crowd together and a tiny rounding error in one coefficient can shove a pole outside the unit circle, and the filter blows up. Splitting into biquads keeps each section's coefficients well-conditioned, so fixed-point rounding perturbs the response slightly instead of destabilizing it. Every serious embedded DSP library ships biquad primitives for exactly this reason. The code below shows the streaming pattern that matters: carry the SOS state across blocks so a chunked stream matches a one-shot filtering exactly.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
+fs = 100.0
+# 4th-order Butterworth bandpass, 0.5-4 Hz, as second-order sections:
+sos = butter(4, [0.5, 4.0], btype="band", fs=fs, output="sos")
+
+# Initialize the filter's internal state (one state vector per section):
+zi = sosfilt_zi(sos)                       # steady-state for a DC input
+
+def stream(chunk, zi):
+    """Filter one arriving chunk, returning output and the UPDATED state."""
+    y, zi = sosfilt(sos, chunk, zi=zi)     # zi carried across calls
+    return y, zi
+
+# Simulate a live stream arriving 10 samples at a time:
+signal = np.random.randn(1000)
+zi = zi * signal[0]                        # prime state to avoid a startup thump
+out = []
+for start in range(0, len(signal), 10):    # blocks of 10 -> 100 ms of samples
+    y, zi = stream(signal[start:start+10], zi)
+    out.append(y)
+streamed = np.concatenate(out)
+
+# Identical to filtering the whole array at once (state threading works):
+oneshot, _ = sosfilt(sos, signal, zi=sosfilt_zi(sos) * signal[0])
+print("max block-vs-oneshot difference:", np.max(np.abs(streamed - oneshot)))</code></pre>
+<div class="code-caption">A fourth-order bandpass realized as second-order sections, filtered in 10-sample blocks with the state <code>zi</code> threaded from one call to the next. The printed difference against one-shot filtering is at floating-point noise level, confirming that block boundaries are invisible when state is carried. Drop the <code>zi</code> plumbing and each block would restart from silence, stamping a transient at every boundary.</div>
+
+<p>Notice two production details in that loop. State is threaded through <code>zi</code>, so the blocked result equals the one-shot result to machine precision, which is the invariant every streaming filter must preserve. And the state is primed to the first sample rather than left at zero, which suppresses the startup transient that would otherwise take the filter's settling time to decay, a thump that in a control loop reads as a real event.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: SOS filtering instead of a hand-rolled biquad cascade</h3>
+<p>Implementing this by hand means writing the biquad difference equation, chaining sections, and manually saving and restoring each section's two state words across every call: roughly 30 to 40 lines, and the state-threading bugs are exactly the kind that pass an offline test and fail live. SciPy's <code>sosfilt</code> with its <code>zi</code> argument collapses the whole thing to two lines and guarantees the block-invariance shown above.</p>
+<pre><code class="language-python">sos = butter(4, [0.5, 4.0], btype="band", fs=fs, output="sos")
+y, zi = sosfilt(sos, chunk, zi=zi)   # design + stable cascade + carried state</code></pre>
+<div class="code-caption">Two lines replace a 30-to-40-line biquad cascade with manual per-section state management. The library handles section ordering, scaling, and state layout; you supply the chunk and thread the returned state.</div>
+<p>The library handles filter design, decomposition into well-conditioned sections, and the state bookkeeping. For microcontroller deployment the same SOS coefficients feed CMSIS-DSP's <code>arm_biquad_cascade_df1</code> primitive, so the design you validate in Python is the one that runs on the device.</p>
+</div>
+
+<h2>When you cannot afford any group delay</h2>
+<p>Sometimes even a few samples of algorithmic delay is too much, and there are two escape routes. The first is a <em>minimum-phase</em> filter: for a given magnitude response, the minimum-phase realization has the smallest possible group delay, at the cost of a nonlinear phase that distorts waveform shape. Trade it when you care about <em>when</em> an event happens (a threshold crossing, an impact) more than about preserving pulse shape. The second route abandons fixed filters for a recursive estimator, the Kalman filter of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, which is strictly causal, updates in fixed cost per sample, and produces an optimal current-time estimate with no look-ahead by using a model of how the signal evolves rather than a fixed frequency template. For many low-latency sensing loops the right answer is not a sharper filter but a model-based estimator, which is precisely why the book pivots to state estimation next.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise 6.6</h3>
+<p>You must filter a 2 kHz accelerometer stream on a microcontroller whose spare budget is 20,000 MACs per second. (a) How many MACs per sample can you afford? (b) A candidate linear-phase FIR needs length 120 to meet the stopband; does it fit, and what is its group delay in milliseconds? (c) An elliptic IIR of order 6 meets the same stopband; give its approximate MACs per sample using the \(2N+1\) estimate and state whether it fits. (d) Your chosen filter runs in blocks of 128 samples for efficiency. Compute the buffering latency this adds and argue whether that is acceptable if the loop deadline is 5 ms.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why can a zero-phase (forward-backward) filter never run in a real-time loop, no matter how fast the processor?</p>
+<p>2. Two implementations filter the same stream, one sample at a time versus in blocks of 256. Their outputs differ by a spike at every 256th sample. What single thing was forgotten, and why does block size not otherwise affect the result?</p>
+<p>3. You port a stable order-8 direct-form IIR to a fixed-point microcontroller and it drifts, then diverges. What restructuring fixes it without changing the intended frequency response?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-6.7.html">Section 6.7</a>, we make the tradeoff this section treated as a fixed budget into a design variable, quantifying exactly how much noise reduction each millisecond of delay buys you, and how to choose the operating point deliberately rather than by accident.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

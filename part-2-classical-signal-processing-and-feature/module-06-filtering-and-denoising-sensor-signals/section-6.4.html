@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.4: Frequency-domain filtering. Building Sensory AI." name="description"/>
+<title>Section 6.4: Frequency-domain filtering | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Filtering and Denoising Sensor Signals</a></div>
+<h1>Frequency-domain filtering</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Give me a spectrum and I will delete whichever frequencies displease me. Give me a stream and I will remember, too late, that the world does not arrive in tidy blocks."</p>
+        <cite>An Overconfident AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you are comfortable with the discrete Fourier transform as a change of basis and with the idea of a frequency response, both introduced in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and developed in full in <a class="cross-ref" href="../module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. It also builds directly on the time-domain filters of <a class="cross-ref" href="section-6.2.html">Section 6.2</a> and the pass-band vocabulary of <a class="cross-ref" href="section-6.3.html">Section 6.3</a>. If the words "FFT" and "convolution" are not yet friends, read those first; here we make them the same operation.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every filter you met so far slides a kernel along the signal, sample by sample, in the time domain. Frequency-domain filtering does the identical job by a different route: transform the whole signal to its spectrum, multiply by a mask that keeps the frequencies you want and zeroes the rest, then transform back. The convolution theorem promises the two routes agree. What changes is the economics and the failure modes. Multiplication is cheap and lets you sculpt an arbitrary response by hand, but blocks of a live stream do not multiply cleanly, and a careless mask rings like a struck bell. This section is about buying the power of spectral editing without paying in artifacts.</p>
+    </div>
+
+    <h2>Filtering is multiplication in the frequency domain</h2>
+    <p>The engine of this whole section is one identity. Convolving a signal \(x\) with a filter kernel \(h\) in time is exactly the same as multiplying their spectra point by point in frequency. Writing \(\mathcal{F}\) for the Fourier transform,</p>
+    \[ y = x * h \quad\Longleftrightarrow\quad \mathcal{F}\{y\} = \mathcal{F}\{x\}\cdot \mathcal{F}\{h\}. \]
+    <p>This is the <strong>convolution theorem</strong>, and it reframes filtering completely. A time-domain filter answers "what weighted average of nearby samples do I output?" The frequency view answers "by how much do I scale each sinusoid the signal is built from?" The scaling factor at each frequency is the filter's <em>frequency response</em> \(H(f) = \mathcal{F}\{h\}\). A low-pass filter is nothing more exotic than an \(H(f)\) that is near \(1\) at low frequencies and near \(0\) at high ones. Because you can draw \(H(f)\) directly and inverse-transform it into a kernel, the frequency domain lets you <em>design the response first and derive the filter second</em>, which is the reverse of hand-tuning taps.</p>
+    <p>Why does this matter for sensors? Because the interference you fight is usually named in frequency, not in time. Power-line hum sits at 50 or 60 Hz. A drone's rotor whine sits at its blade-pass frequency. A structure's resonance sits at its natural mode. When you can point at the offender on a spectrum, deleting it there is the most direct move available, and it costs almost nothing: the Fast Fourier Transform (FFT) turns an \(O(N^2)\) convolution into an \(O(N\log N)\) transform-multiply-transform, which is why long kernels are almost always applied this way in practice.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Time-domain and frequency-domain filtering are not two philosophies; they are two implementations of the same mathematical object. Choose between them on engineering grounds, latency, block size, kernel length, not on principle. A 4001-tap denoiser that would crawl as a direct convolution becomes trivial through the FFT, while a 5-tap smoother is faster left in the time domain. The response \(H(f)\) is the same either way; only the arithmetic changes.</p>
+    </div>
+
+    <h2>Sculpting a spectral mask, and the ringing it invites</h2>
+    <p>The seductive move is to build a "brick-wall" filter: set \(H(f)=1\) inside the pass-band and \(H(f)=0\) everywhere else, a perfectly rectangular mask. In the spectrum this looks flawless. In time it is a disaster, because the inverse transform of a rectangle is a \(\operatorname{sinc}\) function that oscillates forever. Multiply by a sharp-edged mask and every step or transient in your signal sprouts ripples on both sides of it, an overshoot that does not shrink as you add resolution. This is the <strong>Gibbs phenomenon</strong>, and it is the single most common way frequency-domain filtering goes wrong: an ECG with a hard 40 Hz cutoff grows phantom wiggles around every QRS spike that a clinician could mistake for pathology.</p>
+    <p>The cure is to forbid infinitely sharp edges. Replace the vertical wall with a smooth roll-off, a raised-cosine or Gaussian taper that eases \(H(f)\) from \(1\) to \(0\) over a transition band. A smoother mask has a shorter, better-behaved time-domain kernel and rings far less. The price is a gentler cutoff: you cannot both delete a frequency 1 Hz away from one you keep and avoid ringing. That trade, transition sharpness against time-domain artifacts, is the same delay-versus-fidelity tension that <a class="cross-ref" href="section-6.7.html">Section 6.7</a> makes central, seen now from the spectral side.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def fft_lowpass(x, fs, f_cut, width):
+    """Low-pass by masking the spectrum with a smooth raised-cosine edge."""
+    X = np.fft.rfft(x)
+    f = np.fft.rfftfreq(len(x), d=1.0 / fs)
+    # Raised-cosine roll-off from 1 to 0 across [f_cut, f_cut + width]:
+    mask = np.clip((f_cut + width - f) / width, 0.0, 1.0)
+    mask = 0.5 - 0.5 * np.cos(np.pi * mask)          # smooth the ramp
+    return np.fft.irfft(X * mask, n=len(x))
+
+fs = 1000.0
+t = np.arange(0, 2, 1 / fs)
+sig = np.sin(2 * np.pi * 5 * t) + 0.6 * np.sin(2 * np.pi * 120 * t)
+clean = fft_lowpass(sig, fs, f_cut=20.0, width=8.0)   # keep 5 Hz, kill 120 Hz</code></pre>
+    <div class="code-caption"><strong>Listing 6.4.1.</strong> A complete FFT low-pass filter. <code>rfft</code> takes the signal to its spectrum, the raised-cosine <code>mask</code> tapers smoothly from pass to stop across an 8 Hz transition band (avoiding the Gibbs ringing a rectangular mask would cause), and <code>irfft</code> returns to the time domain. Widening <code>width</code> reduces ringing at the cost of a less selective cutoff.</div>
+
+    <p>Listing 6.4.1 is a working filter in a dozen lines, and it exposes the whole idea: the response you want is literally the array <code>mask</code>, drawn by hand. Try replacing the raised-cosine with a hard <code>mask = (f &lt;= f_cut)</code> and you will see the QRS-style ripples appear around any sharp feature in <code>sig</code>.</p>
+
+    <h2>Streaming reality: circular convolution and the block problem</h2>
+    <p>Listing 6.4.1 quietly assumed you own the entire signal at once. Real sensors deliver a never-ending stream, so you must filter in blocks. Here the FFT hides a trap. The multiplication \(X\cdot H\) followed by an inverse transform does not compute the ordinary (linear) convolution; it computes <strong>circular convolution</strong>, which treats each block as if it wrapped around into a loop. Energy that a real filter would push past the end of a block instead reappears, folded back, at the beginning. The result is <em>wrap-around artifacts</em>: corrupted samples at the block edges that grow worse the longer your kernel.</p>
+    <p>The fix is a pair of classic block methods that stitch spectral filtering into a seamless stream. <strong>Overlap-add</strong> chops the input into non-overlapping blocks, filters each (zero-padding so the wrap-around lands in known-empty space), and adds the overlapping tails back together. <strong>Overlap-save</strong> instead overlaps the input blocks, filters, and discards the corrupted edge samples from each, keeping only the valid interior. Both recover the exact linear-convolution result that a time-domain filter would give, block by block, at FFT speed. You rarely implement them yourself, but knowing they exist explains why a naive "FFT, mask, inverse-FFT, repeat" pipeline glitches at every block boundary.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: gearbox vibration on a wind turbine</h3>
+        <p>A condition-monitoring team instruments a wind-turbine gearbox with an accelerometer sampled at 25.6 kHz, hunting for the tell-tale sidebands of a cracking gear tooth (the running thread of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>). The raw stream is dominated by a huge, uninteresting tone at the gear-mesh frequency and its harmonics, which swamp the weak fault sidebands. Rather than design a bespoke bank of notch filters, the engineers transform each measurement window, zero the FFT bins at the mesh harmonics with narrow smooth notches, and inverse-transform. The fault signature, previously buried 30 dB down, becomes visible. Their first prototype filtered each window independently and produced a spray of false alarms every few seconds: classic block-edge wrap-around. Switching to an overlap-save implementation made the alarms disappear, because the corrupted edge samples were now discarded instead of scored.</p>
+    </div>
+
+    <h2>Spectral subtraction: a filter with no time-domain twin</h2>
+    <p>Some denoising is natural only in the frequency domain. <strong>Spectral subtraction</strong> assumes you can estimate the noise's magnitude spectrum, from a quiet interval, say, and then subtract that magnitude from every subsequent block's spectrum while keeping the block's phase. What survives is the signal energy that stood above the noise floor at each frequency. This is not a fixed \(H(f)\): the amount removed at each frequency adapts to how much noise you measured there, so it can suppress broadband hiss that no single pass-band filter would touch. It is the ancestor of the noise-reduction in every hearing aid and voice call.</p>
+    <p>The catch is a distinctly spectral artifact. Because the noise estimate fluctuates, subtraction leaves behind isolated surviving bins that warble in and out, an eerie "musical noise" of random tones. Taming it (over-subtraction margins, spectral flooring, smoothing across blocks) is a craft of its own, and a reminder that operating in the frequency domain buys new powers and new ways to fail. Where spikes and outliers are the enemy rather than steady-state noise, the frequency domain is the wrong tool entirely, and <a class="cross-ref" href="section-6.5.html">Section 6.5</a> reaches instead for robust, order-statistic filters.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Everything above, smooth-masked spectral filtering with correct block handling, is a solved problem in SciPy. Instead of hand-rolling overlap-save (roughly 40 lines with the zero-padding, block bookkeeping, and edge discards that are easy to misalign), design a response once and let <code>oaconvolve</code> apply it via the FFT with the block stitching handled for you:</p>
+        <pre class="language-python"><code class="language-python">from scipy.signal import firwin, oaconvolve
+
+taps = firwin(255, cutoff=20.0, fs=1000.0)      # smooth low-pass kernel
+y = oaconvolve(sig, taps, mode="same")          # FFT-fast overlap-add convolution</code></pre>
+        <div class="code-caption"><strong>Listing 6.4.2.</strong> <code>firwin</code> designs a windowed kernel with a controlled transition band (no Gibbs ringing), and <code>oaconvolve</code> applies it through the FFT using overlap-add internally, giving the exact linear-convolution result at \(O(N\log N)\) cost. Two lines replace both the manual masking of Listing 6.4.1 and the block-stitching of an overlap-save loop.</div>
+        <p>The library removes the arithmetic, not the judgment. It will not tell you where to place the cutoff, how wide the transition band should be, or whether spectral subtraction is even appropriate for your noise; those choices stay yours.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take Listing 6.4.1 and replace the raised-cosine mask with a hard rectangular one, <code>mask = (f &lt;= 20.0).astype(float)</code>. Add a step to the test signal (for example set the second half of <code>sig</code> to a constant). Plot the filtered output near the step for both masks. Measure the peak overshoot as a percentage of the step height for the rectangular mask, then show that widening the raised-cosine transition band monotonically reduces that overshoot. Explain in one sentence why the overshoot does not vanish as you increase the FFT length.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. The convolution theorem says time-domain convolution equals frequency-domain multiplication. Given that, why would anyone ever filter in the time domain instead of always using the FFT?</p>
+        <p class="quiz-question">2. What is circular convolution, and what visible symptom does it produce if you filter a live stream block by block without overlap-add or overlap-save?</p>
+        <p class="quiz-question">3. Why can spectral subtraction remove broadband noise that a fixed low-pass, high-pass, or notch filter cannot, and what new artifact does it introduce in exchange?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-6.5.html">Section 6.5</a>, we confront the noise that frequency-domain filtering handles worst: isolated spikes, dropouts, and outliers that smear their energy across every FFT bin. There the right instinct is not a smooth mask but a robust, order-statistic filter that ignores the outlier entirely, and we will see exactly when linear filtering must step aside for the median.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

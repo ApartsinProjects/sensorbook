@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.6: PCA, ICA, and manifold methods (UMAP, t-SNE) for sensors. Building Sensory AI." name="description"/>
+<title>Section 8.6: PCA, ICA, and manifold methods (UMAP, t-SNE) for sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Feature Engineering and Dimensionality Reduction</a></div>
+<h1>PCA, ICA, and manifold methods (UMAP, t-SNE) for sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me two hundred correlated channels and I will hand you back the three that were doing all the talking."</p><cite>A Parsimonious AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The feature selection of <a class="cross-ref" href="section-8.5.html">Section 8.5</a> keeps a subset of your original columns intact. This section does something different: it <em>transforms</em> many correlated columns into a few new coordinates that are combinations of the originals. Sensor feature tables beg for this. A twelve-axis inertial rig, a sixteen-electrode electromyography sleeve, or a tsfresh table with eight hundred columns is drenched in redundancy, because physically coupled sensors and overlapping features measure the same underlying phenomena over and over. Three tools dominate. Principal component analysis (PCA) finds the linear directions of greatest variance and is your default compressor. Independent component analysis (ICA) goes further and separates a mixture back into statistically independent sources, which is how you pull an eye-blink artifact out of an EEG trace. Manifold methods, t-SNE and UMAP, unfold nonlinear structure into two or three dimensions so you can actually <em>see</em> whether your classes cluster. Knowing which one to reach for, and where each quietly lies to you, is the point of this section.</p>
+</div>
+
+<p>This section assumes the covariance and eigen-decomposition background from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and it inherits the windowed feature tables built across the rest of this chapter. Every method here is unsupervised: it never sees your labels, which is both its strength (it works before you have labels) and its risk (the axis of greatest variance is not always the axis that matters).</p>
+
+<h2>PCA: rotate to the axes of maximum variance</h2>
+<p>PCA answers one question: if I must describe each feature vector with only \(k\) numbers instead of \(d\), which \(k\) linear directions preserve the most variance? Center the data, form the covariance matrix \(\mathbf{C} = \tfrac{1}{N}\mathbf{X}^\top\mathbf{X}\), and take its eigenvectors. The eigenvector with the largest eigenvalue is the first principal component, the direction along which the data spreads most; the second is the orthogonal direction of next-most spread, and so on. Projecting onto the top \(k\) eigenvectors gives the best possible \(k\)-dimensional linear approximation in a least-squares sense:</p>
+$$\mathbf{C}\,\mathbf{v}_j = \lambda_j \mathbf{v}_j, \qquad \text{variance explained by } k = \frac{\sum_{j=1}^{k}\lambda_j}{\sum_{j=1}^{d}\lambda_j}.$$
+<p>Why it works for sensors: physically coupled channels are highly correlated, so a handful of components typically recover 90 to 99 percent of the variance of a table with hundreds of columns. That buys you faster models, less overfitting, and a natural denoising step, because the smallest components are usually where broadband sensor noise hides. When to use it: as a first-line compressor before a classifier, as a whitening stage in front of ICA, and as a sanity check on redundancy. The one non-negotiable preprocessing step is <em>standardization</em>. PCA chases variance, so a feature measured in raw accelerometer counts (variance in the thousands) will swamp a feature measured as a dimensionless ratio unless you first scale every column to unit variance.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: Maximum Variance Is Not Maximum Relevance</h3>
+<p>PCA optimizes for variance, and it is blind to your labels. Nothing guarantees that the direction of greatest spread is the direction that separates your classes; a large, label-irrelevant nuisance (subject-to-subject amplitude differences, changing motor load) can easily own the first component while the discriminative signal sits in component seven. This is the single most common way PCA hurts a sensor pipeline: people keep the top few components, throw away the rest, and discard the class signal along with the noise. If you have labels and want a supervised projection, reach for Linear Discriminant Analysis instead, which maximizes between-class over within-class scatter. Use PCA to compress and denoise, not to guarantee separability.</p>
+</div>
+
+<h2>ICA: unmix statistically independent sources</h2>
+<p>PCA finds uncorrelated directions; ICA finds <em>independent</em> ones, a strictly stronger and often more physically meaningful goal. The setting is the classic cocktail party: several sensors each record a linear mixture \(\mathbf{x} = \mathbf{A}\mathbf{s}\) of several underlying sources \(\mathbf{s}\), and you want to recover an unmixing matrix \(\mathbf{W}\approx\mathbf{A}^{-1}\) so that \(\hat{\mathbf{s}} = \mathbf{W}\mathbf{x}\) gives back the sources. The trick that makes it possible is non-Gaussianity: by the central limit theorem a mixture of independent sources is more Gaussian than any single source, so algorithms like FastICA search for the projection directions that are <em>maximally non-Gaussian</em> (maximizing kurtosis or negentropy). Order and sign of the recovered sources are arbitrary, which you must account for downstream.</p>
+<p>Where ICA earns its keep in sensing is artifact removal and source separation. In electroencephalography, eye blinks and cardiac interference are independent of brain activity and mix linearly across the scalp electrodes, so ICA can isolate them into their own components that you zero out before reconstructing a clean signal, a workhorse technique for the brain-computer interfaces of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-31-eeg-neural-signals-and-brain-computer-interfaces/index.html">Chapter 31</a>. It also separates overlapping motor-unit trains in high-density electromyography and untangles crosstalk in multi-antenna radio arrays. Standard practice is to whiten with PCA first (which also lets you drop the noise dimensions), then run ICA on the whitened, dimension-reduced data.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.decomposition import PCA, FastICA
+
+rng = np.random.default_rng(0)
+t = np.linspace(0, 8, 4000)
+s1 = np.sin(2 * np.pi * 1.0 * t)            # a slow oscillation
+s2 = np.sign(np.sin(2 * np.pi * 3.0 * t))   # a square wave
+s3 = rng.uniform(-1, 1, t.size)             # noise-like source
+S = np.c_[s1, s2, s3]
+A = np.array([[1.0, 0.8, 0.4],              # unknown mixing matrix
+              [0.6, 1.0, 0.7],
+              [0.9, 0.5, 1.0]])
+X = S @ A.T                                 # 3 "sensors", each a mixture
+
+X = (X - X.mean(0)) / X.std(0)              # standardize before either method
+pcs = PCA(n_components=3).fit_transform(X)  # uncorrelated, variance-ranked
+src = FastICA(n_components=3, random_state=0).fit_transform(X)  # independent
+
+def corr_to_truth(est):
+    return np.abs(np.corrcoef(est.T, S.T)[:3, 3:]).max(1).round(2)
+print("PCA best match to each true source:", corr_to_truth(pcs))
+print("ICA best match to each true source:", corr_to_truth(src))
+</code></pre>
+<div class="code-caption">Three sources are linearly mixed into three sensor channels. PCA returns variance-ranked but still-blended directions, while FastICA recovers each original source almost exactly (correlations near 1.0). Run it to see ICA succeed at unmixing where PCA, which only decorrelates, cannot.</div>
+
+<p>The code above makes the distinction concrete: PCA hands back components that are uncorrelated yet still mixtures of the true sources, whereas ICA recovers the individual square wave, sinusoid, and noise source, because independence is a stronger constraint than mere decorrelation.</p>
+
+<h2>Manifold methods: t-SNE and UMAP for seeing structure</h2>
+<p>PCA is linear: it can only rotate and project. Real sensor data often lies on a curved, low-dimensional manifold embedded in high-dimensional feature space (think of the smooth loop a gait cycle traces), and a linear projection smears that structure. Manifold methods embed the data into two or three dimensions while preserving <em>local neighborhoods</em>. t-SNE (t-distributed stochastic neighbor embedding) models pairwise similarities as probabilities and arranges points so near neighbors stay near; its <code>perplexity</code> parameter sets the effective neighborhood size. UMAP (uniform manifold approximation and projection) builds a fuzzy nearest-neighbor graph and optimizes a low-dimensional layout that matches it; it is faster, scales to millions of points, better preserves global structure, and (unlike classic t-SNE) can <code>transform</code> new points with a fitted model.</p>
+<p>When to use them: almost exclusively for <em>visualization and diagnosis</em>, not as features for a downstream model. A UMAP plot of your windowed features colored by class tells you at a glance whether the classes are separable at all, whether two labels are hopelessly overlapping, and whether one subject or device forms its own island (a red flag for the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). What they are not: a metric space. Distances between clusters, cluster sizes, and densities in a t-SNE or UMAP plot are largely artifacts of the algorithm and the hyperparameters. Read them as "these points are neighbors," never as "this gap is twice that gap."</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: A UMAP Plot That Exposed a Leaky Wearable Split</h3>
+<p>A team building a human-activity classifier for a wrist wearable had 563 features per window from a nine-axis inertial unit worn by thirty volunteers. Their model hit 97 percent accuracy in cross-validation, suspiciously high. Before trusting it, an engineer ran UMAP on the standardized feature table and colored the embedding two ways. Colored by activity (walk, run, sit, stairs) the clusters were sensible but overlapping. Colored by <em>subject ID</em>, the plot fractured into thirty tight, well-separated islands: the features encoded who was wearing the device far more strongly than what they were doing. Their random split had leaked subjects across train and test, so the model was partly recognizing wrists, not motion. They switched to a subject-disjoint split (the discipline covered in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>), honest accuracy dropped to 84 percent, and the UMAP diagnosis had saved them from shipping a fantasy. The two-minute plot was worth more than the whole cross-validation table.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: PCA Whitening plus UMAP in Four Lines</h3>
+<p>A correct pipeline that standardizes, PCA-whitens to strip noise dimensions, then embeds with a neighbor graph is easily 120 to 150 lines of hand-written linear algebra, nearest-neighbor search, and gradient optimization. <code>scikit-learn</code> and <code>umap-learn</code> collapse it:</p>
+<pre><code class="language-python">from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import umap
+emb = make_pipeline(StandardScaler(), PCA(n_components=30),
+                    umap.UMAP(n_neighbors=15, min_dist=0.1)).fit_transform(X)
+</code></pre>
+<p>The libraries own the eigensolver, the approximate nearest-neighbor index, and the layout optimizer. You still own the choices no library can make: standardize first, fit the scaler and PCA on the training split only, and treat the plot as a diagnostic, not a distance map.</p>
+<div class="code-caption">Standardization, PCA whitening, and a UMAP embedding in four lines, replacing roughly 120 to 150 lines of error-prone numerical code.</div>
+</div>
+
+<h2>Using them honestly for sensors</h2>
+<p>Three cautions keep these methods from betraying you. First, <em>fit on train only</em>. A PCA basis, an ICA unmixing matrix, and a UMAP model are all fitted objects with learned parameters; fitting any of them on the full dataset before splitting leaks test information and inflates your reported accuracy, the exact trap <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> warns against. Fit on the training fold, then <code>transform</code> validation and test. Second, match the tool to the goal: PCA to compress and denoise, LDA when you have labels and want separation, ICA to recover physical sources, manifold methods to look. Third, resist using t-SNE or UMAP coordinates as model inputs; they are non-deterministic across runs, unstable to hyperparameters, and distort the metric, so a classifier trained on them is standing on sand. Compress with PCA if you need learned low-dimensional features; visualize with UMAP.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the three-source mixing setup from the code block: (1) Add a fourth, purely Gaussian source and rerun FastICA; explain why the algorithm struggles to separate it and what non-Gaussianity has to do with it. (2) On a labeled sensor feature table of your choice, keep enough PCA components for 95 percent variance, train a classifier, then repeat with LDA to the same number of dimensions; compare accuracy and explain the gap. (3) Run UMAP twice with <code>n_neighbors</code> of 5 and 50; describe how the global versus local structure changes and why you cannot read cluster distances as meaningful.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>PCA and ICA both produce a linear transform of the data. What does ICA achieve that PCA cannot, and what property of the sources makes it possible?</li>
+<li>Why should you almost never feed t-SNE or UMAP coordinates into a downstream classifier, and what should you use instead when you need learned low-dimensional features?</li>
+<li>Your first principal component explains 80 percent of the variance but a classifier built on it performs terribly. What is the most likely explanation, and which method would you switch to?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-8.7.html">Section 8.7</a>, we step back and ask the honest question that hangs over this entire chapter: when do these carefully handcrafted, dimensionality-reduced features still beat an end-to-end deep network, and when is it time to let a model learn its own representation from the raw signal?</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

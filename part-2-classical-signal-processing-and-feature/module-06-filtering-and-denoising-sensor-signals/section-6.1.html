@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.1: Moving averages and exponential smoothing. Building Sensory AI." name="description"/>
+<title>Section 6.1: Moving averages and exponential smoothing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Filtering and Denoising Sensor Signals</a></div>
+<h1>Moving averages and exponential smoothing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I averaged the last hundred readings and got a beautifully smooth curve. It was also half a second late, and by then the robot had already hit the wall."</p>
+<cite>A Smoothed-Over AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the discrete-time notation from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>: a sensor stream is a sequence \(x[n] = x(nT_s)\) sampled every \(T_s\) seconds, so a "window of \(N\) samples" spans \(N T_s\) seconds of real time. It also uses the additive measurement model \(x[n] = s[n] + \eta[n]\), where \(s\) is the true quantity and \(\eta\) is zero-mean noise, and the idea that averaging independent noise shrinks its variance, both developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. No frequency-domain machinery is required yet; the transfer-function view that makes these filters rigorous is built in <a class="cross-ref" href="index.html">Section 6.2</a>. A summation refresher lives in Appendix A.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why start a filtering chapter with an average</h3>
+<p>Before you reach for an FIR design tool or a Kalman filter, you almost always reach for the two smoothers in this section. The moving average and the exponential smoother are the most-deployed filters on Earth: they run inside your step counter, your thermostat, your car's fuel gauge, and nearly every microcontroller that has ever debounced a noisy pin. They are worth a section of their own for three reasons. They are the simplest possible answer to "how do I make this jittery signal less jittery," so they set the baseline every fancier method must beat. They expose, in the cleanest possible form, the one tradeoff that governs all of filtering: <em>you buy smoothness with delay</em>. And the exponential smoother, in particular, turns out to be a one-line, one-variable recursion that fits on the tiniest chip, yet it is the direct ancestor of the Kalman filter of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. Master these two and you understand the skeleton of the whole chapter.</p>
+</div>
+
+<h2>The simple moving average: averaging a sliding window</h2>
+<p><strong>What</strong> a simple moving average (SMA) does is replace each sample with the mean of itself and its \(N-1\) predecessors. <strong>Why</strong> it works is the noise-averaging fact from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>: if the underlying signal \(s\) is roughly constant across the window and the noise samples are independent with variance \(\sigma^2\), the average has variance \(\sigma^2/N\), so the noise standard deviation drops by \(\sqrt{N}\). <strong>How</strong> we write it, for a causal (past-only) window of length \(N\), is</p>
+$$y[n] = \frac{1}{N}\sum_{k=0}^{N-1} x[n-k].$$
+<p>This is a convolution with a rectangular kernel of height \(1/N\), which is why the SMA is also called a boxcar filter. Two properties matter for deployment. First, every sample in the window gets equal weight, so a spike that entered the window six samples ago still counts exactly as much as the newest reading, and it keeps counting until it falls off the far edge. Second, the filter is not free: because the output is the mean of samples centered, on average, \((N-1)/2\) steps in the past, a causal SMA delays the signal by roughly</p>
+$$\text{group delay} \approx \frac{N-1}{2}\, T_s \text{ seconds.}$$
+<p>A 50-sample average of a 100 Hz stream is smoother by a factor of about seven, but it also lags the truth by a quarter of a second. That number, not the smoothness, is what ends up mattering in a control loop.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Smoothing and delay are the same knob</h3>
+<p>There is exactly one dial on a moving average, the window length \(N\), and it moves noise reduction and lag in lockstep: noise falls as \(\sqrt{N}\) while delay grows as \(N/2\). You cannot turn one without turning the other. Every "better" filter in this chapter is, at heart, a cleverer way to spend a fixed delay budget on more noise reduction, or a fixed noise budget on less delay. This tension is important enough that <a class="cross-ref" href="index.html">Section 6.7</a> is devoted entirely to quantifying it. When someone shows you a magically smooth sensor trace, your first question should be "how late is it?"</p>
+</div>
+
+<h2>The running-sum trick and weighted variants</h2>
+<p>Computed naively, the SMA re-adds \(N\) numbers every step, which is wasteful when \(N\) is large. Because consecutive windows differ by only two samples, you can maintain a running sum and update it in constant time: add the arriving sample, subtract the one leaving the window. That makes the SMA an \(O(1)\)-per-sample filter regardless of window size, which is why it survives on hardware that streams thousands of samples per second.</p>
+<p>The equal-weight kernel is not always what you want. If recent samples are more trustworthy, you can taper the weights: a <em>triangular</em> moving average weights the center of the window most (equivalent to averaging twice), and a <em>linearly weighted</em> average ramps the weights up toward the newest sample to cut the delay. All of these are still finite-window convolutions, the FIR filters that <a class="cross-ref" href="index.html">Section 6.2</a> treats systematically. The moment you start choosing weights deliberately to shape which frequencies pass, you have stopped hand-waving and started filter design.</p>
+
+<h2>Exponential smoothing: infinite memory in one number</h2>
+<p>The exponential moving average (EMA), also called exponentially weighted moving average or first-order exponential smoothing, throws away the window entirely. Instead of storing the last \(N\) samples, it keeps a single running estimate and nudges it toward each new reading:</p>
+$$y[n] = \alpha\, x[n] + (1-\alpha)\, y[n-1], \qquad 0 < \alpha \le 1.$$
+<p><strong>What</strong> this does is blend the new measurement (weight \(\alpha\)) with everything seen before (weight \(1-\alpha\)). <strong>Why</strong> it is remarkable is that unrolling the recursion shows every past sample still contributes, but with a weight that decays geometrically: sample \(x[n-k]\) enters with weight \(\alpha(1-\alpha)^k\). The filter has infinite memory yet stores exactly one number. <strong>How</strong> you choose \(\alpha\) is the whole design problem. A small \(\alpha\) (say 0.02) trusts history and smooths hard but reacts slowly; an \(\alpha\) near 1 barely filters at all. The knob has an intuitive time interpretation: the smoother's effective memory, its <em>time constant</em>, is about</p>
+$$\tau \approx \frac{T_s}{\alpha} \quad\text{seconds,} \qquad\text{equivalently an SMA of about}\quad N \approx \frac{2-\alpha}{\alpha} \ \text{samples.}$$
+<p>So \(\alpha = 0.1\) behaves roughly like a 19-sample moving average, but with a gentle exponential tail instead of a hard cutoff, and, crucially, with \(O(1)\) memory rather than \(O(N)\).</p>
+
+<pre><code class="language-python">import numpy as np
+
+def ema(x, alpha):
+    """First-order exponential smoother. O(1) memory, one pass."""
+    y = np.empty_like(x, dtype=float)
+    y[0] = x[0]                       # seed with the first reading
+    for n in range(1, len(x)):
+        y[n] = alpha * x[n] + (1 - alpha) * y[n - 1]
+    return y
+
+rng = np.random.default_rng(0)
+t = np.arange(500)
+truth = np.sin(2 * np.pi * t / 200)          # slow underlying signal
+noisy = truth + rng.normal(0, 0.4, t.size)   # heavy sensor noise
+
+fast = ema(noisy, alpha=0.30)   # ~5-sample memory: responsive, still jittery
+slow = ema(noisy, alpha=0.05)   # ~39-sample memory: smooth, but lags the sine
+
+# Noise reduction vs lag, made numerical:
+print("input noise std :", round(noisy.std() - truth.std(), 3))
+print("residual (fast) :", round((fast - truth).std(), 3))
+print("residual (slow) :", round((slow - truth).std(), 3))</code></pre>
+<div class="code-caption">A four-line exponential smoother applied at two settings. The <code>alpha=0.05</code> curve is visibly cleaner than <code>alpha=0.30</code>, but printing the residuals against the known truth also reveals its cost: near the sine's peaks and troughs the slow smoother trails behind, because its long memory is still remembering the climb after the signal has turned. This is the smoothing-versus-delay tradeoff of the earlier callout, now measurable.</div>
+
+<p>The code above makes the two settings concrete: <code>alpha=0.05</code> produces the prettier trace, yet its residual is worst exactly where the signal moves fastest, because a long memory lags a turning signal. That lag is the same phenomenon as the SMA's group delay, wearing different clothes.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The wrist heart-rate monitor that had to forget quickly</h3>
+<p>A wearables team building an optical (PPG) heart-rate feature, the kind revisited in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, smoothed the beat-to-beat rate with a heavy exponential filter (\(\alpha \approx 0.03\)) to kill motion jitter. On the bench, resting on a desk, the number was rock steady and looked premium. In the field it failed a simple test: a user sprinting for a bus saw their displayed heart rate crawl from 70 toward 150 over a full fifteen seconds, long after they were already winded. The time constant \(\tau \approx T_s/\alpha\) had been tuned for cosmetics, not for physiology. The fix was an <em>adaptive</em> \(\alpha\): keep the smoothing heavy while the accelerometer reports the wrist is still, and open \(\alpha\) up the instant motion energy spikes, so the estimate can chase a real change. Same one-line recursion, one context-dependent knob, and the displayed rate finally tracked the body instead of flattering it. The general principle, letting the data decide how much to trust the newest measurement, is precisely what the Kalman filter formalizes.</p>
+</div>
+
+<h2>When a plain smoother is not enough</h2>
+<p>Both filters share a blind spot: they assume the signal is locally flat, so on a signal with a steady <em>trend</em> (a slowly draining battery, a warming engine) they lag persistently, always reporting a value biased toward the recent past. <em>Double exponential smoothing</em> (Holt's method) fixes this by smoothing the <em>level</em> and the <em>slope</em> with two coupled recursions, so it can follow a ramp without a standing error. That is the same conceptual move, tracking a value and its rate of change, that produces the constant-velocity Kalman filter in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. And because these smoothers treat a lone outlier as real data, worth \(1/N\) of the window or \(\alpha\) of the update, they smear spikes rather than rejecting them; the median-based robust filters of <a class="cross-ref" href="index.html">Section 6.5</a> exist for exactly that failure. Reach for a moving average or EMA first; reach past them when trend or outliers break their flat-and-clean assumption.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: skip the hand-rolled recursion</h3>
+<p>The teaching loop above is fine for one array, but production code should not re-implement smoothing, seeding, and edge handling by hand. Pandas expresses both filters as one-liners over any Series or grouped stream:</p>
+<pre><code class="language-python">import pandas as pd
+s = pd.Series(noisy)
+sma = s.rolling(window=20, min_periods=1).mean()   # simple moving average
+ema = s.ewm(alpha=0.05, adjust=False).mean()        # exponential smoother</code></pre>
+<div class="code-caption">Two calls replace roughly 15 to 20 lines of windowing, running-sum bookkeeping, seed handling, and boundary logic. <code>rolling().mean()</code> uses the constant-time running-sum internally, and <code>ewm(adjust=False)</code> is the exact recursion \(y[n]=\alpha x[n]+(1-\alpha)y[n-1]\).</div>
+<p>The library handles the constant-time running sum, the startup transient when the window is not yet full (<code>min_periods</code>), and NaN gaps from dropped samples, all of which are easy to get subtly wrong by hand. For an offline pass over a whole logged dataset this is the right tool; only when you are on a microcontroller with no pandas, streaming one sample at a time, do you write the four-line EMA yourself, and there its \(O(1)\) memory is the reason it wins.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise 6.1</h3>
+<p>A temperature sensor streams at \(f_s = 20\) Hz and you want a smoother whose noise reduction matches a 40-sample moving average, but with \(O(1)\) memory. (a) Estimate the \(\alpha\) that gives an equivalent memory, using \(N \approx (2-\alpha)/\alpha\). (b) Compute the resulting time constant \(\tau \approx T_s/\alpha\) in seconds. (c) The process you are monitoring can ramp at up to \(2^{\circ}\)C per second; estimate the standing lag error your EMA will show during such a ramp, and state in one sentence why double exponential smoothing would remove it. (d) The 40-sample SMA has group delay \((N-1)/2 \cdot T_s\); compare it to your \(\tau\) and comment on which filter feels "faster" to a step change.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. An exponential smoother stores a single number yet "remembers" every past sample. In what precise sense is that true, and how fast does an old sample's influence decay?</p>
+<p>2. You double a moving average's window from \(N\) to \(2N\). By roughly what factor does the output noise drop, and by roughly what factor does the delay grow?</p>
+<p>3. Why does a plain SMA or EMA report a persistently biased value on a signal that is steadily rising, and which named method fixes it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-6.2.html">Section 6.2</a>, we stop treating these smoothers as ad-hoc recipes and name them for what they are: the moving average is a finite impulse response (FIR) filter, the exponential smoother is the simplest infinite impulse response (IIR) filter, and the difference between them, finite versus infinite memory, is the fault line that organizes all classical filter design.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

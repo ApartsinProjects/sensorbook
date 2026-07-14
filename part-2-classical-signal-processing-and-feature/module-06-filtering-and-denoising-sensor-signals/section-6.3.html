@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.3: Low-pass, high-pass, band-pass, notch. Building Sensory AI." name="description"/>
+<title>Section 6.3: Low-pass, high-pass, band-pass, notch | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Filtering and Denoising Sensor Signals</a></div>
+<h1>Low-pass, high-pass, band-pass, notch</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Every filter is a bouncer with a guest list written in hertz. My only job is to hand it the right list."</p><cite>A Selective AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>In <a class="cross-ref" href="section-6.2.html">Section 6.2</a> you learned the two machines that implement a filter: FIR and IIR. This section is about telling those machines <em>what to keep</em>. Almost every denoising problem in sensing reduces to one sentence: "the information I want lives in this band of frequencies, and the garbage lives in that one." Low-pass, high-pass, band-pass, and notch are the four canonical answers. A wearable's heart-rate signal sits in a narrow band while motion artifacts spill above and drift creeps in below; a power-line hum sits at exactly one frequency you want gone and nowhere else. Once you can name the passband, choosing and designing the filter is almost mechanical. This section teaches you to translate a physical goal into a frequency specification, and a specification into a working filter.</p>
+</div>
+
+<p>This section assumes you are comfortable with sampling rate, the Nyquist frequency, and the frequency-domain view of a signal from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and with the FIR/IIR distinction and the notions of order and phase from <a class="cross-ref" href="section-6.2.html">Section 6.2</a>. Everything here is expressed in <em>normalized</em> frequency, so a design ports across sensors regardless of their sampling rate.</p>
+
+<h2>The four response types as passbands</h2>
+
+<p>A frequency-selective filter is fully described by its <strong>magnitude response</strong> \(|H(f)|\): how much of each frequency component survives, from \(0\) (fully removed) to \(1\) (fully passed). The four canonical shapes differ only in which frequencies they let through.</p>
+
+<ul>
+<li><strong>Low-pass</strong> keeps frequencies below a cutoff \(f_c\) and attenuates everything above it. Use it whenever the signal is slow and the noise is fast: smoothing a temperature reading, extracting the gravity vector from a raw accelerometer, anti-aliasing before you downsample.</li>
+<li><strong>High-pass</strong> is the mirror image: it removes slow content below \(f_c\) and keeps the fast content. This is the tool for killing <em>drift</em> and DC offset, the slow wander that plagues strain gauges, EEG baselines, and MEMS accelerometers left in the sun.</li>
+<li><strong>Band-pass</strong> keeps a window \([f_1, f_2]\) and rejects both the slow and the fast sides. It is a low-pass and a high-pass composed into one, ideal when your phenomenon occupies a known band: the roughly \(0.7\)-\(4\)&nbsp;Hz of a resting-to-exercise heart rate, or the resonance band of a bearing fault.</li>
+<li><strong>Notch</strong> (band-stop) is the inverse of band-pass: it passes everything <em>except</em> a narrow sliver, surgically removing one interfering tone while leaving the rest of the spectrum untouched. The archetype is 50/60&nbsp;Hz mains hum in a biosignal.</li>
+</ul>
+
+<p>A profound and practical fact ties these together: you can build all four from the same low-pass prototype. A high-pass is a low-pass subtracted from an all-pass (\(H_{\text{hp}} = 1 - H_{\text{lp}}\)); a band-pass is the product of a low-pass and a high-pass; a notch is one minus a band-pass. Design libraries exploit exactly this, which is why the same function that gives you a Butterworth low-pass gives you the other three with one argument changed.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>There is no such thing as a brick wall. Every real filter has a <strong>transition band</strong>: a finite stretch of frequency over which \(|H(f)|\) falls from pass to stop. You cannot make it infinitely sharp; you can only make it sharper by paying with filter order (more computation, more delay) or with ripple (wiggles in the passband). The entire craft of filter design is negotiating this triangle. A cutoff you specify is really the <em>midpoint</em> of a slope, conventionally the \(-3\)&nbsp;dB point where power has halved, so a component slightly inside your passband is already partially attenuated.</p>
+</div>
+
+<h2>From physical goal to specification</h2>
+
+<p>A filter is not specified by "low-pass, please." It is specified by four numbers you derive from the physics of the signal and the noise. First, the <strong>cutoff</strong>(s), placed in the gap between the highest frequency you want to keep and the lowest frequency you want to remove; the wider that gap, the easier your life. Second, the <strong>passband tolerance</strong>: how much attenuation and ripple you can tolerate on the signal itself, often quoted in decibels. Third, the <strong>stopband attenuation</strong>: how thoroughly the noise must be crushed, for example \(40\)&nbsp;dB (a factor of 100) for a stubborn interferer. Fourth, the <strong>order</strong>, which is not so much chosen as it is the <em>consequence</em> of the previous three plus the filter family.</p>
+
+<p>The order controls the steepness of the transition. A first-order low-pass rolls off at \(6\)&nbsp;dB per octave (each doubling of frequency halves the amplitude); an \(N\)-th order filter rolls off at \(6N\)&nbsp;dB per octave. Steeper is not free: higher order means more coefficients, more numerical sensitivity in IIR forms, and, as <a class="cross-ref" href="section-6.7.html">Section 6.7</a> will make quantitative, more delay. The families you will reach for trade these differently: <strong>Butterworth</strong> is maximally flat in the passband (no ripple, gentle roll-off), <strong>Chebyshev</strong> buys a steeper transition by allowing passband (type&nbsp;I) or stopband (type&nbsp;II) ripple, and <strong>elliptic</strong> gives the steepest transition of all by rippling both. When phase linearity matters, an FIR designed with a windowed-sinc or Parks-McClellan method, or a zero-phase forward-backward pass, is the honest choice.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the wrist that would not sit still</h3>
+<p>A wearable team is estimating heart rate from a wrist PPG sensor sampled at \(64\)&nbsp;Hz. Raw, the signal is a mess: a slow baseline wander from the skin warming under the strap, the true pulse waveform, and sharp spikes every time the wearer's arm swings during a run. They reach for a band-pass. The lower edge goes at \(0.5\)&nbsp;Hz to kill the thermal wander (well below a \(30\)&nbsp;bpm resting floor), and the upper edge at \(5\)&nbsp;Hz to reject the bulk of the stride-cadence harmonics while preserving a \(220\)&nbsp;bpm sprint. A fourth-order Butterworth band-pass, run zero-phase so the detected beats are not shifted in time, turns an unusable trace into clean pulses. It does not solve everything: a \(2.5\)&nbsp;Hz running cadence lands squarely in the passband and still masquerades as a \(150\)&nbsp;bpm heart rate, which is why <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a> pairs this filter with an accelerometer-driven motion reference. The filter is necessary; it is rarely sufficient.</p>
+</div>
+
+<h2>Notch filters: removing one tone without touching the rest</h2>
+
+<p>The notch deserves its own treatment because its job is uniquely surgical. Mains interference at \(50\)&nbsp;Hz (Europe, Asia) or \(60\)&nbsp;Hz (North America) couples into almost every high-impedance biosensor, and it sits at a precise, known frequency. You do not want a low-pass here: the diagnostic content of an ECG extends well past \(50\)&nbsp;Hz, so removing everything above the hum would destroy the QRS complex you are trying to measure. You want to remove a razor-thin band around the offender and nothing else.</p>
+
+<p>The sharpness of a notch is set by its <strong>quality factor</strong> \(Q = f_0 / \Delta f\), where \(f_0\) is the center and \(\Delta f\) is the \(-3\)&nbsp;dB width. A high \(Q\) (narrow notch) preserves nearby signal but assumes the interferer is exactly at \(f_0\); if the mains drifts to \(50.2\)&nbsp;Hz, a razor-narrow notch misses it. A low \(Q\) is forgiving of drift but gouges a wider hole in your signal. Practitioners often cascade notches at the fundamental and its harmonics (\(50, 100, 150\)&nbsp;Hz), or, when the interference wanders, switch to an adaptive notch that tracks \(f_0\). We build the fixed version in code below and revisit adaptive and spectral removal in <a class="cross-ref" href="section-6.4.html">Section 6.4</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
+
+fs = 500.0                      # ECG sampling rate (Hz)
+t  = np.arange(0, 4, 1/fs)
+
+# Synthetic ECG-like beat train + baseline wander + 60 Hz mains hum
+clean = np.sin(2*np.pi*1.2*t) * (np.abs(np.sin(np.pi*1.2*t)) > 0.85)
+wander = 0.6*np.sin(2*np.pi*0.15*t)          # slow drift, ~0.15 Hz
+hum    = 0.4*np.sin(2*np.pi*60.0*t)          # 60 Hz interference
+noisy  = clean + wander + hum
+
+# High-pass at 0.5 Hz to remove baseline wander (drift killer)
+sos_hp = butter(2, 0.5, btype='highpass', fs=fs, output='sos')
+
+# 60 Hz notch, Q = 30 -> ~2 Hz wide, surgical
+b, a   = iirnotch(w0=60.0, Q=30.0, fs=fs)
+sos_no = tf2sos(b, a)
+
+# Zero-phase forward-backward so beats are not time-shifted
+y = sosfiltfilt(sos_hp, noisy)
+y = sosfiltfilt(sos_no, y)
+
+print(f"input std {noisy.std():.3f} -> cleaned std {y.std():.3f}")
+</code></pre>
+<div class="code-caption">Cascading a high-pass (drift removal) with a 60&nbsp;Hz notch (mains removal) on a synthetic ECG, using second-order sections and zero-phase filtering so the R-peaks stay put. The same pattern generalizes: pick the passband, chain the stages, filter forward-backward.</div>
+
+<p>The code above chains a drift-killing high-pass with a hum-killing notch, exactly the two-stage recipe most biosignal front ends use. Note two production habits baked in: filtering in <strong>second-order-section</strong> (SOS) form for numerical stability at higher orders, and using <code>sosfiltfilt</code> for zero-phase response so a downstream R-peak detector is not fed time-shifted beats.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Designing a Butterworth band-pass by hand means placing poles on an s-plane circle, applying the bilinear transform, and expanding the resulting polynomial: comfortably 40-60 lines and a fertile source of sign errors. SciPy's <code>butter(order, [f1, f2], btype='bandpass', fs=fs, output='sos')</code> is <strong>one line</strong>, and it handles the analog prototype, frequency warping, the bilinear transform, and the numerically stable SOS factorization for you. The notch above is likewise one <code>iirnotch</code> call instead of hand-deriving a second-order band-stop from its \(Q\). Reserve hand design for when you genuinely need a custom response the library cannot express.</p>
+</div>
+
+<h2>Choosing the right response in practice</h2>
+
+<p>The decision procedure is short. Sketch or compute the spectrum of a representative recording (the tools are in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>). Mark where your signal lives and where the dominant noise lives. If noise is only above the signal, low-pass; only below, high-pass; on both sides, band-pass; concentrated at a single known tone, notch. Then check three failure modes before you trust it. Is any part of your <em>signal</em> inside the transition band and being quietly attenuated? Does the phase distortion matter for what you do next, and if so, are you filtering zero-phase? And crucially, is the noise actually separable in frequency at all: a spike or an outlier is broadband and will slip through any linear band filter, which is why <a class="cross-ref" href="section-6.5.html">Section 6.5</a> turns to robust, nonlinear methods for exactly those cases.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a \(100\)&nbsp;Hz tri-axial accelerometer recording of a person walking (or synthesize one: a \(2\)&nbsp;Hz step cadence, a slow gravity component, and broadband sensor noise). (a) Design a low-pass to extract the gravity/orientation component and a high-pass to extract the dynamic motion, and confirm that summing the two outputs reconstructs the input. (b) Now design a single band-pass to isolate the step cadence and its first harmonic. (c) Sweep the Butterworth order from 1 to 8 and plot the resulting group delay at the cadence frequency. Relate what you see to the delay-versus-noise tradeoff of <a class="cross-ref" href="section-6.7.html">Section 6.7</a>, and to the inertial-signal pipelines of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>You need to remove DC offset and slow thermal drift from a strain-gauge signal while preserving a \(10\)&nbsp;Hz vibration. Which of the four responses do you reach for, and where do you place the cutoff relative to \(10\)&nbsp;Hz?</li>
+<li>Why is a notch, rather than a low-pass, the correct tool for \(60\)&nbsp;Hz mains hum in an ECG, given that ECG content extends above \(60\)&nbsp;Hz?</li>
+<li>Two engineers propose the same cutoff but orders 2 and 8. Name one advantage each order has over the other.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-6.4.html">Section 6.4</a>, we lift filtering out of the time domain entirely: instead of running samples through recursive coefficients, we transform to the frequency domain with the FFT, zero out or reweight the bins we do not want, and transform back. That view makes band selection almost trivial to visualize, unlocks adaptive and time-varying removal of drifting interference, and sets up the spectral analysis toolkit of Chapter 7.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.5: Feature selection. Building Sensory AI." name="description"/>
+<title>Section 8.5: Feature selection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Signal Processing and Feature Engineering</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Feature Engineering and Dimensionality Reduction</a></div>
+<h1>Feature selection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I generated 794 features per window, kept the 30 with the highest correlation to the label, and only later noticed I had ranked them on the same data I then tested on. My paper reported 96 percent. Reality reported 71."</p>
+<cite>A Chastened AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<p><strong>Prerequisites.</strong> This section assumes you have a bank of candidate features per window: the amplitude and temporal descriptors of Section 8.1, the spectral features of Section 8.2, the statistical and entropy features of Section 8.3, and the automatically generated libraries (tsfresh, catch22) of Section 8.4. It leans on mutual information and correlation from the probability primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and on grouped, leakage-safe splits from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Feature <em>selection</em> keeps a subset of the original, interpretable features; feature <em>transformation</em> into new axes (PCA, ICA, UMAP) waits for Section 8.6.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">From a firehose of features to a defensible handful</h3>
+<p>Automatic extractors are generous to a fault. Point tsfresh at a single accelerometer channel and it returns roughly 800 features per window; run it on a six-axis inertial unit plus a spectral bank and you are past 5000. Most of those features are noise, many are near-duplicates of each other, and a few are quietly encoding the subject or the sensor rather than the phenomenon you care about. Feeding all of them to a model invites three distinct failures: overfitting (the model fits accidental structure in a wide, short table), fragile deployment (a tiny classifier on a microcontroller cannot afford to compute 5000 features per window), and false confidence (you cannot explain to a clinician or a safety auditor what a feature named <code>fft_coefficient__coeff_47</code> means). Feature selection is the discipline of shrinking that firehose to a small, stable, defensible subset that preserves accuracy while restoring interpretability and cutting compute. This section covers the three method families (filter, wrapper, embedded), the redundancy problem that univariate ranking misses, and the single leakage mistake that inflates more sensor papers than any other.</p>
+</div>
+
+<h2>Why fewer features, precisely</h2>
+<p><strong>What</strong> feature selection buys you is easiest to see through the geometry of the curse of dimensionality. With \(d\) features and \(n\) windows, a linear model has \(d\) parameters to fit from \(n\) examples; once \(d\) approaches or exceeds \(n\) the model can fit noise perfectly and generalizes badly. <strong>Why</strong> this bites sensor data especially hard is that windows are cheap to over-count and true examples are scarce: a study with 20 subjects and thousands of overlapping windows has an <em>effective</em> sample size closer to 20, because windows from one person are near-duplicates. So the honest \(n\) is small while \(d\) balloons. <strong>How</strong> selection helps is threefold. It improves generalization by reducing the parameter count relative to the effective \(n\); it slashes inference cost, which matters when a <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> edge target must compute every kept feature in real time; and it produces a model whose inputs a domain expert can name and sanity-check. <strong>When</strong> to prefer selection over the transforms of Section 8.6 is when interpretability or per-feature compute cost is a hard requirement, since PCA components are dense combinations of all original features and cost just as much to evaluate.</p>
+
+<h2>Filter methods: rank before you model</h2>
+<p><strong>Filter</strong> methods score each feature against the label without training the downstream model, then keep the top ranked. They are fast, model-agnostic, and the natural first pass on a 5000-feature table. The simplest is a <em>variance threshold</em>: drop features that barely move across windows, since a near-constant feature carries no information. Next come univariate association scores. For a regression target, Pearson or Spearman correlation \(|\rho|\) ranks linear or monotone dependence; for classification, an ANOVA F-test or, better, <em>mutual information</em></p>
+$$I(X; Y) = \sum_{x,y} p(x,y)\,\log\frac{p(x,y)}{p(x)\,p(y)}$$
+<p>which unlike correlation captures nonlinear and non-monotone dependence, exactly the kind a threshold-crossing feature or a multi-modal spectral band produces. The catch with pure univariate ranking is <em>redundancy</em>: the top 30 features by mutual information are often 30 slightly different flavors of "how much energy is in this window," all strongly correlated with each other. You pay to compute 30 features and get the information content of about three.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Relevance is not enough; you must also fight redundancy</h3>
+<p>A good feature set is not the set of individually best features. It is the set that is jointly informative. Two features that each correlate 0.9 with the label but 0.98 with each other add almost nothing when kept together, while a feature that correlates only 0.4 with the label but is uncorrelated with everything already chosen can be worth more than a third copy of the strong signal. This is the principle behind <em>minimum-redundancy maximum-relevance</em> (mRMR), which greedily adds the feature maximizing relevance to the label minus mean redundancy with the already-selected set, and behind correlation-based filtering that prunes one of every highly correlated pair. Univariate ranking is blind to this; a redundancy-aware filter or an embedded method that sees features jointly is not.</p>
+</div>
+
+<h2>Wrapper and embedded methods: let the model vote</h2>
+<p><strong>Wrapper</strong> methods treat the downstream model as a black box and search over feature subsets, scoring each subset by cross-validated performance. <em>Recursive feature elimination</em> (RFE) is the common form: train the model, drop the least important feature, refit, and repeat until the target count remains. Wrappers find subsets tuned to the specific model and can capture interactions a filter misses, but they are expensive (many model fits) and prone to overfitting the selection to the validation folds unless nested carefully. <strong>Embedded</strong> methods get selection for free during a single training run. An L1-penalized (Lasso) linear or logistic model adds \(\lambda \sum_j |w_j|\) to the loss, which drives many coefficients exactly to zero, so the surviving nonzero features <em>are</em> the selection; the strength \(\lambda\) trades sparsity against fit. Tree ensembles (random forests, gradient boosting) expose an importance per feature, and permutation importance, shuffling one feature and measuring the accuracy drop, gives a more honest ranking than the built-in impurity importance, which is biased toward high-cardinality features. Embedded methods are usually the best accuracy-per-effort choice; filters are the best first-pass thinning; wrappers are worth the compute only when a small final subset must be squeezed for maximum accuracy. These importances also feed the interpretability and root-cause tooling of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Trimming a bearing-fault classifier for a PLC</h3>
+<p>A predictive-maintenance team (the setting of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) runs tsfresh on vibration windows from motor bearings and gets 782 features per axis. The full set scores well offline, but the model must run on a programmable logic controller that can afford maybe 20 features per window at line rate. Their pipeline: a variance threshold removes 140 dead features; a correlation filter at \(|\rho| > 0.95\) collapses clusters of near-duplicate energy features, cutting to about 300; mRMR then ranks what survives, and an L1 logistic model applied to the top 60 zeroes out all but 18. Crucially, the whole chain runs <em>inside</em> each cross-validation fold, and the folds are grouped by machine so no bearing appears in both train and test. The final 18 features, dominated by kurtosis in specific frequency bands and crest factor, are ones a vibration engineer recognizes as classic spall signatures, so the maintenance lead signs off. Accuracy drops less than one point versus the 782-feature model while inference cost falls by a factor of forty.</p>
+</div>
+
+<h2>The leakage trap that inflates half of published results</h2>
+<p>Feature selection uses the label, so it is part of the model, and it must be fit only on training data. The single most common sensor-ML mistake is to rank or filter features on the <em>whole</em> dataset and only afterward split into train and test. This lets the test set vote on which features look good, and the reported accuracy is optimistic, often by 10 to 25 points, exactly the gap in this section's epigraph. The correct pattern is to wrap selection and model in one pipeline and cross-validate the whole thing, so selection is refit from scratch on each training fold and never sees its fold's test data. Sensor data adds a second requirement on top: the splits must be <em>grouped</em> by subject, device, or session (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), because otherwise a feature that encodes subject identity will be selected as if it were predictive, and your grouped test set will expose it. Rigorous benchmarking of the whole selection-plus-model pipeline is the subject of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<p>The code below builds selection into a scikit-learn pipeline and evaluates it with grouped cross-validation, so the numbers it prints are honest by construction.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import VarianceThreshold, SelectKBest, mutual_info_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score, GroupKFold
+
+# X: (n_windows, n_features), y: labels, groups: subject id per window
+pipe = Pipeline([
+    ("drop_dead", VarianceThreshold(threshold=1e-8)),   # remove near-constant features
+    ("rank",      SelectKBest(mutual_info_classif, k=20)),  # keep 20 by mutual information
+    ("clf",       LogisticRegression(penalty="l1", C=0.5, solver="liblinear")),
+])
+
+# selection is REFIT inside every training fold; folds never share a subject
+cv = GroupKFold(n_splits=5)
+scores = cross_val_score(pipe, X, y, groups=groups, cv=cv, scoring="f1_macro")
+print(f"grouped CV macro-F1: {scores.mean():.3f} +/- {scores.std():.3f}")</code></pre>
+<div class="code-caption">Leakage-safe feature selection. Because <code>SelectKBest</code> and the L1 model live <em>inside</em> the <code>Pipeline</code>, <code>cross_val_score</code> refits both on each fold's training data only. <code>GroupKFold</code> keeps every subject entirely in train or test, so a feature that encodes identity cannot inflate the score.</div>
+
+<p>Swap <code>SelectKBest</code> outside the pipeline and rank on all of <code>X</code>, and the printed F1 typically jumps, but that jump is the leak, not skill. Keeping the two selectors and the classifier in one estimator is what makes the difference between a number you can ship and a number you have to retract.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: pipelines and named selectors, not a hand-rolled loop</h3>
+<p>Hand-writing a leakage-safe selector means implementing a fold loop, refitting the ranker per fold, tracking which columns survived, and re-applying that mask to each test fold: roughly 40 lines that are easy to get subtly wrong (the off-by-one that lets one fold's selection bleed into the next). scikit-learn's <code>Pipeline</code> plus <code>SelectKBest</code>, <code>RFE</code>, or <code>SelectFromModel</code> collapses it to the estimator above and guarantees the refit-per-fold contract. For tsfresh output specifically, its <code>select_features</code> helper runs per-feature hypothesis tests with Benjamini-Hochberg multiple-testing control in one call, replacing a bespoke statistics module. The mRMR ranking discussed above is one <code>mrmr_classif(X, y, K=20)</code> call from the <code>mrmr-selection</code> package rather than a nested relevance-minus-redundancy loop.</p>
+</div>
+
+<h2>Stability: does the selection survive a different sample</h2>
+<p>A subset that changes wildly when you resample the data is a warning sign, not a model. <em>Stability selection</em> addresses this by running the selector on many bootstrap resamples (grouped by subject) and keeping only features chosen in, say, at least 70 percent of runs. The payoff is a subset that reflects reproducible structure rather than one lucky split, which matters enormously when the feature list becomes a specification: the 18 features the maintenance team ships must be computable on every deployed controller, and a list that reshuffles each retraining is unmaintainable. Report selection frequency alongside accuracy; a feature kept 95 percent of the time is trustworthy, one kept 55 percent is a coin flip dressed as a signal.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have 400 windows from 10 subjects (40 per subject) and 794 tsfresh features, classifying two activities. (a) A colleague runs <code>SelectKBest</code> on all 400 windows, then does a random 70/30 split and reports 94 percent. Give two independent reasons this number is inflated and the one-line fix for each. (b) After you fix both, accuracy falls to 78 percent. Is the pipeline now broken or was the 94 percent the illusion? Justify in one sentence. (c) Your final L1 model keeps 22 features, but a bootstrap shows 9 of them appear in fewer than half the resamples. What single change to the reporting or the selection would you make before shipping?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Mutual information ranks two features first and second, yet dropping the second barely changes accuracy. What property of the two features explains this, and which method family would have caught it?</p>
+<p>2. Why must feature selection be refit inside each cross-validation fold rather than done once on the full dataset, and what is the typical direction and rough size of the error if you do not?</p>
+<p>3. Give one situation where you would choose feature selection over PCA even though PCA compresses to fewer dimensions, and one where the reverse holds.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-8.6.html">Section 8.6</a>, we turn from <em>keeping</em> a subset of the original features to <em>transforming</em> them into new axes: PCA and ICA for linear compression and source separation, and the manifold methods UMAP and t-SNE that unfold nonlinear structure for visualization and embedding. Where selection preserves named, auditable features, these methods trade interpretability for a denser, lower-dimensional representation, and we will see exactly when that trade is worth making for sensor streams.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
