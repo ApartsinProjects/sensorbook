@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.4: Quantization (int8, int4, and hardware-native 2/4-bit). Building Sensory AI." name="description"/>
+<title>Section 59.4: Quantization (int8, int4, and hardware-native 2/4-bit) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Quantization (int8, int4, and hardware-native 2/4-bit)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to memorize the world in 32 bits per weight. I countered with 4, kept my accuracy, and pocketed the other 28 as battery life."</p>
+<cite>A Thrifty AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you know what a neural network layer computes and have met the hardware budget in <a class="cross-ref" href="section-59.3.html">Section 59.3</a> (memory, power, thermal). The integer-arithmetic units it targets were introduced in <a class="cross-ref" href="section-59.2.html">Section 59.2</a> (NPU, DSP, MCU). The only mathematics required is rounding, linear maps, and the mean-squared-error idea from the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A trained network stores its knowledge as millions of 32-bit floating-point numbers, but almost none of those bits carry meaning. Quantization replaces each real-valued weight and activation with a small integer plus a shared scale, shrinking a model four-fold at int8 and eight-fold at int4, while turning slow floating-point multiply-accumulates into the cheap integer operations that edge silicon runs natively. On a battery-powered sensor node the payoff is not abstract: a model that did not fit in on-chip SRAM now does, an inference that drained the cell in a day now lasts a week, and a classifier that missed its deadline now clears it. The craft is doing all of this without letting the rounding error quietly wreck the predictions you spent Parts IV through XI learning to make.</p>
+</div>
+
+<h2>What quantization is: mapping reals onto a small integer grid</h2>
+<p>Quantization is a linear map from a continuous range of real numbers onto a finite, evenly spaced integer grid. The standard <strong>affine</strong> (asymmetric) scheme picks a positive scale \(s\) and an integer zero-point \(z\), then represents a real value \(r\) by the integer</p>
+\[ q = \operatorname{clip}\!\left(\operatorname{round}\!\left(\frac{r}{s}\right) + z,\; q_{\min},\; q_{\max}\right), \qquad \hat{r} = s\,(q - z). \]
+<p>For signed int8 the grid is \([q_{\min}, q_{\max}] = [-128, 127]\), so 256 levels stand in for the whole dynamic range of a tensor. The scale \(s\) is the width of one grid step; the zero-point \(z\) is the integer that maps exactly to real zero, which matters because padding and ReLU outputs make exact zero extremely common and you do not want to represent it approximately. When a tensor is naturally symmetric about zero (most weights are), you fix \(z = 0\) and use <strong>symmetric</strong> quantization, which drops the zero-point subtraction from the inner loop and is what almost every accelerator prefers for weights.</p>
+<p>Why does this help so much? Two independent wins stack. First, <em>memory and bandwidth</em>: an int8 weight is a quarter the size of an fp32 weight, so the model file, the SRAM footprint, and the traffic across the memory bus that <a class="cross-ref" href="section-59.3.html">Section 59.3</a> flagged as the real energy sink all shrink four-fold. Second, <em>compute</em>: integer multiply-accumulate units are smaller, faster, and far cheaper in energy per operation than floating-point ones, which is exactly why the NPUs and DSPs of <a class="cross-ref" href="section-59.2.html">Section 59.2</a> expose int8 (and increasingly int4) datapaths as their fast path. A quantized matmul accumulates products of int8 values into int32, then a single rescale returns to the next layer's int8 domain.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Precision is not accuracy. Thirty-two bits per weight is precision the model does not use: after training, the information in a weight is worth only a few bits, and the rest is rounding noise you are paying to move around. Quantization is lossy compression tuned to that fact. The engineering question is never "how few bits can I store" in the abstract, but "how few bits before the task metric on a held-out, <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">leakage-safe</a> test set actually moves." Frequently that answer is int8 with no measurable loss, and int4 with a point or two you can often recover.</p>
+</div>
+
+<h2>Choosing the range: the accuracy lives in the clipping</h2>
+<p>Everything hinges on choosing \(s\) and \(z\), which is equivalent to choosing the real interval \([r_{\min}, r_{\max}]\) that the grid covers. Set the range too wide and every step is coarse, so small but important values round to the same integer. Set it too narrow and large values saturate at the clip bound, destroying outliers that may be doing real work. This is a classic estimation tradeoff, resolution against clipping, and it is why range selection (often called <strong>calibration</strong>) is the part of quantization that actually decides your accuracy.</p>
+<p>Weights are easy: you know them at export time, so you just read off their min and max (per channel, see below). Activations are the hard part, because their range depends on the input data and you only learn it by running representative samples through the network. Two families of decision matter:</p>
+<ul>
+<li><strong>Granularity.</strong> <em>Per-tensor</em> quantization uses one \((s, z)\) for a whole weight tensor; <em>per-channel</em> gives each output channel its own scale. Per-channel costs a vector of scales instead of a scalar and almost always recovers most of the int8 accuracy gap on convolutional and depthwise layers, whose channels have wildly different magnitudes. Use per-channel for weights by default.</li>
+<li><strong>Calibration statistic.</strong> Plain min/max is fragile to a single outlier activation. Better estimators clip the range to minimize information loss: a histogram-based search that minimizes the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Kullback-Leibler divergence</a> between the float and quantized distributions, or a percentile cutoff (say the 99.99th) that deliberately saturates the rarest extremes to sharpen the grid for the bulk of values.</li>
+</ul>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a vibration classifier on a factory motor</h3>
+<p>An industrial team deploys a small 1D-convolutional network on an Arm Cortex-M55 mote bolted to a pump, classifying accelerometer vibration into healthy, imbalance, and bearing-fault states (the prognostics setting of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>). The fp32 model is 620 kB and will not fit the 512 kB of on-chip SRAM, so off-chip fetches dominate the energy budget. Post-training int8 quantization with per-channel weights takes the model to 165 kB, fits it entirely on-chip, and the macro-F1 on a held-out set of <em>different pumps</em> drops from 0.94 to 0.938, inside the noise. The one trap they hit: their first calibration set was 30 seconds of a healthy pump, so the activation ranges never saw fault transients and int8 saturated on exactly the events that mattered. Recalibrating on a class-balanced window fixed it. Calibration data must look like deployment data, the same leakage discipline the book has insisted on since <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<h2>PTQ and QAT: two ways to pay for the accuracy</h2>
+<p>There are two routes to a quantized model. <strong>Post-training quantization (PTQ)</strong> takes a finished float model, runs a few hundred unlabeled calibration batches to fix activation ranges, and emits integers. It needs no gradients, no labels, and minutes of compute, and for int8 it usually just works. When it does not, or when you push to int4 and below, <strong>quantization-aware training (QAT)</strong> inserts "fake quantization" nodes into the graph during a short fine-tune: the forward pass rounds exactly as the deployed integer kernel will, so the loss sees the rounding error, while the backward pass uses a straight-through estimator to pass gradients through the non-differentiable rounding step. QAT teaches the weights to be robust to their own quantization and routinely recovers the last point or two of accuracy that PTQ leaves on the table, at the cost of a training loop and labels.</p>
+
+<p>The decision rule is simple. Reach for PTQ first; it is nearly free. Escalate to QAT only when PTQ's held-out metric misses your target, which happens most often at int4, on tiny models with little redundancy to spare, or on tasks where a few misclassified samples are expensive. The listing below shows the PTQ path in modern PyTorch, where the whole calibrate-then-convert flow is a handful of lines.</p>
+
+<pre class="language-python"><code class="language-python">import torch
+from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
+from torch.ao.quantization import get_default_qconfig_mapping
+
+model.eval()
+qmap = get_default_qconfig_mapping("x86")          # per-channel int8 weights
+example = torch.randn(1, 3, 128)                    # one sensor window, shape (B, C, T)
+prepared = prepare_fx(model, qmap, example)         # insert observers
+
+with torch.no_grad():                               # calibration: NO labels needed
+    for window in calib_loader:                     # ~200 representative windows
+        prepared(window)                            # observers record activation ranges
+
+int8_model = convert_fx(prepared)                   # fold ranges -> real int8 kernels
+torch.save(int8_model.state_dict(), "model_int8.pt")</code></pre>
+<div class="code-caption"><strong>Listing 59.4.1.</strong> Post-training int8 quantization in PyTorch FX. <code>prepare_fx</code> inserts observers, the label-free calibration loop lets them record activation ranges from representative sensor windows, and <code>convert_fx</code> folds those ranges into genuine int8 kernels. The calibration loader must be drawn from deployment-like data, not the training set alone.</div>
+
+<p>As Listing 59.4.1 shows, the entire post-training path is observe, calibrate, convert. Note what is absent: no labels, no loss, no optimizer. That is the whole appeal of PTQ, and why it is always the first thing to try.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Writing the affine quant/dequant, per-channel scale bookkeeping, observer statistics, KL-histogram calibration, and integer-kernel lowering by hand is several hundred lines of numerically delicate code, and getting the zero-point and rescale exactly bit-matched to the target kernel is where hand-rolled implementations silently diverge from the deployed result. The PTQ flow above is roughly eight lines. LiteRT (formerly TensorFlow Lite) is comparably terse: <code>converter.optimizations = [tf.lite.Optimize.DEFAULT]</code> plus a representative-dataset generator does full int8 in one screenful. The library owns the arithmetic that must match silicon bit-for-bit; you own the calibration data and the accuracy check.</p>
+</div>
+
+<h2>Int4 and hardware-native 2/4-bit: when four bits is the datapath, not a trick</h2>
+<p>Int8 is now the boring default. The frontier that matters for sensor edge AI is sub-byte. <strong>Int4</strong> halves the model again versus int8, which is decisive when weights, not activations, dominate the footprint (the usual case once you are on-chip). Naive int4 PTQ often loses too much, so two ideas carry it: <em>weight-only</em> quantization (keep activations at int8 or fp16, quantize only the bulky weights, so the sensitive activation path stays precise), and <em>group-wise</em> scales (a separate scale every 32 or 64 weights along a row, which tames the outlier weights that otherwise force a coarse grid). Weight-only int4 with group size 128, popularized by GPTQ and AWQ for language models, transfers directly to the larger sensor and wearable foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+<p>The crucial word is <strong>hardware-native</strong>. A format only buys speed if the silicon has a datapath for it; otherwise the runtime unpacks your 4-bit weights back to int8 or fp16 before every multiply and you save memory but not a single cycle of compute. Recent NPUs and DSPs changed this: many Arm Ethos-U and vendor accelerators expose true 4-bit weight datapaths, and some neuromorphic and TinyML parts go to 2-bit or ternary. When 2/4-bit is native, sub-byte weights cut both bandwidth <em>and</em> multiply energy; when it is emulated, they cut only bandwidth. Always confirm which case you are in against the accelerator's datasheet before promising a latency number, because the two outcomes differ by more than 2x.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current state of the art pushes below int8 with structure rather than brute rounding. GPTQ (Frantar et al., 2023) and AWQ (Lin et al., MLSys 2024) do accurate int4 and int3 weight-only PTQ by accounting for which weights are activation-salient. BitNet b1.58 (Ma et al., 2024) trains transformers whose weights are ternary \(\{-1, 0, +1\}\), roughly 1.58 bits, replacing multiplies with additions and matching fp16 quality at billion-parameter scale, a direct fit for the always-on, energy-starved regime of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>. Hardware is following: 4-bit weight datapaths are now common on commercial edge NPUs, and 2-bit and ternary support is emerging on neuromorphic parts covered in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>. The open problem for sensor AI is calibration and QAT that stay robust under the distribution shift real deployments see, the concern of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+</div>
+
+<div class="callout warning">
+<h3 class="callout-title">Common Pitfall</h3>
+<p>Reporting a compression ratio and calling it a day. Two numbers routinely embarrass teams. First, a "4-bit" model that the runtime silently upcasts to fp16 for compute is 4x smaller and exactly as slow, because the format is not native to the datapath. Second, an accuracy number measured on the calibration data itself, which leaks and looks wonderful, then collapses in the field. Always quote the task metric on a held-out, deployment-like set, and quote latency measured on the actual target, not a proxy.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take any small sensor classifier you have trained (the HAR model from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> is ideal). (1) Apply int8 PTQ with per-tensor weights and record model size and held-out macro-F1. (2) Switch to per-channel weights and re-measure; explain the gap. (3) Sabotage the calibration set by drawing it from a single class and show how the F1 degrades, then relate the failure to specific saturated activation ranges. (4) If you have int4 tooling, quantize weight-only int4 with group size 64 and report where the accuracy lands relative to int8.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. In the affine map \(q = \operatorname{round}(r/s) + z\), what physical role does the zero-point \(z\) play, and why does symmetric quantization set it to zero for weights?</p>
+<p class="quiz-question">2. You quantize to int4 and the model file shrinks 8x but latency is unchanged. What single fact about the target hardware most likely explains this, and how would you confirm it?</p>
+<p class="quiz-question">3. Why does per-channel weight quantization recover more accuracy on a depthwise-separable convolution than per-tensor, in terms of the resolution-versus-clipping tradeoff?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-59.5.html">Section 59.5</a>, we attack the model from the other direction: instead of shrinking every weight's precision, we remove whole weights and channels through pruning and structured sparsity, and see how sparsity and quantization compose into a single edge-optimization budget.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

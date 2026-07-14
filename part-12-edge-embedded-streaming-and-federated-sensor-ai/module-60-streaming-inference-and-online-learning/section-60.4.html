@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.4: Online learning (River) and incremental models. Building Sensory AI." name="description"/>
+<title>Section 60.4: Online learning (River) and incremental models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Online learning (River) and incremental models</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You keep asking me to retrain on the whole history. I have already forgotten most of it, and I am a better model for it. I learned from each sample as it passed, and I kept only what a single number of memory could hold."</p>
+        <cite>A Forgetful AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you are comfortable with gradient descent on a linear model and with the ordinary batch train/test split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), and that you have built at least one feature vector from a sensor window (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>). The streaming feature extractor whose output feeds these models is the subject of the previous section, <a class="cross-ref" href="section-60.3.html">Section 60.3</a>; the mechanism that tells an online model <em>when</em> its world has changed is <a class="cross-ref" href="section-60.5.html">Section 60.5</a>. No new probability is introduced; the only new object is a model whose <code>fit</code> runs one sample at a time.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Batch learning assumes a dataset: a finite table you can shuffle, split, and pass over many times. A sensor stream honours none of those assumptions. It is unbounded, it arrives in time order you cannot shuffle, its statistics drift under your feet, and on an edge device you cannot store more than a sliver of it. <em>Incremental</em> or <em>online</em> learning is the class of algorithms built for exactly this: they update their parameters from one observation at a time, in constant memory and near-constant time per sample, and never require the full history to be resident. This section teaches the contract that makes them work, the three algorithm families that actually deliver it (stochastic linear models, Hoeffding trees, and windowed neighbours), and the River library that packages them. When you finish you will be able to turn a never-ending sensor feed into a model that improves with every reading and fits in a kilobyte of state.</p>
+    </div>
+
+    <h2>The learn-one, predict-one contract</h2>
+    <p>An incremental model exposes two operations instead of one. A batch estimator offers <code>fit(X, y)</code>, which consumes an entire matrix. An online estimator offers <code>predict_one(x)</code>, which scores a single feature dictionary, and <code>learn_one(x, y)</code>, which folds that single labelled example into the parameters and then discards it. The <em>what</em> is a stateful object \(\theta_t\) that evolves as the stream flows: after seeing example \(t\) it becomes \(\theta_{t+1}\), and example \(t\) is gone. The defining constraint is that per-sample cost, in both time and memory, must not grow with \(t\). A model that stores every sample it has seen is not online; it is a batch model in disguise that will exhaust its device by nightfall.</p>
+    <p>Why insist on this? Three reasons stack up for sensor work. First, <strong>the data never ends</strong>, so any algorithm whose footprint scales with the number of samples is disqualified before it starts. Second, <strong>the target moves</strong>: a gait classifier on a recovering patient, a bearing model on an ageing pump, a gesture recogniser adapting to a new user. An online model that weights recent evidence tracks that motion; a frozen batch model decays. Third, <strong>the label often arrives late and locally</strong>: the device learns the ground truth (the user corrected the gesture, the machine actually failed) after the prediction, on the device, where retraining a cloud model is impossible. The <code>predict_one</code> then <code>learn_one</code> ordering is not incidental. It is the natural shape of a stream, and it is also the honest evaluation order we will formalise as prequential testing in <a class="cross-ref" href="section-60.6.html">Section 60.6</a>.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The switch from batch to online is a switch from <em>owning a dataset</em> to <em>owning a summary</em>. A batch model is a function of a table; an online model is a fixed-size sufficient statistic that the stream keeps rewriting. Everything that makes online learning hard, and everything that makes it cheap, follows from that single substitution: you never see the data twice, so the model must extract what it needs on first contact and then let go. Memory is constant because the summary is constant. Adaptation is free because the summary can be told to forget.</p>
+    </div>
+
+    <h2>Three families that actually deliver constant-memory learning</h2>
+    <p>Not every algorithm survives the one-sample-at-a-time constraint, but three families do, and between them they cover most sensor tasks.</p>
+    <p>The first is the <strong>stochastic linear model</strong>. Logistic or linear regression trained by stochastic gradient descent is online by construction: each example produces one gradient step \(\theta \leftarrow \theta - \eta_t \nabla \ell(\theta; x_t, y_t)\), and the parameter vector is the entire state. It is the workhorse: a few floats per feature, microseconds per update, and a learning rate \(\eta_t\) that doubles as a forgetting knob. Hold \(\eta_t\) constant rather than annealing it to zero and the model perpetually re-weights toward recent data, which is exactly what a drifting stream wants. The <em>how</em> is the same calculus you already know; the only change is that you take one step per arriving sample instead of one epoch over a matrix.</p>
+    <p>The second is the <strong>Hoeffding tree</strong>, also called the Very Fast Decision Tree. A batch decision tree needs the whole dataset in memory to choose each split. The Hoeffding tree instead accumulates class statistics at each leaf and uses the Hoeffding bound to decide when it has seen <em>enough</em> samples to split with confidence \(1-\delta\). The bound says the observed mean of a bounded variable is within</p>
+    \[ \epsilon = \sqrt{\frac{R^2 \ln(1/\delta)}{2 n}} \]
+    <p>of its true mean after \(n\) observations, where \(R\) is the variable's range. When the gap between the best and second-best split criterion exceeds \(\epsilon\), the leaf splits and its raw statistics are released. This gives a tree that grows incrementally, keeps only per-leaf counters, and provably approaches the tree a batch learner would have built, all in bounded memory. It is the natural choice when sensor features interact non-linearly, as raw IMU statistics for activity recognition do (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>).</p>
+    <p>The third is the <strong>windowed neighbour or metric method</strong>: a k-nearest-neighbours model backed by a sliding buffer of the last \(w\) examples. It is not memoryless, but it is bounded, because the window caps its size. It shines for fast, local, non-parametric adaptation when the decision boundary is complex but the recent past is a good guide to the near future. The window length \(w\) is the stability knob: short forgets fast, long is steadier.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a wrist wearable that adapts to its wearer</h4>
+        <p>Ship a gesture-controlled smartwatch with one factory model and every user complains it misreads their flick-to-dismiss, because everyone's wrist snap is idiosyncratic. Retraining in the cloud means uploading motion data, which the privacy budget (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>) forbids. Instead the watch runs an incremental logistic model over windowed accelerometer features. Each time the user corrects a misfire (dismisses manually right after a wrong prediction), that becomes a labelled <code>learn_one</code> call on-device. Within a day the model has personalised, its state is a few hundred floats, and no raw motion ever left the wrist. This is on-device adaptation in miniature, and it is the doorway to the continual-learning machinery of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a>.</p>
+    </div>
+
+    <h2>River in practice</h2>
+    <p>River is the de facto Python library for this regime, formed from the merger of Creme and scikit-multiflow. Its whole design is the <code>learn_one</code> / <code>predict_one</code> contract: models consume plain dictionaries, compose into pipelines with the <code>|</code> operator, and carry their own streaming metrics. The snippet below builds a complete streaming classifier, standardising features online (the mechanism from <a class="cross-ref" href="section-60.3.html">Section 60.3</a>) and feeding a Hoeffding tree, then evaluates it in the only honest way a stream allows: predict first, score, then learn.</p>
+
+    <pre class="language-python"><code class="language-python">from river import tree, preprocessing, metrics, datasets
+
+model  = preprocessing.StandardScaler() | tree.HoeffdingTreeClassifier(grace_period=50)
+metric = metrics.Accuracy()
+
+for x, y in datasets.Phishing():          # a stream of (dict, label) pairs
+    y_pred = model.predict_one(x)         # score BEFORE the model sees the label
+    if y_pred is not None:
+        metric.update(y, y_pred)          # prequential: test on the not-yet-learned sample
+    model.learn_one(x, y)                 # now fold it in, then discard it
+
+print(metric)                             # e.g. Accuracy: 88.5%</code></pre>
+    <div class="code-caption"><strong>Listing 60.4.1.</strong> A full online learning loop in River: an incrementally-fitted scaler piped into a Hoeffding tree, evaluated prequentially. Memory stays flat no matter how long the stream runs because <code>learn_one</code> updates fixed-size state and never retains the sample. The <code>Phishing</code> stream stands in for any <code>(features, label)</code> sensor feed.</div>
+
+    <p>As Listing 60.4.1 shows, the entire streaming discipline is three lines inside the loop: predict, score, learn, in that order. Swap <code>HoeffdingTreeClassifier</code> for <code>linear_model.LogisticRegression</code> or <code>neighbors.KNNClassifier</code> and the loop is unchanged; the contract is the interface. Standardising inside the pipeline matters because an online scaler updates its running mean and variance from the same stream, so there is no separate fit phase to leak future statistics into the past.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Written from scratch, an incremental standardiser (Welford running mean and variance), a Hoeffding tree with per-leaf sufficient statistics and the bound test, and a prequential accuracy tracker are on the order of 300 to 500 lines of careful, easy-to-get-wrong numerics. River collapses that to the two constructor calls and three-line loop of Listing 60.4.1, roughly a 50-to-1 reduction, and it handles the fiddly parts you would otherwise botch: numerically stable running moments, leaf memory limits, tie-breaking in the split test, and metric bookkeeping. What it does not hand you is the judgement of which model and which forgetting rate suit your stream; that stays yours.</p>
+    </div>
+
+    <h2>What it costs and what it guarantees</h2>
+    <p>Incremental learning is not free lunch, it is a different lunch. You give up multiple passes, so you cannot shuffle away the order of the data, and a badly-ordered stream (all of class A, then all of class B) can whipsaw a naive model; this is why streams are usually interleaved or the model is given a forgetting mechanism rather than assumed stationary. You give up the global view, so an online model can be transiently worse than a batch model that saw everything at once. In return you get three guarantees that matter more on a sensor than accuracy-in-the-lab: <strong>bounded memory</strong> (state size independent of stream length), <strong>bounded per-sample latency</strong> (the update is \(O(1)\) or \(O(\log)\) in the model size, never in \(t\)), and <strong>adaptivity</strong> (recent data can be made to dominate). The central tension you tune is the <em>stability&ndash;plasticity</em> trade-off: a high learning rate or short window is plastic and tracks change but forgets useful history and jitters on noise; a low rate or long window is stable but sluggish when the world moves. There is no universal setting, only a setting matched to how fast your particular sensor's world drifts, which is precisely what the drift detectors of the next section measure.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Classical online learners are linear or tree-based; the open frontier is incremental <em>deep</em> learning on streams without catastrophic forgetting. Methods such as Adaptive Random Forests (Gomes et al., 2017) already ensemble Hoeffding trees with per-tree drift detectors for state-of-the-art streaming accuracy, and River ships them. Beyond that, streaming variants of gradient-boosted trees and continual-learning neural networks with replay or regularisation (the subject of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a>) are pushing incremental representation learning onto edge hardware (<a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>). The recurring hard question is stability under adversarial or seasonal drift: a model plastic enough to personalise fast is also plastic enough to be poisoned or to overreact to a daily cycle, and separating true concept change from transient noise is still unsolved in general.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the loop in Listing 60.4.1 and replace the model with <code>linear_model.LogisticRegression</code> using a constant learning rate. Construct a synthetic two-feature stream that is stationary for the first 5000 samples and then flips its labels' relationship to one feature (a hard concept change). Run three learning rates (small, medium, large) and, for each, plot the running prequential accuracy across the change point. Which rate recovers fastest after the flip, which is steadiest before it, and why can no single rate win both? Relate your answer to the stability&ndash;plasticity trade-off.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. State the two operations an incremental model exposes and the one cost constraint that separates a genuine online learner from a batch model in disguise.</p>
+        <p class="quiz-question">2. What does the Hoeffding bound let a streaming decision tree decide, and why does that keep the tree's memory bounded?</p>
+        <p class="quiz-question">3. Why must the loop call <code>predict_one</code> before <code>learn_one</code> for the same sample, and what would be wrong with reversing the order when reporting accuracy?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-60.5.html">Section 60.5</a>, we answer the question this section kept deferring: how does an online model <em>know</em> the world has changed, rather than just quietly tracking it and hoping? We build explicit concept-drift detectors, ADWIN and DDM, that watch a stream's error signal, raise an alarm when the distribution has genuinely shifted, and trigger a deliberate adaptation instead of relying on the learning rate alone.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

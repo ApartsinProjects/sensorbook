@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.3: Quantized networks and TinyNAS/MCUNet. Building Sensory AI." name="description"/>
+<title>Section 61.3: Quantized networks and TinyNAS/MCUNet | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Quantized networks and TinyNAS/MCUNet</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You gave me 256 kilobytes and asked me to see. So I stopped memorizing the whole picture at once and started reading it one tile at a time."</p>
+<cite>A Resourceful AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the microcontroller budget of <a class="cross-ref" href="section-61.1.html">Section 61.1</a> (kilobytes of SRAM, hundreds of kilobytes of flash, no operating system) and on the mechanics of integer quantization, per-channel scales, PTQ, and QAT covered in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. It assumes you can read a convolutional network's layer shapes and know what an inverted-residual block is. The only new mathematics is bookkeeping of activation-tensor sizes.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>On a phone or an edge NPU, quantization is about speed and battery. On a microcontroller with 256&nbsp;kB of SRAM, quantization is the difference between the model running at all and not fitting in memory. But shrinking every weight to int8 is only half the job, and on an MCU it is the easy half. The binding constraint is rarely the size of the weights; it is the <em>peak read-and-write memory</em> that the intermediate activations demand at the single busiest layer. A model whose int8 weights fit comfortably in flash can still be impossible to run because one early layer needs more scratch SRAM than the chip has. This section is about the two moves that solve that: designing the network so the memory budget is a first-class search constraint (TinyNAS), and restructuring inference so the peak never blows up in the first place (MCUNet and patch-based execution).</p>
+</div>
+
+<h2>The microcontroller twist: peak SRAM, not model size, is the wall</h2>
+<p>Chapter 59 taught quantization as four-fold-to-eight-fold compression that also speeds up compute. All of that still holds here, and int8 is the non-negotiable default on a microcontroller: Cortex-M4 and M7 cores have no floating-point throughput to spare, the DSP extensions (Arm Helium, CMSIS-NN) accelerate int8 multiply-accumulate, and eight-bit weights are what fits in flash. What changes on an MCU is <em>which</em> resource runs out first.</p>
+<p>A microcontroller has two separate memories with wildly different sizes. <strong>Flash</strong> (typically 512&nbsp;kB to 2&nbsp;MB) is read-only at runtime and holds the program plus the model weights. <strong>SRAM</strong> (often only 128&nbsp;kB to 512&nbsp;kB) is the read-write working memory that must hold the activation tensors while the network computes. Quantizing weights to int8 shrinks the flash footprint. It barely touches the number that actually decides whether the model runs: the <strong>peak activation memory</strong>, the largest amount of SRAM that must be live at any single instant during a forward pass. For an in-place-friendly kernel that reads an input tensor and writes an output tensor, the memory live at a layer is roughly</p>
+\[ M_\ell \;=\; \operatorname{size}(\text{input}_\ell) + \operatorname{size}(\text{output}_\ell), \qquad M_{\text{peak}} = \max_\ell M_\ell . \]
+<p>The trap is that this peak is dominated by the <em>earliest</em> layers. A vision-scale sensor input is spatially large and only slowly downsampled, so a stem that turns a 96&times;96&times;3 image into a 48&times;48&times;16 feature map is holding tens of kilobytes when the later layers, deep and narrow, need a fraction of that. The listing below computes this per-layer peak for a MobileNet-style stem and makes the imbalance visible.</p>
+
+<pre class="language-python"><code class="language-python">def act_kb(c, h, w, bytes_per=1):            # int8 activation => 1 byte / element
+    return c * h * w * bytes_per / 1024
+
+# (name, out_channels, out_H, out_W) after each downsampling block
+layers = [("conv_stem", 16, 48, 48), ("block1", 24, 48, 48),
+          ("block2", 32, 24, 24), ("block3", 64, 12, 12), ("head", 160, 6, 6)]
+
+prev = act_kb(3, 96, 96)                     # 96x96 RGB input tensor
+peak = 0.0
+for name, c, h, w in layers:
+    cur  = act_kb(c, h, w)
+    live = prev + cur                        # input kept while output is written
+    peak = max(peak, live)
+    print(f"{name:10s} live={live:6.1f} KB")
+    prev = cur
+print(f"peak activation SRAM = {peak:.1f} KB")</code></pre>
+<div class="code-caption"><strong>Listing 61.3.1.</strong> Peak activation SRAM for an int8 convolutional stem. The output confirms that the stem and first block, not the deep head, set the peak: those early large-spatial feature maps are what a 256&nbsp;kB MCU cannot hold. Weight size never enters this calculation.</div>
+
+<p>Run Listing 61.3.1 and the peak lands on the stem, near 64&nbsp;kB for a single early transition, even though every weight is already int8. That is the whole problem in one number: you can quantize until the weights are tiny and still be defeated by one spatial feature map. Two strategies attack it from different angles.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>On a microcontroller there are two budgets, not one, and they are set by different things. Flash is set by the <em>parameter count</em> after quantization; SRAM is set by the <em>peak activation</em>, which depends on the network's spatial schedule, not its weight count. A model can be flash-cheap and SRAM-impossible at the same time. Any TinyML design loop that optimizes only model size is measuring the wrong wall. Report both numbers, and report the SRAM peak against the specific chip's SRAM, on a held-out, <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">leakage-safe</a> evaluation, or the deployment will surprise you.</p>
+</div>
+
+<h2>TinyNAS: make the memory budget a search constraint, not an afterthought</h2>
+<p>The first strategy is to stop hand-designing a network and hoping it fits, and instead <em>search</em> for one that fits by construction. Neural architecture search (NAS) automates the choice of depth, width, kernel sizes, and expansion ratios. Naive NAS optimizes accuracy over a fixed, human-chosen search space and then checks the winner against the hardware afterward, which for a 256&nbsp;kB target almost always fails: the whole search space was implicitly designed for millions of parameters. <strong>TinyNAS</strong>, the search half of MCUNet (Lin et al., NeurIPS 2020), inverts that. It performs a two-stage, memory-first search.</p>
+<p>First, it <strong>optimizes the search space itself</strong> to the exact resource budget. Given the target's SRAM and flash, TinyNAS sweeps input resolutions and width multipliers and keeps only the configurations whose peak memory and model size fit, then picks the search space whose models place the most FLOPs inside that budget, on the principle that, at a fixed memory cost, a design space that can afford more computation contains more accurate models. Second, it runs a <strong>once-for-all</strong> style super-network search (following OFA, Cai et al., ICLR 2020) inside that pre-filtered space, training one weight-sharing super-net from which any specialized sub-network can be extracted without retraining. Because the space was memory-filtered up front, <em>every</em> candidate the accuracy search considers already fits the chip. Memory is a hard constraint satisfied by construction, not a penalty term you hope the optimizer respects.</p>
+<p>This co-design matters because the sensor and the silicon set the resolution jointly. A person detector on a QVGA image and a keyword spotter on a 40-band log-mel spectrogram (the feature front ends of <a class="cross-ref" href="section-61.2.html">Section 61.2</a>) have utterly different spatial schedules, so their memory-optimal architectures differ. TinyNAS finds each rather than forcing both through one hand-tuned backbone.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Building a memory-aware NAS from scratch, a super-net trainer, an evolutionary or gradient search, per-candidate peak-memory and latency estimators, and int8 export, is thousands of lines and weeks of tuning. The MCUNet release ships pretrained, memory-specialized backbones you fetch by target: <code>net, resolution, description = build_model(net_id="mcunet-in3", pretrained=True)</code> returns a model already searched to fit a named SRAM/flash budget. Cloud services such as Edge Impulse's EON Tuner wrap the same idea behind a single "find a model for this device" action. You supply the sensor dataset and the chip; the tool owns the search that would otherwise be a research project.</p>
+</div>
+
+<h2>MCUNet and patch-based inference: kill the peak, do not just fit under it</h2>
+<p>TinyNAS finds the most accurate model under a memory ceiling, but the ceiling is still there, and it is set by that first-layer imbalance from Listing 61.3.1. <strong>MCUNetV2</strong> (Lin et al., NeurIPS 2021) attacks the imbalance directly with <strong>patch-based inference</strong>. Instead of computing a full large feature map for the early, memory-heavy stage, it runs those layers over one small spatial <em>patch</em> at a time, keeping only that patch's activations live, and stitches the results before the network reaches its narrower, memory-cheap deep layers. Because early convolutions are local, a patch plus a thin halo of context is enough to compute its output region correctly. The peak activation of the whole network then collapses to the peak of a single patch, often a four-fold to eight-fold reduction, which is exactly the factor that turns an impossible model into a running one.</p>
+<p>Patch-based inference costs some redundant computation in the overlapping halos, so MCUNetV2 pairs it with <strong>receptive-field redistribution</strong>: it shifts receptive field toward the later stages so the patched early stage stays shallow and the recomputation overhead stays small. The combination is what let MCUNet family models run ImageNet-scale classification and Visual Wake Words person detection on microcontrollers with a few hundred kilobytes of SRAM, a regime that was considered out of reach before. The same trick generalizes past vision to any network whose front end is spatially or temporally wide, including long-window inertial and audio models.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: an always-on person detector on a doorbell camera</h3>
+<p>A consumer-hardware team wants a battery doorbell to wake its main processor only when a person is actually present, so the always-on stage must run a person/no-person detector on a Cortex-M7 with 320&nbsp;kB of SRAM, sipping microamps (the wake-up cascade idea of <a class="cross-ref" href="section-61.5.html">Section 61.5</a>). Their first attempt, a hand-shrunk MobileNetV2 quantized to int8, fits flash easily at 480&nbsp;kB but its stem needs 210&nbsp;kB of peak activation, leaving almost no SRAM for the camera buffer and the RTOS; it thrashes and misses frames. Switching to an MCUNet backbone searched for their exact SRAM budget, and enabling patch-based inference for the first three blocks, drops peak activation to 68&nbsp;kB while holding Visual-Wake-Words accuracy within half a point on a held-out set of <em>unseen porches</em>. The camera buffer now coexists with the model, and the always-on current draw falls enough to hit the year-long battery target. The lesson: the fix was not a smaller model, it was a smaller peak.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>MCUNet (Lin et al., NeurIPS 2020) and MCUNetV2 (Lin et al., NeurIPS 2021) established memory-first TinyNAS plus patch-based inference as the reference recipe, co-designed with the TinyEngine runtime. Parallel lines push the frontier: MicroNets (Banbury et al., MLSys 2021) shows that on MCUs latency is nearly proportional to operation count, so differentiable NAS can target latency directly; &micro;NAS (Liberis et al., 2021) searches explicitly under joint SRAM, flash, and latency constraints for tiny classifiers. The open problems for sensor AI are searching jointly over the feature front end and the network (spectrogram parameters are architecture too), extending memory-aware search to attention and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">state-space</a> backbones for long sensor windows, and keeping searched models robust under the field distribution shift of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Sub-byte weights from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">neuromorphic-adjacent</a> formats are beginning to enter the TinyNAS search space as well.</p>
+</div>
+
+<div class="callout warning">
+<h3 class="callout-title">Common Pitfall</h3>
+<p>Trusting a NAS result that was searched with the wrong cost model. If the search estimates "memory" as parameter count, it will happily return a wide, shallow network that is flash-tiny and SRAM-impossible, the exact failure Listing 61.3.1 predicts. Equally, a model searched against generic FLOPs can lose to a higher-FLOP model that the specific int8 kernels run faster. Always search against the metric the target actually pays: measured peak SRAM and measured latency on the real chip and runtime, not proxies. And validate the searched architecture's accuracy with the same leakage discipline as any other model, splitting by device or subject, not by random window (the rule since <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend Listing 61.3.1 into a small memory-aware model chooser. (1) Add a function that, given an input resolution and a width multiplier, returns both peak activation SRAM and total int8 parameter bytes for the MobileNet-style stem. (2) Sweep resolution over {64, 96, 128} and width over {0.5, 0.75, 1.0} and mark which configurations fit a 256&nbsp;kB SRAM / 1&nbsp;MB flash budget. (3) For one configuration that does not fit, simulate patch-based inference by splitting the stem's first two blocks into 2&times;2 patches with a one-pixel halo, recompute the peak, and report the reduction factor. (4) Relate your fitted set to the two-stage TinyNAS idea: which sweep is the search-space filter, and which is the architecture search?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. A model's int8 weights total 300&nbsp;kB and fit the chip's 1&nbsp;MB flash, yet it will not run on a 256&nbsp;kB-SRAM MCU. In one sentence, what number explains this and where in the network does it come from?</p>
+<p class="quiz-question">2. TinyNAS is described as two stages. What does the first stage optimize, and why does doing it first make the memory constraint automatic for the second stage?</p>
+<p class="quiz-question">3. Patch-based inference reduces peak activation memory but adds some compute. Which part of the network does it apply to, and what property of early convolutions makes patching correct?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-61.4.html">Section 61.4</a>, we move from what to run to what runs it: the microcontroller inference runtimes, LiteRT (TensorFlow Lite Micro), microTVM, and ExecuTorch, that turn a quantized, memory-searched graph into a static, malloc-free binary. We will see how MCUNet's companion TinyEngine plans that peak-activation memory ahead of time, and why the runtime, not just the model, decides your final kilobytes and microseconds.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

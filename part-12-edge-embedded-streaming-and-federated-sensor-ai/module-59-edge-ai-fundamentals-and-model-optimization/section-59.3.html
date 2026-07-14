@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.3: Memory, power, and thermal limits. Building Sensory AI." name="description"/>
+<title>Section 59.3: Memory, power, and thermal limits | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Memory, power, and thermal limits</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The cloud told me I had infinite memory. The microcontroller introduced me to 256 kilobytes and a heat sink the size of a stamp."</p>
+        <cite>A Suddenly Humbled AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The big picture</h3>
+        <p>The previous section catalogued the silicon you might run on, from a beefy NPU down to a bare microcontroller. This section explains the three walls every one of them hits: there is only so much memory to hold the model and its intermediate activations, only so many joules in the battery, and only so much heat the package can shed before the clock is forced to slow down. These three limits are not separate nuisances to be handled later; they are a single coupled budget that decides whether your model runs at all, how long it runs, and how fast it runs while it does. Master the arithmetic here and you can predict, before writing a line of inference code, whether a design is feasible. Skip it and you discover infeasibility in the field, after the hardware is soldered down.</p>
+    </div>
+
+    <p>An edge model that is accurate on your laptop and impossible on the target is the most common failure in embedded sensing. This section gives you the three back-of-envelope calculations that catch that failure early: a memory budget, an energy budget, and a thermal budget. You need only comfort with unit arithmetic and the hardware vocabulary from <a class="cross-ref" href="section-59.2.html">Section 59.2</a>. Where the physics of power draw and heat originate, the same energy accounting that governs any sensor front end, connects back to <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>.</p>
+
+    <h2>Memory: the wall you hit first</h2>
+
+    <p><strong>What it is.</strong> An edge device exposes a memory hierarchy, and every level is small. Non-volatile flash or ROM holds the program and the model weights; it is the largest tier but slow and read-mostly. Volatile RAM, on a microcontroller a few tens to a few hundred kilobytes of on-die SRAM, on a phone-class system a shared pool of DRAM, holds everything that changes at runtime. The quantity that actually decides feasibility is not the weight count alone but two separate footprints: the <em>static</em> footprint (weights, which live in flash) and the <em>peak dynamic</em> footprint (the largest set of activation tensors that must coexist in RAM at any single moment of the forward pass).</p>
+
+    <p><strong>Why it bites first.</strong> Practitioners quote model size in megabytes of weights and stop there, but a network can have modest weights and a brutal activation peak. A convolutional first layer over a high-resolution feature map can hold more numbers alive at once than the entire weight tensor. On a microcontroller with 256 KB of SRAM, that peak, not the flash size, is what refuses to fit. The peak is set by the layer whose input plus output plus any tensors that must survive across it is largest, formally</p>
+
+    $$ M_{\text{peak}} = \max_{\ell}\ \Big( \sum_{t \in \text{live}(\ell)} \text{bytes}(t) \Big), $$
+
+    <p>where \(\text{live}(\ell)\) is the set of tensors simultaneously resident while layer \(\ell\) executes. A good runtime shrinks this by reusing buffers and by choosing an execution order that frees tensors early; a naive one keeps everything alive and overflows.</p>
+
+    <p><strong>How to reason about it.</strong> Memory couples to speed through <em>arithmetic intensity</em>, the ratio of compute to bytes moved, \(I = \text{MACs} / \text{bytes}\). The roofline model says achievable throughput is \(\min(P_{\text{peak}},\ I \cdot B)\), where \(P_{\text{peak}}\) is the processor's peak rate and \(B\) is memory bandwidth. Most sensor models, especially the depthwise-separable and pointwise layers that dominate efficient architectures, are memory bound: they starve for bandwidth long before they saturate the multipliers. That is why a model with fewer multiply-accumulates can run slower than one with more, and why moving weights and activations, not multiplying them, is where the time and the joules actually go.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key insight</h3>
+        <p>Data movement, not arithmetic, is the dominant cost at the edge. Reading a 32-bit word from off-chip DRAM can cost on the order of a hundred times the energy of the multiply that consumes it. This single fact explains the entire optimization agenda of this chapter: quantization (<a class="cross-ref" href="section-59.4.html">Section 59.4</a>) and pruning (<a class="cross-ref" href="section-59.5.html">Section 59.5</a>) are worth doing chiefly because they move fewer, smaller bytes, and only secondarily because they cut multiplies.</p>
+    </div>
+
+    <h2>Power and energy: joules, not watts, drain the battery</h2>
+
+    <p><strong>What it is.</strong> Power is the instantaneous rate of draw in watts; energy is power integrated over time, in joules, and the battery stores energy. The figure that matters for a duty-cycled sensor is <em>energy per inference</em>, \(E_{\text{inf}} = P_{\text{active}} \cdot t_{\text{inf}}\), plus the energy leaked while the device idles between inferences. Total power splits into a dynamic part that scales with switching activity and roughly with \(V^2 f\) (voltage squared times clock frequency), and a static leakage part that flows whenever the silicon is powered, whether or not it computes.</p>
+
+    <p><strong>Why the split matters.</strong> Because the two parts respond to opposite tactics. Dynamic power falls fast when you lower voltage and frequency, the lever called <span>dynamic voltage and frequency scaling (DVFS)</span>; since energy for a fixed workload is power times time, and the \(V^2\) term dominates, running slower and cooler can finish the same inference for less total energy up to a point. Static leakage, by contrast, is only defeated by turning things off, which is why aggressive <em>duty cycling</em>, computing in short bursts and deep-sleeping between them, beats running slowly but continuously. A wearable that samples once a minute spends almost all its life asleep, so its leakage floor, not its inference cost, sets battery life. This is the design regime that <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a> pushes to the extreme, where the device harvests its energy and may lose power mid-inference.</p>
+
+    <p><strong>How to budget it.</strong> Battery life is a division problem. Take the pack capacity in milliamp-hours, convert to joules, and divide by average power, which is the duty-cycle-weighted blend of active and sleep draw. The calculator below does exactly this and makes the duty cycle's leverage visible.</p>
+
+    <pre><code class="language-python">def battery_life_days(capacity_mAh, voltage_V,
+                      p_active_mW, p_sleep_uW,
+                      infer_ms, infers_per_hour):
+    energy_J = capacity_mAh / 1000 * voltage_V * 3600   # mAh -> joules
+    active_s_per_hr = infers_per_hour * infer_ms / 1000
+    duty = active_s_per_hr / 3600                        # fraction awake
+    avg_mW = duty * p_active_mW + (1 - duty) * (p_sleep_uW / 1000)
+    life_hours = energy_J / (avg_mW / 1000) / 3600
+    return life_hours / 24, duty
+
+# 120 mAh coin cell, 3 V; radio+CPU burst 18 mW, sleep 12 uW
+days, duty = battery_life_days(120, 3.0, 18.0, 12.0,
+                               infer_ms=40, infers_per_hour=60)
+print(f"{days:.0f} days awake {duty*100:.3f}% of the time")</code></pre>
+    <div class="code-caption">A duty-cycle battery-life estimator. Running one 40 ms inference per minute keeps the device awake roughly 0.07% of the time, so sleep leakage, not the 18 mW active burst, dominates the average draw and thus the lifetime. Raise <code>infers_per_hour</code> and watch the duty cycle, not the per-inference cost, decide when the coin cell dies.</div>
+
+    <p>Run that estimator and the lesson is stark: at one inference per minute the device is awake well under a tenth of a percent of the time, so shaving milliwatts off the active burst barely moves the lifetime, while halving sleep leakage nearly doubles it. The budget tells you where to spend engineering effort before you spend it.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In practice: an atrial-fibrillation detector on a wrist wearable</h3>
+        <p>A smartwatch running continuous <span>photoplethysmography (PPG)</span> rhythm screening, the subject of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, cannot run its neural classifier on every heartbeat; the battery would last hours. The shipped design is a cascade. A cheap always-on stage watches for signal quality and rough irregularity at microwatt cost, and only when it triggers does the expensive model wake, pulling tens of milliwatts for a few hundred milliseconds. The activation peak of that model was tuned down until it fit the watch SoC's on-chip SRAM, because spilling activations to external DRAM both blew the latency target and, through the data-movement energy of the previous insight, drained the battery measurably faster. Memory, power, and thermal limits were not three reviews; they were one joint constraint that shaped the architecture.</p>
+    </div>
+
+    <h2>Thermal: the ceiling on sustained work</h2>
+
+    <p><strong>What it is.</strong> Every watt the chip dissipates becomes heat that must leave through the package and into the air. The <span>thermal design power (TDP)</span> is the sustained dissipation the cooling solution can remove; exceed it and the junction temperature climbs. Silicon protects itself by <em>thermal throttling</em>, dropping voltage and clock to cut dynamic power once a temperature threshold is crossed. The result is a gap between <em>burst</em> throughput (what the chip does for the first few seconds, cold) and <em>sustained</em> throughput (what it settles to once hot).</p>
+
+    <p><strong>Why it matters for sensing.</strong> Benchmarks are usually run cold, so a datasheet frame rate can be a promise the device cannot keep. A fanless camera doing continuous perception, or a robot running a policy for minutes on end, lives in the sustained regime, and the sustained number can be half the burst number. A sensor pipeline that must hold a fixed rate, a lidar stack at <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">a steady stream rate</a>, has to be sized for the throttled clock, not the cold one, or it will fall behind and drop frames once the enclosure warms. Passively cooled and sealed enclosures, common in industrial and outdoor sensors, have low TDP and reach steady state fast, so their sustained ceiling is what you design to.</p>
+
+    <div class="callout warning">
+        <h4>Common Misconception</h4>
+        <p><em>"The benchmark hit 30 frames per second, so we are fine."</em> That number was almost certainly measured on a cold chip over a short burst. Under continuous load in a real enclosure the junction heats, throttling engages, and the sustained rate can settle well below the headline. Always benchmark to thermal steady state, run the workload for minutes and report the settled throughput, before committing to a frame budget.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The right tool: read the memory budget instead of deriving it</h3>
+        <p>Computing a model's parameter footprint and its per-layer activation sizes by hand, tracing every tensor shape through the graph to find \(M_{\text{peak}}\), is tedious and error prone. A profiler reads it straight off the model. What would be <span class="aha-moment">roughly fifty lines of manual shape bookkeeping collapses into three</span>:</p>
+        <pre><code class="language-python">from torchinfo import summary
+info = summary(model, input_size=(1, 3, 96, 96), verbose=0)
+print(info.total_params, info.total_output_bytes)  # weights, activation bytes</code></pre>
+        <div class="code-caption">Reading the static and dynamic footprints with <code>torchinfo</code>. The library walks the graph, tallies parameters per layer, and sums activation bytes, handing you the two numbers, weight footprint and activation footprint, that decide whether the model fits in flash and SRAM respectively. You supply only the input shape.</div>
+    </div>
+
+    <h2>The joint budget: one triangle, not three checklists</h2>
+
+    <p>The three limits pull on each other. Fitting activations in on-chip SRAM (a memory choice) avoids off-chip traffic, which cuts energy and lowers heat. Throttling the clock to stay under TDP (a thermal response) also lowers dynamic power, but stretches inference time and so can raise energy per inference if leakage dominates. Duty cycling to save energy lets the chip cool between bursts, raising the thermal headroom of each burst. You cannot optimize one axis in isolation; a design point is feasible only when all three budgets close at once.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Checkpoint</h3>
+        <p>Feasibility at the edge is a three-way conjunction: the peak activation set must fit in RAM, the energy per inference times the inference rate must fit the battery budget, and the sustained (throttled) throughput must meet the required rate. A model that passes any two and fails the third does not ship. The optimization techniques in the rest of this chapter exist to enlarge all three margins at once.</p>
+    </div>
+
+    <p>This framing is why the ordering of the coming sections is deliberate. Quantization and pruning are introduced next not as accuracy tricks but as the primary levers that shrink bytes moved, and therefore relax memory, energy, and thermal pressure together. Predictive-maintenance edge nodes, the always-on vibration monitors of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>, live at exactly this intersection: sealed enclosure, small battery or harvested power, and a fixed sampling cadence that must never slip.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are given a target with 512 KB of SRAM, a 250 mAh 3.7 V battery, and a fanless enclosure whose sustained ceiling is 60% of its burst clock. Your model has 900 K int8 parameters and a peak activation set of 640 KB, runs one inference in 25 ms cold, and must run four times per second.</p>
+        <ol>
+            <li>Does the model fit in RAM as-is? If not, name two changes that would shrink the peak activation set without touching the weights.</li>
+            <li>Estimate energy per inference and daily battery life if the active burst draws 22 mW and sleep leakage is 15 uW. Adapt the calculator above.</li>
+            <li>At 60% sustained clock the inference takes about 25 / 0.6 ms once hot. Does four inferences per second still fit the sustained timing budget?</li>
+        </ol>
+        <details>
+            <summary>Hint</summary>
+            <p>Attack the activation peak first: a smaller input resolution or a stride-2 stem cuts the largest feature map, and it is that single largest map, not the sum over all layers, that sets \(M_{\text{peak}}\). For part three, compare the throttled per-inference time against the 250 ms period that a 4 Hz rate allows.</p>
+        </details>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why can a model with a small weight file still fail to fit on a microcontroller, and which quantity actually decides?</li>
+            <li>A device runs one short inference per minute. Is its battery life set mainly by active power or by sleep leakage, and why?</li>
+            <li>What is the difference between burst and sustained throughput, and why does benchmarking cold mislead you about a fanless sensor?</li>
+        </ol>
+    </div>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The current front line is co-designing the model, the memory schedule, and the operator library together rather than sequentially. MCUNet (Lin et al., NeurIPS 2020) paired a neural-architecture search with its own inference engine, TinyEngine, precisely to drive the peak activation memory under a fixed SRAM budget, showing that the operator scheduling and the architecture must be searched jointly to fit a 320 KB device. Patch-based inference, executing a convolution over spatial patches so the full feature map never materializes, further cuts \(M_{\text{peak}}\) at the cost of recomputation, trading the memory wall against the compute wall directly. This memory-first search philosophy carries straight into <a class="cross-ref" href="section-59.6.html">Section 59.6</a> on hardware-aware architecture search and into the microcontroller focus of <a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-59.4.html">Section 59.4</a>, we cash in the central insight of this section, that moving bytes dominates cost, by shrinking the bytes themselves. Quantization replaces 32-bit floats with int8, int4, and hardware-native 2-bit and 4-bit representations, cutting weight and activation footprints, memory traffic, and energy in one stroke, and we will measure exactly what it costs in accuracy and what the hardware gives back in speed.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

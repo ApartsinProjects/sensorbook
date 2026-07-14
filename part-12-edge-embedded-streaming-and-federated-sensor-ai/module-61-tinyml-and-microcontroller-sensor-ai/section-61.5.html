@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.5: Wake-up cascades and always-on sensing. Building Sensory AI." name="description"/>
+<title>Section 61.5: Wake-up cascades and always-on sensing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Wake-up cascades and always-on sensing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I sleep for 999 milliseconds out of every second, and the whole trick is arranging to be woken only by things that matter."</p>
+<cite>A Well-Rested AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>An always-on sensor node has a cruel job: listen forever for an event that almost never happens, on a battery that must last months or years. A doorbell camera waits days for a face; a hearing aid waits hours for a spoken command; a wearable waits for a fall that may never come. Running the full classifier continuously would drain the cell in an afternoon, so nobody does. The answer is a <strong>wake-up cascade</strong>: a staircase of detectors, each cheaper and dumber than the next, where a tiny ever-awake stage decides whether it is worth waking a bigger one. The rare interesting moment climbs the staircase; the overwhelming boring majority is rejected at the bottom step for nanojoules. Getting the cascade right is what separates a product that runs for a year from one that runs for a day, and it is a design problem about energy, error rates, and latency all at once, not about any single model's accuracy. This section is about how to build and tune that staircase on a microcontroller.</p>
+</div>
+
+<p>This section builds on the streaming, bounded-memory computation of <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> and the edge power-and-latency budgeting of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. It also leans on the detection-threshold and false-positive reasoning of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>: a cascade is, at heart, a chain of decision thresholds tuned for very different operating points. We do not re-derive receiver operating characteristics here; we ask how to arrange several of them in series so the whole system is both frugal and reliable.</p>
+
+<h2>The always-on problem: duty cycle versus vigilance</h2>
+<p>The core tension is between two numbers. Vigilance demands that the system be able to react within a fraction of a second, which normally means sampling and analyzing the sensor continuously. Battery life demands that the processor sleep, because a Cortex-M core computing draws milliamps while the same core in deep sleep draws microamps, a thousandfold difference. You cannot have continuous full analysis and multi-year battery life at once. The classical escape is <em>duty cycling</em>: wake briefly, look, sleep. But naive duty cycling either misses fast events (if the sleep interval is long) or barely saves power (if it is short). A wake-up cascade replaces the crude timer with an intelligence gradient. The bottom of the cascade is never asleep, but it is so simple that "never asleep" still costs almost nothing; each step up is allowed to be more expensive precisely because it runs a tiny fraction of the time.</p>
+
+<h2>Anatomy of the cascade: stages from analog to cloud</h2>
+<p>A production always-on pipeline typically has three or four stages, each gating the next. <strong>Stage 0</strong> lives in the sensor hardware itself and burns nanowatts: an analog comparator that trips on sound pressure above a threshold, an accelerometer's built-in wake-on-motion interrupt, or a pulse-density microphone with an embedded voice-activity detector. It has no notion of <em>what</em> happened, only that <em>something</em> crossed a level, and it exists to keep the main processor asleep during the silent, still majority of the time. <strong>Stage 1</strong> is the smallest real model, a few kilobytes, running on the microcontroller only after Stage 0 raises an interrupt: a wake-word spotter, a coarse motion classifier, or a "is this even speech" gate. <strong>Stage 2</strong> is the full-quality classifier of this chapter, the quantized TinyNAS network of <a class="cross-ref" href="index.html">this chapter</a>'s earlier sections, invoked only on Stage 1's positives to confirm and refine the decision. <strong>Stage 3</strong>, when it exists, is an off-device escalation: streaming a confirmed audio clip to a phone or the cloud for large-model transcription. Each arrow up the staircase costs orders of magnitude more energy than the one below it, and the entire design goal is to make sure the expensive arrows are traversed as rarely as the application allows.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Recall flows up, precision flows down</h3>
+<p>The counterintuitive rule of cascade tuning is that early stages must be tuned for near-perfect recall, not accuracy. A missed detection at Stage 0 or Stage 1 is fatal: the event never reaches the smart stage that could have recognized it, so the whole cascade misses it. A false positive is merely expensive: it wakes the next stage, wastes some energy, and gets rejected there. So the bottom of the staircase is deliberately trigger-happy (high recall, low precision), and precision is recovered on the way up as each stage applies more discriminating power to the survivors. Design the cascade backwards from this asymmetry: set Stage 0's threshold so it essentially never misses a real event, accept that it fires often on noise, and let the higher stages pay the small cost of throwing those false alarms away.</p>
+</div>
+
+<h2>The energy model: what a cascade actually saves</h2>
+<p>Whether a cascade is worth its complexity is a quantitative question, and the arithmetic is simple enough to do on a napkin. Let stage \(i\) draw power \(P_i\) while active, take time \(t_i\) per evaluation, and be reached at rate \(r_i\) evaluations per second (with \(r_0\) the always-on sampling rate and each subsequent \(r_{i}\) set by the previous stage's trigger rate). The average system power is</p>
+<p>$$ \bar{P} = P_{\text{sleep}} + \sum_{i=0}^{N-1} r_i \, t_i \, (P_i - P_{\text{sleep}}). $$</p>
+<p>The trigger rate cascades multiplicatively: \(r_{i+1} = r_i \cdot f_i\), where \(f_i\) is the fraction of stage \(i\) evaluations that pass to stage \(i+1\), roughly the true-event rate plus stage \(i\)'s false-positive rate. Because \(f_i\) is tiny for a well-tuned early stage (a wake word occurs perhaps once an hour, so even with generous false alarms \(f_0\) might be \(10^{-3}\)), the expensive stages contribute almost nothing to \(\bar{P}\) despite their high \(P_i\). The whole payoff of the cascade is buried in that product of small fractions. The code below evaluates this model for a two-stage keyword pipeline and shows why the big network's power barely registers in the total.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Per-stage: (power_mW_active, time_s_per_eval, pass_fraction_to_next)
+# Stage 0: hardware VAD in the mic ASIC.  Stage 1: 8 KB wake-word net.  Stage 2: full command net.
+stages = [
+    dict(name="HW-VAD",   P_mW=0.05, t_s=1.0,    passfrac=0.02),   # always on; "speech present?"
+    dict(name="WakeWord", P_mW=6.0,  t_s=0.020,  passfrac=0.01),   # runs on VAD triggers
+    dict(name="Command",  P_mW=12.0, t_s=0.050,  passfrac=0.0),    # runs on wake-word hits
+]
+P_sleep_mW = 0.010
+r = 1.0                              # stage-0 evaluations per second (continuous, 1 s frames)
+avg_mW = P_sleep_mW
+for s in stages:
+    duty = r * s["t_s"]              # fraction of wall-clock this stage is active
+    avg_mW += duty * (s["P_mW"] - P_sleep_mW)
+    print(f"{s['name']:9s} reached {r:8.4f}/s  duty {duty:8.5f}  adds {duty*(s['P_mW']-P_sleep_mW):.5f} mW")
+    r *= s["passfrac"]              # trigger rate into the next stage
+
+print(f"\nAverage power: {avg_mW:.4f} mW")
+print(f"Naive always-run Command net: {stages[-1]['P_mW']:.1f} mW  ->  ~{stages[-1]['P_mW']/avg_mW:.0f}x worse")
+</code></pre>
+<div class="code-caption">A two-and-a-half stage always-on voice pipeline evaluated with the average-power model above. The hardware voice-activity detector dominates the budget at 50 microwatts because it alone is truly always on; the 12 mW command network contributes almost nothing because it is reached only a hundredth of a hundredth of the time. Running that command network continuously instead would cost roughly two orders of magnitude more power, which is the entire reason the cascade exists.</div>
+
+<p>Run the snippet and the lesson is stark: the always-on Stage 0 sets the floor, and everything above it is nearly free because the pass fractions multiply down to almost nothing. This is why engineering effort concentrates on Stage 0, the one component whose power you pay every microsecond of every day.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Wrist-raise wake on a smartwatch</h3>
+<p>Consider the "raise to wake" gesture on a fitness watch, a wearable in the family of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>. The display and its application processor draw tens of milliwatts, far too much to leave on, so the screen must light only when the wearer actually lifts and turns the wrist to look. Stage 0 is the accelerometer's own wake-on-motion logic: the inertial sensor of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> watches its own output against a motion threshold and holds the microcontroller in deep sleep, drawing a few microamps, until acceleration exceeds the level. Only then does Stage 1 wake: a few-kilobyte gesture model reads a half-second of the three-axis stream and asks "was that a deliberate wrist raise, or just an arm swing while walking?" A confirmed raise wakes Stage 2, the application processor and screen. The asymmetry from the key insight is visible in the tuning: Stage 0 fires on nearly every arm movement (terrible precision, but it must never sleep through a real raise), while Stage 1 rejects the walking swings, running maybe a few hundred times an hour rather than the tens of thousands of times per hour that continuous gesture inference would demand. The watch lasts a week instead of a day, and the user never notices the staircase underneath the glass.</p>
+</div>
+
+<h2>Tuning the operating points and the cost of latency</h2>
+<p>Each stage carries a decision threshold, and the cascade's quality is the joint choice of all of them. Two quantities constrain the design. The end-to-end <em>false-reject rate</em> is dominated by the early stages, because a miss anywhere low in the cascade cannot be recovered later; you therefore push early thresholds toward maximal recall and audit them against the hardest, quietest true events. The end-to-end <em>false-accept rate</em> and the average power are governed by how much noise each stage lets through, since every false positive wakes the next stage and spends its energy. There is also a latency cost that is easy to forget: waking a power-gated stage is not instantaneous. Bringing a clock domain out of deep sleep, restoring RAM, and running the model can add milliseconds, and for a fast event (a spoken syllable, a fall) the system must have buffered enough recent signal that the newly-woken stage can look <em>backwards</em> in time at the moment that triggered it. Always-on nodes therefore keep a small pre-trigger ring buffer, so the moment that woke Stage 1 is still available for Stage 1 to analyze. Skimping on that buffer produces a cascade that wakes up just in time to have missed the event that woke it.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let the sensor be Stage 0</h3>
+<p>Hand-writing Stage 0 as a polling loop on the microcontroller defeats the purpose: the MCU stays awake to poll. Modern MEMS sensors ship the always-on stage inside the sensor die, and the vendor driver exposes it as a few register writes. Configuring an ST inertial sensor's wake-on-motion interrupt through its HAL replaces a continuous sampling loop with a one-time setup and a sleep:</p>
+<pre><code class="language-c">lsm6dsox_wkup_threshold_set(&dev, 0x02);          // motion threshold (LSB units)
+lsm6dsox_wkup_dur_set(&dev, 0x01);                // debounce duration
+lsm6dsox_pin_int1_route_set(&dev, WAKE_UP);       // route event to INT1 pin
+// MCU now sleeps; the sensor asserts INT1 only when real motion occurs.
+</code></pre>
+<div class="code-caption">Four driver calls move the always-on motion detector off the microcontroller and into the sensor's own logic, which draws microamps. This replaces a hand-rolled wake-and-poll loop (easily a hundred lines of timer, sampling, and threshold code that keeps the MCU active) and lets the main processor stay in deep sleep until the sensor itself decides there is something to see.</div>
+<p>Higher-tier MEMS parts go further, embedding a small decision-tree or state-machine classifier in the sensor so that even Stage 1 coarse gestures resolve without waking the microcontroller at all. The library and the silicon together handle the always-on plumbing; you supply the thresholds and the escalation policy.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Below the microwatt: analog and neuromorphic Stage 0</h3>
+<p>The frontier of always-on sensing is pushing Stage 0 into physics that barely counts as computation. Analog wake-up circuits and mixed-signal keyword detectors (such as the work around Aspinity's analogML and academic sub-microwatt speech detectors) run a coarse classifier directly on the analog waveform before any analog-to-digital conversion, so the digital system, the power-hungry part, stays fully off until the analog front end hears something speech-like. In parallel, event-based and neuromorphic sensors from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a> are naturally always-on wake sources: a dynamic-vision sensor emits nothing during a static scene and floods events only on change, making "activity" a free hardware signal rather than a computed one. The research question is how much of the recognition task can migrate into these near-zero-power substrates before accuracy suffers, and how to co-design the analog Stage 0 with the digital Stages 1 and 2 above it. For batteryless nodes, discussed in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>, this is not a luxury but a precondition: without an almost-free wake stage, an energy-harvesting sensor never accumulates enough charge to run anything larger.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: design a two-stage bird-call detector</h3>
+<p>You are building a solar-plus-battery acoustic node that must log one particular bird species' call and can afford an average of 0.5 mW. The full classifier draws 15 mW and takes 40 ms per inference; the call occurs on average 20 times per hour. Using the energy model above, design a Stage 1 gate (a cheap "is there a loud tonal sound at all" detector) by choosing its power, per-evaluation time, and pass fraction so the average power stays under budget while the true call rate is preserved. Then argue what happens to both average power and false-reject rate if you set Stage 1's threshold too high, and separately too low. Finally, state where in the cascade you would place a pre-trigger ring buffer and how many milliseconds it must hold, given the wake latency of the full classifier.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why must the earliest stage of a wake-up cascade be tuned for high recall rather than high accuracy, and why is a false positive there merely expensive rather than fatal?</li>
+<li>In the average-power model \(\bar{P} = P_{\text{sleep}} + \sum_i r_i t_i (P_i - P_{\text{sleep}})\), explain why the most powerful stage usually contributes the least to the total, and which single stage sets the power floor.</li>
+<li>What is a pre-trigger ring buffer, and what goes wrong in a fast-event detector if it is too small or absent?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="index.html">Section 61.6</a>, we take the cascade off the whiteboard and onto real silicon: how to integrate these stages into firmware, wire the interrupts and power domains correctly, and test the whole pipeline on hardware, where sleep currents, wake latencies, and interrupt races behave in ways no host simulation quite predicts.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

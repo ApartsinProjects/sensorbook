@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.5: Concept-drift detection (ADWIN, DDM) and adaptation. Building Sensory AI." name="description"/>
+<title>Section 60.5: Concept-drift detection (ADWIN, DDM) and adaptation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Concept-drift detection (ADWIN, DDM) and adaptation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My accuracy did not fall off a cliff. The world walked out from under it, one quiet step at a time, and for three weeks I congratulated myself on numbers that no longer meant anything."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you have an online model that updates as data arrives (<a class="cross-ref" href="section-60.4.html">Section 60.4</a>) and that you can compute a running error signal on a stream, which is the prequential machinery of <a class="cross-ref" href="section-60.6.html">Section 60.6</a>. The statistical backbone here is the concentration inequality: if you have met the idea that a sample mean stays close to its true mean with high probability (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>), you have what you need. Drift detection is a cousin of the change-point methods in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>; the difference, developed below, is that here the signal we watch is the model's own loss, not the raw sensor value.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A deployed sensor model rests on a silent assumption: that the joint distribution generating today's data is the one it was trained on. Physical systems violate this constantly. A bearing wears, a patient's medication changes, a factory swaps a supplier, a phone gets a new user. When the mapping from sensor input to correct label shifts, a frozen model degrades, and it usually degrades quietly rather than crashing. This section gives you two things: a precise vocabulary for how streams drift, and two workhorse detectors, DDM and ADWIN, that raise an alarm the moment the ground has moved enough to matter. Detection is only half the job. The other half is what you do when the alarm fires, which is where windows, resets, and adaptive ensembles earn their keep.</p>
+    </div>
+
+    <h2>What drift is, and which kind you are fighting</h2>
+    <p>Formally, concept drift is any change over time in the joint distribution \(P_t(X, y)\) of sensor features \(X\) and target \(y\). It splits usefully by factoring the joint into \(P_t(X)\,P_t(y \mid X)\). A change in \(P_t(X)\) alone, the inputs move but the decision boundary does not, is <em>virtual</em> drift; it can often be absorbed by the online normalization of <a class="cross-ref" href="section-60.3.html">Section 60.3</a>. A change in \(P_t(y \mid X)\), where the very meaning of a feature vector changes, is <em>real</em> drift, and it is the dangerous one because no amount of rescaling fixes a boundary that has genuinely moved. The <em>what</em> matters for the <em>how</em>: virtual drift is a preprocessing problem, real drift is a relearning problem.</p>
+    <p>Drift also has a temporal shape. <strong>Sudden</strong> drift is an abrupt switch, a sensor is recalibrated overnight and every reading jumps. <strong>Gradual</strong> drift interleaves old and new concepts with the new one winning over days. <strong>Incremental</strong> drift moves continuously through intermediate states, the slow creep of a fouling gas sensor. <strong>Recurring</strong> drift cycles back, the daily and seasonal regimes of a building's HVAC load (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-39-energy-buildings-and-environmental-sensors/index.html">Chapter 39</a>). The shape decides your defense: an abrupt switch wants a fast, forgetful detector; a recurring pattern wants a memory of past concepts you can reactivate rather than relearn from zero.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>You almost never observe \(P_t(y \mid X)\) directly, because in production the true labels arrive late, sparsely, or never. So drift detectors do not watch the distribution. They watch a <em>proxy</em>: the model's own stream of prediction errors. A well-calibrated model on stationary data produces a stable error rate; when \(P_t(y \mid X)\) shifts, the error rate rises. Detecting drift therefore reduces to detecting a change in the mean of a binary loss sequence. That reframing is what lets a few kilobytes of running statistics stand in for an unknowable distribution.</p>
+    </div>
+
+    <h2>DDM: watch the error rate for a statistically significant rise</h2>
+    <p>The Drift Detection Method (Gama et al., 2004) is the canonical baseline and the easiest to reason about. Treat each prediction as a Bernoulli trial that is wrong with probability \(p_t\). After \(n\) samples the observed error rate is \(p_t\) with standard deviation \(s_t = \sqrt{p_t(1 - p_t)/n}\). DDM tracks the running minimum of \(p_t + s_t\), calling that best-ever operating point \((p_{\min}, s_{\min})\), and compares the current \(p_t + s_t\) against it. Two thresholds fire:</p>
+    \[ p_t + s_t \ge p_{\min} + 2\,s_{\min} \quad\text{(warning)}, \qquad p_t + s_t \ge p_{\min} + 3\,s_{\min} \quad\text{(drift)}. \]
+    <p>The two-sigma <em>warning</em> level says something may be starting; the three-sigma <em>drift</em> level says it has arrived. The gap between them is the method's cleverest feature: samples seen between a warning and a confirmed drift are exactly the fresh, post-change examples you want in your rebuilt model, so DDM tells you not only <em>when</em> to retrain but <em>which</em> recent buffer to retrain on. The <em>why</em> of the sigma bands is the normal approximation to the binomial: under a stable error rate, a three-sigma excursion is a genuinely rare event, so an alarm is unlikely to be noise. The cost is DDM's blind spot: it assumes errors accumulate fast enough to move the running mean, so it detects sudden and gradual drift well but can lag badly on very slow incremental drift, where the mean creeps up under the radar.</p>
+
+    <div class="callout practical-example">
+        <h4>Field Story: a continuous glucose monitor after a sensor change</h4>
+        <p>A wearable that estimates blood glucose from an electrochemical patch (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>) runs an online calibration model against occasional fingerstick reference readings, which serve as ground-truth labels. Every time the user replaces the disposable sensor, the electrode's sensitivity jumps: textbook sudden, real drift, because the same current now means a different glucose level. DDM sees the calibration error rate cross its warning band within a handful of references and confirms drift shortly after. The system does not wait for a clinician; it flags the interval since the warning as post-change data and refits the calibration curve on it, restoring agreement with the fingersticks before the user notices a bad reading. Without a detector the stale model would have under-reported a dangerous low for hours.</p>
+    </div>
+
+    <h2>ADWIN: an adaptive window that forgets exactly what it should</h2>
+    <p>ADWIN (ADaptive WINdowing, Bifet and Gavald&agrave;, 2007) attacks the same problem from a different angle and comes with a guarantee DDM lacks. It keeps a variable-length window \(W\) of the most recent values of whatever stream you feed it, typically the \(0/1\) loss. The rule is simple to state: <em>as long as the window looks stationary, let it grow; the instant it does not, drop the stale prefix.</em> Concretely, ADWIN considers every way to split \(W\) into an older subwindow \(W_0\) and a newer one \(W_1\). If the means \(\hat\mu_0\) and \(\hat\mu_1\) differ by more than a threshold \(\epsilon_{\text{cut}}\), it declares drift and discards \(W_0\):</p>
+    \[ |\hat\mu_0 - \hat\mu_1| \ge \epsilon_{\text{cut}}, \qquad \epsilon_{\text{cut}} = \sqrt{\frac{1}{2m}\,\ln\frac{4|W|}{\delta}}, \]
+    <p>where \(m\) is the harmonic mean of the two subwindow lengths and \(\delta\) is the confidence parameter. The bound comes from Hoeffding's inequality, which is <em>why</em> ADWIN can promise that a false alarm happens with probability at most \(\delta\) and that a real change of a given size is detected within a bounded delay. The <em>how</em> in practice is an exponential-histogram data structure that compresses the window so the whole thing runs in \(O(\log |W|)\) memory and amortized time, small enough for a microcontroller. The payoff over DDM is that the window length is chosen by the data, not a hyperparameter: on a long stationary stretch the window grows and estimates get tighter; at a change it snaps short and forgets fast. That single property makes ADWIN the drift-detection engine that adaptive learners like Adaptive Random Forest wrap around each of their components.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>The exponential-histogram bookkeeping behind ADWIN, the buckets, the merges, the per-split Hoeffding test, is roughly 200 lines of fiddly, off-by-one-prone code that is easy to get subtly wrong. River ships it, tested and \(O(\log n)\), behind a two-method interface.</p>
+        <pre class="language-python"><code class="language-python">from river import drift
+
+adwin = drift.ADWIN(delta=0.002)      # 1 detector, fully configured
+for loss in loss_stream:              # loss = 0 if correct else 1
+    adwin.update(loss)
+    if adwin.drift_detected:
+        model = model.clone()         # reset the learner on confirmed drift
+        print("drift: reset model")</code></pre>
+        <div class="code-caption"><strong>Listing 60.5.1.</strong> A production-grade ADWIN detector wired to a model reset in eight lines. Hand-rolling the exponential histogram and its confidence bound is a few hundred lines and a week of edge cases; River collapses it to <code>update()</code> and a <code>drift_detected</code> flag. Swapping in <code>drift.binary.DDM()</code> changes only the constructor.</div>
+        <p>Listing 60.5.1 hides the statistics, not the decision: <em>what</em> you do when <code>drift_detected</code> turns true is the design choice the library deliberately leaves to you, and it is the subject of the next paragraph.</p>
+    </div>
+
+    <h2>Adapting once the alarm fires</h2>
+    <p>A detector is a trigger, not a cure. The crudest response is a <strong>hard reset</strong>: throw away the model and relearn from the post-drift buffer. It is correct for sudden real drift and disastrous for a false alarm, because you have just discarded a good model. A gentler family is <strong>windowed retraining</strong>, where you keep only the most recent window of data (<a class="cross-ref" href="section-60.1.html">Section 60.1</a>) and refit continuously, letting the window length, or ADWIN's own adaptive window, control how fast old concepts fade. The most robust production answer is an <strong>adaptive ensemble</strong>: run several models, attach a drift detector to each, and when one member's detector fires, reset or down-weight only that member while the others carry the prediction. This is exactly how the Adaptive Random Forest (Gomes et al., 2017) survives drift with no accuracy cliff, and it dovetails with the continual-learning methods of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a> when the model is a network that must not catastrophically forget.</p>
+    <p>Two engineering realities temper all of this. First, <strong>labels arrive late</strong>. Every scheme above assumes you learn whether a prediction was right; when labels come hours later or only for a sampled fraction, your detector runs on delayed loss and your alarm is delayed with it, which you must budget for in the safety case. Second, <strong>every detector trades false alarms against detection delay</strong>, governed by \(\delta\) for ADWIN or the sigma multipliers for DDM. Loosen the threshold and you react fast but thrash on noise, retraining the model into instability; tighten it and you are calm but slow to notice a real shift. Choosing that operating point is not a default you accept; it is a decision you make against the cost of a stale prediction versus the cost of an unnecessary retrain, and it belongs in the same leakage-safe evaluation discipline (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) as every other hyperparameter.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Generate a synthetic binary-loss stream: 2000 samples at a \(0.10\) error rate, then 2000 at \(0.30\) (a sudden drift), then 2000 that ramp linearly from \(0.10\) to \(0.30\) (incremental drift). Feed the stream to both <code>river.drift.ADWIN</code> and <code>river.drift.binary.DDM</code> and record the sample index at which each first reports drift for the two change types. Which detector fires sooner on the sudden change? Which lags more on the incremental ramp, and does that match the blind spot described for DDM? Then rerun ADWIN with <code>delta</code> at \(0.05\) and \(0.0001\) and report how detection delay and the number of false alarms in the first stationary block trade off.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why do practical drift detectors watch the model's error stream rather than the input distribution \(P_t(X)\) directly, and which factor of \(P_t(X,y)\) does a rising error rate actually reveal?</p>
+        <p class="quiz-question">2. DDM uses a two-sigma warning level below its three-sigma drift level. What concrete use do the samples collected between the warning and the confirmation serve?</p>
+        <p class="quiz-question">3. ADWIN's cut threshold \(\epsilon_{\text{cut}}\) comes from Hoeffding's inequality. What guarantee does that give you about false alarms, and what does the parameter \(\delta\) control?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-60.6.html">Section 60.6</a>, we make the error signal these detectors depend on rigorous. Drift detection is only as trustworthy as the running loss you feed it, so we turn to prequential (test-then-train) evaluation: how to compute honest streaming accuracy, precision, and recall with fading factors, so that both your dashboards and your drift alarms rest on metrics that reflect the model's behavior right now rather than a stale lifetime average.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

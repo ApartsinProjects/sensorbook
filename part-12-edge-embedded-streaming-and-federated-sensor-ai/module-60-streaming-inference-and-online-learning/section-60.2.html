@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.2: Backpressure and data loss. Building Sensory AI." name="description"/>
+<title>Section 60.2: Backpressure and data loss | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Backpressure and data loss</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The sensor never asked whether I was ready. It just kept sending, and every sample I dropped was a small decision I would rather have made on purpose."</p>
+<cite>An Overwhelmed AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>In <a class="cross-ref" href="section-60.1.html">Section 60.1</a> we assumed the stream arrived at a civilized pace: one window, then the next, with time to compute. Real deployments are not so kind. A sensor produces samples at a rate fixed by physics and firmware, and it does not care whether your model has finished the previous window. When the arrival rate exceeds the rate at which you can process, the excess has to go somewhere. In a well-designed system it goes into a bounded buffer and, when that fills, into a <em>deliberate</em> data-loss policy you chose in advance. In a badly designed one it goes into an unbounded queue that grows until latency balloons, memory is exhausted, and the process is killed, taking your model with it. This section is about the physics of that mismatch: what backpressure is, why physical sensors cannot be told to slow down the way a network socket can, and how to shed load on purpose so the samples you drop are the ones you can most afford to lose.</p>
+</div>
+
+<p>This section assumes you understand sampling rates and timestamps from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the compute and memory limits of edge hardware from <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. The stateful-window machinery of <a class="cross-ref" href="section-60.1.html">Section 60.1</a> is the consumer we are trying to protect. We speak in terms of a producer (the sensor and its driver), a bounded queue, and a consumer (feature extraction plus inference).</p>
+
+<h2>Backpressure: the arithmetic of a rate mismatch</h2>
+<p>Backpressure is the signal a slow consumer sends upstream to say "stop, I am full." It is the load-regulating mechanism of every well-behaved pipeline. The clean way to see when it is needed is a queue balance. Let the producer emit samples at mean rate \(\lambda\) (samples per second) and the consumer drain them at mean service rate \(\mu\). The queue occupancy \(L\) obeys, on average, the flow relation from Little's Law:</p>
+<p>$$ L = \lambda \, W, \qquad \rho = \frac{\lambda}{\mu}, $$</p>
+<p>where \(W\) is the mean time a sample waits in the system and \(\rho\) is the utilization. When \(\rho < 1\) the queue is stable and \(W\) is finite. When \(\rho \ge 1\), even momentarily, the queue grows without bound and waiting time diverges. The essential fact of streaming sensor AI is that \(\lambda\) is set by the physical world and is often <em>constant</em>, while \(\mu\) is not: a heavier input (more objects in a radar frame, a burst of events), a thermal throttle on the CPU, or a garbage-collection pause can all drop \(\mu\) below \(\lambda\) for a stretch. During that stretch, backpressure is the only thing standing between you and an out-of-memory crash.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A physical sensor is a producer you cannot pause</h3>
+<p>In a network pipeline, backpressure propagates all the way to the source: TCP shrinks its window, the sender waits, and no bytes are lost. A microphone, an IMU, or a camera has no such courtesy. Its sample clock runs whether or not you are listening, driven by a crystal and a fixed acquisition schedule. You can drop the sensor's data, but you cannot make it produce less of it. This asymmetry is the whole reason streaming sensor systems must treat data loss as a <em>first-class design decision</em> rather than a failure. The only real questions are <em>where</em> the loss happens (in a hardware FIFO, a DMA ring, or your application queue) and <em>which</em> samples you sacrifice.</p>
+</div>
+
+<h2>Bounded queues and drop policies</h2>
+<p>The single most important architectural rule is: <strong>every queue between the sensor and the model must be bounded.</strong> An unbounded queue does not prevent data loss, it merely defers and disguises it, converting a small, controlled drop rate now into a catastrophic latency spike and a process death later. Once the queue is bounded at capacity \(C\), you must specify what happens on overflow. There are four canonical policies:</p>
+<ul>
+<li><strong>Block (apply true backpressure).</strong> The producer stalls until space frees up. Correct only when the producer <em>can</em> wait, for example a file replay or a network source. Fatal for a live sensor whose driver will overflow its own hardware FIFO while you block, moving the loss somewhere you cannot see or measure.</li>
+<li><strong>Drop-newest (tail drop).</strong> Reject the incoming sample when full. Simple, but it discards the freshest data, which is usually the most valuable for real-time inference.</li>
+<li><strong>Drop-oldest (head drop).</strong> Evict the stalest queued sample to admit the new one. This keeps the pipeline current and is the right default for most latency-sensitive perception, because a stale detection is often worse than useless.</li>
+<li><strong>Decimate or sample.</strong> Keep every \(k\)-th sample, or use reservoir sampling to retain a statistically representative subset. This is the graceful-degradation option: you deliberately lower the effective rate rather than losing contiguous chunks.</li>
+</ul>
+<p>The choice is not cosmetic. For a fall detector, drop-oldest preserves the moment of impact; for a vibration-spectrum monitor, contiguous drops corrupt the FFT window (<a class="cross-ref" href="section-60.1.html">Section 60.1</a>), so decimation that preserves uniform spacing is far safer. Match the policy to what your downstream feature extraction assumes about temporal continuity.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A robot that would rather see now than see everything</h3>
+<p>A warehouse mobile robot runs an obstacle detector on a depth camera streaming at 30 frames per second. On flat aisles the detector keeps up comfortably. But when the robot rounds a corner into a cluttered staging area, each frame contains far more geometry, inference time nearly doubles, and \(\mu\) drops below the 30 Hz arrival rate. The engineers configured a queue of capacity two frames with a drop-oldest policy. When the pipeline falls behind, the robot silently discards the frame it has not yet processed and jumps to the newest one, so its worst-case reaction is always to the world <em>as it is now</em>, never to a half-second-old snapshot of where an obstacle used to be. They also emit the drop count on the robot's health channel. During commissioning that counter revealed the cluttered-corner slowdown before it ever caused a near-miss, and they raised the detector's frame budget accordingly. Dropping frames was not the bug; it was the safety valve, and the metric that made it observable was what turned a hidden hazard into a tuning task.</p>
+</div>
+
+<h2>Measuring loss, and choosing what to shed</h2>
+<p>You cannot manage what you do not measure. A production streaming service must export at least three quantities continuously: <em>queue depth</em> (how full is the buffer, a leading indicator of trouble), <em>drop rate</em> (samples discarded per second, and cumulatively), and <em>end-to-end latency or staleness</em> (the age of the sample currently being processed). Watch queue depth against its capacity: a buffer that sits near-empty then spikes is telling you \(\mu\) is bursty; one that rides permanently near capacity is telling you \(\rho \approx 1\) and you are one hiccup from sustained loss. These signals are also the raw material for <a class="cross-ref" href="section-60.7.html">Section 60.7</a> on incident handling and for fleet-wide health monitoring in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+
+<p>The mini-service below implements a bounded queue with a drop-oldest policy and the three metrics, wrapping a producer thread that mimics a fixed-rate sensor and a consumer whose service time occasionally spikes.</p>
+
+<pre><code class="language-python">import collections, threading, time
+
+class BoundedStream:
+    def __init__(self, capacity):
+        self.q = collections.deque(maxlen=capacity)  # deque auto-evicts oldest
+        self.lock = threading.Lock()
+        self.produced = self.dropped = 0
+
+    def push(self, sample):                          # producer side (sensor)
+        with self.lock:
+            self.produced += 1
+            if len(self.q) == self.q.maxlen:         # full: drop-oldest
+                self.dropped += 1                    # the evicted sample is lost
+            self.q.append(sample)                    # maxlen deque drops head for us
+
+    def pop(self):                                   # consumer side (inference)
+        with self.lock:
+            return self.q.popleft() if self.q else None
+
+    def health(self):
+        with self.lock:
+            depth = len(self.q)
+            loss = self.dropped / max(self.produced, 1)
+            return {"depth": depth, "cap": self.q.maxlen, "drop_rate": round(loss, 3)}
+
+stream = BoundedStream(capacity=4)
+for t in range(10):                                  # a burst the consumer cannot match
+    stream.push({"t": t})
+print(stream.health())   # -> {'depth': 4, 'cap': 4, 'drop_rate': 0.6}: 6 of 10 shed on purpose
+</code></pre>
+<div class="code-caption">A bounded stream with an explicit drop-oldest policy and live health metrics. The <code>deque(maxlen=...)</code> makes head-eviction automatic; the counters turn silent data loss into an observable, reportable drop rate. In the burst shown, six of ten samples are shed by design rather than by crash.</div>
+
+<p>Beyond queue policy, two higher-level moves shed load intelligently. <strong>Adaptive quality</strong> swaps in a cheaper model (a smaller network, a coarser stride) when queue depth crosses a high-water mark, and restores the full model when it recovers, trading accuracy for throughput exactly when \(\rho\) demands it. <strong>Uncertainty-aware shedding</strong> spends compute where it matters: skip frames the model is already confident about and reserve full inference for ambiguous ones, using the calibrated confidence machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. Both keep \(\mu\) above \(\lambda\) without a blind, uniform sacrifice of data.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Streaming frameworks give you backpressure for free</h3>
+<p>Hand-rolling bounded queues, drop policies, watermark thresholds, and back-off signalling across a multi-stage pipeline is a few hundred lines of concurrency-sensitive code that is easy to get subtly wrong. Reactive and streaming libraries build it in. With <code>asyncio</code> a bounded queue is one constructor, and its <code>put</code>/<code>get</code> apply backpressure automatically:</p>
+<pre><code class="language-python">import asyncio
+q = asyncio.Queue(maxsize=4)         # bounded: put() blocks when full
+# producers await q.put(x); consumers await q.get(); backpressure is built in
+</code></pre>
+<div class="code-caption">A single bounded <code>asyncio.Queue</code> supplies blocking backpressure that would otherwise be dozens of lines of lock-and-condition code. Frameworks such as RxPY, Faust, and Bytewax extend this to drop, buffer, and sample operators across multi-stage graphs.</div>
+<p>Reactive-Streams implementations (RxPY) and stream processors (Faust, Bytewax) provide named backpressure strategies, drop and sample operators, and windowing in roughly 5 to 10 lines where a from-scratch version runs to several hundred. You still choose the policy and the capacity; the library handles the plumbing and the thread-safety.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: pick the policy that fits the physics</h3>
+<p>You are given three streaming workloads on the same edge box: (a) a 200 Hz IMU feeding a fall detector, (b) a 4 kHz accelerometer feeding a rolling FFT for bearing-fault spectra, and (c) a 30 fps camera feeding an object tracker. For each, choose a queue capacity and one of the four overflow policies (block, drop-newest, drop-oldest, decimate), and justify it in terms of what the downstream feature extraction assumes about temporal continuity and freshness. For workload (b), explain specifically why a drop-oldest policy that creates gaps in the window is dangerous for the FFT, and what you would do instead. Finally, using \(\rho = \lambda / \mu\), state what sustained drop rate you would expect if the consumer's mean service rate were 90% of the arrival rate.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why can true blocking backpressure be applied to a file-replay source but not to a live microphone, and where does the data loss move if you try?</li>
+<li>An unbounded queue "never drops data." Explain why that statement is misleading and what actually fails instead.</li>
+<li>Give one workload where drop-oldest is the right default and one where it is harmful, and say what temporal assumption distinguishes them.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-60.3.html">Section 60.3</a>, we assume the flow-control battle is won and the samples that survive are arriving at a manageable rate. The next problem is computing features and normalization statistics <em>incrementally</em>, one sample at a time, without ever storing the whole stream, so that means, variances, and scalings stay correct even as the data itself keeps moving.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.7: Incident handling. Building Sensory AI." name="description"/>
+<title>Section 60.7: Incident handling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Incident handling</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The pipeline never went down. It stayed up, cheerful and green, and confidently served nonsense to forty thousand devices for six hours. I have since learned that a heartbeat is not the same thing as a pulse."</p>
+        <cite>A Wiser AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the full streaming stack from earlier in the chapter: a windowed, stateful service (<a class="cross-ref" href="section-60.1.html">Section 60.1</a>), a backpressure policy that can shed load without corrupting state (<a class="cross-ref" href="section-60.2.html">Section 60.2</a>), an online learner that mutates itself as data arrives (<a class="cross-ref" href="section-60.4.html">Section 60.4</a>), a drift detector (<a class="cross-ref" href="section-60.5.html">Section 60.5</a>), and the prequential metrics that make its health observable (<a class="cross-ref" href="section-60.6.html">Section 60.6</a>). Here we treat those pieces as an operational system that will, eventually, misbehave. The reliability vocabulary (SLOs, error budgets, on-call) is developed at fleet scale in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>; the safety-case framing for when a bad prediction can hurt someone comes from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A batch model that breaks produces a bad report that a human reviews before anyone acts on it. A streaming sensor model that breaks acts continuously, at machine speed, on live devices, and an online learner can additionally break itself by folding corrupted data into its own weights. The blast radius is larger and the clock is faster, so you cannot rely on catching problems in review. Incident handling is the discipline that keeps a self-updating perception service safe when, not if, something goes wrong: how you notice within seconds rather than hours, how you contain the damage before it compounds, how you fall back to something trustworthy, and how you learn enough from the event that it never recurs the same way. This section is about the machinery and the human process that turn a potential six-hour outage into a ninety-second blip.</p>
+    </div>
+
+    <h2>What counts as an incident, and how bad is it</h2>
+    <p>An incident is any deviation from expected service that warrants an urgent, tracked response. For a streaming inference service the failure modes are broader than "the process crashed," because a crashed process is the <em>easy</em> case: it is loud, and a supervisor restarts it. The dangerous incidents are the quiet ones where the service stays up and wrong. They cluster into four families. <strong>Infrastructure</strong> failures are the classic ones: a consumer lags, a queue backs up, a node dies. <strong>Data</strong> failures are upstream: a sensor drops out, a firmware update changes a unit from Celsius to Fahrenheit, a timestamp clock skews so windows misalign (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>). <strong>Model</strong> failures are the shift itself: drift outruns the detector, or calibration collapses so the confidence scores lie (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>). <strong>Learning</strong> failures are unique to online systems: a burst of mislabeled or adversarial data poisons the running update, and the model degrades itself, permanently, unless the update is reversible.</p>
+    <p>You triage by <em>severity</em>, and severity is a function of blast radius times harm, not of how alarming the log looks. Anchor it to your service-level objective. If the SLO promises that the served error rate stays below a target, the error budget is the slack you are allowed to spend:</p>
+    \[ \text{error budget} = 1 - \text{SLO target}, \qquad \text{severity} \sim (\text{fraction of fleet affected}) \times (\text{cost per wrong action}). \]
+    <p>A one-in-ten-thousand miscalibration on a step counter is a low-severity annoyance; the same rate on an automotive emergency-braking classifier (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>) is a page-everyone, stop-the-line event. Writing the severity ladder <em>before</em> the incident, so the on-call engineer is not negotiating with themselves at 3 a.m., is most of the work.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Availability is not correctness. A liveness probe that returns 200 OK tells you the process is running; it says nothing about whether the predictions are any good. The most expensive streaming incidents live precisely in that gap, the service is green on every infrastructure dashboard while it serves confident garbage. The fix is to make correctness observable in near-real time by promoting the prequential metrics of <a class="cross-ref" href="section-60.6.html">Section 60.6</a> and the drift alarms of <a class="cross-ref" href="section-60.5.html">Section 60.5</a> into first-class health signals, then defining "healthy" in terms of them. If your alerting cannot distinguish a running-but-wrong model from a running-and-right one, your mean time to detection is however long it takes a human to complain.</p>
+    </div>
+
+    <h2>Guardrails: the machinery that makes incidents survivable</h2>
+    <p>Good incident response is designed in before the incident, as a small set of guardrails that let you contain damage fast. Four earn their place in almost every streaming sensor service. The <strong>kill switch for online learning</strong> is the most important and the most specific to this chapter: a single flag that freezes weight updates while inference continues, so a poisoning event stops compounding the instant you notice it. Because the learner keeps mutating, you pair the switch with <strong>versioned model checkpoints</strong> written on a cadence, so "roll back the model" means restoring a known-good snapshot from before the bad data arrived rather than retraining from scratch. A <strong>fallback model</strong> gives you something to serve while the primary is frozen or rolling back: often the last frozen offline model, or a simpler, dumber, but robust classical estimator (a Kalman predictor from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) whose failure modes you fully understand. Finally, a <strong>circuit breaker</strong> wraps the model call so that when health signals cross a threshold, the breaker trips, stops routing traffic to the suspect model, and diverts to the fallback automatically, without waiting for a human.</p>
+    <p>The circuit breaker is worth dwelling on because it is the pattern that converts a slow human response into a fast automatic one. It has three states. <em>Closed</em> is normal: requests flow to the primary model and the breaker counts failures, where a "failure" for a perception service is not just an exception but a health-signal breach such as the drift flag firing or confidence collapsing below a floor. When failures exceed a threshold the breaker <em>opens</em>: all traffic diverts to the fallback and the primary gets a rest. After a cooldown it goes <em>half-open</em>, letting a trickle of traffic through to test whether the primary has recovered, and either closes again or re-opens. This gives you graceful degradation, a served-but-simpler answer, instead of a hard outage, and it buys the on-call engineer time to diagnose the root cause (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>) without the fleet burning down meanwhile.</p>
+
+    <pre class="language-python"><code class="language-python">import time
+
+class ModelCircuitBreaker:
+    """Serve the primary model until health degrades, then fail over to a fallback."""
+    def __init__(self, primary, fallback, fail_threshold=5, cooldown_s=30):
+        self.primary, self.fallback = primary, fallback
+        self.fail_threshold, self.cooldown_s = fail_threshold, cooldown_s
+        self.state, self.failures, self.opened_at = "closed", 0, 0.0
+
+    def predict(self, x, health_ok):
+        now = time.monotonic()
+        if self.state == "open" and now - self.opened_at >= self.cooldown_s:
+            self.state = "half_open"          # probe: let one request test recovery
+        if self.state == "open":
+            return self.fallback(x), "fallback"
+
+        y = self.primary(x)                   # closed or half_open: try the primary
+        if health_ok(x, y):                   # drift flag clear, confidence above floor
+            self.failures, self.state = 0, "closed"
+            return y, "primary"
+        self.failures += 1
+        if self.state == "half_open" or self.failures >= self.fail_threshold:
+            self.state, self.opened_at = "open", now   # trip the breaker
+        return self.fallback(x), "fallback"</code></pre>
+    <div class="code-caption"><strong>Listing 60.7.1.</strong> A model-level circuit breaker. The novelty over a network circuit breaker is that <code>health_ok</code> folds in perception-specific signals (the drift flag from <a class="cross-ref" href="section-60.5.html">Section 60.5</a>, a calibrated-confidence floor from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), so a running-but-wrong model counts as a failure and trips the breaker toward the trustworthy fallback.</div>
+    <p>Listing 60.7.1 is deliberately minimal so the state logic is legible: the primary is served while healthy, a run of health breaches opens the breaker to the fallback, and a single half-open probe after the cooldown decides whether to recover. In a real service you would additionally emit a metric on every state transition, because the transitions themselves are your highest-signal alert.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Listing 60.7.1 is a teaching skeleton. A production breaker also needs thread-safe counters, a rolling failure window rather than a raw count, exponential-backoff cooldown, per-state metrics, and a decorator API, roughly 250 lines to do carefully. The <code>pybreaker</code> library gives you all of it, and you supply only the health predicate and the fallback.</p>
+        <pre class="language-python"><code class="language-python">import pybreaker
+
+breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
+
+@breaker
+def serve(x):
+    y = primary(x)
+    if not health_ok(x, y):
+        raise pybreaker.CircuitBreakerError("unhealthy prediction")
+    return y
+
+try:
+    y = serve(x)                 # breaker counts failures and trips automatically
+except pybreaker.CircuitBreakerError:
+    y = fallback(x)              # degrade gracefully while the primary is out</code></pre>
+        <div class="code-caption"><strong>Listing 60.7.2.</strong> The same failover in a dozen lines with <code>pybreaker</code>: the decorator handles counting, state, cooldown, and half-open probing. You write only the health check and the fallback, about a 20-to-1 reduction over a hand-rolled thread-safe breaker.</div>
+        <p>Listings 60.7.1 and 60.7.2 make the same decision; the library version is what you ship, because the fiddly concurrency and metrics are exactly where a hand-rolled breaker fails you during the one incident it exists to handle.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>Field Story: a poisoned wheel-loader in a mine fleet</h4>
+        <p>A fleet of underground wheel loaders runs an online vibration model that scores drivetrain health and updates itself from operator-confirmed labels (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>). One machine's accelerometer mount cracks. For ninety minutes it streams a resonant artifact that the online learner, taking it as normal operation, folds into its baseline, and the drift detector on that unit starts flapping. Two guardrails catch it. First, the per-unit circuit breaker sees confidence collapse and the drift flag fire, trips open, and fails that machine over to a frozen offline model, so it keeps getting a trustworthy health score. Second, the on-call engineer, paged by the breaker transition, hits the online-learning kill switch for the affected cohort and rolls the model back to the checkpoint written before the artifact appeared, discarding the poisoned updates. Total time from first bad prediction to contained incident: under four minutes. Without the kill switch and checkpoint, the poisoned baseline would have masked a real drivetrain fault fleet-wide, because the same model weights are shared across similar machines.</p>
+    </div>
+
+    <h2>Closing the loop: postmortem, replay, and prevention</h2>
+    <p>Containment ends the bleeding; it does not stop the next incident. The last phase is a blameless postmortem, an SRE practice that transplants cleanly to sensor AI. Blameless means the writeup targets the system and its gaps, not the engineer who was on-call, because a culture that punishes the messenger simply stops reporting incidents, and unreported incidents are the ones that grow. The postmortem answers four questions in order: what was the customer-visible impact, what was the root cause (traced with the methods of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, not guessed), what did detection and response actually cost in wall-clock, and what concrete change stops this class of failure. That last item is a tracked action, not a wish.</p>
+    <p>The measurements that make a postmortem honest are the two clocks: <strong>mean time to detect</strong> and <strong>mean time to recover</strong>. MTTD is dominated by whether correctness was observable at all, which is why the key insight above insists on promoting prequential and drift signals into alerts; MTTR is dominated by whether your guardrails are automatic, which is why the circuit breaker and kill switch pay for themselves. The single most valuable prevention tool for a streaming system is a <strong>replay harness</strong>: keep a rolling archive of raw input, and when an incident happens, replay the exact bytes through a candidate fix in a shadow deployment to confirm it would have caught the event, all under the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> so you are not fooling yourself by evaluating on the very data you tuned against. A fix you cannot replay against the incident is a hypothesis, not a fix.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is autonomous incident response for perception fleets. LLM-based operations agents (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>) are moving from writing the postmortem to running the triage: correlating a drift alarm with a firmware-rollout event, proposing which cohort to freeze, and drafting the rollback for a human to approve. Production systems such as PagerDuty and Datadog now ship agentic incident summarization and remediation suggestions, and the open question is calibration, an operations agent that confidently recommends the wrong rollback is itself a new failure mode, so the same uncertainty and human-in-the-loop guardrails from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> apply to the responder as much as to the model.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the ADWIN-guarded online model from the <a class="cross-ref" href="section-60.5.html">Section 60.5</a> exercise and wrap it in Listing 60.7.1's circuit breaker, with a frozen copy of the pre-drift model as the fallback and <code>health_ok</code> defined as "drift flag clear AND rolling accuracy above 0.80." Inject a 500-sample poisoning burst of flipped labels into the online update. Log every breaker state transition and measure two clocks: how many samples pass between the first bad prediction and the breaker opening (your MTTD proxy), and how many between opening and the half-open probe re-closing after you also fire a kill switch that freezes updates and restores the last checkpoint (your MTTR proxy). Then rerun without the kill switch, letting the poisoned updates stand, and show that the breaker never re-closes because the primary never recovers. What does that tell you about why freeze-plus-rollback and the breaker are complementary rather than redundant?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is a 200 OK liveness probe an inadequate health signal for a streaming inference service, and what two signals from earlier in this chapter would you promote to fix it?</p>
+        <p class="quiz-question">2. What failure mode is unique to an <em>online</em> learner that a frozen offline model cannot suffer, and which two guardrails specifically contain it?</p>
+        <p class="quiz-question">3. A circuit breaker has closed, open, and half-open states. What does the half-open probe accomplish, and why is a single probe safer than immediately restoring full traffic to a recovering model?</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 60</h3>
+        <p>build a streaming inference service with drift detection, online metrics, and adaptive retraining.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Reliability engineering and stability patterns</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://sre.google/sre-book/table-of-contents/">Beyer, Jones, Petoff, and Murphy (2016). Site Reliability Engineering: How Google Runs Production Systems. O'Reilly.</a></p>
+            <p class="bib-annotation">The source text for SLOs, error budgets, on-call practice, and the blameless postmortem. Every severity ladder and MTTD/MTTR argument in this section descends from its operational vocabulary.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Nygard (2018). Release It! Design and Deploy Production-Ready Software, 2nd ed. Pragmatic Bookshelf.</a></p>
+            <p class="bib-annotation">Introduced the circuit-breaker and bulkhead stability patterns to mainstream engineering. Listing 60.7.1 is the perception-specific specialization of the breaker it describes.</p>
+        </div>
+
+        <p class="bib-category">Operating machine learning systems</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley, Holt, Golovin, Davydov, Phillips, Ebner, Chaudhary, Young, Crespo, and Dennison (2015). Hidden Technical Debt in Machine Learning Systems. NeurIPS.</a></p>
+            <p class="bib-annotation">The canonical account of why ML systems rot in production: feedback loops, entanglement, and the self-modifying pipelines that make an online learner able to poison itself.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://research.google/pubs/pub46555/">Breck, Cai, Nielsen, Salib, and Sculley (2017). The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction. IEEE Big Data.</a></p>
+            <p class="bib-annotation">A concrete checklist for monitoring, alerting, and rollback readiness. Directly informs which health signals should page and which guardrails must exist before launch.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2011.09926">Paleyes, Urma, and Lawrence (2022). Challenges in Deploying Machine Learning: A Survey of Case Studies. ACM Computing Surveys.</a></p>
+            <p class="bib-annotation">Surveys real deployment failures across industries, including the quiet-degradation incidents that motivate correctness-aware alerting rather than availability-only monitoring.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2209.09125">Shankar, Garcia, Hellerstein, and Parameswaran (2024). Operationalizing Machine Learning: An Interview Study. arXiv:2209.09125.</a></p>
+            <p class="bib-annotation">Interviews with ML engineers on the realities of on-call, retraining cadence, and incident response; grounds this section's claim that guardrails and playbooks, not heroics, keep services alive.</p>
+        </div>
+
+        <p class="bib-category">Drift adaptation and streaming tools</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/2523813">Gama, Zliobaite, Bifet, Pechenizkiy, and Bouchachia (2014). A Survey on Concept Drift Adaptation. ACM Computing Surveys.</a></p>
+            <p class="bib-annotation">The reference survey linking detection to response strategies (reset, windowed retrain, ensembles); the adaptation side of the detectors an incident playbook triggers.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://riverml.xyz/">Montiel, Halford, and the River contributors (2021). River: Machine Learning for Streaming Data in Python. JMLR / riverml.xyz.</a></p>
+            <p class="bib-annotation">The streaming library that supplies the online learners, drift detectors, and prequential metrics whose alarms this section promotes into first-class incident signals.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>, we shrink the whole picture onto a microcontroller. Every guardrail here assumed you had spare cycles for a fallback model, headroom for checkpoints, and a network path for a page; TinyML strips all three away. We turn to designing sensor intelligence for kilobytes of RAM and milliwatts of power, where the fallback is a lookup table, the rollback is a flash partition, and incident handling becomes a firmware problem solved before the device ever ships.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

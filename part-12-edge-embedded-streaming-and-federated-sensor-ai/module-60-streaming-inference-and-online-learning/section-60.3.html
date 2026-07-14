@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.3: Online normalization and feature extraction. Building Sensory AI." name="description"/>
+<title>Section 60.3: Online normalization and feature extraction | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Online normalization and feature extraction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You trained me to expect a mean of zero. The sensor warmed up, the mean walked off, and nobody told me. I have been confidently wrong for three hours."</p>
+<cite>A Drifting AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every model in this book was trained on features that had been scaled, centered, and shaped by statistics computed over a whole dataset in one relaxed offline pass. In a stream you have none of that comfort. Samples arrive one at a time, you cannot rewind, you often cannot store more than the last few seconds, and the very quantities you need to normalize by, the mean and the spread of the signal, are themselves moving as the sensor warms up, the subject changes activity, or the machine ages. This section is about computing normalization statistics and features <em>incrementally and causally</em>: using only the past, updating in constant time and constant memory per sample, and doing it in a way that keeps the numbers a model sees at inference identical in spirit to the ones it saw during training. Get this layer wrong and it does not matter how good the model is; it receives inputs from a distribution it never met.</p>
+</div>
+
+<p>This section assumes you understand the offline feature pipeline from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> and, above all, the leakage discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: a statistic must never be computed from data the model has not yet seen at that moment. It builds directly on the windowing machinery of <a class="cross-ref" href="section-60.1.html">Section 60.1</a>; here we ask what to compute <em>inside</em> each window, and how to carry state across windows without ever holding the full history.</p>
+
+<h2>Why offline z-scoring quietly breaks on a stream</h2>
+<p>The default preprocessing move is the z-score: subtract the training-set mean, divide by the training-set standard deviation, so each channel is centered and unit-scaled. Offline this is one line. On a live sensor it fails in two distinct ways. First, <strong>causality</strong>: if you standardize a live window using statistics that include future samples, or refit the scaler on the incoming batch, you have leaked information backward in time exactly as <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> warned, and your online accuracy will be optimistically wrong. Second, <strong>non-stationarity</strong>: the mean and variance a sensor produces are not constants. An IMU's bias drifts with temperature (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>), a PPG baseline wanders with skin contact, a vibration sensor's amplitude climbs as a bearing degrades. A scaler frozen at training time slowly centers the wrong point. The fix is to compute the statistics online, from the past only, and to let them adapt at a rate you choose deliberately.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Normalization is a causal filter, not a fixed constant</h3>
+<p>Think of the running mean and variance as the output of a low-pass filter over the signal, one that only ever looks backward. That reframing settles two design questions at once. The filter's time constant is the memory of your normalizer: short means it tracks drift quickly but jitters; long means it is stable but lags a real regime change. And because it is causal, it can be recomputed identically offline and online, which is what makes train-serve consistency achievable rather than aspirational.</p>
+</div>
+
+<h2>Running statistics in constant memory</h2>
+<p>Two algorithms cover almost every case. When you want an unbiased estimate over the whole stream so far and the distribution is roughly stationary, use <strong>Welford's method</strong>, which updates a running mean and a running sum of squared deviations without ever storing the samples and without the catastrophic cancellation of the naive "sum of squares minus square of sum" formula. For the count \(n\), mean \(\mu_n\), and aggregate \(M_{2,n}=\sum_i (x_i-\mu_n)^2\):</p>
+<p>$$ \mu_n = \mu_{n-1} + \frac{x_n - \mu_{n-1}}{n}, \qquad M_{2,n} = M_{2,n-1} + (x_n-\mu_{n-1})(x_n-\mu_n), \qquad \sigma_n^2 = \frac{M_{2,n}}{n-1}. $$</p>
+<p>When the stream is non-stationary, an all-history mean is exactly wrong, because it weights a reading from an hour ago the same as the one just in. There you want an <strong>exponentially weighted</strong> mean and variance, which decay old evidence geometrically with a smoothing factor \(\alpha \in (0,1)\):</p>
+<p>$$ \delta = x_t - \mu_{t-1}, \qquad \mu_t = \mu_{t-1} + \alpha\,\delta, \qquad \sigma_t^2 = (1-\alpha)\left(\sigma_{t-1}^2 + \alpha\,\delta^2\right). $$</p>
+<p>The choice of \(\alpha\) is the whole design. Its effective memory is roughly \(1/\alpha\) samples, so for a 100 Hz stream, \(\alpha = 0.01\) remembers about one second and tracks fast drift, while \(\alpha = 0.0001\) remembers minutes and ignores it. Pick \(\alpha\) from the physical timescale of the drift you want to follow, not by trial and error. The code below implements both, then uses the exponentially weighted version as a live z-score normalizer.</p>
+
+<pre><code class="language-python">import numpy as np
+
+class Welford:
+    "Exact running mean/variance over all history, constant memory."
+    def __init__(self):
+        self.n, self.mean, self.M2 = 0, 0.0, 0.0
+    def update(self, x):
+        self.n += 1
+        d = x - self.mean
+        self.mean += d / self.n
+        self.M2 += d * (x - self.mean)
+    @property
+    def var(self):
+        return self.M2 / (self.n - 1) if self.n > 1 else 0.0
+
+class EWZScore:
+    "Causal exponentially weighted normalizer for a non-stationary stream."
+    def __init__(self, alpha=0.01, eps=1e-6, warmup=50):
+        self.alpha, self.eps, self.warmup = alpha, eps, warmup
+        self.mean, self.var, self.n = 0.0, 1.0, 0
+    def transform(self, x):
+        self.n += 1
+        d = x - self.mean
+        self.mean += self.alpha * d
+        self.var = (1 - self.alpha) * (self.var + self.alpha * d * d)
+        if self.n < self.warmup:          # do not trust stats before warmup
+            return 0.0
+        return d / np.sqrt(self.var + self.eps)   # note: uses PRE-update mean
+
+# 100 Hz signal whose mean ramps (sensor warm-up) then holds
+sig = np.concatenate([np.linspace(0, 5, 500), np.full(500, 5)]) + np.random.randn(1000)*0.3
+scaler = EWZScore(alpha=0.02)
+z = np.array([scaler.transform(x) for x in sig])
+print(f"raw mean drift: {sig[:500].mean():.2f} -> {sig[500:].mean():.2f}; "
+      f"normalized mean ~ {z[100:].mean():.2f}")
+</code></pre>
+<div class="code-caption">Welford gives an exact all-history mean and variance in constant memory; <code>EWZScore</code> instead decays old evidence so it tracks a warming sensor, and it standardizes each sample against the statistics of the past only. The printed drift shows the raw mean moving from about 0 to 5 while the normalized output stays centered near zero.</div>
+
+<p>Two details in <code>EWZScore</code> are load-bearing, not stylistic. The normalizer divides by the <em>pre-update</em> mean and variance, so the current sample never normalizes itself, preserving causality. And it returns zeros during a warmup period, because a z-score computed from three samples is noise; a model fed that noise during the first second of a session will produce garbage exactly when a wearable is being put on.</p>
+
+<h2>Incremental features without a full window scan</h2>
+<p>Normalization is the simplest running statistic; the same constant-time discipline extends to the features themselves. Rolling mean and variance over a fixed window come free from the recursions above. Rolling <strong>min and max</strong> look like they need a scan of the window every step, but a monotonic deque delivers them in amortized \(O(1)\): you keep a deque of candidate extrema, evicting any that a newer, larger (or smaller) value dominates, so the front is always the current extremum. Rolling <strong>quantiles and counts</strong> yield to reservoir or histogram sketches. The most valuable streaming features on sensor data are usually spectral (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>), and here two tricks matter. If you need the energy in one or a few known frequency bins, say the mains hum or a motor's rotation rate, the <strong>Goertzel algorithm</strong> tracks each bin incrementally at a fraction of the cost of a full FFT. If you need the whole spectrum on every hop, the <strong>sliding DFT</strong> updates the previous window's transform with the one sample that entered and the one that left, rather than recomputing from scratch. Both turn a per-window batch operation into a per-sample update, which is what the tight latency and memory budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> demand.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">River does online preprocessing as a fit-transform stream</h3>
+<p>Rolling your own Welford, exponential scaler, monotonic-deque extrema, and warmup logic is a few hundred lines once you add multi-channel support, missing-value handling, and serialization. The <code>river</code> library (its incremental models are the subject of <a class="cross-ref" href="section-60.4.html">Section 60.4</a>) exposes every one of these as a single-pass, causal transformer whose statistics update as the stream flows:</p>
+<pre><code class="language-python">from river import preprocessing, feature_extraction, stats
+
+scaler = preprocessing.StandardScaler()          # running z-score, causal
+roll   = feature_extraction.RollingMean(window_size=100)
+for x in stream:                                 # x is a dict of channels
+    xs = scaler.learn_one(x).transform_one(x)    # update, then normalize
+</code></pre>
+<div class="code-caption">River's <code>StandardScaler</code> maintains running per-feature statistics and standardizes in one causal pass; swapping in <code>preprocessing.AdaptiveStandardScaler</code> gives the exponentially weighted variant. Roughly 3 lines replace the 60-plus of a hand-built multi-channel online normalizer.</div>
+<p>The library handles the numerics, the per-channel bookkeeping, and the update-then-transform ordering that keeps the pipeline causal. You still choose the decay rate and the warmup, because those encode a physical assumption no library can guess.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A CNC spindle whose "normal" keeps moving</h3>
+<p>An industrial team streams accelerometer data from a CNC machining spindle (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) to a bearing-fault classifier trained offline on z-scored vibration features. In the lab it scored well. On the shop floor its false-alarm rate spiked every morning. The cause was normalization, not the model: the spindle runs cold at startup and its vibration amplitude rises for the first twenty minutes as it reaches operating temperature, so a scaler frozen at the training mean saw every cold start as an anomaly. Replacing the fixed z-score with an exponentially weighted normalizer, decay tuned to a memory of about five minutes, let "normal" track the warm-up while still flagging the sharp step change of a real spalling fault. The features fed to the model became stationary again, and the morning false alarms disappeared, with no change to the model weights at all.</p>
+</div>
+
+<h2>Keeping train and serve in agreement</h2>
+<p>The subtle failure in streaming preprocessing is a mismatch between how features were normalized during training and how they are normalized in production. Two policies are defensible, and mixing them silently is the trap. In the <strong>frozen</strong> policy you fit the scaler once on the training set and ship those constants; it is simple and reproducible but blind to drift, and it needs a separate drift monitor (<a class="cross-ref" href="section-60.5.html">Section 60.5</a>) to tell you when the constants have gone stale. In the <strong>adaptive</strong> policy the normalizer keeps updating on the live stream, so it tracks drift for free, but you must then train the model on features that were normalized the <em>same causal, adaptive</em> way, by replaying the training stream through the identical online scaler. If you train on globally z-scored features and serve with an adaptive one, the model meets a distribution it never saw. The rule is blunt: whatever normalizer runs at serve time must have run, sample for sample, over the training data too. This is the online face of the leakage-safe evaluation thread, and it is why test-time adaptation (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>) treats the normalization layer as part of the model, not as inert plumbing.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: tune the memory to the drift</h3>
+<p>Take a 50 Hz triaxial accelerometer trace from a wrist wearable (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>) containing a slow gravity-vector drift as the wrist rotates, plus brief high-amplitude bursts when the user claps. Implement the exponentially weighted normalizer for each axis and sweep \(\alpha\) across three orders of magnitude. Plot the normalized signal and identify the value that removes the slow drift while leaving the claps as clear outliers. Then argue, in terms of effective memory in seconds, why a single \(\alpha\) cannot both fully cancel a 30-second drift and preserve a 0.2-second burst, and propose a two-timescale scheme that can.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does normalizing a live window with statistics that include that window's own future samples count as leakage, and how does the update-then-transform ordering prevent it?</li>
+<li>You have a 200 Hz stream whose baseline drifts over about 10 seconds. Estimate a starting \(\alpha\) for an exponentially weighted normalizer, and explain what its effective memory represents.</li>
+<li>A classifier trained on globally standardized features is deployed behind an adaptive online scaler and its accuracy collapses. Name the mismatch and state the one-sentence rule that would have prevented it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-60.4.html">Section 60.4</a>, we let the model itself learn from the stream. The same River library that gave us causal normalizers provides incremental classifiers and regressors that update one sample at a time, so the model can adapt alongside the features it consumes, turning the frozen predictor of the offline world into a living one.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

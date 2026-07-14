@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.1: TinyML design constraints. Building Sensory AI." name="description"/>
+<title>Section 61.1: TinyML design constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>TinyML design constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They handed me two hundred and fifty six kilobytes of memory and asked for intelligence. I told them a single cloud model's attention layer would not fit through the door. They said the door is the point."</p>
+        <cite>A Frugal AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you understand why sensory inference gravitates to the device and that you have met quantization at least in passing, both from <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. It leans on the idea of a sensor as a timed sample stream with a fixed rate (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), and it uses only elementary arithmetic: bytes, hertz, joules, and unit conversions. The microcontroller hardware vocabulary (SRAM, flash, Cortex-M, DSP) is surveyed in Appendix C, and the always-on power-management patterns this section motivates are built out later in this chapter and in <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>. No new mathematics is introduced.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Edge AI shrinks a model to fit a phone or a small NPU. TinyML goes an order of magnitude further and asks it to fit a microcontroller: a chip with kilobytes of memory, no operating system, no floating-point unit worth the name, and a power budget measured in milliwatts because it must live for a year on a coin cell. The design space is not "the cloud, but smaller." It is a qualitatively different regime where the peak working memory of a single layer, not the parameter count, is usually the wall you hit first, and where the radio and the sensor front-end draw more current than the arithmetic. This section names the five hard constraints that govern that regime: memory, compute, energy, latency, and the deployment cost of firmware. When you finish it you will be able to look at a target chip and a sensing task and say, before training anything, whether the task is even feasible, and which constraint will decide it.</p>
+    </div>
+
+    <h2>A microcontroller is a kilobyte machine</h2>
+    <p>Start with the hardware, because in TinyML the hardware sets the rules and the model obeys. A representative target is an Arm Cortex-M4F or Cortex-M7 microcontroller: a clock of \(80\) to \(480\ \mathrm{MHz}\), a single core, an on-chip SRAM of \(64\) to \(512\ \mathrm{kB}\), an on-chip flash of \(256\ \mathrm{kB}\) to \(2\ \mathrm{MB}\), and an active power draw on the order of \(10\) to \(100\ \mathrm{mW}\). There is no gigabyte of DRAM, no GPU, often no hardware for fast floating-point division, and no operating system to page memory in and out. What is on the die is all you get. This is the same machine that runs a thermostat or a motor controller, and now it must also run a neural network between sensor reads.</p>
+    <p>Two of those numbers matter more than the rest, and they are different kinds of memory. <strong>Flash</strong> is non-volatile: it holds your program and your model weights, and it is read-only at runtime. <strong>SRAM</strong> is volatile working memory: it holds the stack, the sensor buffers, and, critically, the intermediate <em>activations</em> the network computes as it runs. Flash is usually the larger of the two and the cheaper to spend. SRAM is scarce, shared with everything else the firmware does, and it is where TinyML projects go to die. Confusing the two is the most common beginner error: a model can fit comfortably in flash and still be impossible to run because a single layer's activations overflow SRAM.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>In TinyML the binding constraint is almost never the total model size. It is the <em>peak activation memory</em>: the largest amount of SRAM live at any one instant while the network executes. Weights stream from flash and can be enormous relative to SRAM; activations must fit in SRAM all at once. A network with few parameters but one wide early feature map can be infeasible, while a deeper network with a narrow bottleneck runs fine. Design the memory profile of the network, not just its parameter count, and design it layer by layer.</p>
+    </div>
+
+    <h2>Memory is the wall: flash holds weights, SRAM holds the bottleneck</h2>
+    <p>Make the memory arithmetic precise, because it is the arithmetic that gates feasibility. Let a network be a sequence of layers \(1, \dots, L\). Quantized to \(8\)-bit integers (the near-universal default for microcontrollers, developed in <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), each weight and each activation is one byte. The flash you need is essentially the sum of all weights,</p>
+    \[ M_{\text{flash}} \approx \sum_{\ell=1}^{L} w_\ell + C_{\text{code}}, \]
+    <p>where \(w_\ell\) is the weight count of layer \(\ell\) and \(C_{\text{code}}\) is the firmware and runtime footprint. The SRAM you need is the harder quantity. A standard inference runtime keeps, at each step, the input and output tensors of the layer currently executing, so the peak working set is</p>
+    \[ M_{\text{sram}} \approx \max_{\ell}\bigl(a_{\ell-1} + a_{\ell}\bigr) + B_{\text{sensor}} + C_{\text{stack}}, \]
+    <p>where \(a_\ell\) is the byte size of the activation tensor after layer \(\ell\), \(B_{\text{sensor}}\) is the sensor and feature buffer, and \(C_{\text{stack}}\) is the ordinary program stack. The term that hurts is the \(\max\): it is dominated by whichever single layer produces the widest input-plus-output pair, and that is typically an early convolution operating on a high-resolution feature map before pooling has shrunk it. This is why memory-aware architecture search (the subject of <a class="cross-ref" href="section-61.3.html">Section 61.3</a>) spends most of its effort reshaping the first few layers.</p>
+    <p>The <em>why</em> behind the \(\max\) is memory reuse: once layer \(\ell\) has consumed activation \(a_{\ell-1}\) and produced \(a_{\ell}\), the buffer holding \(a_{\ell-1}\) can be recycled for \(a_{\ell+1}\). A good runtime plans these buffers so that only the live tensors coexist, which is why total activation volume across the whole network is irrelevant and only the simultaneous peak matters. The snippet below estimates both budgets for a candidate architecture so you can reject an infeasible design in seconds rather than after an hour of on-device debugging.</p>
+
+    <pre class="language-python"><code class="language-python"># Layers as (weight_bytes, output_activation_bytes), int8 quantized.
+# A tiny CNN for 6-axis IMU windows: wide first conv is the bottleneck.
+layers = [
+    ("conv1", 1_152,  32 * 96),   # 32 channels x 96 timesteps of output
+    ("pool1",     0,  32 * 48),
+    ("conv2", 9_216,  64 * 48),
+    ("pool2",     0,  64 * 24),
+    ("conv3", 18_432, 64 * 24),
+    ("gap",       0,  64),
+    ("dense",  390,   6),
+]
+
+SRAM_BUDGET  = 256 * 1024
+FLASH_BUDGET = 1024 * 1024
+CODE, STACK, SENSOR_BUF = 90 * 1024, 8 * 1024, 4 * 1024
+
+flash = sum(w for _, w, _ in layers) + CODE
+acts  = [a for _, _, a in layers]
+peak  = max(prev + cur for prev, cur in zip([SENSOR_BUF] + acts, acts))
+sram  = peak + SENSOR_BUF + STACK
+
+print(f"flash: {flash/1024:6.1f} kB / {FLASH_BUDGET//1024} kB  "
+      f"{'OK' if flash < FLASH_BUDGET else 'OVER'}")
+print(f"sram peak: {sram/1024:6.1f} kB / {SRAM_BUDGET//1024} kB  "
+      f"{'OK' if sram < SRAM_BUDGET else 'OVER'}")</code></pre>
+    <div class="code-caption"><strong>Listing 61.1.1.</strong> A back-of-envelope feasibility check for a candidate TinyML model on a \(256\ \mathrm{kB}\)-SRAM, \(1\ \mathrm{MB}\)-flash microcontroller. It sums weights for the flash budget and takes the layer-wise input-plus-output maximum for the SRAM peak. Running it shows this network passes on both counts; widen <code>conv1</code> to \(128\) channels and the SRAM line flips to <code>OVER</code> while flash barely moves, exactly the failure mode the Key Insight warned about.</div>
+    <p>Listing 61.1.1 is deliberately crude, but it captures the decisive structure: change the parameter count and flash moves; change the width of one early feature map and the SRAM peak, the number that actually decides feasibility, moves far more.</p>
+
+    <h2>Energy is the real currency, and it is spent in microjoules</h2>
+    <p>A microcontroller sensor node usually runs on a battery that must last months or years, so the true budget is not milliwatts but energy per useful decision, and the decisive lever is the <em>duty cycle</em>: the fraction of time the chip is awake. An MCU asleep draws microamps; awake and computing it draws milliamps, a thousandfold difference. The energy of one inference cycle is roughly</p>
+    \[ E_{\text{cycle}} \approx P_{\text{active}}\, t_{\text{infer}} + P_{\text{sleep}}\,(T - t_{\text{infer}}) + E_{\text{sensor}} + E_{\text{radio}}, \]
+    <p>where \(T\) is the wake period. The lesson hidden in that sum is that the arithmetic term \(P_{\text{active}} t_{\text{infer}}\) is frequently <em>not</em> the largest one. Reading the sensor and, above all, turning on a radio to transmit a result can each cost more energy than the entire inference. This inverts naive intuition: making the model \(20\%\) faster may be pointless if a single wireless packet dwarfs the whole compute. The winning move is almost always to compute locally so that the radio stays off, and to keep the chip asleep between windows. That is the entire economic argument for TinyML restated in joules, and it is why the always-on cascades of <a class="cross-ref" href="section-61.5.html">Section 61.5</a> exist: a tiny cheap detector stays awake to decide when the expensive model is even worth waking.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a livestock health ear-tag</h4>
+        <p>A precision-agriculture startup builds an ear-tag that classifies cattle behaviour (grazing, ruminating, walking, distress) from a triaxial accelerometer, a wearable-style activity task of the kind covered in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>. The tag must survive a full grazing season, a year or more, on a single small cell, sealed against weather and never recharged. Streaming raw \(50\ \mathrm{Hz}\) accelerometry over LoRa would flatten the battery in days: the radio is the glutton. Instead a \(40\ \mathrm{kB}\) quantized model on a Cortex-M0+ classifies each ten-second window on-device and the tag transmits only a behaviour histogram twice a day, a few dozen bytes. The MCU is awake for a few milliseconds per window and asleep the rest, so its average draw sits in the tens of microamps. Every design decision, the \(8\)-bit weights, the tiny window model, the once-a-day radio, traces directly back to the energy equation above: keep the radio off, keep the duty cycle low, and let local inference buy both.</p>
+    </div>
+
+    <h2>Latency, determinism, and the cost of shipping firmware</h2>
+    <p>The last two constraints are latency and deployment. Latency in TinyML is usually easy to meet in the median and easy to <em>miss</em> at the tail: a bare-metal MCU with no operating system gives you deterministic timing, which is a gift, but a model that occasionally spills a buffer or triggers a slow software floating-point routine can blow a real-time deadline the way an airbag or a motor-control loop cannot tolerate. You size the model so that worst-case inference time fits inside the sample period, and you verify it on the actual silicon (<a class="cross-ref" href="index.html">Section 61.6</a>), never on a workstation whose timing tells you nothing. The fifth constraint is the least glamorous and the most underestimated: this code ships inside firmware to devices you may never physically touch again. A model that cannot be updated safely, or that bricks a node on a bad flash, is a liability measured in truck rolls. Field update and rollback (<a class="cross-ref" href="index.html">Section 61.7</a>) is a first-class design constraint, not an afterthought, precisely because the deployment surface is a fleet in the wild rather than a container you can restart.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not write the memory planner, the int8 kernels, or the buffer-reuse allocator that made the \(\max\) in the SRAM equation valid. A microcontroller runtime such as LiteRT for Microcontrollers (formerly TensorFlow Lite Micro) ships an interpreter with a static arena you size once, and it reports the exact peak SRAM it will use.</p>
+        <pre class="language-python"><code class="language-c">// C, on-device: the runtime plans all buffer reuse for you.
+constexpr int kArenaSize = 64 * 1024;      // you cap SRAM here
+static uint8_t tensor_arena[kArenaSize];
+tflite::MicroInterpreter interp(model, resolver, tensor_arena, kArenaSize);
+interp.AllocateTensors();
+printf("actual peak SRAM: %d bytes\n", interp.arena_used_bytes());</code></pre>
+        <div class="code-caption"><strong>Listing 61.1.2.</strong> The runtime turns the layer-by-layer buffer planning of Listing 61.1.1 into one <code>AllocateTensors()</code> call and reports the true peak with <code>arena_used_bytes()</code>. Hand-writing an equivalent tensor allocator, kernel set, and quantized operator library is several thousand lines of C; the runtime collapses it to an arena declaration and one call. Runtimes are compared in <a class="cross-ref" href="section-61.4.html">Section 61.4</a>.</div>
+        <p>Listing 61.1.2 removes the plumbing, not the judgment. The library tells you the peak SRAM; whether that peak fits your chip after the sensor buffers and the rest of the firmware take their share is still your problem to own.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The active frontier is squeezing genuinely capable perception into these budgets and measuring it rigorously. MCUNet (Lin et al., NeurIPS 2020) and its patch-based successor MCUNetV2 (2021) co-designed the network and the runtime memory scheduler to fit ImageNet-grade vision into \(256\ \mathrm{kB}\) of SRAM, directly attacking the peak-activation wall of this section rather than the parameter count. On the measurement side, the MLPerf Tiny benchmark suite (Banbury et al., 2021) gives the field a leakage-safe way to compare latency and energy across chips and runtimes on standard sensor tasks; it is treated in <a class="cross-ref" href="index.html">Section 61.7</a>. The open question these threads share is how far the constraints compose: how much accuracy survives when SRAM is fixed at kilobytes, energy is a coin cell, and inference must be deterministic all at once. The rest of this chapter is the toolkit for pushing that boundary.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the layer list in Listing 61.1.1 and modify it in three ways, one at a time: (a) double the first convolution's channel count, (b) double the number of parameters in the final dense layer, and (c) add a fourth convolution at the network's narrow tail. For each change, predict whether it stresses flash or SRAM more, then run the estimator to check. Write one sentence per change explaining the result in terms of the \(M_{\text{flash}}\) and \(M_{\text{sram}}\) equations, and state which change a memory-aware search would flag as dangerous.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A colleague reports that their model "is only \(80\ \mathrm{kB}\), so it easily fits our \(256\ \mathrm{kB}\) chip." Why is this claim not yet enough to know the model will run, and what quantity must they also compute?</p>
+        <p class="quiz-question">2. Explain why the SRAM budget is governed by a \(\max\) over layers rather than a sum, and what runtime mechanism makes that true.</p>
+        <p class="quiz-question">3. On a battery ear-tag, why can making the neural network faster save almost no energy, and what design lever actually dominates the energy per decision?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-61.2.html">Section 61.2</a>, we move from the constraints to the first thing you build inside them. Before a tiny network ever runs, the raw sensor stream has to become compact features, and on a microcontroller even a spectrogram is a memory-and-cycle decision. We look at how to compute features (windowing, filter banks, FFTs) within the very SRAM and energy budgets this section defined, so the model that follows starts from a representation the chip can actually afford.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

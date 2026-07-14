@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.4: Runtimes: LiteRT/TF-Lite-Micro, microTVM, ExecuTorch. Building Sensory AI." name="description"/>
+<title>Section 61.4: Runtimes: LiteRT/TF-Lite-Micro, microTVM, ExecuTorch | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Runtimes: LiteRT/TF-Lite-Micro, microTVM, ExecuTorch</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"On a server I ask the operating system for memory whenever a thought grows too large. On this microcontroller there is no one to ask. I get one drawer of RAM at boot, and every idea I will ever have must fit in it at once."</p>
+        <cite>A Resourceful AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you have a trained, quantized model in hand: the int8 weights and the TinyNAS or MCUNet architectures of the previous section (Section 61.3), and the general model-optimization toolkit of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. You should recall from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> that a sensor delivers samples on a fixed clock, since the runtime's job is to finish one inference before the next window arrives. No new mathematics is introduced; the arithmetic is memory accounting in bytes. The microcontroller vocabulary (flash, SRAM, arena) is defined as it appears.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>You have a quantized graph. Something has to actually execute it on a chip with no operating system, no dynamic memory allocator you can trust, a few hundred kilobytes of SRAM, and a power budget measured in milliwatts. That something is the <em>runtime</em>: the piece of code that reads your model, lays out its tensors in a fixed slab of memory, and calls the right arithmetic kernel for each operator. This section is about the three runtime families that dominate microcontroller sensor AI and the single design axis that separates them: do you ship an <em>interpreter</em> that walks the graph at run time, or do you <em>compile</em> the graph ahead of time into straight-line C? By the end you will be able to look at a target board and a latency budget and choose LiteRT for Microcontrollers, microTVM, or ExecuTorch on purpose, not by habit.</p>
+    </div>
+
+    <h2>What a microcontroller runtime actually does</h2>
+    <p>On a laptop, running a model is easy to take for granted: the framework mallocs whatever it needs, the OS pages memory in and out, and a missing operator triggers a helpful Python exception. A microcontroller offers none of that. There is no OS to allocate from, dynamic allocation risks heap fragmentation that eventually crashes a device meant to run for years, and there is no console to print an exception to. The runtime must therefore do four concrete things within a fixed, statically sized region of RAM called the <strong>tensor arena</strong>: parse the model, plan where every intermediate tensor lives, dispatch each operator to a numeric kernel, and return, all without ever calling <code>malloc</code> after startup.</p>
+    <p>Memory planning is the heart of it. A network's intermediate activations do not all live at once. Tensor \(t\) is born when its producing operator runs and dies after its last consumer reads it. The runtime computes these lifetimes and packs overlapping tensors into the same bytes, so the arena only needs to be as large as the <em>peak</em> simultaneous footprint, not the sum of all tensors. Formally, if tensor \(i\) occupies bytes and is live over an interval, the required arena is</p>
+    \[ A = \max_{t} \sum_{i \,:\, \text{live at } t} \text{bytes}(i), \]
+    <p>the maximum over time of the total live bytes. This is a one-dimensional bin-packing problem the runtime solves offline or at initialization, and it is why a five-layer network with megabytes of total activations can run in tens of kilobytes of arena. Getting \(A\) under the chip's SRAM is frequently the binding constraint on whether a model deploys at all, more so than flash, which holds the read-only weights.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>On a microcontroller the model's parameters and the model's working memory live in two physically different places with two different budgets. Weights are constant, so they sit in <strong>flash</strong> (often megabytes, read-only, cheap). Activations change every inference, so they sit in <strong>SRAM</strong> (often tens to a few hundred kilobytes, precious). A model can fit in flash and still be undeployable because its peak activation footprint \(A\) overflows SRAM. When you profile a tiny model, report two numbers, not one: flash for weights, arena for activations. The arena is usually the one that kills you.</p>
+    </div>
+
+    <h2>Interpreters versus compilers: the one axis that matters</h2>
+    <p>Every microcontroller runtime resolves the same tension between flexibility and overhead, and the choice defines the three families. An <strong>interpreter</strong> ships a general engine plus your model as data. At run time it loops over the graph: read the next operator code, look up its kernel, call it, advance. This is exactly what <strong>LiteRT for Microcontrollers</strong> does, the runtime long known as TensorFlow Lite Micro (TFLM). Your model is a FlatBuffer (a <code>.tflite</code> file) that the device loads without deserialization; a static <code>MicroInterpreter</code> walks it against a <code>MicroMutableOpResolver</code> into which you register only the operators your network uses, so unused kernels never link and never cost flash. The virtue is portability and predictability: the same interpreter binary runs any model whose ops you registered, updating the model is swapping a data file, and there is no code generation step to debug. The cost is a modest per-operator dispatch overhead and a runtime core of tens of kilobytes.</p>
+    <p>A <strong>compiler</strong> takes the opposite bet. It reads your specific graph ahead of time and emits specialized C or machine code with the interpreter loop unrolled away: no operator table, no dispatch, just the arithmetic your network needs, inlined. This is <strong>microTVM</strong>, the microcontroller path of the Apache TVM compiler. It lowers the graph to an intermediate representation, applies operator fusion and scheduling, and can <em>autotune</em>, empirically searching over loop tilings and orderings on the actual target to find the fastest schedule for that exact chip and cache. The output is a tiny, dependency-free C library with no interpreter at all. The virtue is speed and minimal code size; the cost is that the artifact is welded to one model and one target, and rebuilding for a new model means recompiling, not swapping a file.</p>
+    <p><strong>ExecuTorch</strong>, PyTorch's on-device runtime, occupies an instructive middle ground. You <code>torch.export</code> a model to a graph, then lower it to a <code>.pte</code> program in which subgraphs are <em>delegated</em> to backends: XNNPACK on application processors, CMSIS-NN or a vendor NPU kernel library on microcontrollers. A small ExecuTorch core executes the top-level program and hands each delegated partition to a backend that may itself be ahead-of-time compiled. It keeps the interpreter's model-as-data flexibility for the graph structure while pushing the hot arithmetic into compiled, hardware-specific kernels, and it lets a PyTorch-trained sensor model reach an MCU without a detour through a different framework.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a wearable fall detector on a Cortex-M4</h4>
+        <p>A wrist wearable classifies a one-second window of triaxial accelerometry (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) into fall or not-fall on an 80 MHz Cortex-M4 with 128 kB of SRAM. The team first ships with LiteRT for Micro because iteration is fast: retraining the model overnight means dropping a new FlatBuffer into flash, no firmware rebuild. They register five operators (conv, depthwise-conv, add, mean-pool, fully-connected), and the CMSIS-NN kernels underneath exploit the M4's DSP multiply-accumulate. Profiling shows a 44 kB arena and a 9 ms inference, comfortably inside the 1 Hz window. Only when they later push a larger model that overruns both flash and the latency budget do they recompile the frozen, final architecture through microTVM, whose autotuned schedule shaves the interpreter overhead and drops inference to 6 ms with a smaller binary. The sequence is the lesson: interpret while the model is moving, compile once it stops.</p>
+    </div>
+
+    <h2>Kernels, quantization, and where the speed comes from</h2>
+    <p>Whichever runtime dispatches an operator, the arithmetic itself lives in a <em>kernel</em>, and on Arm microcontrollers the kernel that matters is <strong>CMSIS-NN</strong>. All three runtimes can route their int8 convolutions and matrix multiplies through it. CMSIS-NN uses the SIMD and multiply-accumulate instructions of the Cortex-M DSP and Helium extensions to do several int8 products per cycle, which is why quantization (<a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>) buys speed and not only size: int8 is not merely four times smaller than float32, it is what unlocks the vectorized integer path the silicon is fast at. A runtime carries both a portable <em>reference</em> kernel (correct, slow, used for bring-up and unsupported targets) and an <em>optimized</em> kernel (CMSIS-NN or a vendor library); a common performance trap is unknowingly shipping the reference kernel because the optimized one was not compiled in.</p>
+    <p>You can feel the interpreter's behavior on the desktop, where LiteRT exposes the same FlatBuffer model and a Python <code>Interpreter</code> that runs it. The snippet below loads a quantized <code>.tflite</code> model, reports the arena the interpreter reserved, and runs one inference on a synthetic sensor window, mirroring exactly what the microcontroller does with the same file.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+import tensorflow as tf   # LiteRT ships the same runtime; ai_edge_litert on newer installs
+
+# The .tflite FlatBuffer is byte-for-byte the file the MCU loads from flash.
+interp = tf.lite.Interpreter(model_path="fall_detector_int8.tflite")
+interp.allocate_tensors()                    # this is the arena/memory-planning step
+
+in_d, out_d = interp.get_input_details()[0], interp.get_output_details()[0]
+print("input dtype:", in_d["dtype"], "shape:", in_d["shape"])
+print("arena bytes:", interp._interpreter.GetTensorArenaSize()
+      if hasattr(interp._interpreter, "GetTensorArenaSize") else "see profiler")
+
+# One 1 s window of triaxial accelerometry, int8 as the quantized model expects.
+window = np.random.randint(-128, 127, size=in_d["shape"], dtype=np.int8)
+interp.set_tensor(in_d["index"], window)
+interp.invoke()                              # the interpreter loop walks every operator
+print("logits:", interp.get_tensor(out_d["index"]))</code></pre>
+    <div class="code-caption"><strong>Listing 61.4.1.</strong> Loading and running a quantized FlatBuffer through the LiteRT interpreter on the desktop. The <code>allocate_tensors()</code> call is the memory-planning step that computes the arena \(A\); <code>invoke()</code> is the interpreter loop the microcontroller executes verbatim against the identical file. Running this before flashing catches shape, dtype, and operator-coverage errors on a machine that can actually print them.</div>
+    <p>Listing 61.4.1 is the cheapest debugging you will ever do: any op the target would reject, any shape mismatch, any quantization surprise shows up here with a readable traceback instead of a silent hard-fault on a board with no console.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Writing a microcontroller runtime by hand, a FlatBuffer parser, a bin-packing memory planner, int8 kernels for every operator, and the dispatch loop, is thousands of lines of C you must then verify bit-exact against the training framework. ExecuTorch collapses the export-and-lower step to a few lines and emits a ready-to-flash program with its backend delegation already wired.</p>
+        <pre class="language-python"><code class="language-python">import torch
+from executorch.exir import to_edge
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+
+exported = torch.export.export(model.eval(), (example_window,))
+program  = to_edge(exported).to_backend(XnnpackPartitioner()).to_executorch()
+open("fall_detector.pte", "wb").write(program.buffer)   # flash this</code></pre>
+        <div class="code-caption"><strong>Listing 61.4.2.</strong> Three effective lines take a trained PyTorch sensor model to a delegated, on-device <code>.pte</code> program. The partitioner decides which subgraphs go to the compiled backend; the hand-written equivalent (parser, planner, kernels, delegation glue) is several thousand lines. The library removes the plumbing, not the judgment: whether the delegated kernels preserve your accuracy is still an evaluation you own.</div>
+    </div>
+
+    <h2>Choosing a runtime, and living with the choice</h2>
+    <p>The decision reduces to a few honest questions. If your model is still changing and you value dropping a new file into flash without a firmware rebuild, favor the interpreter: <strong>LiteRT for Microcontrollers</strong>, mature, widely ported, with the largest operator coverage and the best CMSIS-NN integration for Arm sensor nodes. If the architecture is frozen and you are fighting for the last kilobyte of flash or the last millisecond of latency, favor the compiler: <strong>microTVM</strong>, whose autotuned, interpreter-free C is the smallest and often the fastest, at the price of recompiling per model and per target. If your team lives in PyTorch and wants training and deployment in one framework with clean delegation to whatever accelerator the board carries, <strong>ExecuTorch</strong> is the path, and it is the direction PyTorch's ecosystem is investing in. Many production fleets use two: an interpreter during the development and A/B phase, a compiled artifact for the final locked build. Whatever you pick, the runtime is now part of your firmware and your update story, and shipping a new model to a fleet in the field, safely and reversibly, is its own discipline covered in <a class="cross-ref" href="index.html">this chapter's</a> later material and in the fleet operations of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The active frontier is compiler-level co-design that erases the runtime boundary entirely. The TinyEngine work behind MCUNet (Lin et al., NeurIPS 2020 and 2021) showed that a code generator specializing memory scheduling, in-place depthwise convolution, and operator fusion to one network can cut peak SRAM enough to run ImageNet-scale inference on a 256 kB microcontroller, beating a general interpreter by large margins. microTVM's autotuning and ExecuTorch's ahead-of-time delegation are the productized descendants of that idea. The open question for sensor AI is how far this specialization can go for <em>always-on streaming</em> models, where the runtime must also manage a rolling input buffer and wake from deep sleep between windows, tying runtime design directly to the always-on cascades of the next section and to the intermittent, batteryless regime of <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a small quantized <code>.tflite</code> classifier (train one on an activity dataset, or use any int8 example model). Run it through Listing 61.4.1 and record two numbers: the reported arena size and the wall-clock time of a single <code>invoke()</code>. Now reason about the peak-live-bytes formula \(A = \max_t \sum_i \text{bytes}(i)\): if you doubled the width of the widest hidden layer, would the arena double, less than double, or more than double, and why? State which of your two measured numbers (flash weights or SRAM arena) you expect to become the binding constraint first as the model grows, and defend it in two sentences.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does a network with megabytes of total intermediate activations often run in an arena of only tens of kilobytes? Answer using the notion of tensor lifetimes and the formula for \(A\).</p>
+        <p class="quiz-question">2. Give one concrete advantage and one concrete cost of an interpreter (LiteRT for Micro) versus a compiler (microTVM) for a model you expect to retrain monthly.</p>
+        <p class="quiz-question">3. Quantizing to int8 speeds up inference on a Cortex-M, not just shrinks it. Which piece of the stack, the runtime dispatch or the numeric kernel, is responsible for that speedup, and why?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-61.5.html">Section 61.5</a>, we put this runtime to work under the hardest constraint of all: staying awake. Always-on sensing cannot afford to run a full model on every window, so we build wake-up cascades, a cheap always-listening stage that decides when to spend the energy of invoking the runtime you just learned to choose, turning inference from a constant drain into a rare, deliberate event.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

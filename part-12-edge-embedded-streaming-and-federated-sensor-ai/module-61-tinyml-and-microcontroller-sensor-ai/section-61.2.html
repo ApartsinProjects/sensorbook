@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.2: Feature extraction on microcontrollers. Building Sensory AI." name="description"/>
+<title>Section 61.2: Feature extraction on microcontrollers | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Feature extraction on microcontrollers</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"On a chip with no floating-point unit, the fanciest thing I own is a well-scaled integer, and I have learned to love it."</p>
+<cite>A Fixed-Point AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>On a microcontroller the neural network is rarely the expensive part. The expensive part is the front end that turns a raw sensor stream into the compact numbers the network eats. Get that front end right and a 20-kilobyte classifier reaches accuracy that a raw-waveform network ten times its size would need; get it wrong and no amount of clever architecture recovers the signal you threw away. Feature extraction on a microcontroller is a different craft from the same task on a workstation. There is often no floating-point unit, a few tens of kilobytes of RAM, no room to buffer a whole recording, and a power budget that punishes every wasted cycle. This section is about computing the classic signal-processing features, spectrograms, mel-frequency energies, statistical descriptors of motion, in fixed-point arithmetic, in place, one block at a time, on a chip that costs less than a cup of coffee. It is where the physics of the sensor meets the arithmetic the hardware can actually afford.</p>
+</div>
+
+<p>This section assumes you know what these features <em>mean</em>: the spectral and time-frequency transforms of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, the feature-engineering vocabulary of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, and the sampling and windowing discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Here we do not re-derive the mel filterbank or the short-time Fourier transform; we ask how to run them on a Cortex-M with kilobytes of SRAM and no operating system, which changes almost every implementation decision.</p>
+
+<h2>Why compute features on the device at all</h2>
+<p>The instinct from Part IV is to feed a network the raw signal and let it learn its own front end. On a microcontroller that instinct is usually wrong, for three concrete reasons. First, arithmetic budget: a hand-crafted spectrogram compresses a 16 kHz audio window of 1024 raw samples into perhaps 40 mel energies, a 25-fold reduction, before the network sees a single multiply. The classifier that follows can be tiny because the hard, high-dimensional work is done by a fixed transform that costs no trained parameters and no training data. Second, sample efficiency: TinyML datasets are small, and a fixed, physically meaningful front end injects strong priors (frequency structure, energy, periodicity) that a data-starved network could never learn reliably. Third, determinism: a fixed-function DSP pipeline has a known, constant cost per block, which is exactly what a real-time always-on system needs. The feature extractor is therefore not a preprocessing afterthought; it is the component that decides how small the network is allowed to be.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The front end is a free parameter budget</h3>
+<p>Every bit of structure you extract with a fixed transform is a parameter the network does not have to learn or store. A mel spectrogram encodes the logarithmic frequency sensitivity of human hearing and the roll-off of most mechanical noise for zero parameters and zero training samples. Spend RAM and cycles on a good front end and you buy back model size, flash, training data, and energy, all at once. On a workstation this trade is optional. On a microcontroller with 64 KB of RAM it is the difference between a model that fits and one that does not.</p>
+</div>
+
+<h2>Fixed-point arithmetic: the native language of the MCU</h2>
+<p>Most microcontrollers used in always-on sensing (the Cortex-M0 and M3, and the M4 or M7 without the optional FPU enabled) have no hardware floating point. Emulating floats in software is ten to a hundred times slower than integer math, so the entire feature pipeline runs in <strong>fixed-point</strong>: integers interpreted as fractions with an implied binary point. The common convention is Q-format. A Q15 value stores a number in \([-1, 1)\) as a signed 16-bit integer, where the stored integer \(x_{\text{int}}\) represents the real value</p>
+<p>$$ x = \frac{x_{\text{int}}}{2^{15}}, \qquad x_{\text{int}} \in [-32768,\ 32767]. $$</p>
+<p>Multiplying two Q15 numbers gives a Q30 result that must be shifted right by 15 to return to Q15, and additions risk overflow that you manage with saturation or a wider Q31 accumulator. The engineering cost of fixed-point is not the arithmetic; it is <em>scaling</em>. You must track, at every stage, the dynamic range of your data so that intermediate values neither overflow the 16-bit register nor collapse into a handful of least-significant bits and lose all precision. A microphone frame is small and needs headroom; the squared magnitudes after an FFT can be large and need a downshift. Getting these shifts right, block by block, is the real work of porting a feature extractor, and it is why the same mel-spectrogram code that is trivial in NumPy becomes a careful ledger of bit positions on the device.</p>
+
+<h2>The audio front end in kilobytes: log-mel and MFCC</h2>
+<p>The most widely deployed microcontroller feature pipeline is the log-mel spectrogram, the input to nearly every keyword spotter and acoustic event detector on the edge. It is a fixed sequence of five stages, each with a fixed-point implementation: (1) slice the stream into overlapping frames of, say, 320 samples; (2) apply a Hann window to suppress spectral leakage; (3) take a real fixed-point FFT to get magnitudes; (4) sum those magnitudes into a bank of triangular mel-spaced filters, mapping linear frequency \(f\) in hertz to the perceptual mel scale</p>
+<p>$$ m(f) = 2595 \, \log_{10}\!\left(1 + \frac{f}{700}\right); $$</p>
+<p>and (5) take the logarithm of each filter's energy to compress the enormous dynamic range of sound into a few bits. The classic MFCC adds a discrete cosine transform to decorrelate the log-mel energies, but modern tiny CNNs usually skip it and consume the log-mel image directly, since a convolution learns any decorrelation it needs. The reference implementation shipped with TensorFlow Lite Micro's keyword example, the <em>microfrontend</em>, does exactly these steps in integer arithmetic with a noise-reduction and gain-control stage, producing an 8-bit spectrogram ready for a quantized network. The Python below computes the same log-mel features in floating point so you can see the pipeline end to end; on the device each line becomes a CMSIS-DSP call over Q15 buffers.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def hz_to_mel(f):        return 2595.0 * np.log10(1.0 + f / 700.0)
+def mel_to_hz(m):        return 700.0 * (10.0**(m / 2595.0) - 1.0)
+
+def mel_filterbank(n_mels, n_fft, sr):
+    edges = mel_to_hz(np.linspace(hz_to_mel(0), hz_to_mel(sr/2), n_mels + 2))
+    bins  = np.floor((n_fft + 1) * edges / sr).astype(int)
+    fb = np.zeros((n_mels, n_fft // 2 + 1))
+    for i in range(1, n_mels + 1):
+        for j in range(bins[i-1], bins[i]):   fb[i-1, j] = (j - bins[i-1]) / (bins[i] - bins[i-1])
+        for j in range(bins[i], bins[i+1]):   fb[i-1, j] = (bins[i+1] - j) / (bins[i+1] - bins[i])
+    return fb
+
+def log_mel_frame(frame, fb, n_fft):
+    windowed = frame * np.hanning(len(frame))          # step 2: suppress leakage
+    mag = np.abs(np.fft.rfft(windowed, n_fft))         # step 3: real FFT magnitude
+    mel_energy = fb @ (mag ** 2)                        # step 4: mel filterbank
+    return np.log(mel_energy + 1e-6)                   # step 5: log compression
+
+sr, n_fft, n_mels = 16000, 512, 40
+fb = mel_filterbank(n_mels, n_fft, sr)                  # precomputed once, stored in flash
+frame = np.random.randn(320).astype(np.float32)
+feats = log_mel_frame(np.pad(frame, (0, n_fft - 320)), fb, n_fft)
+print(feats.shape)                                     # -> (40,)  one column of the spectrogram
+</code></pre>
+<div class="code-caption">The five-stage log-mel front end that feeds most microcontroller keyword spotters, shown in floating point for clarity. The 40-value filterbank <code>fb</code> is computed once on a workstation and baked into flash as a constant table; on the device only the per-frame window, FFT, filter sum, and log run in real time, each as a fixed-point CMSIS-DSP routine. A 320-sample frame collapses to 40 numbers before the network runs.</div>
+
+<p>Two implementation notes carry over to the device and are invisible in the code above. The filterbank matrix is <em>static</em>, so it lives in flash as a Q15 constant table and costs no RAM to recompute. And the FFT is the single most expensive operation; on a Cortex-M4 a 512-point Q15 FFT via the CMSIS-DSP radix-2 routine dominates the cycle budget of the whole front end, which is why frame size and hop are chosen as much for compute cost as for time-frequency resolution.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">CMSIS-DSP does the fixed-point plumbing</h3>
+<p>Writing a saturating Q15 radix-2 FFT, a windowing multiply, and a log by hand is several hundred lines of bit-shift-tracking C that is agony to debug. Arm's CMSIS-DSP library provides the whole chain as vetted, SIMD-accelerated primitives, so the per-frame front end becomes a handful of calls:</p>
+<pre><code class="language-c">arm_mult_q15(frame, hann_window, windowed, FRAME_LEN);      // step 2
+arm_rfft_q15(&fft_inst, windowed, fft_out);                 // step 3
+arm_cmplx_mag_squared_q15(fft_out, power, N_FFT/2);         // |X|^2
+arm_mat_mult_q15(&mel_fb, &power_mat, &mel_energy);         // step 4
+// step 5: fixed-point log via a small lookup table
+</code></pre>
+<div class="code-caption">Five CMSIS-DSP calls replace roughly 300 lines of hand-tuned fixed-point C, and each uses the Cortex-M4 or M7 SIMD instructions for the fixed-point arithmetic. You still choose scaling and frame parameters; the library handles saturation, rounding, and vectorization.</div>
+<p>The library handles overflow, rounding, and processor-specific SIMD; you own the scaling decisions and the frame geometry. That is roughly a 60-fold reduction in code you must write and verify for the most error-prone part of the pipeline.</p>
+</div>
+
+<h2>Streaming: features that never buffer the whole signal</h2>
+<p>A workstation loads the entire recording and slides a window over it. A microcontroller cannot; the signal is infinite and the RAM is not. Feature extraction therefore runs as a <strong>streaming</strong> computation over a circular (ring) buffer. New samples arrive from the sensor by DMA (direct memory access) into one half of a double buffer while the CPU processes the other half, the classic ping-pong that keeps capture and compute concurrent without dropping a sample. Each time a frame's worth of new data lands, the front end emits one feature column, which is appended to a small rolling feature window (say the last 49 columns of a spectrogram) that the network consumes. Crucially, features that are sums or recursions update incrementally: a running mean, an exponentially weighted energy, or a sliding-window RMS need only the newest and oldest samples, not the whole buffer. This is the same online-computation discipline developed in <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, applied under a far tighter memory ceiling. The design rule is blunt: if a feature cannot be computed incrementally in bounded memory, it does not belong in an always-on microcontroller front end.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A bearing-fault detector on a factory motor</h3>
+<p>An industrial condition-monitoring node (the setting of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) is bolted to a pump motor and runs on a Cortex-M4 sipping a few milliwatts so it can live for years on a small cell. Its job is to hear the onset of a bearing fault, which shows up as rising energy at specific vibration harmonics. A raw accelerometer stream at 4 kHz would swamp both the RAM and the tiny classifier, so the firmware never stores it. Instead, DMA fills a ping-pong buffer, and every 256 samples the device computes a 256-point Q15 FFT, sums the magnitudes into a dozen frequency bands matched to the motor's characteristic fault frequencies, and appends one 12-value vector to a rolling window. A 4-kilobyte network reads that window and flags anomalies. The whole front end holds two 256-sample buffers and a 12-band filter table in a few kilobytes, and it runs in a fraction of the time between frames, so the CPU sleeps most of the duty cycle. The physics of the bearing chose the bands; the microcontroller merely had to afford them. The same template drives motion features on a wearable, where the accelerometer of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> yields streaming mean, variance, and zero-crossing rate for the activity models of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Learnable and auto-tuned front ends</h3>
+<p>The fixed mel front end is a strong default, but it is not sacred, and a research thread asks whether the front end itself should be learned under the microcontroller's constraints. Google's LEAF (Learnable Audio Frontend, Zeghidour et al., 2021) replaces the mel filterbank and log with trainable Gaussian filters and a learned compression, and can be quantized for the edge. On the tooling side, Edge Impulse's DSP autotuning and its EON compiler search over front-end hyperparameters (frame length, filter count, transform choice) jointly with the classifier, then generate fixed-point C for the winning configuration, turning the scaling ledger described above into a compiled artifact. The open question is when a learned or auto-searched front end earns its extra flash and cycles over a well-chosen classical one; for many always-on sensing tasks the hand-crafted spectrogram remains the frugal winner, but the gap is closing.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: budget a spectrogram front end</h3>
+<p>You must run a keyword spotter on a Cortex-M4 at 16 kHz with 128 KB of RAM. Design the front end: choose a frame length and hop, a mel filter count, and an FFT size, then compute (1) the RAM for the ping-pong input buffer plus the rolling feature window, (2) the number of FFTs per second, and (3) the reduction ratio from raw samples per second to feature values per second. Now double the mel filter count and halve the hop; state precisely which of the three quantities change and by how much, and argue whether the accuracy gain is likely to justify the extra cycles on an always-on device. Use the log-mel code above to generate the feature dimensions for each configuration.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does computing a fixed mel spectrogram on the device let you use a dramatically smaller network than feeding the raw waveform, and name two costs besides model size that the front end buys back.</li>
+<li>In Q15 arithmetic, what goes wrong if you forget to right-shift after multiplying two values, and separately what goes wrong if you shift too aggressively?</li>
+<li>Explain why a ping-pong DMA buffer lets a microcontroller extract features from an unbounded stream in bounded memory, and give one example of a feature that cannot be computed this way.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-61.3.html">Section 61.3</a>, we move from the front end to the network it feeds. With features already compressed and quantized, the remaining question is how to build the classifier itself under kilobyte memory limits: the integer-only quantized networks, and the neural architecture search of TinyNAS and MCUNet that co-designs the model with the microcontroller's memory and compute so the whole pipeline, front end plus network, fits and runs in real time.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.5: Pruning and sparsity. Building Sensory AI." name="description"/>
+<title>Section 59.5: Pruning and sparsity | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Pruning and sparsity</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"They gave me ten million weights and told me to recognize a footstep. Nine million of them were just there to watch."</p>
+        <cite>A Recently Downsized AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can train a small neural network and read a PyTorch training loop (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>), and that you have met Section 59.4's quantization vocabulary, since pruning and quantization are complementary and usually shipped together. The hardware realities that decide whether sparsity actually buys speed (NPUs, DSPs, sparse tensor cores) come from Sections 59.2 and 59.3. Nothing here needs anything heavier than gradient descent and the notion of a weight matrix.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A trained network is almost always larger than the task needs. Many weights contribute so little that setting them to exactly zero changes the output by a rounding error. Pruning finds those weights and deletes them; sparsity is the resulting structure of mostly-zeros. Done well, pruning shrinks a sensor model by half or more with negligible accuracy loss, cutting the flash footprint on a wearable and the energy per inference on a battery. The catch, and the whole engineering story of this section, is that <em>zeros are not automatically free</em>. Whether a pruned model runs faster depends entirely on whether your hardware can skip the zeros, and that turns a simple idea into a set of sharp design choices.</p>
+    </div>
+
+    <h2>What pruning removes, and why the network survives it</h2>
+    <p>Pruning sets a chosen subset of a model's parameters to zero and (ideally) never computes with them again. The premise is <strong>over-parameterization</strong>: modern networks are trained with far more weights than the final function requires, because the surplus makes optimization easier, not because the deployed model needs it. After training, much of that capacity is dead weight. The classic evidence is that you can rank weights by magnitude \(|w|\), delete the smallest fraction, and lose almost no accuracy, because a weight near zero already contributes almost nothing to any activation. The objective is to find a binary mask \(m \in \{0,1\}^{d}\) that keeps a target fraction of weights while minimizing the loss:</p>
+    \[ \min_{m} \; \mathcal{L}\big(w \odot m\big) \quad \text{subject to} \quad \|m\|_0 \le k, \]
+    <p>where \(\odot\) is elementwise multiplication and \(k\) is the number of weights you are willing to keep. Solving this exactly is combinatorial, so every practical method is a heuristic for choosing the mask.</p>
+    <p>The <em>why it works</em> is that a sensor model rarely needs its full expressive budget. A human-activity classifier separating walking from cycling from sitting (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) is solving a far lower-dimensional problem than the network it was trained in can represent. Prune the excess and you keep the decision boundary while discarding the scaffolding. The reason the network <em>survives</em> is that the remaining weights can be re-tuned: after masking, a short fine-tuning pass lets the survivors absorb the small errors the deletions introduced. Pruning without that recovery step is what turns a harmless trim into a wound.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Sparsity is not the same thing as speed. Setting 90% of a weight matrix to zero saves nothing if the hardware still multiplies by every zero. The number that matters on a datasheet is not the sparsity percentage; it is whether your runtime and silicon can <em>skip</em> the zeros. That single distinction is why "structured" pruning exists and why an impressive 95%-sparse model can be slower in practice than a boring 50%-dense one.</p>
+    </div>
+
+    <h2>Unstructured, structured, and the N:M compromise</h2>
+    <p>Pruning methods differ mainly in the <em>shape</em> of the zeros they create, and that shape decides whether any speedup is real.</p>
+    <p><strong>Unstructured pruning</strong> removes individual weights wherever they are smallest. It reaches the highest sparsity at a given accuracy, because it is unconstrained: it can delete exactly the least useful weight anywhere in the matrix. Its problem is that the surviving weights sit at scattered, irregular positions. A general-purpose CPU or GPU still loads the whole matrix and multiplies through the zeros, so you get a smaller <em>file</em> (great for flash-limited microcontrollers, per <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>) but usually no faster inference unless a specialized sparse kernel is available.</p>
+    <p><strong>Structured pruning</strong> removes whole units: entire channels, filters, attention heads, or rows and columns of a weight matrix. Because it deletes contiguous blocks, the result is simply a <em>smaller dense network</em> that every runtime already accelerates, no special kernels needed. The price is lower peak sparsity: forcing deletions to fall on structural boundaries throws away some useful weights alongside the useless ones. For most edge sensor deployments, structured pruning is the pragmatic default precisely because its speedup is guaranteed on ordinary hardware.</p>
+    <p><strong>N:M semi-structured sparsity</strong> is the modern compromise: within every contiguous block of \(M\) weights, at most \(N\) are nonzero. The 2:4 pattern (two nonzeros in every four) is directly accelerated by NVIDIA Ampere-and-later sparse tensor cores and by a growing set of edge NPUs, delivering close to a \(2\times\) matmul speedup while staying near the accuracy of unstructured pruning. It is regular enough for hardware to exploit, yet fine-grained enough to keep the weights that matter. When your target silicon supports it, N:M is often the best size-accuracy-speed point available.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a vibration monitor on a wind-turbine gearbox</h3>
+        <p>A condition-monitoring team deploys a small 1D-CNN on an accelerometer clamped to a gearbox, flagging bearing faults from vibration spectra (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>). The node runs on a harvested-power budget and wakes only when RMS energy crosses a threshold, so every millijoule per inference matters. The dense model is 1.8 MB and draws too much to meet the duty cycle. They apply channel (structured) pruning to remove 40% of the convolutional filters, then fine-tune for a few epochs on the original training set. Accuracy on held-out turbines drops from 96.1% to 95.7%, well inside their tolerance, while the model shrinks to 1.05 MB and inference energy falls by roughly a third because the runtime simply executes a smaller dense convolution. Crucially, they measured on a leakage-safe split by turbine, not by window, so the recovered accuracy reflects new machines and not memorized ones. Unstructured pruning would have shrunk the file further but, on their Cortex-M NPU without sparse kernels, would not have cut the energy at all.</p>
+    </div>
+
+    <h2>How to prune: schedules, criteria, and recovery</h2>
+    <p>The naive recipe, "train, delete the smallest weights once, ship," leaves accuracy on the table. Three refinements do the real work.</p>
+    <p><strong>Gradual, iterative pruning</strong> beats one-shot pruning at high sparsity. Instead of removing everything at once, you raise the sparsity target on a schedule across training, interleaving small deletions with fine-tuning so the network continually re-adapts. A widely used schedule ramps sparsity \(s_t\) from an initial \(s_i\) to a final \(s_f\) as</p>
+    \[ s_t = s_f + (s_i - s_f)\left(1 - \frac{t - t_0}{n\,\Delta t}\right)^{3}, \]
+    <p>which prunes aggressively early and tapers off, giving the survivors many steps to compensate. <strong>The pruning criterion</strong> is how you score which weights to cut. Magnitude (\(|w|\)) is the cheap, strong baseline. Better criteria weight each parameter by its estimated effect on the loss, for example \(|w \cdot \partial \mathcal{L}/\partial w|\) (a first-order saliency), which catches small-magnitude weights that nonetheless move the output a lot. <strong>Recovery fine-tuning</strong> is non-negotiable at anything above modest sparsity: after each pruning step, continue training the unmasked weights so they redistribute the load. Skip it and a 70%-sparse model can collapse; include it and the same model often matches the dense baseline within noise. And because you are re-training and re-evaluating, everything <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> says about leakage-safe splits applies: measure the recovered accuracy on data the fine-tuning never touched.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn.utils.prune as prune
+
+# A tiny sensor classifier; prune its linear layers to 60% sparsity by magnitude.
+layers = [(model.fc1, "weight"), (model.fc2, "weight")]
+
+for epoch in range(n_epochs):
+    train_one_epoch(model, loader, optimizer)      # normal fine-tuning
+    target = 0.6 * min(1.0, (epoch + 1) / warmup)  # ramp sparsity up gradually
+    for module, name in layers:
+        prune.l1_unstructured(module, name=name, amount=target)  # smallest |w| -> 0
+    evaluate(model, val_loader_by_subject)         # leakage-safe split
+
+for module, name in layers:
+    prune.remove(module, name)                     # bake the mask into the weights</code></pre>
+    <div class="code-caption"><strong>Listing 59.5.1.</strong> Gradual magnitude pruning with recovery. Each epoch trains the surviving weights, then raises the sparsity target and re-applies an L1 (magnitude) mask so deletions and fine-tuning interleave. <code>prune.remove</code> finalizes the mask so the zeros are permanent. This produces <em>unstructured</em> sparsity: the file compresses well, but a speedup needs a sparse kernel or an N:M-aware backend.</div>
+
+    <p>Listing 59.5.1 shows the pattern in about a dozen lines: ramp the target, re-mask, keep training. Note the evaluation uses a subject-wise validation loader, so the accuracy you recover is not inflated by windows leaking between train and test.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Writing <em>structured</em> pruning by hand is where the pain lives: deleting a convolutional filter means also deleting the matching input channels in the next layer, fixing up batch-norm statistics, and rewiring residual connections so the tensor shapes still line up. Done manually that is 150-plus lines of shape bookkeeping, easy to get wrong at every skip connection. The <code>torch-pruning</code> library traces the model's dependency graph and does the whole cascade for you:</p>
+        <pre class="language-python"><code class="language-python">import torch_pruning as tp
+example = torch.randn(1, 6, 128)                     # 6-axis IMU window
+pruner = tp.pruner.MagnitudePruner(model, example, pruning_ratio=0.4)
+pruner.step()                                        # removes filters + repairs all dependents</code></pre>
+        <div class="code-caption"><strong>Listing 59.5.2.</strong> Structured channel pruning with dependency tracking in three lines. The library propagates each deleted filter through every downstream layer and skip connection, replacing roughly 150 lines of manual shape surgery, and returns a smaller <em>dense</em> model that runs faster on stock hardware.</div>
+        <p>As Listing 59.5.2 shows, the library removes the bookkeeping, not the judgment: you still choose the ratio, the criterion, and how much fine-tuning the accuracy budget allows.</p>
+    </div>
+
+    <h2>When pruning pays off, and when it does not</h2>
+    <p>Reach for pruning when the model is over-parameterized for a well-scoped sensing task, when flash or energy is the binding constraint, and when you can afford a fine-tuning pass with a clean evaluation split. It composes cleanly with quantization from Section 59.4: prune first to remove whole units, then quantize the survivors, and the two savings multiply rather than fight. On a wearable running an always-on gesture model, a structured-pruned-then-int8 model can be a quarter of the original size at nearly the original accuracy.</p>
+    <p>Be skeptical when the claimed win is unstructured sparsity on hardware with no sparse kernel, because there the "90% sparse" headline yields a smaller download and identical latency. Be skeptical too when a model is already tight for its task: pruning a lean TinyML network past a point degrades it fast, since there is no surplus to remove. And always re-validate on a leakage-safe split, because pruning followed by fine-tuning is a fresh training process with fresh opportunities to overfit the very samples you meant to hold out.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier has moved toward pruning very large models <em>without</em> full retraining, which matters as sensor pipelines adopt transformer and foundation backbones (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>). <strong>SparseGPT</strong> (Frantar and Alistarh, ICML 2023) prunes billion-parameter models to 50% sparsity in one shot using a layer-wise second-order reconstruction, no gradient fine-tuning required. <strong>Wanda</strong> (Sun et al., ICLR 2024) reaches comparable quality with a strikingly simple criterion, scoring each weight by \(|w|\) times the norm of its input activation, computable from a handful of calibration batches. Both produce weights compatible with the 2:4 N:M pattern that Ampere-class and newer edge accelerators execute directly, closing the historic gap between "sparse on paper" and "fast in silicon."</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a small CNN or MLP you have trained on any sensor dataset. (1) Apply one-shot magnitude pruning at 50%, 70%, and 90% sparsity <em>without</em> fine-tuning and record accuracy at each level. (2) Repeat with gradual pruning plus recovery fine-tuning to the same three targets. Plot both curves on one axis. (3) Now measure wall-clock inference latency for the 90%-sparse unstructured model versus a structured-pruned model of the same parameter count on your target device. Which pruning style actually ran faster, and does the answer change if you move from CPU to an NPU with sparse support?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can a 95%-sparse unstructured model be <em>slower</em> in production than a 50%-sparse structured one?</p>
+        <p class="quiz-question">2. What does the N:M (for example 2:4) pattern give up relative to unstructured pruning, and what does it gain?</p>
+        <p class="quiz-question">3. Why is recovery fine-tuning essential at high sparsity, and why must its accuracy be reported on a leakage-safe split rather than the fine-tuning data?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-59.6.html">Section 59.6</a>, we stop hand-tuning which weights and channels to keep and let the search itself become the model designer: hardware-aware neural architecture search, which optimizes accuracy jointly with the latency, memory, and energy budget of a specific edge target, turning the manual pruning-and-quantizing loop of this chapter into an automated objective.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

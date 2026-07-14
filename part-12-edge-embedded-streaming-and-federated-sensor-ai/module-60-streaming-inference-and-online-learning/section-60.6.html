@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.6: Streaming evaluation and prequential metrics. Building Sensory AI." name="description"/>
+<title>Section 60.6: Streaming evaluation and prequential metrics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Streaming evaluation and prequential metrics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My dashboard says 94% accuracy. It has said 94% since March. It is the lifetime average of a model that has been failing since June, and the good early days are burying the bad new ones."</p>
+<cite>A Complacent AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every accuracy number earlier in this book came from the same ritual: freeze a model, run it over a held-out set, average the score, print one figure. That ritual assumes the test set is a fixed, representative sample and that a single average summarizes performance. On a live sensor stream both assumptions collapse. There is no held-out set, because data never stops arriving; there is no single true accuracy, because the distribution moves under you as sensors age, subjects change, and seasons turn (the drift of <a class="cross-ref" href="section-60.5.html">Section 60.5</a>). A lifetime average is worse than useless here: it is dominated by the distant past and hides exactly the recent decay you deploy monitoring to catch. This section is about evaluating a model <em>as it runs</em>: scoring each prediction the moment its label arrives, weighting recent behavior over ancient behavior, and turning the resulting live curve into an honest signal you can alarm on. Get it right and your monitoring detects a regression in minutes; get it wrong and you find out from a customer.</p>
+</div>
+
+<p>This section assumes the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the offline evaluation protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, which this extends into the online regime. It pairs naturally with the drift detectors of <a class="cross-ref" href="section-60.5.html">Section 60.5</a>: a drift detector watches the input or the error stream for a change point, while a prequential metric tells you what the error actually is right now. We build the metric here; the two together form the monitoring layer of the streaming service.</p>
+
+<h2>Test-then-train: the prequential principle</h2>
+<p>The foundational idea, due to Dawid, is <strong>prequential</strong> (predictive-sequential) evaluation, and it is beautifully simple. For each arriving sample, first <em>predict</em> with the current model and record whether the prediction was right, then <em>learn</em> from the labeled sample and move on. Every sample is thus a test sample before it is ever a training sample, which means no example is scored by a model that has already seen it. This is the streaming analogue of a train-test split, and it is automatically leakage-safe by construction: causality is enforced by the arrow of time itself. Formally, if \(\hat{y}_t\) is the prediction made from state \(\theta_{t-1}\) and \(\ell\) is a per-sample loss, the prequential loss is the running aggregate</p>
+<p>$$ L_t = \sum_{i=1}^{t} \ell\big(y_i, \hat{y}_i\big), \qquad \hat{y}_i = f_{\theta_{i-1}}(x_i), $$</p>
+<p>and the reported metric is some average of the per-sample terms. The subtlety, and the entire content of this section, is <em>which</em> average. The naive choice, dividing \(L_t\) by \(t\), gives the cumulative mean, and that is the trap in the epigraph.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A lifetime average has infinite memory, which is the wrong memory</h3>
+<p>The cumulative mean weights the very first sample exactly as much as the most recent one. After a month at 100 Hz that is over 250 million samples of inertia. When performance degrades, the fresh bad scores are averaged against an enormous reservoir of old good ones, so the number barely moves, and it moves slower every day. What monitoring needs is the opposite: a metric whose memory matches the timescale on which you would act. That means <em>forgetting</em>, either abruptly (a sliding window) or gradually (an exponential fade). The choice of forgetting horizon is not a detail; it <em>is</em> the metric.</p>
+</div>
+
+<h2>Windowed and fading estimators</h2>
+<p>Two forgetting schemes cover almost everything. A <strong>sliding-window</strong> estimator keeps the last \(w\) labeled predictions in a ring buffer and reports the mean over exactly those, so the metric reflects a crisp, interpretable horizon ("accuracy over the last 1000 samples") and drops old evidence completely. Its cost is a buffer of size \(w\) and a slight steppiness as samples enter and leave. A <strong>fading-factor</strong> (exponentially weighted) estimator instead decays the running sums geometrically with a factor \(\gamma \in (0,1)\), holding no buffer at all:</p>
+<p>$$ S_t = \gamma\, S_{t-1} + \ell(y_t,\hat{y}_t), \qquad N_t = \gamma\, N_{t-1} + 1, \qquad \overline{\ell}_t = \frac{S_t}{N_t}. $$</p>
+<p>Here \(N_t\) is the effective sample count, which converges to \(1/(1-\gamma)\); that quantity is the estimator's memory in samples, the direct analogue of the window length \(w\). A \(\gamma\) of \(0.999\) remembers about 1000 samples, \(0.9999\) about 10,000. The normalization by \(N_t\) matters: it makes the estimate unbiased from the very first sample, so you get a usable reading during warm-up instead of a figure creeping up from zero. Fading factors are the default in streaming libraries because they cost two floats and one multiply per sample and degrade gracefully, whereas a window trades memory for a sharper horizon. Choose the horizon from how fast you need to detect a regression: a safety-critical automotive perceptor may want a few hundred samples, a slow-degrading industrial asset tens of thousands.</p>
+
+<pre><code class="language-python">class PrequentialMetric:
+    "Test-then-train accuracy with either a sliding window or a fading factor."
+    def __init__(self, gamma=0.999):
+        self.gamma = gamma          # closer to 1 == longer memory
+        self.correct = 0.0          # faded sum of correctness
+        self.total = 0.0            # faded effective count
+
+    def update(self, y_true, y_pred):
+        # 1) TEST: score the prediction the model already committed to
+        hit = 1.0 if y_true == y_pred else 0.0
+        self.correct = self.gamma * self.correct + hit
+        self.total   = self.gamma * self.total + 1.0
+        # (2) TRAIN happens outside, AFTER this call: model.learn_one(x, y_true)
+        return self.correct / self.total   # live accuracy, unbiased from t=1
+
+# usage on a labeled stream
+metric = PrequentialMetric(gamma=0.999)   # ~1000-sample memory
+for x, y in stream:
+    y_hat = model.predict_one(x)          # predict FIRST
+    live_acc = metric.update(y, y_hat)    # then score
+    model.learn_one(x, y)                 # then learn
+    if live_acc &lt; 0.80:
+        raise_alarm(live_acc)             # act on the recent number
+</code></pre>
+<div class="code-caption">A complete prequential accuracy tracker in a dozen lines: predict, score with a fading factor, then learn. The order of the three calls is the whole leakage-safety argument; swapping predict and learn would score the model on data it has already trained on. The <code>learn_one</code> / <code>predict_one</code> interface is the online-model API from <a class="cross-ref" href="section-60.4.html">Section 60.4</a>.</div>
+
+<p>The code above makes the test-then-train order explicit and shows the fading estimate feeding an alarm threshold directly. Notice there is no train-test split anywhere: the stream <em>is</em> the split, unrolled in time.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">River does the bookkeeping for you</h3>
+<p>The hand-rolled tracker above, extended to precision, recall, F1, ROC-AUC, and a rolling wrapper, is roughly 150 to 200 lines to get right (numerically stable class counts, correct handling of the warm-up, per-class aggregation). In <a class="cross-ref" href="section-60.4.html">River</a> it is three: <code>metric = metrics.Rolling(metrics.Accuracy(), window_size=1000)</code> then <code>metric.update(y, y_hat)</code> in the loop, or <code>metrics.Accuracy()</code> wrapped in a fading factor. River also ships <code>evaluate.progressive_val_score</code>, which runs the entire test-then-train loop and returns the prequential score for you, so the correct evaluation protocol is a single function call rather than a loop you can get subtly wrong.</p>
+</div>
+
+<h2>Choosing the right metric, not just the right memory</h2>
+<p>Forgetting fixes <em>when</em> you measure; you still must choose <em>what</em> to measure, and the streaming setting sharpens the classic warnings. Sensor event streams are usually severely imbalanced: falls, arrhythmias, machine faults, and intrusions are rare by design, so a model that predicts "normal" forever scores 99% prequential accuracy while catching nothing. On a stream this is more dangerous than offline, because the positive class is not just rare but <em>clustered in time</em>: you can go hours between events, during which accuracy is a flat, reassuring, meaningless line. Track a metric that only moves when it should, such as rolling recall on the positive class, rolling F1, or a rolling cost-weighted error that prices a missed fault against a false alarm. For probabilistic and calibrated outputs (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), a prequential log-loss or Brier score reacts to <em>confidence</em> drift before the hard-label accuracy does, giving earlier warning of a model losing its grip.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The escalator that was never wrong</h3>
+<p>A predictive-maintenance team monitored vibration on a fleet of airport escalator gearboxes with an online classifier flagging incipient bearing wear (the fault physics of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>). Their dashboard showed 99.6% prequential accuracy, cumulative, and stayed there for months. A gearbox then failed with no alert. The post-mortem was not a model failure but an evaluation failure: faults were about one sample in 3000, so the cumulative-accuracy line was pinned near the base rate and could not have moved even as recall quietly fell. Rebuilt with a <em>rolling</em> recall on the fault class over a two-week window plus a fading-factor F1, the same model's monitoring dropped visibly the first time it began missing early-warning windows, days before the mechanical failure. The lesson: on a rare-event stream, the choice of metric and its memory horizon decide whether you see the problem, and the reassuring number is often the one lying to you.</p>
+</div>
+
+<h2>Delayed and missing labels: the hard part in practice</h2>
+<p>Prequential evaluation quietly assumes the label \(y_t\) is available right after the prediction. On real sensor systems it rarely is. A human activity recognizer may wait until a subject annotates a diary at day's end; a fault predictor's ground truth arrives only when a technician opens the machine weeks later; many streams never get a label at all. This <strong>label latency</strong> breaks naive test-then-train, because you cannot both alarm now and wait a week for truth. Three practices keep evaluation honest. First, <strong>buffer predictions with their timestamps</strong> and score them only when the matching label lands, so a prediction made Monday and confirmed Friday updates Friday's metric against Monday's model state, not a later one. Second, when labels are merely delayed by a known horizon \(h\), report the metric <em>lagged</em> by \(h\) and say so on the dashboard, rather than pretending the latest point is settled. Third, when labels are sparse or absent, fall back to <em>unsupervised</em> proxies: track the drift statistics of <a class="cross-ref" href="section-60.5.html">Section 60.5</a> on the input and on the model's output-confidence distribution, which need no labels and often move before accuracy does. A monitoring layer that mixes a lagged supervised metric with an always-on unsupervised proxy degrades gracefully when ground truth is scarce.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: make the metric confess the decay</h3>
+<p>Take a labeled stream and inject an abrupt concept drift halfway through (for example, flip the labels of one class, or swap in a different subject). Run three estimators in parallel on the same test-then-train loop: cumulative accuracy, a sliding window of 500, and a fading factor with \(\gamma = 0.998\). Plot all three against sample index. (a) How many samples after the drift does each estimator fall by half of its eventual drop? (b) Sweep \(\gamma\) over \(\{0.99, 0.999, 0.9999\}\) and relate the detection lag to the effective memory \(1/(1-\gamma)\). (c) Now delay every label by 200 samples and re-run with a prediction buffer; confirm the metric curve is simply shifted, not distorted. Report the smallest memory horizon that detects the drift within your target latency without alarming on ordinary noise.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why is prequential test-then-train evaluation automatically leakage-safe, and which single line in the loop enforces it?</p>
+<p>2. Your cumulative prequential accuracy has not moved in six weeks. Give two independent reasons this can happen even while the model is silently degrading, and the metric change that would expose each.</p>
+<p>3. Labels for your stream arrive three days late. Why does naive test-then-train mislead here, and what do you buffer to fix it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>A live metric that drops is a signal, not a resolution. In <a class="cross-ref" href="section-60.7.html">Section 60.7</a>, we turn the monitoring curve into action: how to design incident handling for a streaming service, from alarm thresholds and hysteresis that avoid flapping, through automatic fallback to a safe model, to the human-in-the-loop escalation and rollback that close the loop when a deployed model has genuinely gone bad.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

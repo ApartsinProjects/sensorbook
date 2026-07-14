@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 60.1: Windowed and stateful inference. Building Sensory AI." name="description"/>
+<title>Section 60.1: Windowed and stateful inference | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 60: Streaming Inference and Online Learning</a></div>
+<h1>Windowed and stateful inference</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The batch version of me got to see the whole song before naming the tune. Now I have to name it while it is still being played, and I am not allowed to forget the opening notes."</p>
+        <cite>A Real-Time AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can treat a signal as a stream of timestamped samples arriving at some rate (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), and that you have trained at least one model on fixed-length windows offline, such as a human-activity classifier (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). Familiarity with the recurrent and state-space models that carry hidden state through time (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) helps for the second half but is not required for the first. No new mathematics is introduced; the arithmetic is limited to rates, latencies, and buffer sizes.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Offline, a model is handed a complete recording and asked for one answer. Online, the recording never ends: samples keep arriving, and the model must emit answers <em>during</em> the stream, not after it. This section is about the two moves that bridge those worlds. The first is <strong>windowing</strong>: chopping an unbounded stream into finite chunks a fixed-input model can consume, and choosing how those chunks overlap in time. The second is <strong>statefulness</strong>: deciding whether each chunk is scored from scratch or whether the model carries an internal memory forward so that history costs nothing to re-read. Get windowing wrong and you either react too slowly or drown in redundant compute. Get statefulness wrong and you either recompute the past forever or silently corrupt a hidden state that should have been reset. By the end you will be able to size a window, pick a hop, and decide which of the two inference styles a deployment demands, before touching the model itself.</p>
+    </div>
+
+    <h2>From an endless stream to finite windows</h2>
+    <p>A trained sensor model almost always expects an input of fixed shape: a tensor of \(W\) timesteps by \(C\) channels. The stream, by contrast, is unbounded. The job of windowing is to reconcile the two by defining a moving frame over the stream. Three parameters describe any windowing scheme. The <strong>window length</strong> \(W\) is how many samples the model sees at once, the <em>what</em> of the receptive field. The <strong>hop</strong> \(H\) (also called the stride or step) is how far the frame advances between successive inferences. The <strong>overlap</strong> is the remainder \(W - H\), the number of samples two consecutive windows share.</p>
+    <p>These three choices name the classical taxonomy. When \(H = W\) there is no overlap and the frames tile the stream edge to edge: these are <strong>tumbling windows</strong>, and every sample is scored exactly once. When \(H &lt; W\) the frames overlap and slide forward by less than their length: these are <strong>sliding</strong> or <strong>hopping windows</strong>, and each sample participates in \(W/H\) inferences. The degenerate case \(H = 1\) advances one sample at a time and is a true sample-by-sample sliding window, maximally responsive and maximally expensive.</p>
+    <p>Why does the hop matter so much? Because it sets your <em>decision latency</em> and your <em>compute rate</em> simultaneously, and they pull in opposite directions. A model cannot emit its first answer until a full window has filled, so at sample rate \(f_s\) the startup latency is \(W/f_s\). After that, a fresh answer arrives every \(H/f_s\) seconds, so the inference rate is \(f_s/H\) per second. Shrinking \(H\) makes the system more responsive and produces smoother output, but multiplies how often the model runs. Enlarging \(W\) gives the model more context (better for slow phenomena like a gait cycle or a bearing fault tone) but delays the first decision and blurs the boundary of fast events. The window length is a bet on the timescale of what you are trying to detect.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Window length and hop are not preprocessing trivia; they are latency-accuracy knobs set by physics, not by convenience. Length \(W\) must cover at least one full period of the phenomenon you want to recognize, or the model never sees the pattern whole. Hop \(H\) must be small enough that the worst-case reaction time \((W + H)/f_s\) fits inside the action deadline of the loop the model lives in (<a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>). You tune these against the signal and the deadline first, and only then check that the resulting inference rate \(f_s/H\) fits the compute budget. If it does not, that is a hardware conversation, not a licence to starve the window.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: fall detection on a wrist wearable</h4>
+        <p>A wrist accelerometer streams triaxial data at \(50\ \mathrm{Hz}\). A fall, from stumble to impact to stillness, unfolds over roughly one to two seconds, so the team picks a window of \(W = 128\) samples (about \(2.56\) s) to be sure a whole fall fits inside one frame. If they used tumbling windows (\(H = 128\)), a fall straddling two frames would be split in half and missed, and a new verdict would arrive only every \(2.56\) s, far too slow to summon help promptly. Instead they hop \(H = 32\) samples (\(0.64\) s), a \(75\%\) overlap. Now every fall is captured whole by at least one window regardless of when it begins, the classifier fires four times per window so a brief event still triggers several positive votes, and a fresh decision lands every \(0.64\) s. The cost is that each sample is scored four times, which the wearable's NPU absorbs comfortably because the model is small. Overlap bought them event-boundary robustness and responsiveness; they paid for it in redundant compute they could afford.</p>
+    </div>
+
+    <p>Mechanically, windowing is implemented with a <strong>ring buffer</strong> (circular buffer): a fixed array of length \(W\) into which new samples are written, overwriting the oldest, with a running index. When the buffer has advanced by \(H\) new samples since the last inference, you snapshot the current window and score it. This is \(O(1)\) memory per channel regardless of stream length, which is exactly why it works on a device with kilobytes of RAM. The snippet below turns a sample stream into windows without ever allocating in the hot path.</p>
+
+    <pre class="language-python"><code class="language-python">from collections import deque
+
+def windowed(stream, W=128, H=32):
+    """Yield overlapping windows of length W, advancing H samples each step."""
+    buf = deque(maxlen=W)          # ring buffer: O(W) memory, drops oldest
+    since_last = 0
+    for sample in stream:          # sample: one (C,) vector per timestep
+        buf.append(sample)
+        since_last += 1
+        if len(buf) == W and since_last >= H:
+            since_last = 0
+            yield list(buf)        # snapshot the current window -> model input
+
+# 50 Hz triaxial accelerometer, 2.56 s window, 0.64 s hop (75% overlap)
+for window in windowed(accel_stream, W=128, H=32):
+    prob_fall = model.predict(window)</code></pre>
+    <div class="code-caption"><strong>Listing 60.1.1.</strong> A hopping-window generator over an endless sample stream using a bounded ring buffer. Memory stays at \(W\) samples no matter how long the stream runs; a window is emitted only once every \(H\) new samples, giving the \(f_s/H\) inference rate discussed above. The <code>prob_fall</code> line is where the fall-detection story's four-votes-per-event behaviour comes from.</div>
+    <p>Listing 60.1.1 makes the ring-buffer discipline explicit: the memory footprint is set by \(W\) alone, and the <code>since_last &gt;= H</code> guard is what converts a per-sample loop into a per-window inference cadence.</p>
+
+    <h2>Stateless windowing versus stateful streaming</h2>
+    <p>Windowing as described so far is <strong>stateless</strong>: each window is a self-contained input, scored with no memory of the windows before it. For a convolutional or feedforward model on overlapping windows this is simple and robust, but it hides a quiet inefficiency. With \(75\%\) overlap, three quarters of every window is recomputed from scratch on the next step: the model re-reads history it already processed one hop ago. For a small classifier that waste is negligible. For a deep model or a long window it can dominate the compute bill.</p>
+    <p><strong>Stateful streaming</strong> attacks that waste head on. Recurrent models (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) and modern state-space models like Mamba and S4 (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) summarize everything they have seen into a fixed-size hidden state \(h_t\). The recurrence</p>
+    \[ h_t = f(h_{t-1},\, x_t), \qquad y_t = g(h_t) \]
+    <p>means the model can consume the stream one sample (or one small chunk) at a time, updating \(h_t\) in place, and never re-reads the past because the past already lives in the state. Instead of feeding a \(W\)-sample window every hop, you feed the \(H\) genuinely new samples and let the carried state supply all prior context. The per-step cost drops from \(O(W)\) to \(O(H)\), and in the sample-by-sample limit to \(O(1)\), independent of how much history matters. A Kalman filter (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) is the classical ancestor of exactly this idea: its state carries the entire relevant past forward so each new measurement is cheap.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Overlapping windows and a carried hidden state are two answers to the same question: how does a model at time \(t\) remember what happened before \(t\)? Stateless windowing remembers by physically re-including old samples in the input, paying \(O(W)\) every step. Stateful streaming remembers by compressing the past into \(h_t\) and paying only for the new samples. The stateless path is simpler, trivially parallel, and easy to reset; the stateful path is dramatically cheaper for long context but demands that you manage \(h_t\) as a first-class piece of live infrastructure. Choosing between them is choosing where the memory lives: in the input tensor or in the model's state.</p>
+    </div>
+
+    <p>That management burden is real and is where stateful deployments go wrong. Three hazards recur. First, <strong>state initialization</strong>: the very first chunk of a stream has no valid history, so \(h_0\) must be a sensible default (usually zeros or a learned initial state), and the first few outputs are warm-up transients that should be trusted less. Second, <strong>state reset at boundaries</strong>: when one logical stream ends and another begins (a new patient, a new machine, a new recording session, or a gap after dropped data), the carried state from the old context must be cleared, or the model will hallucinate continuity across a discontinuity that never existed. Third, <strong>train/serve consistency</strong>: a model trained on independent windows but served with carried state, or vice versa, sees a distribution it was never fit on. You must stream at inference the same way you streamed during training, and you must reset on the same boundaries, or the leakage-safe evaluation you did offline (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) no longer predicts online behaviour.</p>
+
+    <div class="callout warning">
+        <h3 class="callout-title">Watch Out: the state that outlives its context</h3>
+        <p>The most insidious streaming bug is a hidden state that is never reset. A per-machine vibration model deployed across a fleet, sharing one model object, will silently blend machine A's history into machine B's first predictions if the state is not cleared when the input switches sources. The symptom is maddening: the model scores perfectly in offline batch evaluation (where every recording starts fresh) and misbehaves only for the first few seconds of each stream in production. Treat state reset as an explicit, logged event tied to a session identifier, never as something that happens by accident.</p>
+    </div>
+
+    <h2>Sizing the window and honoring the deadline</h2>
+    <p>Putting the pieces together, a streaming inference design is fixed by four numbers and one policy. The four numbers are the sample rate \(f_s\), the window length \(W\), the hop \(H\), and the per-inference model latency \(\ell\). The policy is stateless-versus-stateful. From these you can predict everything an operator cares about before deployment. The worst-case time from an event to its first possible detection is the fill-plus-hop latency \((W + H)/f_s\), and the end-to-end latency to a delivered decision adds the model's own \(\ell\). The sustained compute load is one inference every \(H/f_s\) seconds, so the model must satisfy \(\ell &lt; H/f_s\) or windows pile up faster than they clear, the failure mode that spills into the backpressure and data-loss problems of <a class="cross-ref" href="section-60.2.html">Section 60.2</a>. The memory footprint is the ring buffer (\(W \times C\) for stateless) or the hidden state (fixed, independent of \(W\), for stateful).</p>
+    <p>These constraints frequently conflict, and resolving the conflict is the design. If the deadline demands a small \((W+H)/f_s\) but the phenomenon needs a large \(W\) to be recognizable, stateless windowing cannot satisfy both, and a stateful model that keeps long context in \(h_t\) while consuming small hops is often the only escape. If the compute budget cannot sustain \(f_s/H\) inferences with the required \(W\), overlap-heavy stateless scoring is off the table and statefulness again earns its keep. The window is where the timescale of the world meets the timescale of your hardware, and the two rarely agree without negotiation.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not need to hand-roll the buffering, hop scheduling, and per-source state management for a production stream. The <code>river</code> online-machine-learning library (which the rest of this chapter leans on, see <a class="cross-ref" href="section-60.4.html">Section 60.4</a>) exposes rolling-window feature transformers, and stream-processing frameworks such as Apache Flink or Faust provide windowed operators with keyed state, so each source keeps its own hidden state and resets are handled per key.</p>
+        <pre class="language-python"><code class="language-python">from river.utils import Rolling
+from river import stats
+
+# a rolling mean over the last 128 samples, updated per sample in O(1)
+roll = Rolling(stats.Mean(), window_size=128)
+for x in accel_stream:
+    roll.update(x)
+    feature = roll.get()   # always reflects the current window</code></pre>
+        <div class="code-caption"><strong>Listing 60.1.2.</strong> A maintained rolling-window statistic in four lines. Writing the equivalent ring buffer, incremental update, and eviction logic by hand (and getting the \(O(1)\) update right rather than recomputing over the window each step) is a few dozen lines and a common source of off-by-one bugs; <code>river</code> collapses it to <code>update</code> plus <code>get</code>. The keyed-state managers in Flink or Faust do the same for the per-source reset discipline the warning above demands.</div>
+        <p>Listing 60.1.2 removes the plumbing but not the judgment: choosing \(W\), the hop, and the reset boundaries is still yours, and those are exactly the decisions this section argues you must make deliberately.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>Field Story: streaming ECG on a Holter monitor</h4>
+        <p>A wearable Holter monitor (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>) records single-lead ECG at \(250\ \mathrm{Hz}\) for days and must flag arrhythmias in near real time. A beat-morphology classifier needs to see a full heartbeat plus its neighbours, so the team uses a \(W\) of about \(2.5\) s of context. Rather than re-scoring \(2.5\) s of samples every step (a heavy tax over days of continuous recording), they deploy a stateful recurrent model that ingests short \(0.2\) s chunks and carries its hidden state across the entire session, so a decade of prior beats costs nothing to remember. Critically, they reset the state whenever the electrode contact is lost and re-established: after a lead-off event the signal history is meaningless, so carrying it forward would poison the first post-reconnection beats. That single reset rule, tied to the lead-off flag, was the difference between a monitor cardiologists trusted and one that produced a burst of false alarms every time the patient rolled over.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are given a \(100\ \mathrm{Hz}\) gyroscope stream and must detect a hand gesture that lasts about \(0.8\) s, with a delivered-decision deadline of \(1.2\) s from gesture onset. (a) Choose a window length \(W\) that comfortably contains the gesture and justify it. (b) Choose a hop \(H\) so the worst-case fill-plus-hop latency \((W+H)/f_s\) leaves room for a model latency \(\ell\) of \(20\) ms under the deadline. (c) Compute the resulting inference rate \(f_s/H\). (d) State one concrete reason you might switch from stateless overlapping windows to a stateful streaming model here, and one boundary event at which you would reset the state.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Distinguish tumbling from sliding windows in terms of the hop \(H\) and the window length \(W\). Why does \(75\%\) overlap mean each sample is scored four times?</p>
+        <p class="quiz-question">2. Both overlapping windows and a carried hidden state let a model remember the past. Where does the memory physically live in each case, and how does the per-step compute cost differ?</p>
+        <p class="quiz-question">3. A stateful model passes offline batch evaluation but misbehaves for the first few seconds of every production stream. What is the most likely cause, and what explicit event fixes it?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-60.2.html">Section 60.2</a>, we confront what happens when the arithmetic of this section fails: when samples arrive faster than the model can clear them and the ring buffer starts to overflow. We take up backpressure, load shedding, and principled data loss, the discipline of deciding <em>which</em> data to drop and how to keep a streaming system honest when it cannot keep up.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

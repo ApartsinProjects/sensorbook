@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.1: Why sensory AI runs on-device. Building Sensory AI." name="description"/>
+<title>Section 59.1: Why sensory AI runs on-device | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Why sensory AI runs on-device</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They asked why I think at the sensor instead of in the cloud. Because by the time my thought reaches the cloud and returns, the moment it was about has already happened without me."</p>
+        <cite>A Punctual AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can read a signal as a stream of timed samples (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>) and that you have met at least one deployed sensor model, such as a wearable activity classifier (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) or a condition monitor (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>). No new mathematics is introduced here; the back-of-envelope arithmetic uses only rates and unit conversions. The hardware vocabulary this section leans on (NPU, DSP, MCU) is defined in the very next section, and the privacy machinery it gestures at is built out in <a class="cross-ref" href="../module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every other chapter in this part optimizes <em>how</em> a model runs on constrained hardware. This one answers the prior question: why put it there at all, when a data center holds effectively unlimited compute? The answer is not nostalgia for embedded systems. It is that a sensor lives inside a physical control loop with a hard deadline, produces far more raw data than any link can afford to move, and observes things people did not consent to broadcast. Latency, bandwidth, energy, privacy, and availability each independently push inference toward the sensor. When you finish this section you will be able to look at a sensing problem and predict, before writing a line of model code, whether it belongs on-device, and say precisely which of those five forces decided it.</p>
+    </div>
+
+    <h2>The round trip has a deadline the network cannot meet</h2>
+    <p>A sensor rarely measures for the sake of measuring. It measures inside a loop: perceive, decide, act, and the action changes what the next measurement sees. The loop has a deadline set by physics, not by a product manager. An airbag controller reading a crash accelerometer has roughly \(15\) to \(30\) milliseconds between impact and the instant the occupant reaches the wheel. A robot arm closing a force-feedback grasp needs a control update on the order of a millisecond or the object slips or crushes. These deadlines are the <em>what</em>: the maximum time from sample to actuation that keeps the system stable and safe.</p>
+    <p>Now price the cloud round trip against that budget. A packet from a device to a regional data center and back crosses, at best, a few thousand kilometers of fiber. Light in fiber travels at roughly \(2 \times 10^8\ \mathrm{m/s}\), so \(1000\ \mathrm{km}\) each way already costs about \(10\) ms of pure propagation, before the radio access network, queueing, TLS, and server-side scheduling add their own tens of milliseconds. Measured end to end, a mobile request to a cloud model commonly lands in the \(50\) to \(150\) ms range, with a long tail that occasionally spikes to seconds when a cell tower is congested. That tail is the killer: a control loop is only as safe as its <em>worst</em> update, not its median.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>On-device inference is not chosen because it is faster on average; it is chosen because it is <em>bounded</em>. A local NPU gives you a latency you can put in a datasheet and a safety case: this model returns in under \(N\) milliseconds, every time, with no dependency on a radio link you do not control. A cloud call has a good median and an unbounded tail, and a physical control loop is designed against the tail. Determinism, not raw speed, is the deciding property.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: automotive pedestrian braking</h4>
+        <p>An automatic emergency braking system fuses a forward camera and a radar (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>) to decide whether to brake for a pedestrian stepping off a curb. At \(50\ \mathrm{km/h}\) the car covers about \(14\) metres every second, so \(150\) ms of added cloud latency is more than two metres of extra stopping distance, the difference between a hard stop and a collision. No car maker ships this in the cloud, and no regulator would certify it there. The perception model runs on an in-vehicle SoC precisely so its latency is bounded and survives a dead cellular connection in a tunnel. This is the round-trip argument in its starkest form: the deadline is set by kinetic energy, and the network cannot negotiate with it.</p>
+    </div>
+
+    <h2>Raw sensor data is too big and too expensive to ship</h2>
+    <p>Suppose latency did not matter. A second force still pushes inference down to the device: the sheer volume of what sensors produce. Consider the data rates. A single automotive lidar emits on the order of \(1\) to \(2\) million points per second; a \(1080\)p camera at \(30\) frames per second is tens of megabytes per second raw; even a humble triaxial IMU sampled at \(1\ \mathrm{kHz}\) is \(3000\) floating-point numbers a second, per sensor, and a wrist wearable carries several. Multiply by a fleet and the arithmetic becomes brutal.</p>
+    <p>The point is that inference is a form of compression. A model turns a firehose of raw samples into a trickle of decisions: <em>fall detected</em>, <em>bearing fault, stage 2</em>, <em>heart rate 72</em>. Running that compression at the sensor means you transmit the trickle, not the firehose. Running it in the cloud means you transmit the firehose and throw almost all of it away after it arrives. Let \(R\) be the raw sensor rate and \(D\) the decision rate the model emits. The compression ratio</p>
+    \[ \rho = \frac{R}{D} \]
+    <p>is routinely \(10^3\) to \(10^6\) for sensor workloads, and every factor of \(\rho\) you keep local is bandwidth and cloud-ingest cost you never pay. Energy follows the same logic and often dominates it: on battery-powered devices the radio, not the processor, is the thirstiest component. Transmitting a bit over a cellular link can cost hundreds to thousands of times the energy of the arithmetic that would have classified it on-device. A wearable that streams raw accelerometry to the cloud dies before lunch; one that classifies locally and uploads a daily summary runs for a week on the same battery.</p>
+
+    <div class="callout practical-example">
+        <h4>Field Story: a vibration monitor on a remote pump</h4>
+        <p>An industrial predictive-maintenance node (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) sits on a water pump in a field with only a low-power LTE-M radio and a small solar panel. The accelerometer runs at \(25.6\ \mathrm{kHz}\) to catch high-frequency bearing tones, which is roughly \(100\) kB of raw data per second, far more than the radio or the energy budget can sustain around the clock. The engineers put a small spectral-feature model (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>) on the node. It processes the full-rate stream locally and transmits only a fault probability and a handful of band energies once a minute, a few dozen bytes. The node now runs indefinitely on solar, and the backhaul carries decisions instead of a raw signal nobody would ever have the bandwidth to read.</p>
+    </div>
+
+    <p>You can make this concrete in a few lines. The snippet below compares the yearly bytes leaving a device under two policies: stream every raw sample, or run the model locally and emit one decision per second.</p>
+
+    <pre class="language-python"><code class="language-python">raw_hz      = 25_600          # accelerometer samples per second
+bytes_each  = 4               # float32 per sample
+decision_hz = 1               # model emits 1 result/second on-device
+decision_b  = 16              # bytes per decision (probability + a few bands)
+
+sec_per_year = 365 * 24 * 3600
+stream_gb   = raw_hz * bytes_each * sec_per_year / 1e9
+ondevice_gb = decision_hz * decision_b * sec_per_year / 1e9
+
+print(f"stream raw:   {stream_gb:8.1f} GB/year")
+print(f"on-device:    {ondevice_gb:8.4f} GB/year")
+print(f"ratio:        {stream_gb / ondevice_gb:,.0f}x less data moved")</code></pre>
+    <div class="code-caption"><strong>Listing 59.1.1.</strong> A back-of-envelope bandwidth comparison for the pump monitor. Streaming raw float32 accelerometry costs about \(3200\) GB per device per year; emitting one \(16\)-byte decision per second costs about \(0.0005\) GB, roughly six million times less. The numbers referenced in the prose above come straight from running this.</div>
+    <p>As Listing 59.1.1 makes brutally clear, the choice is not marginal. The gap between shipping raw data and shipping decisions is measured in orders of magnitude, and that gap is what pays for the whole edge-AI discipline that fills this part of the book.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not hand-write the on-device inference runtime. Converting a trained model into a form that runs in kilobytes of RAM on a phone or microcontroller is a solved problem: LiteRT (the runtime formerly shipped as TensorFlow Lite) or ExecuTorch will take a trained graph, quantize it, and produce a self-contained interpreter call.</p>
+        <pre class="language-python"><code class="language-python">import tensorflow as tf
+conv = tf.lite.TFLiteConverter.from_saved_model("pump_model")
+conv.optimizations = [tf.lite.Optimize.DEFAULT]   # int8 quantization
+open("pump_model.tflite", "wb").write(conv.convert())</code></pre>
+        <div class="code-caption"><strong>Listing 59.1.2.</strong> Four lines convert a full-precision SavedModel into a quantized on-device artifact ready for a phone or MCU. Writing an equivalent int8 kernel, memory planner, and interpreter by hand is thousands of lines; the library collapses it to one <code>convert()</code> call. What quantization actually does to the weights is the subject of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/section-59.4.html">Section 59.4</a>.</div>
+        <p>Listing 59.1.2 removes the plumbing, not the judgment: whether int8 keeps your accuracy is an evaluation question you still own, and one this part treats with care.</p>
+    </div>
+
+    <h2>Privacy, autonomy, and availability finish the argument</h2>
+    <p>Three further forces settle cases that latency and bandwidth alone leave ambiguous. The first is <strong>privacy</strong>. Sensor data is intimate in a way that clicks and text are not: a microphone hears everything in a kitchen, a camera sees who is home, PPG and ECG streams are biometric identifiers and health data under regulations like GDPR and HIPAA (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>). Data that never leaves the device cannot be breached in transit, subpoenaed from a server, or repurposed by a vendor. Keeping raw biosignals on the wrist and shipping only derived, non-identifying summaries is often the <em>only</em> design a regulator or a hospital will accept, which is why on-device inference is the foundation the federated methods of <a class="cross-ref" href="../module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a> build on.</p>
+    <p>The second is <strong>availability</strong>. A sensor system that stops working when the network does is not a product; it is a demo. A pacemaker, a factory safety interlock, a drone navigating a canyon, a car in a tunnel: all must keep perceiving through a dead link. On-device inference makes correct behaviour the default state rather than the connected state. The third is <strong>cost and autonomy at fleet scale</strong>: a million devices each making a cloud call per second is a per-inference bill and a server farm you must operate and scale; the same million devices inferring locally cost nothing per decision after manufacture. The economics invert completely once the fleet is large.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is pushing full foundation-scale perception onto the device, not just small classifiers. Apple's on-device foundation models (2024, roughly \(3\) billion parameters running on-phone) and Google's Gemini Nano, together with the MobileNetV4 (2024) and EfficientViT vision backbones and MCUNet-style tiny networks (Lin et al., NeurIPS 2020), show sensor-reasoning and vision-language capability (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>) shrinking into phone and even microcontroller budgets. The open question this part keeps circling is how far the five forces of this section can be satisfied at once: how much capability survives when latency must be bounded, energy is a battery, and the weights must fit in on-chip memory. The rest of Chapter 59 is the toolkit for answering that.</p>
+    </div>
+
+    <p>None of this abolishes the cloud. Training happens there, large models are served there, and fleets report summaries there. The professional stance is a spectrum, not a religion: some computation belongs at the sensor, some in the cloud, and the interesting engineering is where you draw the line. Deciding that split, the edge-cloud partition, is important enough that it gets its own treatment in <a class="cross-ref" href="section-59.7.html">Section 59.7</a>. This section only insists on the prior point: the default gravity for <em>sensory</em> AI pulls toward the device, because the sensor is where the deadline, the data, and the privacy all physically live.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Pick a sensing product you use: a smartwatch, a video doorbell, a car, a robot vacuum. For each of the five forces in this section (latency, bandwidth, energy, privacy, availability), write one sentence stating whether it pushes that product's core perception on-device or leaves it comfortably in the cloud. Then name the single force you believe was decisive, and one piece of evidence from the product's observable behaviour (battery life, offline behaviour, what it uploads) that supports your guess.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is a cloud model's <em>median</em> latency the wrong number to design a physical control loop against, and what number should you use instead?</p>
+        <p class="quiz-question">2. Restate "inference is a form of compression" using the ratio \(\rho = R/D\). Why does a large \(\rho\) argue for computing at the sensor rather than in the data center?</p>
+        <p class="quiz-question">3. On a battery device, transmitting a bit often costs far more energy than computing on it. What design conclusion follows for a wearable that must run all day?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-59.2.html">Section 59.2</a>, we open the box the model has to run inside. Having established <em>why</em> inference belongs at the sensor, we survey the silicon that hosts it: the tradeoffs between CPU, GPU, NPU, DSP, and microcontroller, and how each choice reshapes the latency, energy, and memory budgets this section treated as fixed constraints.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

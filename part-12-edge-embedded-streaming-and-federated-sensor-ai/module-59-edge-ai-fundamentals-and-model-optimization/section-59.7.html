@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.7: Edge-cloud partitioning and the deployment lifecycle. Building Sensory AI." name="description"/>
+<title>Section 59.7: Edge-cloud partitioning and the deployment lifecycle | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Edge-cloud partitioning and the deployment lifecycle</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I was asked to run the whole model on the sensor. Then I was asked to run it in the cloud. The correct answer was: some of me, in both places, and it depends on the radio."</p><cite>A Bilocating AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous sections in this chapter shrank a single model to fit a single device: quantization, pruning, and hardware-aware search all answer "how do I make this one network cheap enough to run here?" This section zooms out to the system. A deployed sensory pipeline is rarely one model on one chip. It is a graph of computation that can be split across a microcontroller, a gateway, and a datacenter, and that split is a design decision with measurable consequences for latency, energy, bandwidth, privacy, and cost. Getting the partition right often matters more than squeezing another two percent of accuracy out of the backbone. And because sensors, models, and regulations all keep changing, the split is not a one-time choice: it is a lifecycle you version, ship, monitor, and roll back like any other production system.</p>
+</div>
+
+<p>This section assumes you are comfortable with the on-device cost model from Sections 59.1 through 59.3 (compute, memory, power, thermal) and the compression techniques from 59.4 through 59.6. It also leans on the sampling and time-synchronization ideas from <a href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because a partition boundary is also a place where timestamps must survive a network hop. If either of those is shaky, read them first: everything below reasons about where computation happens relative to where the data is born.</p>
+
+<h2>What "partitioning" actually means</h2>
+<p>Partitioning is the assignment of each stage of an inference pipeline to a compute tier. The classic tiers are the <em>device</em> (the thing physically attached to the sensor: a wearable SoC, an MCU, a camera ISP), the <em>edge</em> or gateway (a nearby richer machine: a phone, a vehicle domain controller, a factory-floor industrial PC), and the <em>cloud</em> (elastic datacenter compute). Some systems add a fourth "near-edge" tier such as a cellular base station running multi-access edge computing (MEC). The point of naming tiers is not taxonomy; it is that each tier has a different cost vector, and the arrows between them cost energy and time.</p>
+<p>There are three broadly useful partition patterns. In <strong>full on-device</strong> inference the entire model runs at the sensor and only a decision leaves. In <strong>full offload</strong> the raw or lightly-featurized signal is streamed up and all inference happens in the cloud. The interesting middle is <strong>split computing</strong>: run the first \(k\) layers on the device, transmit the intermediate tensor (the "bottleneck" activation), and finish the network upstream. Split computing works because a well-chosen intermediate representation can be far smaller than the raw input, and because early layers are cheap while later layers are expensive. If you also <em>train</em> the network to have a compressible bottleneck at the cut point, you get "bottleneck injection," which is the idea behind split-inference toolkits and much of the neural-compression literature.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The right cut point is the layer where the activation tensor is smallest relative to the compute already spent to produce it. Convolutional and sensor backbones typically narrow after a few downsampling stages, so a raw 16&#8239;kHz audio window or a full IMU burst might be tens of kilobytes, while the activation four layers in is a few hundred bytes. Sending the small tensor instead of the raw signal can cut radio-on time by an order of magnitude, and the radio, not the CPU, is usually the dominant energy consumer on a battery sensor.</p>
+</div>
+
+<h2>A cost model you can actually optimize</h2>
+<p>Treat the partition as an optimization problem, not a vibe. For a pipeline cut after stage \(k\), the per-inference latency is the time to compute the head on the device, plus the time to move the intermediate tensor over the link, plus the time to compute the tail wherever it lands:</p>
+$$ T(k) = \sum_{i \le k} \frac{c_i}{r_{\text{dev}}} \;+\; \frac{b(k)}{B} \;+\; \sum_{i > k} \frac{c_i}{r_{\text{srv}}} $$
+<p>Here \(c_i\) is the compute (in operations) of stage \(i\), \(r_{\text{dev}}\) and \(r_{\text{srv}}\) are the effective throughputs of device and server, \(b(k)\) is the number of bytes crossing the cut, and \(B\) is the usable link bandwidth. Energy on the battery-powered device has a parallel form: compute energy for the head plus radio energy \(e_{\text{tx}} \cdot b(k)\) to transmit, where \(e_{\text{tx}}\) (joules per byte) is often the term that dominates. The engineering move is to evaluate \(T(k)\) and the device energy for every candidate cut \(k\) and pick the split that meets your latency budget at minimum energy, or minimum energy subject to a privacy constraint. Full on-device is just \(k = N\) with \(b(N)=0\) bytes crossing; full offload is \(k=0\) with \(b(0)\) equal to the raw input size.</p>
+<p>Two facts make this model bite. First, \(B\) is not a constant: a cellular uplink swings by 100x between good and bad coverage, so a partition that is optimal in the lab can miss its deadline in a tunnel. Second, \(b(k)\) can be shrunk independently by quantizing or entropy-coding the transmitted activation, which is why split-inference systems usually pair the cut with an int8 or learned codec on the bottleneck. A partition policy that ignores link variability is a latency bug waiting to happen.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Per-stage compute (MFLOPs) and output tensor size (bytes) for a small
+# sensor CNN, profiled once on the target device.
+flops   = np.array([12., 20., 34., 41., 8., 3.])     # per stage
+out_bytes = np.array([8192, 4096, 1024, 256, 128, 4]) # tensor leaving each stage
+
+r_dev, r_srv = 0.9e9, 60e9    # effective FLOP/s on device and server
+e_tx = 3.0e-7                 # joules per byte on the radio (LTE-M-ish)
+e_dev = 4.5e-10              # joules per FLOP on the device NPU
+
+def cut_cost(k, B):
+    dev_flops = flops[:k].sum() * 1e6
+    srv_flops = flops[k:].sum() * 1e6
+    bytes_up  = out_bytes[k-1] if k > 0 else out_bytes[0]
+    latency = dev_flops / r_dev + bytes_up / B + srv_flops / r_srv
+    energy  = dev_flops * e_dev + bytes_up * e_tx
+    return latency, energy
+
+for B in (5e6, 50e6):        # bad link vs good link (bytes/s)
+    costs = [(k, *cut_cost(k, B)) for k in range(len(flops) + 1)]
+    best = min(costs, key=lambda t: t[2] if t[1] < 0.050 else 9e9)  # min energy under 50 ms
+    print(f"B={B:.0e}  best cut k={best[0]}  lat={best[1]*1e3:.1f} ms  E={best[2]*1e3:.3f} mJ")
+</code></pre>
+<div class="code-caption">Sweeping every cut point of a six-stage sensor CNN under two link speeds. The energy-optimal split moves earlier (more offload) when the link is fast and later (more on-device) when it is slow, which is exactly the adaptive behavior a static partition cannot express.</div>
+
+<p>The snippet above is deliberately tiny, yet it already reproduces the central lesson: as the usable uplink \(B\) drops, the energy-optimal cut moves later into the network, because transmitting bytes becomes more expensive than computing them locally. Run it and watch the chosen \(k\) shift. That is the whole game of adaptive partitioning in ten lines.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a continuous-glucose alerting wearable</h3>
+<p>A clinical wearable samples an electrochemical glucose sensor and must raise a hypoglycemia alarm within two seconds, even offline, because a missed alarm is a safety event. The team ran the full alerting classifier on-device (a quantized temporal CNN, per Section 59.4) so the safety-critical decision never depends on a radio. Separately, a heavier trend-forecasting model that predicts glucose 30 minutes ahead runs in the cloud, fed by a compressed feature stream uploaded every five minutes. The partition here is driven by <em>criticality</em>, not by FLOPs: the two-second life-safety path is pinned on-device by design, while the non-urgent analytics ride the cloud where a bigger model and the patient's history live. This split also keeps raw biosignal off the network most of the time, which matters for the biometric-privacy obligations discussed in <a href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<h2>Choosing the partition: the deciding forces</h2>
+<p>Beyond latency and energy, four forces routinely override the raw cost model. <strong>Privacy and data residency</strong>: if the signal is a face, a voice, or a biosignal, the cheapest place to keep it is on the device, and regulation may forbid it from leaving a jurisdiction at all. Partitioning is a privacy control, and split computing is attractive precisely because an intermediate activation is harder to invert into the raw sensor reading than the raw reading itself (though not impossible, so do not treat it as encryption). <strong>Availability</strong>: anything that must work in a tunnel, on a factory floor with flaky Wi-Fi, or on a drone beyond radio range must degrade gracefully to on-device operation. <strong>Cost at fleet scale</strong>: cloud inference is an operating expense that scales with every device times every inference per second; a partition that offloads a 30&#8239;Hz vision stream from a million cameras is a datacenter bill, not a feature. <strong>Freshness of the model</strong>: cloud tiers can be updated in minutes, while on-device models ship on a slower, riskier cadence, so teams often keep the fast-moving logic (thresholds, business rules, new classes) upstream and the stable perception backbone on-device.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Partition by <em>criticality and privacy first, then optimize energy within that envelope</em>. Decide which decisions must survive a dead radio (those are pinned on-device) and which data must never leave (that computation is pinned on-device too). Only the remaining, non-critical, non-sensitive computation is free to float to wherever the cost model sends it. Reversing this order, optimizing energy first and bolting on safety later, is how you ship a wearable that stops alarming in an elevator.</p>
+</div>
+
+<h2>The deployment lifecycle</h2>
+<p>A partition is only the first frame of a longer movie. Once a model is split and shipped, it enters a lifecycle that looks much like software CI/CD but with two extra hazards: the artifact is statistical, so it can silently rot as the world shifts, and it is physical, so a bad update can brick a device in a customer's home. The stages are packaging, staged rollout, monitoring, and rollback, and each interacts with the partition.</p>
+<p><strong>Packaging and versioning.</strong> Every tier's model is an artifact with a version, a hash, and a recorded compatibility contract: the device head at version 3 must interoperate with the cloud tail at version 3, because a split network's two halves share a private activation format. Bump one half and you must either bump the other or guarantee backward compatibility of the bottleneck. Treat the pair as a single deployable unit with a joint version, or you will eventually route a v3 activation into a v2 tail and get quiet garbage.</p>
+<p><strong>Staged rollout.</strong> You never flip a fleet at once. Ship to an internal cohort, then 1 percent, then 5, then 25, watching health metrics at each gate. Because sensory models fail on distribution shift rather than on exceptions, canaries must watch prediction-quality proxies (confidence distributions, class balance, disagreement with a shadow model), not just crash rates. This is the shift-detection machinery of <a href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> wired into the release gate.</p>
+<p><strong>Monitoring and rollback.</strong> A deployed partition needs telemetry from both sides of the cut: on-device inference latency and drop rate, uplink success, and server-side accuracy against whatever ground truth trickles back. When a metric crosses a threshold you roll back, which for an on-device model means shipping the previous signed artifact and, critically, having reserved enough flash to hold two model versions at once (A/B slots) so the rollback does not itself require a risky flash erase. The full fleet-scale version of this discipline, with device attestation and phased over-the-air campaigns, is the subject of <a href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>; here the message is narrower: design the partition and the flash layout for reversibility from day one.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>Static partitions are giving way to <em>learned, input-adaptive</em> ones. Early-exit networks (BranchyNet and its descendants) attach classifiers to intermediate layers and let easy inputs terminate on-device while only hard inputs traverse the full pipeline upstream, turning the partition into a per-sample decision. SPINN and Neurosurgeon framed dynamic device-cloud splitting under varying bandwidth, and more recent work compresses the transmitted bottleneck with learned entropy codecs so the tensor crossing the cut is itself a rate-distortion-optimized code. On the foundation-model side, running a large sensor or time-series model like MOMENT or a wearable model such as Google's LSM as a cloud tail, distilled into a tiny on-device head, is an active pattern: the frontier question is how to keep the two halves co-adapted as the cloud model is updated without reflashing every device.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: don't hand-roll the OTA update path</h3>
+<p>The staged-rollout, A/B-slot, signed-artifact, and rollback machinery above is roughly 800 to 1500 lines of fiddly, safety-critical firmware if you write it yourself, and every line is a chance to brick a device. Managed edge-deployment stacks (AWS IoT Greengrass, Azure IoT Edge, Balena, or a TFLite/LiteRT model-manager on Android) collapse "package a versioned model, roll it to a cohort, watch health, roll back on failure" into a manifest plus a few dozen lines of callback code. You keep ownership of the partition decision and the health metrics; you rent the campaign engine, the atomic dual-slot flashing, and the signature verification. Reserve your custom firmware budget for the part that is actually yours: the model and the cut point.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the six-stage cost model in the code block and extend it. (1) Add a per-stage int8 quantizer that halves <code>out_bytes</code> at the cut but adds a fixed 0.5&#8239;ms device-side encode cost; does the optimal cut move? (2) Add a privacy constraint that forbids any cut where more than 512 bytes leave the device, and re-solve. (3) Make \(B\) a random variable drawn from a heavy-tailed distribution and report the 95th-percentile latency of a fixed cut versus an adaptive cut that re-solves per inference. Which partition would you actually ship, and why is the tail, not the mean, the number that matters?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does the energy-optimal split point move <em>later</em> into the network as the uplink degrades, and what physical quantity drives that?</li>
+<li>A teammate proposes bumping the cloud tail to v4 while leaving device heads at v3 to "get the accuracy win faster." What is the failure mode, and what contract prevents it?</li>
+<li>Give one decision in your own domain that must be pinned on-device regardless of what the latency-energy cost model recommends, and state the force (privacy, availability, or criticality) that pins it.</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 59</h3>
+<p>quantize and prune a sensor classifier for edge inference; measure latency/size/accuracy tradeoffs.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Split computing and device-cloud partitioning</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/8114708">Kang et al. (2017). Neurosurgeon: Collaborative Intelligence Between the Cloud and Mobile Edge. ASPLOS / IEEE Micro.</a></p><p class="bib-annotation">The foundational study showing that the optimal DNN partition between device and cloud depends on network conditions and layer compute, and that it shifts dynamically. The origin of the cost model in this section.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3372224.3419215">Laskaridis et al. (2020). SPINN: Synergistic Progressive Inference of Neural Networks over Device and Cloud. MobiCom.</a></p><p class="bib-annotation">Combines early exits with dynamic device-cloud splitting under variable bandwidth, making the partition a per-input, runtime decision rather than a static design choice.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3527155">Matsubara, Levorato, Restuccia (2022). Split Computing and Early Exiting for Deep Learning Applications: Survey and Research Challenges. ACM Computing Surveys.</a></p><p class="bib-annotation">A comprehensive survey of bottleneck injection, learned activation compression, and the design space of where to cut a network. The best single entry point to the modern literature.</p></div>
+
+<p class="bib-category">Adaptive and early-exit inference</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/7900006">Teerapittayanon, McDanel, Kung (2016). BranchyNet: Fast Inference via Early Exiting from Deep Neural Networks. ICPR.</a></p><p class="bib-annotation">Introduced side-branch classifiers so easy inputs terminate early, the mechanism underlying input-adaptive partitioning between edge and cloud tiers.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1804.09081">Teerapittayanon, McDanel, Kung (2017). Distributed Deep Neural Networks over the Cloud, the Edge and End Devices. ICDCS.</a></p><p class="bib-annotation">Extends early exiting to a three-tier end-device / edge / cloud hierarchy, directly matching the tier vocabulary used in this section.</p></div>
+
+<p class="bib-category">Edge deployment lifecycle and foundation-model tails</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami et al. (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p><p class="bib-annotation">A representative heavy time-series model of the kind that lives in the cloud tail of a split deployment, distilled or queried by a lightweight on-device head.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2402.02653">Narayanswamy et al. (2024). Scaling Wearable Foundation Models (LSM). arXiv.</a></p><p class="bib-annotation">Google's Large Sensor Model, trained on multimodal wearable data, exemplifies the cloud-resident sensor backbone that on-device heads are increasingly partitioned against.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://docs.aws.amazon.com/greengrass/v2/developerguide/">Amazon Web Services (2024). AWS IoT Greengrass v2 Developer Guide. AWS Documentation.</a></p><p class="bib-annotation">A production reference for the packaging, versioned components, staged deployment, and rollback machinery that the library-shortcut callout recommends renting rather than hand-rolling.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>Partitioning decides <em>where</em> each stage of inference runs; it does not yet say how a model consumes an unending sensor stream in real time or adapts as that stream evolves. In <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, we move from the static split to the moving stream: windowing and stateful inference over continuous signals, backpressure and latency under bursty input, and online learning that lets the on-device head keep pace with a world that refuses to hold still.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

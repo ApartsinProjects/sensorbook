@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.2: CPU, GPU, NPU, DSP, MCU tradeoffs. Building Sensory AI." name="description"/>
+<title>Section 59.2: CPU, GPU, NPU, DSP, MCU tradeoffs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>CPU, GPU, NPU, DSP, MCU tradeoffs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me five kinds of silicon and one power budget, then acted surprised when I had opinions about which one wakes up first."</p>
+<cite>A Frugal AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous section argued that sensory AI belongs on the device. The instant you accept that, a second question lands on your desk: <em>which</em> piece of silicon runs each part of the model? A modern sensing product almost never has one processor. It has a small zoo of them on a single chip: a general-purpose CPU, sometimes a GPU, a neural processing unit (NPU), one or more digital signal processors (DSPs), and often a tiny always-on microcontroller (MCU). Each is a different bargain between flexibility, throughput, energy per operation, and how much of your model it can actually run. Pick wrong and you either miss the latency budget, drain the battery by lunchtime, or discover that your favorite operator silently falls back to the slowest core on the die. This section gives you the mental model to place each workload on the right engine, grounded in the one equation, the roofline, that predicts whether a layer is starved for compute or starved for memory bandwidth.</p>
+</div>
+
+<p>This section assumes you are comfortable with the arithmetic of a neural network layer as a pile of multiply-accumulate operations, the material from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and with the idea that numeric precision is a design knob, which we develop fully in <a class="cross-ref" href="section-59.4.html">Section 59.4</a> on quantization. We will speak in terms of MACs (multiply-accumulate operations), bytes moved through memory, and two hardware numbers every datasheet reports: peak throughput and peak memory bandwidth. We keep the memory, power, and thermal envelope itself for <a class="cross-ref" href="section-59.3.html">Section 59.3</a>; here the concern is the compute fabric.</p>
+
+<h2>Five engines, one spectrum from flexible to frugal</h2>
+<p>The five processor classes are not five arbitrary products; they sit on a single axis that trades programmability against energy efficiency. Understanding <em>where</em> each sits tells you what it is for.</p>
+<p>The <strong>CPU</strong> is the generalist. It runs arbitrary control flow, branches, and any operator you can compile, including the odd preprocessing step or custom layer no accelerator supports. Modern embedded CPUs (Arm Cortex-A, and the vector-extended Cortex-M) add SIMD (single-instruction-multiple-data) units that process several samples per instruction, so a CPU is rarely the fastest option but is almost always the <em>fallback</em> that guarantees a model runs at all. Its weakness is energy: general-purpose pipelines spend most of their transistors on instruction fetch, decode, and speculation, not on arithmetic.</p>
+<p>The <strong>GPU</strong> trades that flexibility for throughput. Its SIMT (single-instruction-multiple-thread) design runs thousands of lightweight threads over dense, regular tensors, which is why it dominates training and heavy vision workloads. On a phone or a robot the GPU is the engine for large convolutional and transformer blocks (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>), but it is power-hungry and has meaningful launch latency, so waking it for a tiny always-on classifier is wasteful.</p>
+<p>The <strong>NPU</strong> (also called a TPU, neural engine, or matrix accelerator) is a fixed-function array of MAC units, typically a systolic array, built to do one thing: dense low-precision matrix multiply at extreme efficiency. NPUs report throughput in TOPS (tera-operations per second) and, more tellingly, in TOPS per watt, where they beat a CPU by one to two orders of magnitude. The catch is operator coverage: an NPU runs the operators its compiler supports, in the precisions it supports (usually int8, increasingly int4), and anything outside that set is evicted back to the CPU. A model that looks tiny can run slowly because one unsupported activation forces a round trip off the accelerator every layer.</p>
+<p>The <strong>DSP</strong> is the specialist for streaming signal math: FIR/IIR filters, FFTs, and the fixed-point vector loops of an audio or radar front end. DSPs use VLIW (very-long-instruction-word) and SIMD designs to sustain many MACs per cycle at very low power, and crucially they are efficient on the <em>always-on</em> duty cycle, staying awake to watch a microphone or an IMU while the big cores sleep. Many recent DSPs also run quantized neural nets, blurring the line with NPUs.</p>
+<p>The <strong>MCU</strong> is the floor of the hierarchy: a self-contained chip with kilobytes to a few megabytes of RAM, no operating system required, microamp sleep currents, and a unit cost measured in cents. It is the home of TinyML (<a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a> develops this fully). An MCU will not run a large model, but it will run a 30 KB keyword spotter for a year on a coin cell, which no other engine here can claim.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Programmability and efficiency trade off along one line</h3>
+<p>Read the five engines left to right, CPU, GPU, DSP, NPU, MCU, and two quantities move in opposition. As you specialize the hardware, energy per operation falls (an NPU MAC can cost a hundredth of a CPU MAC) but the <em>set of models it will run unchanged</em> shrinks. The CPU runs everything slowly; the NPU runs a blessed subset blazingly. Good edge design is therefore not "pick the fastest chip." It is <em>partitioning</em>: route each operator to the most frugal engine that still supports it, and keep the CPU as the safety net for the rest.</p>
+</div>
+
+<h2>The roofline: is your layer compute-bound or memory-bound?</h2>
+<p>Peak TOPS is a seductive and often useless number, because most sensor-model layers never reach it. Whether a layer is limited by arithmetic or by moving data is decided by its <em>arithmetic intensity</em> \(I\), the number of operations performed per byte fetched from memory:</p>
+<p>$$ I = \frac{\text{operations}}{\text{bytes moved}}, \qquad I^{\star} = \frac{\text{peak throughput (ops/s)}}{\text{memory bandwidth (bytes/s)}}. $$</p>
+<p>The ridge point \(I^{\star}\) is a property of the hardware alone. When a layer's \(I < I^{\star}\), the engine finishes its math faster than memory can feed it, so the layer is <strong>memory-bound</strong> and adding TOPS buys nothing. When \(I > I^{\star}\), the layer is <strong>compute-bound</strong> and faster memory buys nothing. The achievable rate is the roofline: \(\min(\text{peak throughput},\ I \times \text{bandwidth})\). This single inequality explains why an NPU rated at 10 TOPS can crawl on a depthwise convolution (very low \(I\), so memory-bound) while flying on a dense fully connected layer (high \(I\), so compute-bound). It also explains why quantization helps twice: int8 weights are a quarter the bytes of float32, which both raises \(I\) and lowers the bandwidth wall.</p>
+
+<pre><code class="language-python">def roofline(layer_macs, bytes_moved, peak_tops, bandwidth_gbps):
+    ops = 2 * layer_macs                       # 1 MAC = 1 multiply + 1 add
+    intensity = ops / bytes_moved              # operations per byte
+    ridge = (peak_tops * 1e12) / (bandwidth_gbps * 1e9)
+    bound = "compute-bound" if intensity > ridge else "memory-bound"
+    achievable = min(peak_tops * 1e12, intensity * bandwidth_gbps * 1e9)
+    return intensity, ridge, bound, achievable / 1e9   # Gops/s attainable
+
+# A depthwise 3x3 conv on a 56x56x64 feature map, int8 weights + activations
+macs = 56 * 56 * 64 * 9
+bytes_moved = (56*56*64) + (56*56*64) + (64*9)   # in + out + weights, 1 byte each
+print(roofline(macs, bytes_moved, peak_tops=10, bandwidth_gbps=25))
+# -> intensity ~8.9 ops/byte, ridge 400 ops/byte => memory-bound; ~223 Gops/s, far below 10 TOPS
+</code></pre>
+<div class="code-caption">A ten-line roofline estimator: it converts a layer's MAC count and byte traffic into an arithmetic intensity, compares it to the hardware ridge point, and reports whether the layer is starved for compute or for bandwidth. The depthwise convolution above lands deep in the memory-bound region, so its 10-TOPS NPU delivers a small fraction of peak, exactly the surprise that wrecks naive latency estimates.</div>
+
+<p>The estimator above is the fastest sanity check in edge deployment. Before you trust a vendor's TOPS figure, run each dominant layer through it: if your model is mostly depthwise separable convolutions or attention over short sensor windows, it is probably memory-bound, and you should be shopping for bandwidth and on-chip SRAM, not raw TOPS.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let the runtime pick the engine for you</h3>
+<p>Hand-writing per-operator dispatch, deciding which layer goes to the NPU, which to the DSP, and which falls back to the CPU, and inserting the quantize/dequantize glue between them, is hundreds of lines of brittle, chip-specific code. A modern inference runtime does it declaratively. With ONNX Runtime you list the execution providers in priority order and it partitions the graph, assigning each subgraph to the first provider that supports it and silently routing the rest to CPU:</p>
+<pre><code class="language-python">import onnxruntime as ort
+
+sess = ort.InferenceSession(
+    "sensor_model.onnx",
+    providers=["NnapiExecutionProvider",   # NPU / DSP via Android NNAPI
+               "XnnpackExecutionProvider",  # optimized CPU SIMD
+               "CPUExecutionProvider"])      # guaranteed fallback
+out = sess.run(None, {"input": window})
+</code></pre>
+<div class="code-caption">Four lines of provider configuration replace a hand-rolled operator-placement pass; the runtime partitions the graph across NPU, DSP, and CPU and inserts the precision-conversion glue itself.</div>
+<p>The runtime handles graph partitioning, operator-support checking, and the conversion boundaries between engines. You still must <em>profile</em> the result, because an unsupported operator that forces a fallback is invisible in the code and obvious only in the latency trace, but you write roughly 5 lines instead of 300.</p>
+</div>
+
+<h2>Matching the workload to the engine</h2>
+<p>Placement follows from three questions asked per workload: how often does it run, how big is it, and how regular is its compute? An always-on trigger that runs every few milliseconds must live on the most frugal engine that can hold it, usually a DSP or MCU, because its energy cost is duty cycle times per-inference cost, and the duty cycle is brutal. A heavy but occasional model (run the full detector only when the trigger fires) belongs on the NPU or GPU, which are efficient per operation but expensive to wake, so you want them asleep most of the time. Irregular or unsupported operators, custom pre-processing, control flow, rare layer types, stay on the CPU, whichever way the rest of the graph is partitioned. This is the <em>wake-up cascade</em> pattern: a tiny gatekeeper on cheap silicon decides whether to pay for the expensive engine, and it is the single most important architectural move in battery-powered sensing.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A hearing aid that hears its wake word on a DSP</h3>
+<p>Consider a modern hearing aid, a clinical-grade wearable running on a zinc-air cell smaller than a shirt button, with a power budget around one milliwatt for the whole audio pipeline. Its designers face all five engines in miniature. The always-on stage, a beamformer and a voice-activity detector filtering two microphones at 16 kHz, runs on a fixed-point DSP, because it must stay awake continuously and DSPs sustain streaming FIR/FFT math at microwatts. Only when voice activity is detected does a small quantized NPU wake to run the noise-suppression and speech-enhancement network, spending its energy in short bursts. A tiny MCU core supervises the battery, the Bluetooth link, and the volume buttons. There is no GPU and no application CPU anywhere on the die: at one milliwatt, a GPU's launch energy alone would flatten the cell. The lesson generalizes directly to earbuds, smartwatches, and body-worn cameras. The engine you keep <em>awake</em> matters more than the engine that is fastest when running.</p>
+</div>
+
+<p>The same logic scales up. An automotive perception SoC keeps lidar and radar preprocessing on DSPs, runs the BEV detection network (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>) on a large NPU, and reserves the CPU cluster for the planning and fusion logic that is all branches and no dense math. An event-camera system (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>) may skip conventional engines entirely for a neuromorphic core whose sparse, event-driven compute has no equivalent on a GPU. In every case the partition is dictated by duty cycle and operator regularity, not by which chip has the biggest headline number.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: place the pipeline</h3>
+<p>You are building a wrist-worn fall detector (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> covers the IMU) on a SoC with a Cortex-M MCU, a low-power DSP, a 2-TOPS int8 NPU, and a Cortex-A CPU. The pipeline is: (1) read a 3-axis accelerometer at 100 Hz and compute a sliding-window magnitude and jerk; (2) a small always-on gate that flags candidate impacts; (3) a 40-layer int8 CNN that confirms a real fall; (4) a rule-based state machine that waits 30 seconds and calls for help. Assign each stage to an engine and justify it in terms of duty cycle, operator support, and energy per inference. Then use the roofline estimator to argue whether stage 3, dominated by depthwise separable convolutions, will hit the NPU's peak 2 TOPS or fall short, and say what that implies for the SoC memory you would specify.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>A vendor advertises 15 TOPS. Your model is mostly depthwise convolutions and short-window attention. Why might you still miss your latency budget, and which single number from the datasheet, other than TOPS, would you check first?</li>
+<li>Explain in one sentence why int8 quantization improves roofline performance through <em>two</em> distinct mechanisms.</li>
+<li>Why is it usually a mistake to run an always-on wake-word or impact detector on the GPU, even when the GPU is by far the fastest engine on the chip?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-59.3.html">Section 59.3</a>, we turn from choosing engines to the envelope they all share: memory, power, and thermal limits. The roofline showed that bandwidth and on-chip SRAM often matter more than raw arithmetic; next we quantify the memory hierarchy that feeds these engines, the energy each data movement costs, and the thermal ceiling that quietly throttles a chip long before its datasheet peak is reached.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

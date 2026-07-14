@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 59.6: Hardware-aware NAS. Building Sensory AI." name="description"/>
+<title>Section 59.6: Hardware-aware NAS | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 59: Edge AI Fundamentals and Model Optimization</a></div>
+<h1>Hardware-aware NAS</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked me to minimize FLOPs, so I did. The chip ran it slower. Turns out the chip never read the same textbook I did."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Quantization (Section 59.4) and pruning (Section 59.5) shrink a network you already designed. Hardware-aware Neural Architecture Search (NAS) goes one step earlier: it lets the target device help <em>design the network in the first place</em>. The move that makes it "hardware-aware" is deceptively small but reshapes everything. Instead of searching for the most accurate architecture and hoping it runs fast, you fold a <em>measured</em> cost on the actual silicon, milliseconds of latency, millijoules of energy, kilobytes of RAM, directly into the objective the search optimizes. The result is not a network you then squeeze onto the chip; it is a network the chip effectively chose, sitting on the accuracy-versus-latency Pareto frontier for that one device. This section explains why proxy metrics like parameter count lie, how a cost model turns real hardware into a term in a loss function, and how modern weight-sharing search finds a good architecture in GPU-hours instead of GPU-years.</p>
+    </div>
+
+    <p>Why does a network with half the floating-point operations of another sometimes run <em>slower</em> on your <a class="cross-ref" href="index.html">edge accelerator</a>? Because the chip does not bill you by the FLOP. It bills you for memory movement, for kernels its compiler cannot fuse, for depthwise convolutions its <span>neural processing unit (NPU)</span> handles at a fraction of peak throughput, and for activation tensors that spill out of on-chip SRAM. This section assumes you are comfortable with the device taxonomy of Section 59.2 (CPU, GPU, NPU, DSP, MCU) and the memory, power, and thermal budgets of Section 59.3, and that you have met the six-constraint tension web from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-01-what-is-sensory-ai/index.html">Chapter 1</a>. The single idea to hold onto: an architecture's cost is a property of the hardware, not of the math, so the search must measure it there. <span><em>In short:</em> stop optimizing a proxy for speed and optimize speed itself, measured on the chip you will ship.</span></p>
+
+    <div class="callout warning">
+        <h4>Common Misconception</h4>
+        <p>The most common misconception is that FLOPs or parameter count is a reliable stand-in for latency, so a smaller-FLOP model is automatically a faster model. On real accelerators the correlation is often weak and sometimes inverted: a depthwise-separable block has few FLOPs but poor arithmetic intensity, so it starves a systolic-array NPU that would happily saturate a denser convolution. MnasNet and ProxylessNAS both reported architectures that a FLOP-only search would have rejected, yet which ran fastest on the target phone. Optimize the proxy and you optimize the wrong thing.</p>
+    </div>
+
+    <h2>Why hardware-aware, and what "aware" means</h2>
+
+    <p><strong>What</strong> NAS automates: the choice of architecture itself, kernel sizes, channel widths, block types, depth, expansion ratios, treated as a search over a discrete space rather than a design a human hand-tunes. <strong>Why</strong> make it hardware-aware: classical NAS optimized accuracy alone and produced networks too heavy for any sensor node. Hardware-aware NAS reframes the search as multi-objective. Formally, for a candidate architecture \(\alpha\) drawn from a search space \(\mathcal{A}\), we want</p>
+
+    $$ \max_{\alpha \in \mathcal{A}} \; \text{Accuracy}(\alpha) \quad \text{subject to} \quad \text{Latency}(\alpha) \le \tau, $$
+
+    <p>which the seminal MnasNet work relaxes into a single differentiable-in-spirit reward using a soft penalty,</p>
+
+    $$ R(\alpha) = \text{Accuracy}(\alpha) \cdot \left[ \frac{\text{Latency}(\alpha)}{\tau} \right]^{w}, \qquad w < 0, $$
+
+    <p>so that missing the latency target \(\tau\) is punished smoothly rather than by a hard cutoff. <strong>How</strong> "aware" is achieved: the \(\text{Latency}(\alpha)\) term is not estimated from FLOPs. It is either measured by running the candidate on the physical device, or, far more cheaply, read from a <em>latency lookup table (LUT)</em> that was profiled once per operator per device. <strong>When</strong> you need it: whenever the deployment target is fixed and unusual enough that its cost curve does not match a desktop GPU, which is nearly every sensor node.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The entire discipline reduces to one substitution: replace the analytic proxy (FLOPs, parameters) in the search objective with a term that came from the real hardware. Everything else, the search strategy, the supernet, the differentiable relaxation, is machinery for making that substitution affordable. If your cost term does not trace back to a measurement on the device you will ship, your search is not hardware-aware, no matter how sophisticated the optimizer wrapped around it.</p>
+    </div>
+
+    <h2>The cost model: latency lookup tables and measured energy</h2>
+
+    <p>Running every candidate on-device is accurate but glacial: a search may evaluate tens of thousands of architectures. The workhorse compromise is the <em>operator-wise latency LUT</em>. You profile each primitive block (a \(3\times3\) depthwise convolution at a given input resolution and channel count, say) once on the target, store its measured latency, and then estimate any architecture's latency as the sum over its blocks. This assumes block latencies are additive, which holds well on hardware without aggressive cross-layer fusion and is the basis of ProxylessNAS and FBNet. The code below builds a tiny LUT and scores candidate architectures against a latency budget, exactly the inner loop of a hardware-aware search.</p>
+
+    <pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+# Latency LUT: measured ms per block type on a target NPU (profiled once).
+LUT_MS = {"conv3x3": 0.90, "dwconv3x3": 0.28, "dwconv5x5": 0.41,
+          "mbconv6":  0.62, "skip":     0.00}
+# Accuracy contribution proxy per block (from a trained supernet).
+ACC = {"conv3x3": 0.040, "dwconv3x3": 0.021, "dwconv5x5": 0.028,
+       "mbconv6":  0.035, "skip":     0.000}
+
+BLOCKS, DEPTH, BUDGET_MS = list(LUT_MS), 8, 3.0
+
+def sample_arch():
+    return [rng.choice(BLOCKS) for _ in range(DEPTH)]
+
+def latency(arch):  return sum(LUT_MS[b] for b in arch)   # additive LUT model
+def acc_proxy(arch): return 0.60 + sum(ACC[b] for b in arch)
+
+# MnasNet-style reward: accuracy scaled by a soft latency penalty (w < 0).
+def reward(arch, w=-0.07):
+    return acc_proxy(arch) * (latency(arch) / BUDGET_MS) ** w
+
+best, best_r = None, -1.0
+for _ in range(4000):                       # random search over the space
+    a = sample_arch(); r = reward(a)
+    if r > best_r and latency(a) <= BUDGET_MS:   # respect the hard budget too
+        best, best_r = a, r
+print(f"latency={latency(best):.2f} ms  acc_proxy={acc_proxy(best):.3f}")
+print("arch:", " -> ".join(best))
+</code></pre>
+    <div class="code-caption"><strong>Listing 1.</strong> A minimal hardware-aware search: a measured latency LUT plus a MnasNet-style soft-penalty reward, searched by random sampling under a 3&nbsp;ms budget. Swapping the LUT values for a different device changes the winning architecture without touching the search code.</div>
+
+    <p>Listing 1 is a caricature of the real thing (random search, a hand-set accuracy proxy), but its structure is the real thing. Change one number in <code>LUT_MS</code>, the profile of a different chip, and the search returns a different network. That is the whole point: the architecture is a function of the hardware. Energy and peak-RAM cost models slot into the same objective; for a <span>microcontroller (MCU)</span> the binding constraint is often not latency at all but the largest activation tensor, which must fit in tens of kilobytes of SRAM.</p>
+
+    <div class="callout practical-example">
+        <h4>In Practice: A Wrist-Worn Activity Classifier</h4>
+        <p>A wearables team building a fall-and-activity detector for an elderly-care band (the kind of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">human-activity recognition</a> model this book returns to often) had a hand-designed convolutional network that hit 92% on their leakage-safe test set but drew too much power to survive a day on the band's coin cell. Rather than prune it blindly, they ran a hardware-aware search over a MobileNet-style block space with a latency-and-energy LUT profiled on the band's actual Cortex-M55 core. The search discarded the wide \(5\times5\) convolutions the humans had loved (cheap in FLOPs, expensive in cycles on that core) and favored narrow depthwise blocks with early downsampling. The found network landed at 91.4% accuracy, a 0.6-point drop, at 3.9 times lower energy per inference. The band went from 14 hours to a full week between charges. The device chose the trade the humans could not see, because the cost lived in the silicon, not the FLOP count.</p>
+    </div>
+
+    <h2>Search strategy: from thousands of trainings to one supernet</h2>
+
+    <p>Early NAS trained every candidate from scratch and cost thousands of GPU-days, which no sensor-AI team can afford. The breakthrough that made hardware-aware NAS practical is <em>weight sharing</em>. You train a single over-parameterized <em>supernet</em> that contains every candidate architecture as a sub-path; each candidate inherits the supernet's weights instead of training its own. Evaluating an architecture becomes a forward pass, not a training run. Two families dominate. <strong>Differentiable NAS</strong> (DARTS, FBNet) places a continuous, learnable weight on each candidate operation and adds the LUT latency as a differentiable term in the loss, so gradient descent tunes architecture and weights jointly:</p>
+
+    $$ \mathcal{L}(\theta, \alpha) = \mathcal{L}_{\text{task}}(\theta, \alpha) + \lambda \sum_{l} \sum_{o} p_{l,o}(\alpha)\,\text{LUT}[o], $$
+
+    <p>where \(p_{l,o}\) is the (softmaxed) probability of choosing operation \(o\) at layer \(l\) and \(\lambda\) sets the latency pressure. <strong>Once-for-All</strong> (OFA) decouples training from search entirely: it trains one supernet with progressive shrinking so that <em>every</em> sub-network is independently deployable, then, for each new device, it searches the already-trained supernet against that device's LUT in minutes, no retraining. That "train once, specialize many" property is what lets a single model family target a phone, a smartwatch, and an MCU from one training run.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool</h3>
+        <p>You will not hand-roll a supernet, a progressive-shrinking schedule, and a per-device evolutionary search. The Once-for-All release ships pretrained supernets and a device-conditioned search in a few lines:</p>
+        <pre><code class="language-python">from ofa.model_zoo import ofa_net
+from ofa.nas.accuracy_predictor import AccuracyPredictor
+from ofa.nas.search_algorithm import EvolutionFinder
+
+ofa = ofa_net("ofa_mbv3_d234_e346_k357_w1.0", pretrained=True)
+finder = EvolutionFinder(AccuracyPredictor(ofa), efficiency_predictor="note10")
+best_arch, _ = finder.run_evolution_search(latency_budget=25)   # ms on the target
+subnet = ofa.get_active_subnet(best_arch)   # deployable network, no retraining
+</code></pre>
+        <div class="code-caption"><strong>Listing 2.</strong> Specializing a pretrained Once-for-All supernet to a 25&nbsp;ms latency budget on a named device using its built-in evolutionary finder and accuracy predictor.</div>
+        <p>Roughly six lines replace what would otherwise be several thousand: a supernet training loop, a progressive-shrinking curriculum, a latency predictor, and an evolutionary search. The library owns the weight-shared training and the device cost model; you supply only the budget and the target. Building the same pipeline from scratch is weeks of work and a large GPU bill, which is exactly why weight-sharing NAS only became usable once these tools existed.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The current frontier pushes in three directions. <em>Zero-cost proxies</em> (Mellor et al.'s jacobian-covariance score, NASWOT, and the <span>synflow</span> saliency measure) rank architectures at initialization without any training, collapsing a search from GPU-hours to seconds, though their correlation with true accuracy remains uneven. <em>Hardware-aware transformer search</em> (HAT, Wang et al., 2020) extends the LUT idea to attention blocks, searching layer widths and head counts against device latency, which matters as <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">transformers move onto sensor nodes</a>. And <em>MCU-scale NAS</em> (MCUNet's TinyNAS, Lin et al., 2020) co-designs the network and its tiny inference engine under a joint SRAM-and-flash budget, reaching ImageNet-grade accuracy on a microcontroller with under 512&nbsp;KB of RAM, a regime <a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a> develops in full. As of 2024 to 2025, once-for-all supernets combined with zero-cost ranking are the pragmatic default for teams that must retarget one model family across a fleet of heterogeneous devices.</p>
+    </div>
+
+    <h2>Pitfalls: the LUT can lie too</h2>
+
+    <p><strong>What</strong> goes wrong: a hardware-aware search is only as honest as its cost model. The additive-LUT assumption breaks when a compiler fuses adjacent operators (so the sum overcounts) or when memory-bandwidth contention makes a block slower in context than in isolation (so the sum undercounts). <strong>Why</strong> it matters: a mis-calibrated LUT quietly steers the search toward architectures that look fast on paper and stall on-device, reintroducing the very proxy-gap NAS was meant to close. <strong>How</strong> to guard against it: validate the search's predicted latency against a handful of real on-device measurements of the <em>final</em> candidates before trusting the ranking, and re-profile the LUT whenever the compiler, runtime, or driver version changes. <strong>When</strong> this bites hardest: on fused NPU toolchains and on shared-memory MCUs, precisely the targets sensor AI cares about most. And as always in this book, the accuracy numbers that feed the search must come from a <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">leakage-safe split</a>, or the search will happily optimize an architecture for a benchmark you cannot reproduce in the field.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take Listing 1 and change a single LUT entry: set <code>dwconv5x5</code> to <code>0.20</code> ms (as if a new NPU driver accelerated \(5\times5\) depthwise kernels). Re-run the search and report how the winning architecture changes. Then add an energy LUT (invent plausible millijoule values per block) and a second constraint that total energy stay under a budget you pick, turning the reward into a two-constraint search. Which blocks survive both budgets, and which were only ever cheap on one axis? Write two sentences explaining why a FLOP-only search could not have made this distinction.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Explain why a network with fewer FLOPs can run slower than one with more FLOPs on the same NPU, and name one architectural feature that causes this.</p>
+        <p class="quiz-question">2. What does weight sharing (the supernet) buy you, and why did NAS become affordable for sensor teams only after it appeared?</p>
+        <p class="quiz-question">3. The additive latency LUT can both overcount and undercount true on-device latency. Give one mechanism for each direction, and state the validation step that catches the error before deployment.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-59.7.html">Section 59.7</a>, we zoom out from the single device to the full pipeline: how to decide which computation stays on the node and which crosses to the cloud, and how quantization, pruning, and the hardware-aware architectures of this section fit into a repeatable edge-cloud deployment lifecycle rather than a one-off optimization.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
