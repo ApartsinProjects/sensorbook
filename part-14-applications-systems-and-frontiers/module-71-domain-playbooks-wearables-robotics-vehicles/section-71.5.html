@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 71.5: Environmental and climate sensing (spatial interpolation, early warning, citizen sensing). Building Sensory AI." name="description"/>
+<title>Section 71.5: Environmental and climate sensing (spatial interpolation, early warning, citizen sensing) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIV: Applications, Systems, and Frontiers</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 71: Domain Playbooks: Wearables, Robotics, Vehicles, Smart Spaces, Environment, Security</a></div>
+<h1>Environmental and climate sensing (spatial interpolation, early warning, citizen sensing)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me nine air-quality stations and asked what the tenth block smells like. The map is mostly my imagination, and my job is to say exactly how much."</p>
+<cite>A Geostatistically Honest AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every other domain in this chapter puts the sensor where the phenomenon is: the accelerometer on the wrist, the lidar on the roof, the microphone in the room. Environmental sensing breaks that luxury. The phenomenon (a pollution plume, a heat dome, a rising river, a wildfire's smoke) is a continuous field spread over kilometers or continents, and you can afford instruments at only a scatter of points. So this section is about three moves that define the domain. First, <em>spatial interpolation</em>: reconstruct the field between sensors and quantify how wrong the guess can be. Second, <em>early warning</em>: turn that field into an alert with enough lead time to act, without crying wolf so often that nobody listens. Third, <em>citizen sensing</em>: fold in thousands of cheap, drifting, unevenly sited consumer devices without letting their noise poison the answer. These reuse machinery from across the book (Gaussian processes, calibration, change detection, graph models), but the sparse-and-spatial setting changes the engineering enough to earn its own playbook.</p>
+</div>
+
+<p>This section assumes the probability and estimation vocabulary from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, the environmental-sensor hardware and gas-sensing failure modes from <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-39-energy-buildings-and-environmental-sensors/index.html">Chapter 39</a>, and the change-detection tests from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Where a spatial model becomes a graph problem, it connects forward to <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a>.</p>
+
+<h2>Making a field out of points: spatial interpolation</h2>
+
+<p>You have air-quality monitors at a handful of locations \(\{x_i\}\) reading concentrations \(\{z_i\}\), and a regulator who wants the concentration at an unmonitored school. Naive answers fail in instructive ways. Nearest-neighbor snaps to the closest station and produces discontinuous cliffs at Voronoi boundaries. Inverse-distance weighting smooths those cliffs but invents no error bars, so a value halfway between two stations looks as trustworthy as a value sitting on top of one. The regulated answer is <em>kriging</em>, the geostatistical name for Gaussian-process regression (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> treats the GP machinery in depth). Kriging models the field as a Gaussian process whose covariance is fit from the data itself: you compute the empirical <em>variogram</em>, \(\gamma(h) = \tfrac{1}{2}\,\mathrm{Var}[z(x{+}h) - z(x)]\), which measures how fast readings decorrelate with separation \(h\), fit a parametric model to it, and invert that covariance to get both a prediction and a variance.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The deliverable of environmental interpolation is not the predicted map, it is the <em>uncertainty</em> map. A pollution surface with no confidence interval is a decision waiting to be sued. Kriging's real gift is the kriging variance: it is near zero on top of stations and swells in the gaps, so it draws you a picture of exactly where your network is blind. That map is what tells a city where to put its next sensor, and it is the number a regulator needs before shutting a school playground.</p>
+</div>
+
+<p>The code below fits a Gaussian process to five monitors and asks it for the concentration, with uncertainty, at a school between them. The point of the listing is the second returned array: the standard deviation, which no inverse-distance scheme can give you.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+
+# Five PM2.5 monitors: (east_km, north_km) -> concentration (ug/m3)
+X = np.array([[0., 0.], [8., 1.], [3., 6.], [9., 7.], [5., 3.]])
+z = np.array([12.0,     31.0,     18.0,     27.0,     22.0])
+
+# Matern covariance (spatial smoothness) + WhiteKernel (sensor noise)
+kernel = Matern(length_scale=4.0, nu=1.5) + WhiteKernel(noise_level=2.0)
+gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True).fit(X, z)
+
+school = np.array([[6.0, 5.0]])          # an unmonitored location
+mean, std = gp.predict(school, return_std=True)
+print(f"estimate: {mean[0]:.1f} ug/m3  +/- {std[0]:.1f} (1 sigma)")
+</code></pre>
+<div class="code-output">estimate: 24.8 ug/m3  +/- 3.6 (1 sigma)</div>
+<div class="code-caption"><strong>Listing 71.5.1.</strong> Gaussian-process (kriging) interpolation over five monitors. The <code>WhiteKernel</code> term encodes per-sensor measurement noise so the surface is not forced through noisy readings, and <code>return_std=True</code> yields the uncertainty that turns a point estimate into a defensible decision.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: don't hand-roll the kriging solver</h3>
+<p>Written from scratch, ordinary kriging is roughly 60 lines: bin the pairwise distances, estimate the empirical variogram, fit a spherical or Matern model to it, assemble the covariance matrix with a Lagrange constraint, and solve the linear system per prediction point. <code>sklearn</code>'s <code>GaussianProcessRegressor</code> collapses that to the three lines above and learns the length scale and noise level by marginal-likelihood optimization instead of a hand-tuned variogram fit. When you need classical geostatistics vocabulary (explicit variogram models, block kriging, anisotropy), <code>PyKrige</code> does the same job in about five lines while exposing the variogram directly. Either way you drop from ~60 lines to ~5 and inherit a numerically stable solver.</p>
+</div>
+
+<h2>Early warning: buying lead time without crying wolf</h2>
+
+<p>An interpolated field becomes useful the moment you turn it into an alert. Environmental early-warning systems (flood gauges, seismic networks, wildfire and air-quality alerts) all live on the same brutal tradeoff: <em>lead time</em> versus <em>false-alarm rate</em>. Alert earlier and you catch more real events but fire on more noise; wait for certainty and the warning arrives after the flood crest. The governing quantity is not accuracy but the cost-weighted expectation over both error types, and the weights are wildly asymmetric. A missed flash-flood warning kills; a false one costs an evacuation and a little public trust, and trust is a depletable resource: a network that false-alarms weekly gets ignored on the day it matters.</p>
+
+<p>The mechanism that buys lead time is almost always a <em>fast, cheap signal that outruns the slow, expensive damage</em>. Seismic early warning is the cleanest example: the USGS <em>ShakeAlert</em> system and Android's global earthquake-alert network detect the low-energy P-wave that travels ahead of the destructive S-wave and surface waves, sending a phone alert that beats the shaking by seconds to tens of seconds. That is enough to stop a train or drop a surgeon's scalpel. Flood systems watch upstream gauges to warn downstream towns; air-quality systems run the change-detection tests of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> on the interpolated field to catch a plume's onset before any single station saturates.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a wildfire smoke early-warning grid</h3>
+<p>A wildland-urban-interface county fused three networks to warn residents of hazardous smoke. Reference-grade monitors (six of them, county-wide) anchored accuracy but were far too sparse for street-level warnings. Roughly 400 <em>PurpleAir</em> citizen sensors filled the gaps, and NASA's TROPOMI/Sentinel-5P satellite aerosol product provided regional context between them. The team kriged the corrected low-cost readings against the six reference anchors every ten minutes, then ran a CUSUM change detector on each grid cell. The design decision that made it work was the alerting policy: a single cell crossing threshold raised nothing, but a spatially coherent cluster of cells rising together, the signature of an advancing plume rather than a barbecue or a drifting sensor, triggered a neighborhood push alert. Requiring spatial coherence cut false alarms by more than half while preserving lead time, because real smoke fronts are correlated in space and sensor glitches are not.</p>
+</div>
+
+<h2>Citizen sensing: thousands of cheap, drifting eyes</h2>
+
+<p>The wildfire story only works because of the 400 consumer sensors, and they are the domain's defining opportunity and hazard. Low-cost devices (optical PM2.5 counters, electrochemical gas cells, consumer weather stations) cost 1 to 5 percent of a reference instrument, so citizens deploy them by the thousands and give you spatial density no agency budget could buy. The price is data quality. Optical particle sensors read high in humid air because water droplets scatter light like particles; electrochemical cells drift and cross-respond to interfering gases (the cross-sensitivity failure mode from <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-39-energy-buildings-and-environmental-sensors/index.html">Chapter 39</a>); and siting is uncontrolled, so one unit bakes on a sunny wall while its neighbor sits in shade.</p>
+
+<p>The fix is <em>colocation calibration</em>: park a batch of low-cost units next to a reference monitor, learn a correction that maps their raw output plus covariates (temperature, humidity) onto the reference truth, then push that correction to field units. This is the exact structure that produced the widely used US EPA correction for PurpleAir, a simple humidity-aware linear model that made a consumer network usable for public messaging. Two disciplines from earlier chapters are non-negotiable here. Calibration must be <em>leakage-safe</em>: split colocation data by time and by device, never by shuffled row, or a model that has secretly memorized one week's weather will report a fantasy accuracy (the leakage trap of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-01-what-is-sensory-ai/index.html">Chapter 1</a>'s sensing chain and Chapter 5). And the correction should carry uncertainty, so that a freshly-calibrated unit and a two-year-old drifting one enter the kriging step with appropriately different noise levels rather than as equals.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Do not average a citizen network as if every sensor were equal. The right architecture is a two-tier one: a small, trusted reference layer sets the truth, and the large, noisy citizen layer is bias-corrected and down-weighted against it. Feed each sensor into the spatial model with a per-sensor noise variance that reflects its calibration age and siting quality. Sparse accurate anchors plus dense corrected volunteers beats either layer alone, which is why the best environmental products are always fusions of both.</p>
+</div>
+
+<h2>Fusing networks and closing the loop</h2>
+
+<p>The three moves compose into one pipeline: correct the citizen layer against the reference layer, interpolate the fused set with a GP that respects per-sensor noise, and run early-warning tests on the resulting field with its uncertainty attached. Two extensions matter at scale. When sensors are numerous and their spatial and temporal correlations are rich, the interpolation stops being a static GP and becomes a spatiotemporal graph problem, which is where the graph neural networks of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a> take over from classical kriging, learning the correlation structure instead of assuming a stationary variogram. And because citizen sensors sit in people's yards and gardens, their raw locations are personal data; aggregating or perturbing coordinates, or training corrections without centralizing raw streams, connects directly to the privacy-preserving methods of Chapter 64. The domain's motto is the honesty of the epigraph: most of the map is inference, and the engineering is about stating, defensibly, how much.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You run a 12-station reference network and want to add 300 citizen PM2.5 sensors. (a) Design the colocation study: how many units, over what duration, and why must the train/test split be by time-block and by device rather than by random row? (b) After correction, each unit still has a residual error you estimate. Show where that per-sensor error enters Listing 71.5.1, and predict qualitatively what happens to the kriging variance map when you add 300 noisy points versus 300 perfect ones. (c) Propose an alerting rule that uses the kriging variance itself, so the system refuses to issue a confident warning in a region where the network is effectively blind.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is inverse-distance weighting inadequate for a regulatory air-quality map even when its point predictions look reasonable, and what specific output does kriging add?</li>
+<li>Seismic early warning warns before the damaging waves arrive. What physical fact makes that lead time possible, and what caps it as a hard limit?</li>
+<li>A colleague reports 98 percent calibration accuracy for a low-cost sensor fleet after shuffling all colocation samples into a random train/test split. State the leak and how it inflates the number.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-71.6.html">Section 71.6</a>, we turn the same sparse-network and fusion thinking toward adversarial settings: defense, security, and critical infrastructure, where the sensors are not merely noisy but actively spoofed, the alerts feed a triage queue with real consequences, and the ethics of perimeter sensing move from a footnote to the center of the design.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

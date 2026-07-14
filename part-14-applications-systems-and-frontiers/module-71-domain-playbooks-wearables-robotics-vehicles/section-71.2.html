@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 71.2: Robotics and autonomous systems (perception stack, sim-to-real, recovery). Building Sensory AI." name="description"/>
+<title>Section 71.2: Robotics and autonomous systems (perception stack, sim-to-real, recovery) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIV: Applications, Systems, and Frontiers</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 71: Domain Playbooks: Wearables, Robotics, Vehicles, Smart Spaces, Environment, Security</a></div>
+<h1>Robotics and autonomous systems (perception stack, sim-to-real, recovery)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The robot does not fall because it misjudged the floor. It falls because it believed its judgment for one frame too long."</p><cite>A Grounded AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A robot is the place where every idea in this book has to survive contact with a moving physical world at a fixed frame rate. Cameras, lidar, wheel encoders, and an inertial measurement unit (IMU) each report a partial, noisy, delayed slice of reality; the perception stack has to turn those slices into a single coherent belief that the planner can act on before the next control tick. This section is a domain playbook, not a new algorithm: it shows how the perception pieces you already know compose into a stack, how models trained in simulation cross the reality gap without collapsing, and how a robot recovers when a sensor lies or dies. The through-line is that autonomy is a systems property. No single perception module makes a robot safe; the arrangement, the timing, and the fallback behavior do.</p>
+</div>
+
+<p>This section assumes the estimation and fusion machinery from earlier parts. You should be comfortable with recursive state estimation from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, sensor fusion foundations from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, and the SLAM and robot-perception treatments in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a> and <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>. Here we assemble them.</p>
+
+<h2>The perception stack as a latency-bounded pipeline</h2>
+<p>Think of a mobile-robot perception stack as five stages that must all complete inside one control period: <em>acquire</em> raw sensor frames, <em>preprocess</em> and time-align them, <em>fuse</em> into a common representation, <em>estimate</em> state and a local map, and <em>expose</em> a belief to the planner. What makes this hard is not any one stage but the budget. A robot navigating at 1.5 m/s that runs planning at 20 Hz has 50 ms per cycle. If the lidar-to-occupancy step alone takes 40 ms, everything downstream is starved. So the first design question in robotics perception is never "what is the most accurate model" but "what is the most accurate model that fits the budget with margin".</p>
+
+<p>Timing forces two architectural commitments. First, <strong>time synchronization is load-bearing</strong>: fusing a camera detection with an IMU pose only works if both carry hardware timestamps on a shared clock, because at 1.5 m/s a 30 ms misalignment is 4.5 cm of positional error injected into the map (revisit <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> on why the timestamp, not the arrival order, defines the measurement). Second, the fused representation is usually a <em>local metric grid</em> or occupancy volume in a body-centered frame, because the planner needs "is the cell 0.8 m ahead free" far more often than it needs a globally consistent map. Global consistency is the SLAM back-end's job and runs on a slower thread. This split, a fast local estimator feeding the controller and a slow global optimizer correcting drift, is the backbone of nearly every deployed stack.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Robot perception is a two-rate system by necessity. A fast, forgetful front-end (tens of Hz, body frame, low latency) keeps the robot from hitting things right now; a slow, global back-end (a few Hz or on-demand) keeps the map from drifting over minutes. Conflating them, forcing the controller to wait on a globally optimized map, is the single most common cause of sluggish, unsafe robots. Design the two rates first, then choose models to fit each.</p>
+</div>
+
+<h2>Sim-to-real: training where reality is expensive</h2>
+<p>Robots break, batteries drain, and a real failure during data collection can cost hardware. So perception and control policies are increasingly trained in simulation, then transferred to the physical robot. The obstacle is the <em>reality gap</em>: a policy that overfits the simulator's clean depth maps, perfect friction, and noiseless IMU will fail the moment it meets real sensor noise, motion blur, and unmodeled dynamics. Two techniques close the gap, and they attack it from opposite directions.</p>
+<p><strong>Domain randomization</strong> makes the simulator deliberately diverse. During training you randomize textures, lighting, sensor noise variance, latency, friction coefficients, and payload mass across episodes. The bet is that if the policy is robust across a wide distribution of simulated worlds, the real world looks like just one more sample from that distribution. Formally, if \(p_\text{sim}(\xi)\) is the distribution over randomized parameters \(\xi\) and the real world is \(\xi_\text{real}\), randomization works when \(\xi_\text{real}\) lies inside the support of \(p_\text{sim}\) and the policy has learned to be invariant to \(\xi\). <strong>System identification</strong> takes the complementary route: measure the real robot's parameters (motor delays, camera intrinsics, IMU bias) and calibrate the simulator toward them, shrinking the gap rather than covering it. Production pipelines use both, randomizing what is hard to measure and calibrating what is easy. This is the applied face of the digital-twin and synthetic-data methods in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>, and the transfer itself is a distribution-shift problem of the kind analyzed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a warehouse AMR that only fell over in the rain</h3>
+<p>An autonomous mobile robot (AMR) fleet at a logistics site passed every simulation and every indoor test, then began stalling near the loading dock on wet mornings. The lidar was fine; the failure was the RGB obstacle detector, trained on synthetic renders that never modeled specular reflections from wet concrete. Puddles produced bright returns the detector read as phantom obstacles, so the safety layer froze the robot. The fix was not a smarter detector. The team added specular and puddle textures to the domain-randomization set, and, crucially, added a runtime cross-check: an "obstacle" seen by the camera but absent from the lidar occupancy volume was downgraded from stop to slow. Phantom-freeze incidents dropped to near zero. The lesson is that sim-to-real failures cluster exactly at the conditions the simulator forgot, and a cross-modal sanity check is cheaper insurance than chasing every missing texture.</p>
+</div>
+
+<h2>Recovery: assuming your sensors will betray you</h2>
+<p>Deployed robots do not fail because perception is imperfect; they fail because perception is imperfect and the system trusted it anyway. Robust autonomy treats every sensor as capable of three failure modes: <em>silence</em> (the frame stops arriving), <em>staleness</em> (frames arrive but the timestamp is old, a frozen driver), and <em>plausible-but-wrong</em> (a well-formed frame carrying garbage, the hardest case). A recovery architecture layers three defenses. <strong>Detection</strong>: runtime monitors watch each stream for silence and staleness, and cross-modal consistency checks catch plausible-but-wrong by asking whether independent sensors agree, exactly the residual-gating idea from robust fusion. <strong>Degradation</strong>: when a modality drops, the fusion estimator should keep running on the survivors rather than crash, which is why missing-modality robustness (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>) is a safety feature, not a nicety. <strong>Fallback</strong>: a small, deterministic reflex layer, often not learned at all, brings the robot to a safe state (stop, back off, hold pose) when the belief becomes untrustworthy. Designing that reflex layer and its trigger conditions is the functional-safety discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+
+<p>The monitor below is the smallest useful recovery primitive: a per-stream watchdog that flags a sensor as unhealthy when frames stop or timestamps stall. In a real stack its verdict gates fusion, so a stale lidar is dropped from the estimate rather than believed.</p>
+
+<pre><code class="language-python">import time
+
+class SensorWatchdog:
+    """Flags a stream as unhealthy on silence or a frozen timestamp."""
+    def __init__(self, name, max_gap_s=0.2):
+        self.name, self.max_gap_s = name, max_gap_s
+        self.last_arrival = None      # wall-clock of last frame
+        self.last_stamp = None        # sensor timestamp of last frame
+
+    def update(self, sensor_stamp, now=None):
+        now = time.monotonic() if now is None else now
+        healthy = True
+        if self.last_arrival is not None:
+            if now - self.last_arrival &gt; self.max_gap_s:
+                healthy = False                       # silence
+            if sensor_stamp == self.last_stamp:
+                healthy = False                       # frozen driver
+        self.last_arrival, self.last_stamp = now, sensor_stamp
+        return healthy
+
+lidar = SensorWatchdog("lidar", max_gap_s=0.15)
+print(lidar.update(sensor_stamp=100.0, now=1.00))   # True  (first frame)
+print(lidar.update(sensor_stamp=100.1, now=1.05))   # True  (fresh)
+print(lidar.update(sensor_stamp=100.1, now=1.10))   # False (frozen stamp)
+print(lidar.update(sensor_stamp=100.3, now=1.40))   # False (30 ms budget blown)
+</code></pre>
+<div class="code-caption">A per-stream health watchdog. It catches two of the three failure modes (silence via the arrival gap, staleness via a repeated timestamp); the third, plausible-but-wrong, needs cross-modal residual gating, not a single-stream monitor. The watchdog's boolean is meant to gate whether the stream enters fusion at all.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You rarely hand-roll the plumbing. In a ROS 2 stack, per-topic liveliness and deadline QoS policies give you silence-and-staleness detection declaratively: set a <code>Deadline</code> of 150 ms on the lidar topic and register a callback, and the middleware fires it when a frame is late, replacing the watchdog loop, its threading, and its per-node bookkeeping (roughly 40 to 60 lines per stream) with about 5 lines of QoS configuration. The middleware handles the monotonic clock, the timer wheel, and the missed-deadline event. You still own the policy decision (drop, degrade, or fall back), because that is domain logic no library can guess.</p>
+</div>
+
+<h2>Putting the playbook together</h2>
+<p>A production robot perception stack, read top to bottom, is a stack of hedges. Time-synchronize so fusion is meaningful. Run a fast body-frame front-end for the controller and a slow global back-end for the map. Train in a randomized-and-calibrated simulator so the reality gap is narrow. Wrap every stream in a health monitor and every fusion step in a cross-modal consistency check. Keep a dumb, reliable reflex layer underneath the smart, learned stack. None of these is glamorous, and that is the point: the parts of robotics that keep a machine upright and safe are mostly disciplined systems engineering wrapped around the perception models from the rest of this book. The models supply the belief; the playbook decides how much to trust it and what to do when trust runs out.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend <code>SensorWatchdog</code> into a two-sensor consistency gate. Given a camera obstacle detection (a range estimate) and a lidar occupancy query for the same bearing, return one of <code>{trust, downgrade, ignore}</code>: <code>trust</code> when both agree within a tolerance, <code>downgrade</code> when the camera sees an obstacle the lidar does not (the wet-concrete case), and <code>ignore</code> when both are stale per their watchdogs. State the tolerance you chose and justify it from the robot's speed and control period.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does a deployed robot split perception into a fast local front-end and a slow global back-end instead of running one globally consistent estimator?</li>
+<li>Domain randomization and system identification both narrow the reality gap. Which one would you reach for to handle a friction coefficient you can measure precisely, and why?</li>
+<li>Name the three sensor failure modes a recovery architecture must handle, and explain why a single-stream watchdog cannot catch the third.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-71.3.html">Section 71.3</a>, we take the same systems mindset onto the road: multimodal sensor suites for vehicles, in-cabin driver and occupant monitoring, fleet-scale predictive maintenance, and the safety-case discipline that turns a perception stack into something a regulator will let carry passengers.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
