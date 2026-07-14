@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 64.5: Split and split-federated learning. Building Sensory AI." name="description"/>
+<title>Section 64.5: Split and split-federated learning | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 64: Federated and Privacy-Preserving Sensor AI</a></div>
+<h1>Split and split-federated learning</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You said the device was too weak to hold the whole model and too private to hand over its data. So I kept the first few layers on the device, sent only what they whispered, and let the big machine finish the thought."</p>
+        <cite>A Resourceful AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can trace a forward and backward pass through a layered network and know what an activation is (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>). It builds directly on the previous sections of this chapter: the on-device data constraint of <a class="cross-ref" href="section-64.1.html">Section 64.1</a>, the FedAvg mechanics of <a class="cross-ref" href="section-64.2.html">Section 64.2</a>, and the privacy accounting of <a class="cross-ref" href="section-64.4.html">Section 64.4</a>. It also leans on the edge compute-and-energy budget arguments of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. The math is limited to the chain rule.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Federated learning solved the privacy constraint but quietly assumed each device can train the <em>whole</em> model. A hearing aid, a batteryless soil sensor, or a wrist wearable often cannot: the backbone will not fit in memory, and a full backward pass would drain the cell. Split learning removes that assumption by cutting the network in two. The device runs only the first few layers, sends the resulting activations (not the raw data) across the link, and a well-resourced server runs the rest. Neither party holds the whole model, and the raw sensor stream never leaves the device. The price is a new kind of traffic: instead of exchanging weights once per round, you exchange activations and their gradients once per batch. This section shows how the cut works, why plain split learning trains painfully slowly across a fleet, and how split-federated learning fuses the split idea with FedAvg to get parallel clients, a small device footprint, and private data all at once.</p>
+    </div>
+
+    <h2>The split: cut the network, not the data</h2>
+    <p>Take a network of \(L\) layers and pick a <em>cut layer</em> \(c\). The client holds the parameters of layers \(1{:}c\), the server holds \(c{+}1{:}L\). The activation produced at the cut is called the <em>smashed data</em>. A training step (the <em>what</em>) runs as follows. The client does a forward pass on its local batch \(X\) up to the cut, producing \(a_c = f_{1:c}(X)\), and sends only \(a_c\) to the server. The server continues the forward pass, computes the loss against the labels, and backpropagates until it reaches the cut, where it obtains the gradient \(\partial \mathcal{L} / \partial a_c\). It sends that gradient tensor back to the client, which finishes backprop into its own layers and updates \(1{:}c\). Two tensors cross the wire per batch: the smashed activation forward, and its gradient back.</p>
+    <p>The <em>why</em> is twofold and specific to sensing. First, <strong>compute offload</strong>: nearly all the parameters and FLOPs of a deep model sit in its later layers, so a device that keeps only \(1{:}c\) does a fraction of the work, which is the whole point on a microcontroller-class node (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>). Second, <strong>privacy</strong>: the raw waveform never leaves, and unlike FedAvg the client never even holds the full model, so a model-inversion attacker who compromises one device recovers only the first few layers. The <em>when</em>: reach for split learning when the device genuinely cannot train the full backbone, or when you want to withhold both the data and the bulk of the model weights from every edge node.</p>
+
+    <h2>U-shaped splits and keeping the labels private too</h2>
+    <p>Plain two-party split learning has a leak most people miss on the first pass: the labels. Because the server computes the loss, it must see \(y\). For a fall detector that is a shrug, but for a clinical model the label (a diagnosis) is often the most sensitive field of all. The fix is the <em>U-shaped</em> configuration. Keep the first few layers <em>and</em> the final head on the client, and give the server only the middle. The client sends smashed data forward at the first cut; the server processes the middle and returns activations at the second cut; the client runs its head, computes the loss against labels it never released, and starts the backward pass locally. The data stays on the device and so does the label. The server becomes a pure feature-transforming middle that sees neither end of the pipeline. This is the configuration to default to whenever the target variable is itself private, which in health sensing (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>) is most of the time.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The cut layer is the master dial of split learning, and it trades three quantities at once. Push the cut <em>later</em> (more layers on the device) and you shrink the smashed-data leak and often shrink the activation tensor, but you load more compute onto the weak node. Push it <em>earlier</em> and the device barely works, but you ship a fat, near-raw activation that both costs bandwidth and leaks more. Crucially, the per-round traffic scales with your <em>dataset size</em>, not your model size: you send one activation per sample per epoch. That single fact decides split-versus-federated. When the model is huge and the local dataset is small, split learning's activation traffic is cheaper than FedAvg's whole-model exchange; when the local dataset is large and the model is modest, FedAvg wins. Sizing that comparison before you build is the difference between a system that fits the radio budget and one that does not.</p>
+    </div>
+
+    <h2>Split-federated learning: parallel clients, best of both</h2>
+    <p>Vanilla split learning across a fleet (SplitNN, Gupta and Raskar, 2018; Vepakomma et al., 2018) has a crippling flaw: clients are trained <em>sequentially</em>. Client one trains with the server, hands the updated client-side weights to client two, and so on around the ring, because there is only one server-side model and it must stay consistent. On a thousand-device fleet that is a thousand serial handoffs per epoch, and the wall-clock is hopeless.</p>
+    <p><strong>Split-federated learning</strong> (SplitFed, Thapa et al., AAAI 2022) removes the serialization by borrowing the aggregation trick from <a class="cross-ref" href="section-64.2.html">Section 64.2</a>. Every client keeps a <em>copy</em> of the client-side model and runs its forward-to-cut in parallel. A server (the "main" server) processes all the smashed activations and returns gradients, so every client backpropagates at once. Then a separate <em>fed server</em> collects the client-side weights and FedAvgs them into one shared client model, exactly as in ordinary federated learning, while the server-side model is updated centrally from the pooled gradients. The result keeps split learning's tiny device footprint and label option, but recovers federated learning's parallelism and its per-round communication rhythm. In short: split learning gives you the small device, federated averaging gives you the fast fleet, and SplitFed is the union. It has become the reference recipe when devices are too weak for full on-device federated training.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: split-federated ECG triage across a clinic network</h4>
+        <p>A device maker ships single-lead ECG patches to a dozen partner clinics to train an arrhythmia classifier (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). Two rules bind them: raw ECG cannot leave a clinic, and the diagnostic labels are regulated health data that cannot leave either. The patch and its gateway are too small to train the full residual backbone, so plain federated learning is out. They deploy a U-shaped SplitFed setup: each clinic's gateway holds a shallow encoder and the final diagnostic head; the vendor's server holds the heavy middle. Raw beats and diagnoses both stay inside the clinic; only mid-network activations and their gradients cross to the vendor. A fed server FedAvgs the twelve client encoders and heads nightly. The team pairs this with differential privacy on the smashed activations (<a class="cross-ref" href="section-64.4.html">Section 64.4</a>) and, non-negotiably, evaluates on a clinic-disjoint test split so no site appears in both train and test (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The shared model reaches accuracy none of the small clinics could have trained alone.</p>
+    </div>
+
+    <p>The listing below implements one split-learning training step end to end in NumPy so you can watch the smashed activation and its returned gradient cross the boundary. It is referenced in the discussion that follows.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+# Toy task: 4-D sensor window -> binary label. Model split at one hidden layer.
+X = rng.normal(size=(64, 4)); y = (X[:, 0] * X[:, 1] > 0).astype(float)
+Wc = rng.normal(scale=0.3, size=(4, 8))   # CLIENT-side weights (layers 1:c)
+Ws = rng.normal(scale=0.3, size=(8, 1))   # SERVER-side weights (layers c+1:L)
+relu = lambda z: np.maximum(z, 0.0)
+
+for step in range(400):
+    # --- CLIENT: forward up to the cut, send only the smashed activation ---
+    a_c = relu(X @ Wc)                     # smashed data leaves the device
+
+    # --- SERVER: finish forward, compute loss, backprop to the cut ---
+    p = 1 / (1 + np.exp(-(a_c @ Ws)))
+    dlogit = (p - y[:, None]) / len(y)
+    dWs = a_c.T @ dlogit
+    grad_a_c = dlogit @ Ws.T              # gradient of loss w.r.t. smashed data
+    Ws -= 0.5 * dWs                       # server updates its own layers
+
+    # --- CLIENT: receive grad_a_c, finish backprop into its layers ---
+    dWc = X.T @ (grad_a_c * (a_c > 0))    # chain rule through the ReLU
+    Wc -= 0.5 * dWc                       # device updates layers 1:c only
+
+acc = (( (relu(X @ Wc) @ Ws) > 0).astype(float) == y[:, None]).mean()
+print(f"split-trained accuracy = {acc:.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 64.5.1.</strong> A complete split-learning step in about 20 lines. Only two tensors ever cross the client-server boundary: <code>a_c</code> (forward) and <code>grad_a_c</code> (back). Neither raw <code>X</code> nor the server weights <code>Ws</code> are ever on the same machine, yet the chain rule stitches the two halves into a single trained model.</div>
+
+    <p>As Listing 64.5.1 makes concrete, the split is a clean cut in the computational graph: the client owns everything to the left of <code>a_c</code>, the server everything to the right, and the returned <code>grad_a_c</code> is the only channel that carries training signal back across the boundary. Extending this to SplitFed means running many clients' <code>a_c</code> in parallel and averaging their <code>Wc</code> copies, which is the FedAvg step of <a class="cross-ref" href="section-64.2.html">Section 64.2</a> dropped in unchanged.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not hand-derive the cut-layer gradient plumbing or the socket transport. Splitting a real model is a slice of its module list plus a framework that ships the boundary tensors. With PyTorch you detach at the cut and let autograd handle each half; frameworks such as Flower and PySyft add the transport and, for SplitFed, the FedAvg of client-side weights.</p>
+        <pre class="language-python"><code class="language-python">import torch.nn as nn
+backbone = nn.Sequential(*layers)          # your full sensor model
+cut = 3
+client_net = backbone[:cut]                # lives on the device
+server_net = backbone[cut:]               # lives on the server
+
+# one step (transport of smashed / grad is what the framework provides):
+smashed = client_net(x).detach().requires_grad_()   # send forward
+loss = criterion(server_net(smashed), y)            # server side
+loss.backward()                                     # fills smashed.grad
+client_opt.zero_grad(); client_net(x).backward(smashed.grad)  # send grad back</code></pre>
+        <div class="code-caption"><strong>Listing 64.5.2.</strong> The cut in four lines with autograd doing both backward passes; a federation library adds client sampling, the boundary-tensor transport, and the client-weight FedAvg for SplitFed. Building that transport and aggregation by hand is hundreds of lines.</div>
+        <p>Listing 64.5.2 removes the plumbing, not the design choices: where to cut, whether to go U-shaped, and how much to perturb the smashed data are still experiments you own.</p>
+    </div>
+
+    <h2>What the smashed data still leaks</h2>
+    <p>Do not mistake "raw data stayed home" for "the data is safe." The smashed activation is a learned function of the input, and early in training, when the client layers are near-linear, it can be close to invertible. A curious or compromised server can mount a <em>model-inversion</em> or feature-space reconstruction attack that recovers a recognizable approximation of the input from \(a_c\) alone, and gradient tensors leak too. The <em>how</em> to defend has three standard moves. Cut <em>later</em> so the activation is a more abstract, less invertible representation. Add a decorrelation objective such as NoPeek, which penalizes the distance correlation between \(a_c\) and the input \(X\) so the smashed data keeps task information while shedding reconstructable detail. And apply differential privacy directly to the activations or their gradients (<a class="cross-ref" href="section-64.4.html">Section 64.4</a>) for a formal, if lossy, guarantee. The uncomfortable truth is that these are mitigations, not proofs of safety, which is why split systems are audited with the same adversarial eye as the rest of the federated stack (<a class="cross-ref" href="section-64.7.html">Section 64.7</a>).</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>SplitFed (Thapa et al., AAAI 2022) is the current reference for compute-constrained federation, but the live questions are sharp. Reconstruction attacks against smashed data and their defenses (NoPeek-style distance-correlation losses, activation-level DP) remain an active arms race with no settled equilibrium. A second thread is <em>where</em> to cut adaptively: per-device cut selection that reacts to a node's live energy and thermal budget, tying split learning to the batteryless and intermittent regime of <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>. A third is scale: split fine-tuning of large sensor and wearable backbones (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>), where keeping only a shallow adapter on the device and the frozen giant on the server may be the only way a tiny node participates at all. Across all three, certifying per-client calibration when the server never sees the data (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) is the recurring open problem.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using Listing 64.5.1, estimate the communication cost of split learning and compare it to FedAvg for the same model. Let the client-side output have \(d_c\) units, the local dataset have \(n\) samples, one epoch per round, and the full model have \(P\) parameters. Write the per-round bytes for split learning (activation plus gradient, both size \(n \cdot d_c\)) and for FedAvg (one model exchange, size \(P\)). Solve for the dataset size \(n^\star\) at which the two are equal, then state the rule: for local datasets smaller than \(n^\star\), which method ships fewer bytes, and how does moving the cut later change \(n^\star\)?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In plain two-party split learning, exactly two tensors cross the boundary per batch. Name them and their directions, and say which raw quantity still has to reach the server (and how a U-shaped split removes that leak).</p>
+        <p class="quiz-question">2. Why does vanilla split learning across a fleet train slowly, and what specifically does SplitFed borrow from FedAvg to fix it?</p>
+        <p class="quiz-question">3. "The raw data never left, so smashed data is safe." State why this is false and name two defenses that reduce the smashed-data leak.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-64.6.html">Section 64.6</a>, we let the sensors disagree not just statistically but in kind. Real fleets mix modalities and device classes: a phone with a camera and IMU, a watch with PPG, a fixed microphone. We turn to multimodal and cross-device federation, where different clients hold different sensors entirely, and ask how to train one system when no two participants even measure the same thing.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

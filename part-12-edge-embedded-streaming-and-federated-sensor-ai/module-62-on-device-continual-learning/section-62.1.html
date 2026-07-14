@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.1: Why static deployment is obsolete. Building Sensory AI." name="description"/>
+<title>Section 62.1: Why static deployment is obsolete | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Why static deployment is obsolete</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They froze my weights on a Tuesday in spring and shipped me to a machine that has not stopped changing since. I was correct once. Correctness, it turns out, has a shelf life."</p>
+        <cite>A Perishable AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you understand a trained model as a fixed function of its weights, and that sensors are physical devices whose response drifts with age, temperature, and mounting (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>). It leans on the notion of a data distribution and how a test distribution can diverge from the training one; the formal treatment of that divergence lives in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. The retrain-and-ship machinery this section critiques is the subject of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>. No new mathematics is introduced; the one model here is a simple decay curve you could sketch on a napkin.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The dominant deployment story in machine learning is: train once on a big dataset, validate, freeze the weights, ship the artifact, and treat it as done. That story is quietly built on an assumption that the world the model will see tomorrow looks like the data it saw in training. For sensory AI that assumption is not merely imperfect; it is structurally false. Sensors age, users change, seasons turn, firmware updates, and the phenomenon being measured evolves. A frozen model does not stay correct: it decays, and it decays on a clock set by the physical world, not by your release calendar. This section makes the case that a static model on a live sensor is a depreciating asset, quantifies how fast it depreciates, and shows why the obvious fix, periodic retraining in the cloud, cannot reach every device fast enough or cheaply enough. That gap is exactly the space this chapter fills.</p>
+    </div>
+
+    <h2>The static assumption and the moving world</h2>
+    <p>A deployed model is a function \(f_\theta\) with the weights \(\theta\) frozen at the moment you export the artifact. Static deployment bets that the joint distribution \(p(x, y)\) of sensor inputs \(x\) and labels \(y\) at inference time matches the training distribution \(p_{\text{train}}(x, y)\). The bet pays off in a controlled benchmark. It fails in the field because sensor data is <em>non-stationary</em>: the distribution the model faces is a moving target, and it moves for reasons that have nothing to do with your model.</p>
+    <p>The movement has several distinct sources, and it helps to name them because each demands a different response. <strong>Sensor drift</strong> is the slow change of the transducer itself: an electrochemical gas sensor loses sensitivity over months, an IMU's bias walks with temperature, a camera's lens hazes. The measured \(x\) changes even when the underlying physical truth does not (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>). <strong>Environmental shift</strong> is change in the world being sensed: a factory line runs a new product, a wearer moves from a cold winter to a humid summer, road conditions vary by geography. <strong>Behavioral and user shift</strong> is the drift of the subject: a person's gait changes after an injury, their resting heart rate falls as they train, their vocabulary of gestures grows. And <strong>concept shift</strong> is when the mapping \(p(y \mid x)\) itself moves: the same vibration signature that meant "healthy" on a new bearing means "worn" on an aged one. A model frozen against one snapshot of \(p(x, y)\) is wrong about all four the moment they begin to move, which is immediately.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Static deployment implicitly treats a sensor stream as a stationary process, but a sensor sits inside a physical system that is guaranteed to be non-stationary: it ages, its subject changes, and its environment turns over. The question is never <em>whether</em> a frozen model will drift out of calibration, only <em>how fast</em>. "Train once and freeze" is therefore not a neutral default; it is an unstated and usually wrong assumption about stationarity. The professional move is to make the stationarity assumption explicit, measure its half-life, and design for the case where it does not hold.</p>
+    </div>
+
+    <h2>Quantifying decay: a model has a half-life</h2>
+    <p>It is tempting to treat drift as a vague worry. It is better treated as a measurable decay curve. Suppose accuracy \(a(t)\) starts at \(a_0\) on release day and erodes as the field distribution drifts away from the training snapshot. A useful first-order model is exponential relaxation toward a floor \(a_\infty\) (chance level, or the accuracy of guessing the majority class):</p>
+    \[ a(t) = a_\infty + (a_0 - a_\infty)\, e^{-t / \tau} \]
+    <p>where \(\tau\) is the drift time constant: small \(\tau\) for a fast-changing wearable on a growing child, large \(\tau\) for a temperature-stabilized lab instrument. The half-life of usefulness, the time to lose half the gap between launch accuracy and the floor, is \(t_{1/2} = \tau \ln 2\). The value of this framing is that it turns an argument into a number you can put next to a maintenance schedule: if \(\tau\) is three weeks, a model refreshed quarterly spends most of its deployed life below its acceptance threshold. The snippet below plots the decay and marks where accuracy crosses a service-level line.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+a0, a_inf, tau = 0.94, 0.50, 21.0     # launch acc, floor, drift constant (days)
+threshold = 0.85                      # contractual minimum accuracy
+
+t = np.arange(0, 120)
+acc = a_inf + (a0 - a_inf) * np.exp(-t / tau)
+
+half_life = tau * np.log(2)
+below = t[acc < threshold]
+crosses = below[0] if below.size else None
+
+print(f"half-life of usefulness: {half_life:5.1f} days")
+print(f"drops below {threshold:.2f} after: {crosses} days")
+print(f"accuracy at day 90:      {acc[90]:.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 62.1.1.</strong> A first-order decay model for a drifting sensor classifier. With a three-week time constant, the model's usefulness half-life is about \(14.6\) days and it falls below an \(85\%\) service level after roughly \(11\) days, long before a quarterly cloud retrain would rescue it. The exact numbers are placeholders; the shape is the point.</div>
+    <p>As Listing 62.1.1 shows, a model with a modest three-week drift constant breaches an \(85\%\) contract inside two weeks. If your release cadence is measured in months and your decay is measured in weeks, static deployment guarantees that most devices in your fleet are running a stale model most of the time. Measuring \(\tau\) for a real deployment, ideally with time-aware, leakage-safe evaluation so the estimate is not optimistic (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), is one of the highest-value diagnostics you can run before deciding how a model should be maintained.</p>
+
+    <div class="callout practical-example">
+        <h4>Field Story: a continuous glucose sensor that ages by the hour</h4>
+        <p>A continuous glucose monitor worn under the skin degrades measurably over its ten-day wear period: enzyme activity falls, the tissue reaction around the filament evolves, and the raw current-to-glucose mapping drifts continuously from insertion to removal. A single factory-frozen calibration model is systematically wrong on day one (a fresh, still-settling sensor) and wrong again on day nine (a spent one), in opposite directions. Vendors handle this not by shipping a better static model but by letting the calibration adapt over the wear cycle, nudged by occasional reference measurements. The physical truth is blunt: the sensor the model was trained on no longer exists a week later; it has chemically become a different device on the same wrist. No amount of cloud retraining reaches inside the wear cycle of one specific sensor on one specific person. Only adaptation local to that device does.</p>
+    </div>
+
+    <h2>Why the cloud retrain loop cannot close the gap</h2>
+    <p>The textbook answer to drift is the MLOps loop: monitor the fleet, collect fresh labeled data, retrain in the cloud, validate, and push a new artifact over the air (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>). This loop is real, valuable, and necessary, and it is also insufficient on its own for four reasons that recur across every sensor domain.</p>
+    <p>First, <strong>latency</strong>. The loop's period is set by human review, data pipelines, and staged rollouts, and it is measured in weeks to months. When \(\tau\) is measured in days, the loop is chasing a target that has already moved by the time the new artifact lands. Second, <strong>labels</strong>. Retraining needs ground truth, but the field is where labels are scarcest: no one annotates a wearer's activities, and the interesting drift is precisely the novel condition you have no labeled examples of yet. Third, <strong>connectivity and privacy</strong>. A batteryless soil sensor, an implanted device, or a factory node behind an air gap may rarely or never phone home, and much sensor data is biometric or proprietary and may not be allowed to leave the device at all (<a class="cross-ref" href="../module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>). Fourth, and most fundamental, <strong>heterogeneity</strong>. A single global model shipped to a million devices is a compromise averaged over all of them; it is optimal for none. The best model for <em>this</em> pump, on <em>this</em> foundation, in <em>this</em> climate, differs from the fleet average, and no central retrain can produce a million bespoke models. The optimum is per-device, and per-device optimization has to happen on the device.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is moving the adaptation itself onto the sensor. Latent replay for on-device continual learning (Pellegrini et al., 2020) showed rehearsal-based updates running on a Raspberry-Pi-class device; TinyOL (Ren et al., 2021) demonstrated incremental training on a microcontroller with kilobytes of RAM; and test-time adaptation methods such as Tent (Wang et al., ICLR 2021) update a model from unlabeled test data alone, sidestepping the label bottleneck entirely (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>). The open problem this chapter circles is doing all of this under a real edge budget: adapting fast enough to track \(\tau\), without forgetting what was learned before (<a class="cross-ref" href="section-62.2.html">Section 62.2</a>), and inside an energy envelope a battery can sustain (<a class="cross-ref" href="section-62.5.html">Section 62.5</a>).</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not have to build the continual-learning bookkeeping, the replay buffers, the per-task accuracy matrices, and the forgetting metrics, from scratch to start measuring drift and adaptation. The Avalanche library packages the standard benchmarks, strategies, and metrics behind a few lines.</p>
+        <pre class="language-python"><code class="language-python">from avalanche.benchmarks import nc_benchmark
+from avalanche.training import Naive
+from avalanche.evaluation.metrics import forgetting_metrics
+
+bench = nc_benchmark(train_ds, test_ds, n_experiences=5, task_labels=False)
+strategy = Naive(model, optimizer, criterion, train_mb_size=32)
+for experience in bench.train_stream:
+    strategy.train(experience)          # adapt as each new "experience" arrives
+    strategy.eval(bench.test_stream)    # track accuracy and forgetting over time</code></pre>
+        <div class="code-caption"><strong>Listing 62.1.2.</strong> A drifting stream framed as a sequence of experiences with Avalanche. Hand-rolling the stream splitter, the per-experience evaluation matrix, and the forgetting metric is several hundred lines; the library collapses the scaffolding to a loop so you can study <em>what</em> to adapt rather than the plumbing. The strategy shown here is deliberately naive; making it not forget is the rest of the chapter.</div>
+        <p>Listing 62.1.2 removes the harness, not the hard part. Whether an adaptation strategy actually holds up under a leakage-safe, time-aware evaluation is a judgment the library cannot make for you.</p>
+    </div>
+
+    <h2>From maintenance chore to design principle</h2>
+    <p>Put the pieces together and a conclusion emerges that reframes the whole problem. Static deployment is not a stable end state that occasionally needs a patch; it is the beginning of a decay you have chosen not to manage. For a large class of sensor products, the right response is to treat the model less like a shipped artifact and more like an organism that keeps learning in place, adapting to its own drifting sensor, its own user, its own site. This is a spectrum, not a binary: some models can and should stay frozen (a certified safety classifier whose behavior must be auditable and unchanging), and cloud retraining remains the backbone for large architectural updates. The argument here is narrower and firmer: for non-stationary sensor streams, <em>some</em> capacity to adapt on-device is not a luxury feature but a precondition for staying correct. The streaming and online-learning machinery of <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> is one route in; this chapter takes the harder road of updating the model's learned representation itself, on the device, without a supervisor and without forgetting.</p>
+    <p>That road has a signature hazard, which is why it needs a whole chapter and not a paragraph. The moment you let a model update itself on a live stream, you invite it to overwrite what it already knew. Naively adapting to today's data can erase yesterday's competence, and doing it on a device with kilobytes of memory and a battery makes every safeguard expensive. Establishing that hazard precisely is where we go next.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a sensing product you can observe, such as a fitness tracker's step counter or a phone's face-unlock. Sketch its accuracy decay \(a(t)\) qualitatively and estimate its drift time constant \(\tau\): does it drift over hours (a wound-healing biosignal), weeks (a person's fitness), or years (a fixed industrial vibration sensor)? Then classify the dominant driver as sensor drift, environmental shift, behavioral shift, or concept shift, and argue in three sentences whether a monthly cloud retrain could keep it above an \(85\%\) service level, or whether on-device adaptation is required.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Name the four sources of non-stationarity in a sensor stream and give a one-line example of each. Which one changes \(p(y \mid x)\) rather than \(p(x)\)?</p>
+        <p class="quiz-question">2. In the decay model \(a(t) = a_\infty + (a_0 - a_\infty)e^{-t/\tau}\), what does \(\tau\) represent physically, and how does the usefulness half-life relate to it?</p>
+        <p class="quiz-question">3. Give two reasons the cloud retrain-and-push loop cannot, by itself, keep a fast-drifting per-device sensor model calibrated. Why does fleet heterogeneity in particular argue for on-device adaptation?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-62.2.html">Section 62.2</a>, we confront the price of adaptation. Once a model is allowed to keep learning on a live sensor stream, updating it on new data tends to overwrite the old, a failure mode called catastrophic forgetting. We will see why it is especially vicious on the edge, where you cannot keep the original training set around to rehearse from, and set up the memory and energy constraints that shape every solution in the rest of the chapter.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

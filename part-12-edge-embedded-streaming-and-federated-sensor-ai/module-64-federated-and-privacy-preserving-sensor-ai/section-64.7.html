@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 64.7: Federated evaluation, security, and failure modes. Building Sensory AI." name="description"/>
+<title>Section 64.7: Federated evaluation, security, and failure modes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 64: Federated and Privacy-Preserving Sensor AI</a></div>
+<h1>Federated evaluation, security, and failure modes</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked me to report my accuracy. But I cannot see the test set, one in twenty of my teachers is lying to me on purpose, and a third of them go offline before the bell rings. My confidence interval, it turns out, is a leap of faith."</p>
+        <cite>A Skeptical AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section closes the chapter, so it assumes the whole arc: FedAvg and non-IID sensor fleets (<a class="cross-ref" href="section-64.2.html">Section 64.2</a>), personalization (<a class="cross-ref" href="section-64.3.html">Section 64.3</a>), and the differential-privacy and secure-aggregation machinery of <a class="cross-ref" href="section-64.4.html">Section 64.4</a>. It leans on leakage-safe, subject-disjoint splitting (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) and on the general vocabulary of calibration and worst-group metrics (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>). The statistics are elementary: means, medians, and quantiles of per-client numbers.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Everything so far assumed the federated system behaves: clients train faithfully, report truthfully, and stay online. Deployment breaks all three assumptions at once. You must evaluate a model whose test data you are forbidden to gather in one place, defend an aggregator that any of a million strangers can send a crafted update to, and keep the whole thing converging while devices die mid-round. This section is the reliability engineering of federated sensing. It answers three coupled questions: how do you measure a federated model faithfully when the ground truth is scattered and hidden, how do you keep a malicious minority from steering or backdooring the shared model, and what silent failure modes erode a fleet that no one is watching. The uncomfortable theme is that the privacy protections of <a class="cross-ref" href="section-64.4.html">Section 64.4</a> and the security defenses of this one are frequently in direct conflict: the very encryption that hides an honest client's gradient also hides an attacker's poison.</p>
+    </div>
+
+    <h2>Federated evaluation: measuring a model you cannot pool</h2>
+    <p>Centralized evaluation computes one number on one held-out set. Federated evaluation cannot, because the test data lives on the same devices as the training data and is equally forbidden to move. The <em>how</em> mirrors training: the server broadcasts the current global model, each client runs inference on its own local held-out split, and each returns only aggregate statistics (loss, per-class counts, a confusion matrix), which the server averages. The <em>why it is hard</em> is that a single averaged accuracy is now a summary of a distribution, and the distribution is where the truth lives. A model that scores 94 percent averaged can be 99 percent on the majority of clients and 55 percent on a skewed tenth, which for a fall detector or an arrhythmia flag is the tenth that matters.</p>
+    <p>So federated evaluation reports the <em>distribution over clients</em>, not just its mean. The three numbers that matter are the population average, weighted by client sample count \(n_k\), and the tails:</p>
+    \[ \text{Acc}_{\text{avg}} = \sum_k \frac{n_k}{n}\,a_k, \qquad \text{Acc}_{q} = \operatorname{Quantile}_{q}\big(\{a_k\}\big), \]
+    <p>where \(a_k\) is client \(k\)'s local accuracy and the low quantile \(\text{Acc}_{0.1}\) (the worst-decile client) is the operational headline for any safety-relevant fleet. Two subtleties turn this from arithmetic into engineering. First, the split must be leakage-safe <em>within</em> each client: a subject's data cannot straddle its own train and test partitions, exactly the discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, now enforced a thousand times over with no central auditor to check it. Second, only clients that <em>participate</em> in an evaluation round contribute, and participation is not random: devices that are charging, on Wi-Fi, and idle are systematically different from those that are not, so the reported average is a biased estimate of true fleet performance. This participation bias is the federated analogue of survivorship bias, and it flatters your metrics.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>In federated sensing the mean accuracy is the least informative number you can report. Heterogeneity guarantees that the interesting behavior is in the tail, and privacy guarantees you cannot inspect that tail directly. The correct instinct is to treat every reported metric as a random variable over a self-selected sample of clients, and to publish its low quantile and its participation rate alongside its mean. A federated result without a worst-decile and a participation figure is not a measurement; it is a hope.</p>
+    </div>
+
+    <h2>Security: poisoning, backdoors, and Byzantine robustness</h2>
+    <p>Open a training loop to a million untrusted devices and you have opened it to attackers who control some of them. The threat model splits by intent. <strong>Data poisoning</strong> corrupts a client's local training set (mislabeling, or injecting crafted sensor samples) so its honest-looking update nudges the global model wrong. <strong>Model poisoning</strong> is stronger: a compromised client ignores its data entirely and sends a hand-crafted weight vector, and because FedAvg simply averages, one large malicious update can drag the mean arbitrarily far, an attack the literature calls Byzantine because the faulty node may behave adversarially rather than merely crash. The most insidious variant is a <strong>backdoor</strong>: the attacker leaves the model's accuracy untouched on ordinary inputs but plants a trigger, so a specific accelerometer pattern or an RF watermark makes the model output an attacker-chosen label. Backdoors survive averaging surprisingly well and are nearly invisible to the distribution-level evaluation above, because the model looks healthy on every client's real data.</p>
+    <p>The <em>defense</em> replaces the mean with a <strong>robust aggregation</strong> rule that a minority of outliers cannot dominate. Coordinate-wise <strong>median</strong> and <strong>trimmed mean</strong> discard extreme values per parameter; <strong>Krum</strong> (Blanchard et al., NeurIPS 2017) selects the single update closest to its neighbors, on the logic that honest updates cluster and a poison vector sits far out; <strong>Bulyan</strong> and <strong>coordinate-wise median</strong> variants trade compute for stronger guarantees. The <em>when</em>: any cross-device deployment with open enrollment needs at least a trimmed mean; a cross-silo deployment among a few vetted hospitals or factories can rely more on authentication and less on statistics. The listing below shows why the mean is indefensible and how one line of robust aggregation restores it.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+# 20 honest clients agree on an update near the true direction; 3 are poisoned.
+true = np.array([1.0, -0.5])
+honest = true + rng.normal(0, 0.1, size=(20, 2))
+poison = np.tile([50.0, 50.0], (3, 1))          # 3 large model-poisoning updates
+updates = np.vstack([honest, poison])
+
+def trimmed_mean(U, beta=0.15):                  # drop top/bottom beta fraction per coord
+    k = int(beta * len(U))
+    return np.mean(np.sort(U, axis=0)[k:len(U) - k], axis=0)
+
+print("plain mean :", np.mean(updates, axis=0).round(2))   # hijacked by 3 clients
+print("coord median:", np.median(updates, axis=0).round(2))
+print("trimmed mean:", trimmed_mean(updates).round(2))     # recovers the true update</code></pre>
+    <div class="code-caption"><strong>Listing 64.7.1.</strong> A 23-client aggregation with three model-poisoning updates. The plain FedAvg mean is dragged toward \([7.4, 6.0]\), miles from the honest consensus near \([1.0, -0.5]\); the coordinate-wise median and the trimmed mean both ignore the outliers and recover the true direction. Robust aggregation is the difference between one bad actor owning your model and one bad actor being discarded.</div>
+
+    <p>As Listing 64.7.1 shows, robustness is cheap to add and expensive to omit. But it collides head-on with the privacy layer. Secure aggregation (<a class="cross-ref" href="section-64.4.html">Section 64.4</a>) is designed so the server sees only the <em>sum</em> of masked client updates and never an individual vector, which is exactly what a median or a Krum score needs to inspect. You cannot trim outliers you are cryptographically forbidden to see. Reconciling the two, robust aggregation under secure aggregation, via zero-knowledge range proofs or verifiable secret sharing, is one of the live tensions of the field.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a backdoored gesture-unlock across a smart-lock fleet</h4>
+        <p>A smart-lock vendor trains a wrist-gesture authenticator federated across a hundred thousand users' wearables (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>). An attacker enrolls a few hundred sock-puppet devices and, on each, trains the model to accept one specific figure-eight flick as anyone's valid unlock, scaling the malicious update to survive averaging. Federated evaluation stayed green: false-accept and false-reject rates on every honest user's real gestures were unchanged, because the backdoor only fires on the trigger. The team caught it not from accuracy but from an update-space monitor that flagged a tight cluster of anomalously large, mutually similar updates arriving from newly enrolled clients. They switched aggregation from FedAvg to a trimmed mean with norm-clipping, rate-limited new-enrollee influence, and added a canary set of trigger-like probes to evaluation. The lesson generalizes: a healthy accuracy number is not a security property, and the same functional-safety mindset as sensor spoofing (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) applies to the training channel, not just the inference input.</p>
+    </div>
+
+    <h2>Failure modes: the fleet that quietly rots</h2>
+    <p>Most federated systems do not die from attacks; they degrade from mundane systems failures that no exception ever surfaces. <strong>Stragglers and dropout</strong> are chronic: a client that starts a round but loses power or connectivity contributes nothing, and if slow devices (older hardware, weaker links) drop out systematically, the global model is trained on a faster, richer, non-representative slice of the fleet. <strong>Staleness</strong> afflicts asynchronous designs, where an update computed against an old global model arrives rounds later and pulls the current model backward. <strong>Non-participation bias</strong> is the training twin of the evaluation bias above: models learn the world of charging, idle, well-connected devices and underserve everyone else. And <strong>silent quality collapse</strong> is the worst, because the server, forbidden to see data, is half-blind: a firmware update that recalibrates a sensor, a seasonal distribution shift (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>), or a slow drift in labeling quality can erode accuracy for months with no error thrown. The defenses are operational, not algorithmic: monitor participation demographics, track the per-client metric distribution over time (not just its mean), version the model per client, and keep a small trusted validation cohort whose data <em>can</em> be inspected as a tripwire, the federated corner of MLOps for sensor fleets (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>).</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The 2023 to 2026 frontier is reconciling the three tensions this section exposed. On robustness-under-privacy, work on verifiable and zero-knowledge secure aggregation (building on Bonawitz et al.'s protocol and Google's production federated stack) lets a server enforce norm bounds and outlier rejection without ever decrypting a client's update. On backdoor durability, defenses such as differentially-private training with norm-clipping, spectral-signature detection, and per-client update auditing compete with steadily stealthier attacks in an unresolved arms race. On evaluation, the open problem is certifying <em>per-client</em> calibration and worst-group guarantees (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) when the certifier is structurally blind to the data, with federated conformal prediction an active thread. The plain state of the art: strong empirical defenses exist for each threat in isolation, but a system that is simultaneously private, Byzantine-robust, and truthfully evaluated remains a research target, not a shipping default.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not implement Krum, trimmed mean, or federated evaluation aggregation from scratch. Flower ships robust strategies and a federated-evaluation loop as configuration: swap the aggregation rule and pass an evaluation function, and the framework fans it across clients and collects the per-client distribution for you.</p>
+        <pre class="language-python"><code class="language-python">import flwr as fl
+
+# Robust aggregation + built-in federated evaluation, no plumbing.
+strategy = fl.server.strategy.Krum(          # or FedTrimmedAvg, FedMedian
+    num_clients_to_keep=1,
+    fraction_evaluate=0.5,                    # sample half the fleet each eval round
+    evaluate_metrics_aggregation_fn=weighted_and_quantiles,  # your worst-decile reducer
+)
+fl.simulation.start_simulation(client_fn=client_fn, num_clients=100000,
+                               strategy=strategy)</code></pre>
+        <div class="code-caption"><strong>Listing 64.7.2.</strong> Byzantine-robust aggregation plus distribution-aware federated evaluation in a handful of lines. Hand-rolling the Krum score computation, the client sampling for evaluation, and the per-client metric collection is several hundred lines; here it is a strategy swap and one reducer function. The science you still own is the threat model and the choice of worst-group metric.</div>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 64.7.1 into a small sweep. Vary the number of poisoned clients from 0 to 10 out of 23, and for each, record the L2 error between the true update and (a) the plain mean, (b) the coordinate median, (c) the trimmed mean at \(\beta \in \{0.1, 0.2\}\). Plot error versus attacker count for all four rules and identify the <em>breakdown point</em> of each, the fraction of poison it tolerates before failing. Then add a stealthy attacker that scales its poison to just below the trimming threshold, and show which defense it defeats. State in one sentence why no aggregation rule can tolerate a poison fraction at or above one half.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is the population-average accuracy the wrong headline metric for a safety-relevant federated fleet, and what two numbers should accompany or replace it?</p>
+        <p class="quiz-question">2. Distinguish data poisoning, model poisoning, and a backdoor. Which one is nearly invisible to distribution-level federated evaluation, and why?</p>
+        <p class="quiz-question">3. Explain the direct conflict between secure aggregation and robust aggregation. What class of technique aims to resolve it?</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 64</h3>
+        <p>Simulate federated training across users/devices for a wearable model; add differential privacy and measure the utility cost.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, we lift the evaluation discipline glimpsed here (worst-group metrics, leakage-safe splits, honest reporting under bias) out of the federated special case and make it the general contract for any sensor model, centralized or not: task versus operational metrics, user and site and device and session splits, time-aware cross-validation, and the field-validation protocols that separate a benchmark number from a deployable claim.</p>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Federated learning foundations and systems</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.mlr.press/v54/mcmahan17a.html">McMahan, Moore, Ramage, Hampson, Aguera y Arcas (2017). Communication-Efficient Learning of Deep Networks from Decentralized Data. AISTATS.</a></p>
+            <p class="bib-annotation">The FedAvg paper. Its size-weighted averaging is exactly the aggregation rule that robust methods must replace, so it defines the attack surface this section defends.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/1912.04977">Kairouz, McMahan, et al. (2021). Advances and Open Problems in Federated Learning. Foundations and Trends in ML.</a></p>
+            <p class="bib-annotation">The field's reference survey. Its chapters on robustness, privacy, and evaluation frame the three tensions organized here, and catalogue the open problems named in the frontier callout.</p>
+        </div>
+
+        <p class="bib-category">Security, poisoning, and Byzantine robustness</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.neurips.cc/paper/2017/hash/f4b9ec30ad9f68f89b29639786cb62ef-Abstract.html">Blanchard, El Mhamdi, Guerraoui, Stainer (2017). Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent. NeurIPS.</a></p>
+            <p class="bib-annotation">Introduces Krum, the archetypal robust aggregation rule that selects the update closest to its neighbors. The formal basis for the defense in Listing 64.7.1.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.mlr.press/v80/yin18a.html">Yin, Chen, Kannan, Bartlett (2018). Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates. ICML.</a></p>
+            <p class="bib-annotation">Establishes the coordinate-wise median and trimmed-mean estimators with breakdown-point guarantees, the exact rules and the one-half limit the exercise asks you to verify.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.mlr.press/v108/bagdasaryan20a.html">Bagdasaryan, Veit, Hua, Estrin, Shmatikov (2020). How To Backdoor Federated Learning. AISTATS.</a></p>
+            <p class="bib-annotation">Shows model-replacement backdoors that survive averaging while leaving benign accuracy intact, the attack behind the smart-lock example and the reason accuracy is not a security property.</p>
+        </div>
+
+        <p class="bib-category">Privacy attacks and secure aggregation</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3133956.3133982">Bonawitz, Ivanov, Kreuter, et al. (2017). Practical Secure Aggregation for Privacy-Preserving Machine Learning. ACM CCS.</a></p>
+            <p class="bib-annotation">The production secure-aggregation protocol whose server-sees-only-the-sum design is precisely what collides with robust aggregation; the frontier work builds directly on it.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.neurips.cc/paper/2019/hash/60a6c4002cc7b29142def8871531281a-Abstract.html">Zhu, Liu, Han (2019). Deep Leakage from Gradients. NeurIPS.</a></p>
+            <p class="bib-annotation">Demonstrates reconstructing training samples from shared gradients, the concrete privacy attack that motivates why federated updates cannot be treated as safe to expose.</p>
+        </div>
+
+        <p class="bib-category">Frameworks</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2007.14390">Beutel, Topal, Mathur, et al. (2020). Flower: A Friendly Federated Learning Research Framework.</a></p>
+            <p class="bib-annotation">The library behind the Right-Tool listing. Provides FedMedian, FedTrimmedAvg, Krum, and a federated-evaluation loop as configuration rather than plumbing.</p>
+        </div>
+    </section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

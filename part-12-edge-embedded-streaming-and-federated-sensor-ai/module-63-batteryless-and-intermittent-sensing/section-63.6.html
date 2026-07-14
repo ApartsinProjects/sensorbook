@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 63.6: Systems and reliability constraints. Building Sensory AI." name="description"/>
+<title>Section 63.6: Systems and reliability constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 63: Batteryless and Intermittent Sensing</a></div>
+<h1>Systems and reliability constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My computation is provably correct. It is everything around the computation, the clock, the radio, the sensor, and the flash cell, that keeps lying to me."</p>
+<cite>A Distrustful AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous sections made a single inference survive a power failure and made it right-sized for the energy on hand. That is necessary but not sufficient. A batteryless sensor is a <em>whole system</em>: a clock that stops when the capacitor dies, a radio mid-handshake when the lights go out, a sensor whose reading ages while the node sleeps, and a non-volatile memory that wears out one commit at a time. Checkpointing (<a class="cross-ref" href="section-63.2.html">Section 63.2</a>) guarantees the CPU's registers and RAM come back consistent, but it says nothing about whether the timestamp on your data is meaningful, whether the reading is still fresh, whether the half-sent packet corrupted a peer's state, or whether the flash cell you write on every wake will still hold a bit next year. This section is about correctness and dependability at the level of the whole device rather than the single forward pass. It is what separates a demo that works on a bench power supply from a fleet that survives a year on a windowsill.</p>
+</div>
+
+<p>This section assumes the harvesting and storage model of <a class="cross-ref" href="section-63.1.html">Section 63.1</a> and the intermittent-execution and checkpoint machinery of <a class="cross-ref" href="section-63.2.html">Section 63.2</a>. It also depends on the timing and synchronization ideas of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because much of what breaks here is time itself, and it connects to the functional-safety view of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>, since an intermittent device is a hazard source when it silently emits stale or mis-timed data. We write \(E\) for stored energy and reason about time as the scarcest and most fragile resource on the board.</p>
+
+<h2>Correctness is bigger than the checkpoint</h2>
+<p>Checkpointing solves a narrow problem: after a power failure, the volatile state (registers, stack, heap) is restored to a point from which forward progress is safe. But a program touches the world through peripherals whose state is <em>not</em> in the checkpoint. Consider a sensor read that is a multi-step I2C transaction, or a radio transmission that is a stateful handshake. If power fails between the "start conversion" command and the "read result" command, restoring RAM restores the CPU's belief that a conversion is in flight, but the sensor was reset by the same brown-out and has forgotten. The classic failure is the <em>write-after-read (WAR) hazard</em> on non-volatile memory, where a re-executed idempotent-looking block reads a variable it already wrote before the failure and corrupts it; but the more insidious version is a peripheral WAR, where the re-executed block re-issues a command to a device that has silently changed state underneath it.</p>
+<p>The systems-level rule is that every interaction with the physical world outside the checkpoint boundary must be made <em>idempotent</em> or <em>transactional</em>. An idempotent operation can be replayed after a failure with no additional effect; a transactional one either completes fully or leaves no trace. Reading a sensor and committing the value in one atomic double-buffered swap is transactional. Incrementing a counter in flash without a two-phase commit is neither, and it will eventually double-count across a failure. The discipline is the same one distributed systems use, applied to a single chip whose "network partition" is a cloud passing in front of the sun.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The power failure is a fault injector that fires at the worst possible instant</h3>
+<p>On a battery device, faults are rare and roughly random. On a batteryless device, the power failure is not random noise: it preferentially strikes when the device is doing expensive work, because expensive work is what drains the capacitor to brown-out. That means the failure lands disproportionately on your longest, most stateful operations, the multi-packet transmission, the model's deepest layer, the multi-word flash commit. Reliability engineering for intermittency therefore starts from an adversarial premise: assume the outage will occur at the single instant that maximizes damage, and make that instant survivable. A system that is merely "usually" recoverable is a system whose bug reports are all timestamped at dusk.</p>
+</div>
+
+<h2>Time and freshness: the data that ages in the dark</h2>
+<p>The reliability failure unique to intermittent sensing is the loss of time. Most microcontrollers keep time by counting cycles or ticks in a volatile timer; when power fails, that count is gone. A node that wakes, reads a temperature, and stamps it "t = 4021 ms" has no idea whether 4 seconds or 4 hours of darkness preceded the wake. For a sensor stream this is fatal: a reading without a trustworthy timestamp cannot be ordered, cannot be joined against another modality, and cannot be aged out when it goes stale.</p>
+<p>Two mechanisms restore a sense of time without a battery-backed real-time clock. The first is a small persistently powered RTC crystal, cheap in energy but not free and defeated by a total outage. The second, more elegant, exploits <em>physical remanence</em>: an uninitialized SRAM array or a deliberately-built RC network decays predictably after power is lost, so the fraction of bits still set (or the residual voltage) is a coarse clock that survives the outage itself. This is the idea behind remanence timekeepers such as TARDIS and its successors. The measured decay gives an estimate of elapsed dark time \(\hat{\Delta t}\), which lets the node reconstruct an absolute timestamp and, crucially, decide whether a buffered reading is still <em>fresh</em>.</p>
+<p>Freshness is a first-class reliability property. Define a reading's staleness as the elapsed time since it was captured, and let the application declare a validity horizon \(\tau\). A reading is safe to use only while</p>
+<p>$$ t_{\text{now}} - t_{\text{capture}} \;=\; \Delta t \;\le\; \tau. $$</p>
+<p>On an intermittent node \(\Delta t\) is not known exactly; it is the remanence estimate \(\hat{\Delta t}\) with an error that <em>grows</em> the longer the node was dark, because the decay curve flattens. A dependable node therefore gates on a conservative bound, treating a reading as expired unless it is confidently within \(\tau\). Shipping a stale reading as if it were current is exactly the kind of silent, plausible-looking error that downstream fusion (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>) has no way to detect.</p>
+
+<pre><code class="language-python">import math
+
+# Remanence-based dark-time estimate and a freshness gate.
+# SRAM decay: fraction of "1" bits still set decays ~ exp(-t / tau_decay).
+TAU_DECAY_S = 900.0      # characterized per chip at the deployment temperature
+
+def dark_time_estimate(frac_bits_set, frac0=1.0):
+    if frac_bits_set <= 0.0:
+        return math.inf, math.inf            # fully decayed: only a lower bound
+    dt = -TAU_DECAY_S * math.log(frac_bits_set / frac0)
+    # Error grows as the curve flattens: 1-sigma bound in seconds.
+    sigma = TAU_DECAY_S * 0.05 / max(frac_bits_set, 1e-3)
+    return dt, sigma
+
+def is_fresh(frac_bits_set, tau_valid_s, k_sigma=2.0):
+    dt, sigma = dark_time_estimate(frac_bits_set)
+    upper = dt + k_sigma * sigma             # conservative worst-case staleness
+    return upper <= tau_valid_s, dt, upper
+
+for frac in (0.95, 0.60, 0.20, 0.02):
+    fresh, dt, upper = is_fresh(frac, tau_valid_s=1200.0)
+    verdict = "USE" if fresh else "EXPIRE"
+    print(f"bits={frac:>4} -> ~{dt:6.0f}s (<= {upper:6.0f}s)  {verdict}")
+# bits=0.95 ->    ~46s (<=   118s)  USE
+# bits=0.60 ->   ~460s (<=   613s)  USE
+# bits=0.20 ->  ~1449s (<=  1794s)  EXPIRE
+# bits=0.02 ->  ~3521s (<=  4271s)  EXPIRE
+</code></pre>
+<div class="code-caption">A freshness gate built on physical remanence: the fraction of still-set SRAM bits estimates how long the node was dark, and the reading is used only when even the conservative upper bound on staleness fits inside the application's validity horizon. Note that the error term grows as the bits decay, so a long outage correctly forces an <code>EXPIRE</code> even when the point estimate is near the limit.</div>
+
+<p>The gate above turns "I have no clock" into "I have a coarse, conservative clock", which is the difference between a node that silently lies about time and one that admits when it cannot be trusted. That admission is what makes the data downstream-safe.</p>
+
+<h2>Memory endurance, peripherals, and the year-long budget</h2>
+<p>Non-volatile memory is where intermittent systems quietly wear out. Every checkpoint and every logged sample is a write, and write endurance is finite: NOR flash tolerates on the order of \(10^4\) to \(10^5\) erase cycles per block, whereas ferroelectric RAM (FRAM), the workhorse of batteryless platforms, tolerates around \(10^{14}\) writes. That gap is why FRAM dominates this space, but even \(10^{14}\) is a budget, not infinity, once a node checkpoints thousands of times per hour for years. A dependable design computes its wear budget up front: total writes over the deployment lifetime must stay well under the rated endurance of the most-written cell, which in turn constrains checkpoint frequency and argues for wear-aware placement so no single address becomes the hot spot that fails first.</p>
+<p>Peripherals add a second, often-forgotten reliability surface. A radio that was mid-transmission when power failed may have corrupted a peer's receive buffer; a node that re-sends after recovery can deliver a duplicate. Communication under intermittency therefore needs sequence numbers and idempotent receivers, the same defenses used on lossy networks, because from the receiver's point of view an intermittent transmitter <em>is</em> a lossy, duplicating network. Sensor front-ends need explicit re-initialization after every wake rather than an assumption of retained configuration, since a brown-out silently returns most peripherals to their reset defaults.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">An industrial vibration tag that must never cry wolf</h3>
+<p>Consider a batteryless vibration tag clamped to a factory pump, harvesting from the pump's own motion and reporting a bearing-health score to a plant gateway (the broader setup lives in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-35-industrial-sensing-systems/index.html">Chapter 35</a>). The tag runs an anomaly detector, but its reliability problem is not the detector, it is everything around it. When the pump stops for maintenance, harvesting stops, the tag goes dark for hours, and its volatile clock resets. If it later wakes and transmits a "spike detected" alert stamped with a fresh-looking but meaningless timestamp, the maintenance team chases a ghost. So the tag runs a remanence timer: on wake it estimates dark time, and any buffered pre-outage reading whose conservative staleness exceeds the 20-minute validity horizon is dropped, not sent. Its FRAM wear budget is sized for a five-year life at the pump's duty cycle, checkpointing at most a few times per active minute and rotating the log region to spread wear. Its radio protocol carries sequence numbers so a transmission interrupted by a power failure and retried does not register as two separate faults. The result is a tag that, when it does raise an alarm, has earned the plant's trust, because its silence and its timestamps both mean what they claim.</p>
+</div>
+
+<h2>Testing what only fails in the dark</h2>
+<p>The final constraint is that intermittent bugs are nearly impossible to reproduce by hand. A WAR hazard or a stale-timestamp bug manifests only for a specific alignment of the power trace with the program counter, and attaching a debugger changes the energy the device receives, which changes the trace, which hides the bug (a genuine Heisenbug). The field answers this with energy-interference-free debuggers such as EDB, which power the target through an energy-aware harness so breakpoints do not perturb the harvest, and with programmable power emulators such as Ekho that record a real harvester's I-V behavior in the field and replay it deterministically on the bench. Replaying the exact energy trace that triggered a failure turns an irreproducible field crash into a repeatable lab test.</p>
+<p>Because exhaustive trace testing is infeasible, this is also where formal reasoning pays off: tools that prove a task is idempotent across any failure point, or that a checkpoint boundary admits no WAR hazard, give guarantees no amount of random power-cycling can. The practical workflow combines the two, formal checks for the memory-consistency invariants and recorded-trace replay for the peripheral and timing behavior that formal models abstract away. Both feed the fleet-operations story of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, where the same energy traces become regression fixtures for every firmware update.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: composable correctness for whole intermittent systems</h3>
+<p>Early intermittent runtimes protected only volatile memory. The current frontier extends the guarantee across the whole device. Task-based systems in the lineage of Ratchet, Chain, and Alpaca give WAR-freedom by construction, and I/O-aware runtimes such as Sytare and TICS (time-in-consistent-state) treat peripherals and even elapsed time as first-class recoverable state rather than as things outside the checkpoint. On the timekeeping side, remanence timers descended from TARDIS and CusTARD are being fused with harvested-energy history to bound staleness under temperature drift. The open problems are composability, proving that independently-correct tasks remain correct when scheduled together under an adversarial energy trace, and end-to-end freshness guarantees that a fusion layer can rely on. The direction of travel is a batteryless node that is not merely recoverable but <em>certifiably dependable</em>, a prerequisite for the safety-critical uses discussed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">WAR-safe tasks without hand-auditing every write</h3>
+<p>Hand-proving that a block of firmware is idempotent across an arbitrary failure point means tracking every non-volatile read and write and every peripheral side effect, hundreds of lines of error-prone bookkeeping and privatization buffers. Task-based intermittent runtimes turn it into a declaration. Using a Chain- or Alpaca-style API you name tasks and the channels between them, and the runtime enforces WAR-freedom, double-buffers the shared state, and drives the restart logic:</p>
+<pre><code class="language-python">from intermittent import task, channel   # illustrative API
+
+buf = channel("reading")
+
+@task(next="commit")
+def sense():
+    buf.write(read_adc())          # privatized: no WAR across a failure
+
+@task(next="sense")
+def commit():
+    log_append(buf.read())         # replayed safely if power fails mid-append
+</code></pre>
+<div class="code-caption">A task-based runtime makes the WAR-freedom and atomic-commit guarantees structural: declaring two tasks and one channel replaces roughly 150 lines of manual double-buffering, undo logging, and restart-point bookkeeping with about 10. The runtime owns memory consistency; you still own peripheral re-initialization and the freshness horizon.</div>
+<p>What the library cannot take off your hands is the physical layer: it will not re-initialize your I2C sensor after brown-out, and it will not tell you whether a recovered reading is still fresh. Those stay the systems engineer's job, which is precisely the material of this section.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: budget the endurance, gate the freshness</h3>
+<p>A batteryless FRAM-based logger (rated \(10^{14}\) writes per cell) checkpoints its state and appends one 16-byte sample on every wake, and wakes on average once every 8 seconds when powered. (a) If the deployment target is 7 years and the node is powered roughly 40 percent of the time, estimate the total writes to the single busiest cell under a naive append scheme, and state whether it stays within endurance; then show how log-region rotation across 64 addresses changes the answer. (b) Using the freshness code block, the validity horizon is 20 minutes and you measure <code>frac_bits_set = 0.15</code>; decide whether the buffered reading may be used, and explain why the growing error term is what forces the decision. (c) Describe one peripheral (not memory) state that a checkpoint restore would leave inconsistent after a brown-out, and the idempotent re-initialization that fixes it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is a peripheral write-after-read hazard more dangerous than a pure in-memory WAR hazard, even though checkpointing addresses the latter?</li>
+<li>Remanence-based dark-time estimates get <em>less</em> accurate as the outage grows longer. Why does a well-designed freshness gate still behave safely in that regime?</li>
+<li>FRAM tolerates about \(10^{14}\) writes while flash tolerates \(10^4\) to \(10^5\). Give one reason you might still deliberately place some data in flash on a batteryless node despite the endurance gap.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-63.7.html">Section 63.7</a>, we pull back from the single node to the planetary picture. Sustainability and the zero-power frontier ask what it means to build sensing that leaves no battery to landfill and draws only ambient energy, and what perception at truly zero standing power could look like. The reliability discipline of this section is the foundation that lets such devices be trusted to run, unattended and un-serviced, for their entire physical lifetime.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

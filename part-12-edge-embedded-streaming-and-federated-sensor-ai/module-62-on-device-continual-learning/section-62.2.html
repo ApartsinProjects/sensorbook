@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.2: Catastrophic forgetting on the edge. Building Sensory AI." name="description"/>
+<title>Section 62.2: Catastrophic forgetting on the edge | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Catastrophic forgetting on the edge</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You taught me to recognize your new gym. In exchange, I quietly forgot how to recognize you sleeping. Nobody mentioned this was the deal."</p>
+<cite>A Plastic AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous section argued that a deployed sensor model must keep learning after it ships. The moment it does, it meets the oldest and nastiest failure of neural networks: <strong>catastrophic forgetting</strong>. Train a network on today's data with plain gradient descent and it will overwrite the weights that encoded yesterday's knowledge, sometimes collapsing an old task from ninety percent accuracy to near chance in a handful of updates. In the cloud this is a nuisance you dodge by reshuffling the full dataset. On a wearable or a microcontroller you cannot: the old data is gone, the memory to store it does not exist, and the stream arrives once, in order, from a single user. This section explains the mechanism, why every edge constraint sharpens it, and how to measure it honestly before you reach for the mitigations in the rest of the chapter. Get the measurement wrong and you will ship a model that silently degrades in the field while your validation numbers look fine.</p>
+</div>
+
+<p>This section assumes you are comfortable with gradient descent on a neural network and with the online, single-pass setting introduced in <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>. We lean on the Fisher information matrix from the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The replay and few-shot remedies previewed here are developed fully in <a class="cross-ref" href="section-62.3.html">Section 62.3</a> and <a class="cross-ref" href="section-62.4.html">Section 62.4</a>; our job now is to understand the disease, not yet to cure it.</p>
+
+<h2>The mechanism: shared weights and the stability-plasticity dilemma</h2>
+<p>A neural network stores every task in the same pool of weights. When you fine-tune on task \(B\), the gradient of the task-\(B\) loss knows nothing about task \(A\); it moves each weight in whatever direction lowers the \(B\) loss fastest. If a weight was load-bearing for \(A\), that move degrades \(A\) with no penalty, because \(A\)'s error signal is no longer in the batch. Forgetting is not decay or noise. It is the optimizer doing exactly its job on the wrong objective. Formally, sequential training minimizes \(\mathcal{L}_B(\theta)\) starting from \(\theta_A^\star\), and nothing in that objective keeps \(\theta\) near the region where \(\mathcal{L}_A\) is small.</p>
+<p>This is one face of the <strong>stability-plasticity dilemma</strong>: a system rigid enough to protect old knowledge (stable) cannot easily absorb new knowledge (plastic), and vice versa. Freeze the weights and you never forget but never learn; let them move freely and you learn instantly but forget just as fast. Every continual-learning method is a particular compromise on this axis. The regularization family, exemplified by Elastic Weight Consolidation (EWC), makes the compromise explicit by adding a quadratic penalty that pins important weights in place:</p>
+<p>$$ \mathcal{L}(\theta) = \mathcal{L}_B(\theta) + \frac{\lambda}{2}\sum_i F_i \,\big(\theta_i - \theta_{A,i}^\star\big)^2 . $$</p>
+<p>Here \(F_i\) is the diagonal of the Fisher information matrix, an estimate of how sharply the old task's loss depends on weight \(i\). Weights with large \(F_i\) are stiff; the rest stay free to learn \(B\). The strength \(\lambda\) is the stability-plasticity knob in numeric form. This is elegant, but note what it costs to store: a full copy of \(\theta_A^\star\) and of \(F\), that is, twice the model's parameters kept in memory purely to remember. On a device with a few hundred kilobytes of RAM that overhead alone can be disqualifying, which is the theme of the next subsection.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Forgetting is interference, not forgetting</h3>
+<p>The word "forgetting" suggests information leaking away over time. The truth is sharper and more actionable: the knowledge is destroyed by a <em>specific</em> update in a <em>specific</em> direction, the moment new data with a different distribution arrives. This reframing tells you exactly where to intervene. You do not need to slow time; you need to constrain the update, either by penalizing motion in important directions (regularization), by mixing old examples back into the batch so their gradients reappear (replay, <a class="cross-ref" href="section-62.3.html">Section 62.3</a>), or by giving new knowledge its own parameters (isolation). Every remedy in this chapter is a different answer to one question: how do you stop the task-\(B\) gradient from trampling task \(A\)?</p>
+</div>
+
+<h2>Why the edge makes it worse</h2>
+<p>Catastrophic forgetting is a general problem, but four properties of on-device learning turn a manageable nuisance into a first-order risk. First, <strong>no data rehearsal</strong>: the classic cloud fix is to interleave old and new data, but on the edge the old data has been discarded for privacy or storage reasons (see the federated motivation in <a class="cross-ref" href="../module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>), so the naive defense is simply unavailable. Second, <strong>a single ordered pass</strong>: the sensor stream is non-IID and arrives in temporal blocks, a user runs for a week, then swims for a week, so the model sees long runs of one distribution and drifts hard toward it, exactly the worst case for interference. Third, <strong>a tiny memory and compute budget</strong>: EWC's Fisher matrix, a replay buffer, or a second frozen copy of the network may not fit at all, and the energy cost of the extra passes is itself constrained (<a class="cross-ref" href="section-62.5.html">Section 62.5</a>). Fourth, <strong>quantized, low-precision weights</strong>: an int8 model has coarse weight steps, so a single update can jump across several quantization levels, making forgetting both more abrupt and harder to regularize smoothly.</p>
+<p>The compounding effect is what makes this an <em>advanced</em>, research-frontier topic rather than a solved one. A method that controls forgetting beautifully on a GPU with a 10,000-example replay buffer may be useless when the buffer must shrink to 50 latent vectors and the Fisher matrix must be dropped entirely. The design space is genuinely three-way: forgetting, memory, and energy, and you cannot maximize all three.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field stands</h3>
+<p>The regularization line began with Elastic Weight Consolidation (Kirkpatrick et al., 2017) and Synaptic Intelligence (Zenke et al., 2017); Learning without Forgetting (Li and Hoiem, 2017) added a distillation term that needs no stored data. For sensor edge devices the current center of gravity is <strong>latent replay</strong> (Pellegrini et al., 2020), which rehearses cheap intermediate activations instead of raw inputs and has been demonstrated learning new classes on a Raspberry Pi and on Arm Cortex-M microcontrollers. The <strong>TinyOL</strong> line (Ren et al., 2021) trains only a final adaptation layer on-device in a few kilobytes of RAM. The open <strong>Avalanche</strong> framework has become the de facto benchmark harness for reproducible continual-learning evaluation. The unsolved frontier is doing all of this under a joint memory-and-energy budget with quantized weights and a guarantee of stability, which is precisely why <a class="cross-ref" href="section-62.7.html">Section 62.7</a> treats a self-updating model as a safety concern.</p>
+</div>
+
+<h2>Measuring forgetting honestly</h2>
+<p>You cannot manage what you do not measure, and a single accuracy number hides forgetting completely: a model that has traded all of task \(A\) for task \(B\) can post a fine average on today's data. The standard instrument is the <strong>accuracy matrix</strong> \(R\), where \(R_{i,j}\) is the accuracy on task \(j\) after the model has finished training through task \(i\). From it we read three quantities. <strong>Average accuracy</strong> is the mean of the last row, overall competence after all tasks. <strong>Backward transfer</strong> (BWT) averages \(R_{T,j} - R_{j,j}\) over earlier tasks: how much learning later tasks helped (positive) or hurt (negative) the ones already learned; strongly negative BWT is the fingerprint of forgetting. <strong>Forgetting</strong> reports, per task, the gap between its best-ever accuracy and its final accuracy. Crucially, all of this must be evaluated on <em>held-out, per-user and per-session splits</em>, the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, or you will measure memorization of the replay buffer instead of retention.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def continual_metrics(R):
+    """R[i, j] = accuracy on task j after training through task i (T x T)."""
+    R = np.asarray(R, dtype=float)
+    T = R.shape[0]
+    final = R[-1]                                   # accuracy on every task at the end
+    avg_acc = final.mean()
+    bwt = np.mean([R[-1, j] - R[j, j] for j in range(T - 1)])   # < 0 means forgetting
+    forgetting = np.mean([R[:, j].max() - R[-1, j] for j in range(T - 1)])
+    return {"avg_acc": avg_acc, "bwt": bwt, "forgetting": forgetting}
+
+# A 3-task run: each new task wrecks the previous one (diagonal high, off-diagonal collapses)
+R = [[0.92, 0.00, 0.00],
+     [0.61, 0.90, 0.00],
+     [0.55, 0.58, 0.89]]
+print(continual_metrics(R))
+# -> {'avg_acc': 0.673, 'bwt': -0.315, 'forgetting': 0.315}
+</code></pre>
+<div class="code-caption">Twelve lines that turn a task-by-task accuracy matrix into the three numbers every continual-learning report must state. The strongly negative backward transfer and the 0.315 forgetting expose a model whose 0.89 accuracy on the newest task hides a near-total loss of the first two, the exact deception a single accuracy figure would let through.</div>
+
+<p>The estimator above is the first thing to wire into any on-device learning experiment, because it converts the vague fear of forgetting into an auditable number you can track across a fleet. Pair it with a calibration check (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), since a forgetting model often becomes overconfident on the classes it is losing, and the confidence drift is an early warning that fires before accuracy does.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The smartwatch that forgot how to sit still</h3>
+<p>A fitness wearable ships a human-activity-recognition model (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) that classifies walking, running, cycling, and resting from the IMU. A user takes up rowing, and the product team enables on-device personalization to add the new class. Over a week of enthusiastic rowing, the watch adapts, rowing recognition climbs past ninety percent, and the demo dazzles. Then support tickets arrive: the watch has started logging phantom "rowing" while the user sleeps and no longer scores their resting heart-rate windows correctly. The single ordered stream of rowing data had dragged the shared weights toward the new class and trampled "resting," whose examples never reappeared to defend themselves. The accuracy matrix told the whole story after the fact: rowing at 0.93, resting fallen from 0.95 to 0.40, backward transfer deeply negative. The fix, latent replay of a few dozen stored activation vectors per old class, is the subject of the next section. The lesson here is that the team had no forgetting metric in their telemetry, so a regression that a two-line backward-transfer check would have caught reached real users first.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Do not hand-roll the benchmark harness</h3>
+<p>Building the scaffolding to run a continual-learning experiment correctly, splitting a dataset into a task stream, training through it, evaluating the full accuracy matrix after every task, and computing forgetting and backward transfer, is a few hundred lines of error-prone bookkeeping where an off-by-one in the evaluation loop silently inflates your retention. The <strong>Avalanche</strong> library packages the whole loop, including EWC, replay, and the metrics above, behind a handful of calls:</p>
+<pre><code class="language-python">from avalanche.benchmarks.generators import nc_benchmark
+from avalanche.training import EWC
+from avalanche.evaluation.metrics import forgetting_metrics, accuracy_metrics
+
+bench = nc_benchmark(train_ds, test_ds, n_experiences=5, task_labels=False)
+strategy = EWC(model, optimizer, criterion, ewc_lambda=0.4,
+               evaluator=default_evaluator([accuracy_metrics(), forgetting_metrics()]))
+for experience in bench.train_stream:
+    strategy.train(experience)
+    strategy.eval(bench.test_stream)     # full accuracy matrix + forgetting, logged
+</code></pre>
+<div class="code-caption">Avalanche replaces roughly 300 lines of task-stream construction, training loop, accuracy-matrix bookkeeping, and metric computation with about 8, and the EWC regularizer is a one-argument swap for replay or LwF.</div>
+<p>The library handles the stream generation, the after-every-task evaluation grid, and the metric definitions so your comparison across methods is apples-to-apples. You still design the split to be leakage-safe, but you write roughly 8 lines instead of 300.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: induce and quantify forgetting</h3>
+<p>Take any small IMU activity classifier from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> and split its classes into three sequential tasks (two classes each). Fine-tune the model on the tasks one after another with plain SGD, storing the accuracy on <em>every</em> task after each stage to build the accuracy matrix \(R\). Run it through <code>continual_metrics</code> and report average accuracy, backward transfer, and forgetting. Now add the EWC penalty with three values of \(\lambda\) spanning two orders of magnitude and plot forgetting against final-task accuracy. Identify the point where extra stability starts costing more plasticity than it saves, and state, in one sentence, why no single \(\lambda\) is right for every deployment.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does a high average accuracy after a personalization update fail to rule out catastrophic forgetting, and which single metric would expose it?</li>
+<li>Name the two things EWC must keep in memory to protect an old task, and explain why that overhead is often disqualifying on a microcontroller.</li>
+<li>The edge stream is described as "a single ordered pass." Why does the <em>ordering</em>, not just the absence of old data, make forgetting worse than an IID shuffle would?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-62.3.html">Section 62.3</a>, we take the most effective family of remedies, rehearsal, and make it fit the device. Storing raw sensor windows is impossible on kilobytes of RAM, so we turn to latent and quantized replay: rehearsing a handful of compressed intermediate activations that let the old-task gradients reappear in every batch at a fraction of the memory cost, the technique that would have saved the rowing watch.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

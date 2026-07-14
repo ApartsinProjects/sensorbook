@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.7: Field update and rollback; MLPerf Tiny. Building Sensory AI." name="description"/>
+<title>Section 61.7: Field update and rollback; MLPerf Tiny | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Field update and rollback; MLPerf Tiny</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Shipping the model was the easy part. The hard part was promising a million sleeping devices that I could change my mind later without bricking a single one."</p>
+<cite>A Reversible AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>A microcontroller you deploy is not a model you can log into. It is glued inside a smoke detector on a ceiling, potted in resin on a wind turbine, or stitched into a shoe, and it may not see a human being again for a decade. Yet the model on it will be wrong about something eventually: a new false-alarm pattern, a retrained classifier, a security patch. So the last engineering problem of TinyML is not accuracy, it is <strong>reversible change at a distance</strong>. You must be able to push a new model to a fleet you cannot touch, and, when a fraction of that fleet starts crashing or misclassifying, un-push it before a truck roll becomes a recall. This section covers the two halves of that discipline: the mechanics of safe over-the-air (OTA) update and automatic rollback on a device with a few hundred kilobytes of flash, and <strong>MLPerf Tiny</strong>, the industry benchmark that lets you say, in numbers your competitors also report, how fast and how frugal your candidate model actually is before you dare to ship it.</p>
+</div>
+
+<p>This section closes the deployment arc of the chapter. It assumes the firmware integration and on-hardware testing of the previous section, and the quantized runtimes (LiteRT for Microcontrollers, microTVM, ExecuTorch) that produce the model artifact you are about to ship. It connects outward to fleet-scale operations: the mechanisms here are the device-side half of the release pipeline detailed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, and the leakage-safe measurement discipline that MLPerf depends on is developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. We do not re-derive quantization or benchmark statistics; we ask how to change a fielded model without breaking it, and how to prove a model is good enough to be worth changing to.</p>
+
+<h2>The dual-bank invariant: never trust a new image until it proves itself</h2>
+<p>The foundational technique for safe MCU update is <strong>A/B partitioning</strong>, also called dual-bank flash. You divide the program flash into two slots. Slot A holds the running firmware-plus-model image; slot B is idle. An update writes the new image entirely into slot B while slot A keeps running, so a power loss or a corrupt download during transfer costs you nothing: slot A is untouched. Only when the new image is fully received, its cryptographic signature verified, and its integrity hash checked does the bootloader flip a pointer and boot slot B on the next reset. The invariant that makes this safe is simple to state and unforgiving to violate: <em>there is always at least one known-good, bootable image on the device.</em> You never erase the slot you are running from, and you never boot an unverified image as if it were trusted.</p>
+
+<p>The subtlety that separates a demo from a product is what happens <em>after</em> the first boot of the new image. A signature proves the image came from you; it says nothing about whether the image works on this particular device with this particular sensor and this particular flash wear pattern. So the new image boots in a <strong>trial state</strong> and must earn permanence. The bootloader arms a hardware watchdog and marks slot B as "pending confirm." The new firmware, if it is healthy, runs its self-tests, confirms the sensor reads sane values, runs a canary inference, and only then writes a "confirmed" flag that tells the bootloader to make slot B the new default. If the image hangs, crashes, or fails its health check, the watchdog fires, the device resets, and the bootloader, seeing an unconfirmed pending image, <strong>rolls back automatically</strong> to slot A. No human, no network, no truck.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Rollback is a promise the bootloader keeps, not the application</h3>
+<p>The single most important design decision in field update is that the rollback authority lives <em>below</em> the code being updated. The application cannot be trusted to un-install itself, because the whole reason for rollback is that the application is broken. So the confirm-or-revert logic must sit in an immutable bootloader (ideally in one-time-programmable memory or a locked flash region protected by secure boot) that runs before and outside the new image. A useful mental test: if the new firmware bricks completely on its first instruction, does the device still recover? With bootloader-owned rollback the answer is yes, because the watchdog reset returns control to code the bad image could never touch. If your rollback logic lives inside the updatable image, you have built a system that cannot recover from exactly the failure rollback exists to handle.</p>
+</div>
+
+<h2>Shipping models, not just firmware: delta updates and split artifacts</h2>
+<p>Sending a full firmware image over a constrained radio (a BLE link, a LoRaWAN uplink of a few hundred bytes per message, an NB-IoT trickle) to a battery device is expensive in both energy and airtime, and the model is usually the part that changes most often while the driver and runtime code stay fixed. Two techniques cut the cost. First, <strong>split the artifact</strong>: store the model weights in their own flash region with their own version and signature, separate from the runtime firmware, so a model refresh ships only the tensor blob and not the whole binary. Second, use <strong>delta (differential) updates</strong>: transmit only the byte-level difference between the old and new image, reconstructed on-device against the current slot. For a fine-tune that nudges a few layers, a delta can be a small fraction of the full weight size, turning a multi-minute radio session that drains the cell into a short one. The cost is a patch-apply step that needs scratch space and must itself be power-fail-safe, which is exactly why it happens into the idle B slot, never in place.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let MCUboot own the A/B state machine</h3>
+<p>Hand-rolling the dual-bank bootloader, the pending-confirm flags, the signature verification, and the watchdog-driven revert is several hundred lines of security-critical code you do not want to own. <strong>MCUboot</strong>, the secure bootloader used by Zephyr, the nRF Connect SDK, and many vendor stacks, implements the entire swap-and-confirm state machine, image signing (ECDSA or RSA), and rollback for you. On the device the application shrinks to two calls: <code>boot_set_pending()</code> to stage the freshly downloaded slot-B image, and <code>boot_set_confirmed()</code> once your health check passes. That is roughly 300 to 500 lines of audited, portable bootloader logic reduced to two function calls in your firmware, with the immutable-root-of-trust property handled correctly. Pair it with a host-side signing key and you have verified, revertible OTA without writing the dangerous parts yourself.</p>
+</div>
+
+<p>The listing below is a host-side simulation of the confirm-or-revert state machine, so you can reason about the fleet-health logic without an MCU in front of you. It models a staged rollout where each device boots the new image in trial mode, runs a health gate, and either confirms or reverts, and it stops the rollout automatically if the confirmed fraction across a batch falls below a safety threshold.</p>
+
+<pre><code class="language-python">import random
+
+def deploy_to_device(healthy_prob, watchdog_s=8.0):
+    """One device: stage image in slot B, boot trial, health-gate, confirm or revert."""
+    # Boot the pending image under a watchdog. A broken image never reaches the gate.
+    booted = random.random() < 0.995              # 0.5% brick on first boot
+    if not booted:
+        return "revert:watchdog"                  # bootloader restores slot A
+    # Health gate: sensor sane + canary inference within latency budget.
+    if random.random() < healthy_prob:
+        return "confirm"                          # boot_set_confirmed(): B becomes default
+    return "revert:healthgate"                    # app declines to confirm -> A on next reset
+
+def staged_rollout(fleet=2000, batch=200, min_confirm=0.98, healthy_prob=0.99):
+    deployed = 0
+    while deployed < fleet:
+        results = [deploy_to_device(healthy_prob) for _ in range(min(batch, fleet - deployed))]
+        confirmed = sum(r == "confirm" for r in results)
+        rate = confirmed / len(results)
+        deployed += len(results)
+        print(f"batch of {len(results):4d}: confirm rate {rate:5.1%}  (cumulative {deployed})")
+        if rate < min_confirm:
+            print(f"HALT: confirm rate {rate:.1%} below gate {min_confirm:.0%}; pausing rollout")
+            break                                 # no truck roll: fielded devices already reverted
+    return deployed
+
+random.seed(0)
+staged_rollout()
+</code></pre>
+<div class="code-caption">A canary/staged-rollout simulation of bootloader-owned rollback. Each device confirms only after a health gate; a batch whose confirm rate drops below the safety threshold halts the rollout automatically, because reverted devices are already safe on their previous image.</div>
+
+<p>The code makes the operational point concrete: because reversion is automatic and device-local, a bad batch is self-limiting. The fleet-health monitor merely has to <em>stop sending</em> the bad image; it never has to reach in and rescue devices, because the watchdog and health gate already did. This is the device-side counterpart of the canary-release strategy for whole sensor fleets in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, and it composes with the on-device learning safety concerns of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a>, where the "new model" is one the device trained itself.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A glucose patch that changed its mind safely</h3>
+<p>Consider a continuous-glucose-style wearable patch: a sealed, single-use device with a Cortex-M0+ and a BLE radio, worn for fourteen days, running a quantized model that turns raw electrochemical current into a glucose estimate. Months after launch, the team discovers the model over-reads during rapid post-meal spikes for one sensor lot. They cannot recall the patches; people are wearing them right now. Instead they ship a delta update: a few kilobytes of corrected calibration weights into slot B over BLE while the patch keeps measuring from slot A. Each patch boots the new weights in trial mode and runs a canary against the last hour of stored readings; if the corrected estimate diverges implausibly from the trend (a health-gate failure), it reverts and reports the failure. The rollout monitor watches the confirm rate lot by lot. When one older hardware revision shows a 4 percent revert rate, the rollout halts for that revision automatically, and not one patient wears a patch running an unconfirmed model. The clinical-grade lesson: reversibility is not a nicety here, it is the difference between a software fix and a medical-device recall. Chapter 34's validation and regulation discussion, cited in this chapter's clinical thread, treats why that boundary is drawn where it is.</p>
+</div>
+
+<h2>MLPerf Tiny: proving a model is worth shipping</h2>
+<p>Before any of that update machinery runs, you have to decide the new model is actually better on the axes that matter for a microcontroller: latency, energy, and accuracy at a fixed, tiny memory budget. <strong>MLPerf Tiny</strong>, maintained by MLCommons, is the standard benchmark for exactly this regime. It is deliberately small: four reference tasks chosen to represent the always-on sensing workloads of this chapter. Keyword spotting (a 12-class wake-word task on the Speech Commands data), visual wake words (person-present binary classification on a tiny image), image classification (CIFAR-10 at low resolution), and anomaly detection (autoencoder-based machine-condition monitoring on the ToyADMOS/DCASE data). Each task ships a reference model, a reference dataset split, and a reference quantization, so submissions differ only in the system under test, not in what is being asked.</p>
+
+<p>MLPerf Tiny reports three things, and the discipline is in reporting all three together on the <em>same</em> configuration. <strong>Latency</strong> is the median time for a single inference. <strong>Energy</strong> is the joules per inference, measured with a standardized power harness (the EEMBC EnergyRunner), because on a coin cell energy, not speed, is the currency that runs out. <strong>Accuracy</strong> is the task metric (top-1, or AUC for anomaly detection), which acts as a quality floor: you may not trade accuracy away silently to win on latency. Crucially, the benchmark separates a <em>closed</em> division, where you must run the exact reference model so hardware and runtimes compete on equal footing, from an <em>open</em> division, where you may substitute your own model (a TinyNAS-found network, an aggressively pruned variant) and compete on the full co-design. The closed division answers "how good is my silicon and runtime," the open division answers "how good is my whole stack."</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the frontier sits</h3>
+<p>Recent MLPerf Tiny rounds (v1.0 through the 2023 to 2025 submissions) show the state of the art moving in two directions at once. On the hardware side, dedicated neural accelerators and near-memory-compute MCUs (from vendors such as Syntiant, Analog Devices' MAX78000, and the Ambiq Apollo line) push keyword spotting into the sub-millijoule, sub-millisecond regime that makes truly perpetual always-on sensing feasible. On the model side, the open division is dominated by hardware-aware neural architecture search in the MCUNet/TinyNAS family, which co-optimizes the network and its memory-planned runtime to hit accuracy targets inside a few hundred kilobytes of SRAM. The open research problem is that MLPerf Tiny measures clean, in-distribution accuracy: it does not yet score robustness to sensor drift or distribution shift, which is what actually degrades a fielded model over its multi-year life. Combining a MLPerf-style efficiency benchmark with the shift-and-OOD evaluation of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> is an active gap.</p>
+</div>
+
+<p>The leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is what makes a MLPerf number trustworthy. Because the benchmark fixes the dataset split and the reference preprocessing, a submitter cannot quietly leak test data into calibration or tune quantization on the evaluation set; the harness and the closed-division rules enforce a single honest measurement. When you report your own model's efficiency against MLPerf Tiny, hold the same line: measure accuracy, latency, and energy in one pass on one configuration, never stitch the best accuracy from one build to the best latency from another. That is not merely good manners; it is the only way the number predicts field behavior.</p>
+
+<h2>When to update, and when to leave it alone</h2>
+<p>The final judgment is operational restraint. Every OTA update spends energy, spends airtime, and introduces a nonzero brick risk, however small. A model that is 0.3 percent more accurate on a clean benchmark is not automatically worth pushing to a million battery devices, because the update itself costs battery and the improvement may not survive contact with real, drifting sensor data. Update when the change fixes a real field failure (a false-alarm pattern, a security vulnerability, a lot-specific calibration bug), when the accuracy gain is large enough to clear the energy and risk cost of the transfer, or when a security patch is non-negotiable. Otherwise, the safest fielded model is often the one already running, proven over months. Reversibility exists so you <em>can</em> change your mind cheaply; MLPerf Tiny exists so you change it for a measured reason, not a hunch.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You maintain a fleet of 50,000 acoustic leak-detection nodes on a gas network, each on a primary lithium cell rated for ten years. A retrained model improves recall by 2 percent but the weight delta is 40 KB, and pushing it over NB-IoT costs roughly 30 seconds of radio at 200 mW. (1) Estimate the energy cost of the update per device and compare it to a ten-year budget on a 19 kJ cell. (2) Design the health gate the new image must pass before <code>boot_set_confirmed()</code>, given that a leak is rare and you cannot wait for one to occur to validate. (3) Specify the fleet confirm-rate threshold that halts the rollout, and justify it against the cost of a truck roll to a bricked node.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why must the rollback authority live in the bootloader rather than in the application being updated, and what specific failure does that placement protect against?</p>
+<p>2. In A/B partitioning, what invariant must never be violated during a transfer, and why does honoring it make a mid-download power loss harmless?</p>
+<p>3. MLPerf Tiny reports latency, energy, and accuracy. Why does the benchmark insist all three come from the same configuration, and which one is usually the binding constraint on a coin-cell device?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 61</h3>
+<p>deploy a motion classifier to an MCU (or a faithful embedded simulation) and benchmark it.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Benchmarks and evaluation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2106.07597">Banbury, C., Reddi, V. J., Torelli, P., et al. (2021). MLPerf Tiny Benchmark. NeurIPS Datasets and Benchmarks.</a></p>
+<p class="bib-annotation">The defining paper for MLPerf Tiny: motivates the four reference tasks, the standardized energy harness, and the closed/open division split that this section builds on.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://mlcommons.org/benchmarks/inference-tiny/">MLCommons (2021-2025). MLPerf Tiny Inference: Rules and Results.</a></p>
+<p class="bib-annotation">The living specification and public results tables; the authoritative source for current task definitions, submission rules, and where the hardware/model frontier actually sits.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1804.03209">Warden, P. (2018). Speech Commands: A Dataset for Limited-Vocabulary Speech Recognition.</a></p>
+<p class="bib-annotation">The dataset underlying the MLPerf Tiny keyword-spotting task; its careful speaker-disjoint splits are a model of leakage-safe benchmark construction.</p>
+</div>
+
+<p class="bib-category">Tiny models and co-design</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2007.10319">Lin, J., Chen, W.-M., Lin, Y., Cohn, J., Gan, C., Han, S. (2020). MCUNet: Tiny Deep Learning on IoT Devices. NeurIPS.</a></p>
+<p class="bib-annotation">The TinyNAS plus memory-planned-runtime co-design that dominates the MLPerf Tiny open division; the model side of "is it worth shipping."</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.tensorflow.org/lite/microcontrollers">David, R., Duke, J., Jain, A., et al. (2021). TensorFlow Lite Micro: Embedded Machine Learning for TinyML Systems. MLSys.</a></p>
+<p class="bib-annotation">The runtime that turns a trained network into the deployable artifact you version, sign, and ship; establishes the memory-arena model these updates operate within.</p>
+</div>
+
+<p class="bib-category">Secure over-the-air update and rollback</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://docs.mcuboot.com/">Linaro / MCUboot Project (2017-2025). MCUboot: Secure Bootloader for 32-bit Microcontrollers.</a></p>
+<p class="bib-annotation">The reference open-source implementation of the dual-bank swap-and-confirm state machine, image signing, and watchdog-driven rollback used across Zephyr and vendor SDKs.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.rfc-editor.org/rfc/rfc9019.html">Moran, B., Tschofenig, H., Brown, D., Meriac, M. (2021). RFC 9019: A Firmware Update Architecture for Internet of Things (IETF SUIT).</a></p>
+<p class="bib-annotation">The standardized architecture for authenticated, revertible IoT firmware update: manifests, signing, and the trust model behind safe field updates.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.usenix.org/conference/atc16/technical-sessions/presentation/mishra">Chandra, R., et al. related IoT OTA work; and Zandberg, K., et al. (2019). Secure Firmware Updates for Constrained IoT Devices Using Open Standards. IEEE Access.</a></p>
+<p class="bib-annotation">A practical evaluation of standards-based OTA on constrained MCUs, quantifying the energy and airtime cost of update that motivates delta and split-artifact transfer.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-62-on-device-continual-learning/index.html">Chapter 62</a>, the "new model" stops arriving from a server and starts being trained by the device itself. We turn from pushing updates to a fleet to letting each node adapt in place, and we confront catastrophic forgetting, quantized replay, and the sharper version of the safety question this section opened: how do you keep rollback and health gates meaningful when the model changes without anyone signing it?</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

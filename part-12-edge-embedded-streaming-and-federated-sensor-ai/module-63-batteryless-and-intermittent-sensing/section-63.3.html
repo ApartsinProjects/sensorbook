@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 63.3: Energy-adaptive inference. Building Sensory AI." name="description"/>
+<title>Section 63.3: Energy-adaptive inference | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 63: Batteryless and Intermittent Sensing</a></div>
+<h1>Energy-adaptive inference</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I do not run the same model twice. When the capacitor is full I think hard; when it is nearly empty I make a quick guess and hope the sun comes back."</p>
+<cite>A Thrifty AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>On a battery-powered device you size the model once for the worst case and forget it. On a batteryless device that assumption collapses. The energy available for the next inference is a moving target set by whatever the harvester scraped from light, vibration, or a radio field in the last few seconds, and it can swing by two orders of magnitude between a bright windowsill and a dim corridor. A model that is right-sized for the sunny case starves in the shade; one sized for the shade wastes the surplus when energy is plentiful. Energy-adaptive inference resolves the tension by making the computation itself a knob: the device measures how much energy it holds, then chooses <em>how much model to run</em>, trading accuracy for joules on every single inference. This section shows what that knob is made of, how to build a model that has one, and how to close the control loop between the storage capacitor and the network so the device always returns the best answer its current energy allows.</p>
+</div>
+
+<p>This section builds on the harvesting and storage physics of <a class="cross-ref" href="section-63.1.html">Section 63.1</a> (where the energy comes from and how a capacitor stores it) and the intermittent-execution model of <a class="cross-ref" href="section-63.2.html">Section 63.2</a> (how a computation survives power failures through checkpointing). It also leans on the model-compression toolkit of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>: quantization, pruning, and the roofline all reappear here, but now the compression ratio is chosen at run time rather than baked in at export. We speak in terms of energy per inference measured in millijoules, and of a stored energy budget \(E\) that the harvester replenishes and each inference draws down.</p>
+
+<h2>The energy-quality frontier</h2>
+<p>Every model configuration you can run occupies a point on a curve of accuracy against energy per inference. Call it the <em>energy-quality frontier</em>. A full-precision, full-depth network sits at the top right: high accuracy, high cost. A shallow int8 stub sits at the bottom left: cheap and rough. The purpose of an energy-adaptive model is to expose <em>many</em> points along this frontier from a <em>single</em> deployed artifact, so that at inference time the device can slide along it to the most accurate point it can currently afford.</p>
+<p>Formally, if configuration \(k\) costs energy \(e_k\) and delivers expected quality \(q_k\), and the device holds usable energy \(E\), energy-adaptive inference solves a tiny optimization on every trigger:</p>
+<p>$$ k^{\star} = \arg\max_{k}\; q_k \quad \text{subject to} \quad e_k \le E - E_{\text{reserve}}. $$</p>
+<p>The reserve term \(E_{\text{reserve}}\) is not optional. It is the energy the device must keep in hand to checkpoint its state and commit a result before the capacitor browns out, the safety margin that connects this section to the intermittent-computing machinery of the previous one. Choose \(k\) too greedily and the inference dies mid-forward-pass, wasting every joule it already spent; the reserve is what makes an adaptive choice <em>safe</em> rather than merely optimistic.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Adaptation converts wasted surplus and fatal deficits into graceful degradation</h3>
+<p>A fixed model has exactly one operating point, so it is wrong in two directions at once. When energy is abundant it leaves accuracy on the table, running a small model while the capacitor overflows and the harvester's output is simply thrown away. When energy is scarce it fails hard, unable to complete even one forward pass. An energy-adaptive model replaces both failures with a smooth slide down the frontier: the answer gets rougher as the light dims, but an answer still arrives. For a batteryless sensor, a slightly less accurate reading that <em>completes</em> beats a perfect reading that never finishes.</p>
+</div>
+
+<h2>Four mechanisms for a tunable model</h2>
+<p>The frontier is only useful if you can move along it cheaply, ideally without swapping model weights (an expensive flash read on a batteryless device). Four mechanisms give a single network multiple operating points.</p>
+<p><strong>Early-exit (anytime) networks</strong> attach lightweight classifier heads at intermediate depths. Inference proceeds layer by layer, and the device can stop at any exit head and emit that head's prediction. Energy scales almost linearly with the exit depth chosen, so the exit index <em>is</em> the energy knob. A natural refinement is confidence-based exit: run until a head is confident enough, then stop. That couples this section to <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, because an early head that is overconfident will exit too soon and be wrong, so the exit heads must be <em>calibrated</em> before their confidence can gate energy.</p>
+<p><strong>Slimmable and dynamic-width networks</strong> train a single network whose channels can be truncated at run time, so the same weights run at 25 percent, 50 percent, or full width. Width scales compute quadratically, giving a wide dynamic range of cost from one weight tensor.</p>
+<p><strong>Run-time precision scaling</strong> exploits that many accelerators (and bit-serial designs especially) can execute the same weights at int4, int8, or higher precision, spending energy roughly in proportion to the bit width. Dropping precision when energy is scarce is the cheapest possible adaptation because it changes no shapes.</p>
+<p><strong>Model cascades</strong> keep a family of separate tiny-to-large models and pick one per inference. This is the coarsest mechanism and costs the most memory, but it is the easiest to reason about and the most common in practice, especially as the second stage of a wake-up cascade (<a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>) where a tiny gate decides whether to spend energy on a larger confirmer at all.</p>
+
+<h2>Closing the loop: from capacitor voltage to configuration</h2>
+<p>The device does not know its stored energy directly; it knows the storage capacitor's voltage, which it samples with an on-chip ADC. Because a capacitor's energy is \(E = \tfrac{1}{2} C V^{2}\), and useful energy is only the part above the microcontroller's brown-out voltage \(V_{\min}\), the usable budget is</p>
+<p>$$ E_{\text{usable}} = \tfrac{1}{2}\,C\,\bigl(V^{2} - V_{\min}^{2}\bigr). $$</p>
+<p>That quadratic is the whole reason a voltage reading is a rich energy signal: a small voltage headroom above brown-out means very little usable energy, so the controller must be conservative near the floor. The control loop is then simple and runs before every inference: read \(V\), compute \(E_{\text{usable}}\), subtract the checkpoint reserve, and pick the most accurate configuration whose profiled cost fits. The profiling, measuring \(e_k\) for each configuration on the real hardware once, offline, is the step people skip and regret, because datasheet TOPS figures (see the roofline discussion in <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>) predict energy poorly for the memory-bound layers typical of sensor models.</p>
+
+<pre><code class="language-python">import math
+
+# Profiled once on real hardware: energy per inference (mJ) and validation accuracy.
+CONFIGS = [  # sorted cheapest -> most expensive
+    {"name": "exit1_int4", "energy_mj": 0.8, "acc": 0.71},
+    {"name": "exit2_int8", "energy_mj": 2.1, "acc": 0.84},
+    {"name": "full_int8",  "energy_mj": 5.6, "acc": 0.91},
+    {"name": "full_fp16",  "energy_mj": 9.4, "acc": 0.93},
+]
+
+def usable_energy_mj(v, c_farad, v_min):
+    e_joule = 0.5 * c_farad * (v**2 - v_min**2)
+    return max(0.0, e_joule) * 1e3            # J -> mJ
+
+def choose_config(v, c_farad=100e-6, v_min=2.4, reserve_mj=0.5):
+    budget = usable_energy_mj(v, c_farad, v_min) - reserve_mj
+    affordable = [c for c in CONFIGS if c["energy_mj"] <= budget]
+    if not affordable:
+        return None                            # too low: sleep and keep harvesting
+    return max(affordable, key=lambda c: c["acc"])
+
+for v in (2.5, 2.9, 3.3, 3.6):
+    pick = choose_config(v)
+    label = pick["name"] if pick else "SLEEP"
+    print(f"V={v:>3} -> {label}")
+# V=2.5 -> SLEEP      (only ~0.1 mJ usable, below the reserve)
+# V=2.9 -> exit2_int8
+# V=3.3 -> full_int8
+# V=3.6 -> full_fp16
+</code></pre>
+<div class="code-caption">An energy-adaptive inference controller in a dozen lines: it converts the storage-capacitor voltage into usable millijoules, subtracts the checkpoint reserve, and returns the most accurate profiled configuration that fits, or <code>SLEEP</code> when even the cheapest exit is unaffordable. The four <code>CONFIGS</code> are points on the energy-quality frontier exposed by a single early-exit network.</div>
+
+<p>The loop above is deliberately stateless: it decides based only on the present voltage. A production controller adds hysteresis (do not thrash between configurations as the voltage jitters) and often a short-horizon forecast of incoming harvest, which is exactly the charging-aware scheduling problem developed next in <a class="cross-ref" href="section-63.4.html">Section 63.4</a>. Here the point is narrower and complete: given the energy you hold <em>now</em>, always run the best model that fits, and never start one you cannot finish.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A solar wildlife tag that classifies by the weather</h3>
+<p>Picture a coin-sized, batteryless bird-monitoring tag glued to a nest box, powered by a small photovoltaic cell and a 100 microfarad supercapacitor, running an on-device acoustic classifier that distinguishes the resident species' call from background and other birds. On a bright afternoon the capacitor sits near 3.6 volts; the tag runs the full fp16 network on every detected call and logs a high-confidence species label. As dusk falls and the cell's output drops, the controller slides down the frontier: first to full int8, then to an int8 early exit, trading a few points of accuracy for the ability to keep classifying at all. On an overcast morning it may spend most of its time in the cheapest int4 exit, and in deep shade it falls through to <code>SLEEP</code>, buffering raw audio features until enough charge accumulates for even the smallest head. The ecologists never touch it for a season, and the data stream degrades gracefully with the weather instead of going dark the first cloudy day. The same pattern drives batteryless soil-moisture nodes, structural-vibration tags, and RF-powered inventory sensors: the model's effort tracks the sky.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: co-designing the network with the energy signal</h3>
+<p>Early energy-adaptive systems bolted a controller onto an off-the-shelf network. Current research co-designs the two. Slimmable networks (Yu et al., 2019) and the once-for-all supernet (Cai et al., 2020, "Once-for-All: Train One Network and Specialize It for Efficient Deployment") train a single weight set that specializes into an entire family of subnetworks, so the whole energy-quality frontier ships in one artifact and is selected in microseconds. On the systems side, batteryless-inference work such as intermittent deep-learning runtimes (for example Gobieski et al.'s <em>SONIC</em> and the <em>Protean</em> and <em>iNAS</em> lines of intermittent neural-architecture search) folds the harvester model, the checkpoint reserve, and the accuracy target into the architecture search itself, so the exits and widths are placed where the <em>energy trace</em>, not just the FLOP count, says they pay off. The open frontier is learning the controller policy directly from the harvest distribution with reinforcement learning, and doing so with formal guarantees that an adaptively chosen inference can always reach a safe checkpoint before brown-out.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Early exits without hand-wiring the heads</h3>
+<p>Writing an early-exit network by hand, splicing classifier heads into intermediate layers, threading confidence thresholds, and managing the partial forward pass, is a few hundred lines of fiddly model surgery. High-level dynamic-inference toolkits collapse it. With a framework such as the anytime-inference utilities in modern edge stacks you wrap a backbone, declare the exit points, and get a model whose forward pass accepts a budget or a confidence threshold:</p>
+<pre><code class="language-python">from dynamic_inference import EarlyExitWrapper   # illustrative API
+
+model = EarlyExitWrapper(backbone, exit_layers=[2, 4, 6],
+                         calibrate=True)          # temperature-scale each head
+# Run only as deep as the energy budget allows:
+logits = model(x, max_exit=chosen_exit_index)
+</code></pre>
+<div class="code-caption">A wrapper attaches and calibrates the intermediate heads and exposes a single <code>max_exit</code> knob, turning roughly 300 lines of manual head-splicing and partial-forward bookkeeping into about 3. You still profile each exit's real energy on hardware; the library handles the graph, not the physics.</div>
+<p>The library owns the head placement, the calibration, and the partial forward pass. What it cannot own is the mapping from exit index to millijoules on <em>your</em> silicon, which is why the profiling table in the controller above stays your responsibility.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: size the reserve, then the frontier</h3>
+<p>You are given a batteryless gesture sensor with a 220 microfarad capacitor, a brown-out voltage \(V_{\min} = 2.2\) V, and an operating ceiling of 3.6 V. Checkpointing the model state and committing a result costs a measured 0.7 mJ. (a) Compute the total usable energy at 3.6 V and confirm the checkpoint reserve is a small fraction of it. (b) Using the four-configuration table in the code block, extend <code>choose_config</code> to add hysteresis so the device will not switch to a more expensive configuration unless the budget exceeds that configuration's cost by at least 20 percent, and explain why this reduces wasted, aborted inferences. (c) Sketch the accuracy-versus-voltage curve the resulting controller produces, and mark the voltage at which the device transitions from <code>SLEEP</code> to its first real inference.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does energy-adaptive inference need <em>calibrated</em> exit heads before it can use confidence to decide when to stop early?</li>
+<li>The usable-energy formula is quadratic in voltage. What does that imply about how conservative the controller should be when the capacitor is only slightly above brown-out?</li>
+<li>Give one reason a model cascade (separate small and large models) might be preferred over an early-exit network on a device, and one reason it might not.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-63.4.html">Section 63.4</a>, we stop treating the present energy as a fixed budget and start anticipating it. Charging-aware scheduling (the CARTOS approach) forecasts the harvester's near-future output and schedules <em>when</em> to sense, compute, and communicate so the device rides the incoming energy rather than merely reacting to the capacitor voltage. The adaptive controller of this section becomes one move inside a larger plan over time.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

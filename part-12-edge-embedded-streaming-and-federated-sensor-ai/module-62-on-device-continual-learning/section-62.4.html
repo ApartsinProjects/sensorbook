@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.4: Few-shot class-incremental learning (TinyOL). Building Sensory AI." name="description"/>
+<title>Section 62.4: Few-shot class-incremental learning (TinyOL) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Few-shot class-incremental learning (TinyOL)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Show me a new gesture five times and I will know it forever, without unlearning the ten you taught me last week. I did not retrain. I simply remembered a new direction in a space I already understood."</p>
+        <cite>A Frugal AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The user of an edge device does not deliver a labelled dataset; they deliver a handful of examples and an expectation. Teach the earbud my new tap gesture. Recognise this one bird call I just recorded twice. Learn that this particular vibration means <em>my</em> pump is failing. Each request adds a <em>class</em> the model never saw at build time, backed by only a few shots, and each must land without erasing the classes already deployed. Full retraining is impossible: the cloud is out of reach, the data is private, and a microcontroller cannot backpropagate through a whole network anyway. Few-shot class-incremental learning (FSCIL) is the discipline that makes this work, and its embedded incarnation, TinyOL (Tiny Online Learning), reduces it to a single trainable layer riding on a frozen feature extractor. This section explains why freezing the backbone is the entire trick, how a new class becomes a single prototype vector, and how you register one in kilobytes of RAM and microseconds of compute.</p>
+    </div>
+
+    <p>This section builds directly on the forgetting problem of <a class="cross-ref" href="section-62.2.html">Section 62.2</a> and the replay defences of <a class="cross-ref" href="section-62.3.html">Section 62.3</a>. Where replay fights forgetting by rehearsing old data, FSCIL sidesteps most of it by refusing to move the parameters that hold old knowledge. You should be comfortable with embeddings from a pretrained encoder (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) and with the microcontroller deployment constraints of <a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+
+    <h2>The FSCIL problem, stated precisely</h2>
+    <p>FSCIL runs in <em>sessions</em>. A generous <strong>base session</strong> trains the model on \(C_0\) classes with plenty of data, offline, where you have GPUs and full datasets. Then a stream of <strong>incremental sessions</strong> arrives on-device, each introducing new classes with only \(N\)-shot support, typically \(N \in \{1, 5, 10\}\), in the classic \(N\)-way \(K\)-shot framing. After session \(t\) the model must classify <em>every</em> class seen so far, base and incremental alike, and it is scored on a joint test set. Two forces pull against each other. <strong>Overfitting</strong>: five examples are far too few to fit thousands of network weights, so naive fine-tuning memorises the shots and generalises to nothing. <strong>Forgetting</strong>: any gradient step that improves the new classes drags the shared weights off the optimum for the old ones, the catastrophic interference of <a class="cross-ref" href="section-62.2.html">Section 62.2</a>. The insight that resolves both at once is to stop training the representation entirely.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Separate <em>learning to see</em> from <em>learning to name</em>. A frozen backbone, pretrained once on the base classes (or self-supervised on unlabelled sensor data), is a fixed map \(f_\phi: x \mapsto \mathbb{R}^d\) from raw window to embedding. Adding a class then costs zero backbone updates: you only decide where the new class lives in that fixed \(d\)-dimensional space. Because the shared features never move, old classes cannot be forgotten, and because you fit only a \(d\)-vector per class instead of the whole network, five shots are enough. FSCIL is hard when you try to keep learning the representation; it is almost easy once you accept a good-enough frozen one.</p>
+    </div>
+
+    <h2>Prototypes and weight imprinting: learning without backprop</h2>
+    <p>If the backbone is frozen, how do you register a class? The cheapest answer is a <strong>prototype</strong>, the mean embedding of its support shots. Given \(N\) examples \(x_1, \dots, x_N\) of a new class \(c\), compute</p>
+    \[ p_c = \frac{1}{N} \sum_{i=1}^{N} \frac{f_\phi(x_i)}{\lVert f_\phi(x_i) \rVert_2}. \]
+    <p>Prediction is nearest-prototype in the embedding space, the Nearest Class Mean rule, usually with a cosine metric: \(\hat{y} = \arg\max_c \langle \tilde{z}, \tilde{p}_c \rangle\) for the L2-normalised query embedding \(\tilde{z}\). This is exactly <strong>weight imprinting</strong> (Qi et al., 2018): the normalised prototype <em>is</em> the new column of a cosine classifier's weight matrix, imprinted in one pass with no gradient descent at all. Registering a class is therefore \(O(N)\) forward passes plus an average, it touches no existing prototype, and it guarantees zero forgetting by construction, because old columns are literally untouched. The <em>when</em>: use pure prototypes when you truly have a frozen encoder and only a few shots; add a light optional fine-tune of just the classifier head when you have tens of shots and want to sharpen boundaries between confusable classes.</p>
+
+    <p>TinyOL (Ren, Anicic, and Runkler, 2021) is this idea made concrete for a microcontroller. A quantised backbone runs inference as usual; a single trainable dense layer is appended and updated on-device from streaming labelled samples, one example at a time, in the flash-and-RAM budget of a Cortex-M class part. It is the same freeze-the-body, train-the-head split, specialised to the regime where you cannot store a batch, cannot hold gradients for the whole model, and must learn from the sensor feed as it arrives, the online contract of <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: an assembly-line acoustic inspector that learns new defects on site</h4>
+        <p>A factory deploys microphones over a press line with a model trained to flag three known fault sounds. In week two, operators hear a new rattling defect the model ignores. Sending audio to a vendor for retraining is barred by the plant's data policy and would take weeks. Instead the on-device tool runs a frozen audio encoder (self-supervised on plant noise, per <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) with a TinyOL head. An operator tags six examples of the rattle on the HMI; the device averages their embeddings into a new prototype and, from the next cycle, flags the rattle as a fourth class. The three original faults are detected exactly as before, because their prototypes never changed. Personalising the head to <em>this</em> line's acoustics is the theme of <a class="cross-ref" href="section-62.6.html">Section 62.6</a>.</p>
+    </div>
+
+    <h2>Registering a class in a dozen lines</h2>
+    <p>The listing below shows the whole mechanism with a frozen encoder stubbed out. Note what is absent: no optimiser, no loss, no epochs. Adding a class is an averaging operation, and inference is a single matrix-vector product against the stacked prototypes.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def embed(x):                       # frozen backbone f_phi, returns a d-vector
+    z = backbone_forward(x)         # e.g. a quantised CNN on the MCU
+    return z / (np.linalg.norm(z) + 1e-8)
+
+class ImprintHead:
+    def __init__(self):
+        self.protos, self.labels = [], []      # one row per registered class
+
+    def register(self, support_x, label):      # few-shot: N examples of one new class
+        p = np.mean([embed(x) for x in support_x], axis=0)
+        self.protos.append(p / (np.linalg.norm(p) + 1e-8))
+        self.labels.append(label)              # old prototypes untouched -> no forgetting
+
+    def predict(self, x):
+        z = embed(x)
+        scores = np.stack(self.protos) @ z     # cosine similarity to every class
+        return self.labels[int(np.argmax(scores))]
+
+head = ImprintHead()
+head.register(base_bird_calls,  "robin")       # base session class
+head.register(five_new_samples, "cuckoo")      # incremental: 5 shots, no retraining
+print(head.predict(new_recording))             # nearest-prototype decision</code></pre>
+    <div class="code-caption"><strong>Listing 62.4.1.</strong> Weight-imprinting FSCIL head. Each <code>register</code> call adds one class as a mean-embedding prototype without a single gradient step, so registering "cuckoo" from five shots cannot perturb the "robin" prototype. State grows by exactly \(d\) floats per class; inference is one dot product per class.</div>
+
+    <p>As Listing 62.4.1 makes plain, the entire incremental capability is the <code>register</code> method: five embeddings in, one prototype out, existing prototypes bit-for-bit unchanged. That structural guarantee, not a tuned hyperparameter, is why the method does not forget.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A production FSCIL setup wants normalised prototypes, a cosine head with a learnable temperature, an optional prototype-drift correction step, and calibrated confidences for the new classes. Written from scratch, with the encoder export, quantisation-aware head, and evaluation harness, that is several hundred lines. Avalanche (the ContinualAI library) provides the <code>ICaRL</code>, <code>NCM</code>, and cosine-classifier building blocks plus the session-based benchmark scaffolding in roughly ten lines of configuration, an order-of-magnitude reduction, and it handles the awkward parts: streaming the sessions in the right order, keeping the joint test set honest, and logging per-session accuracy. What it will not choose for you is the backbone and the shot budget, which decide whether the frozen features are good enough in the first place.</p>
+    </div>
+
+    <h2>Where it breaks, and how to shore it up</h2>
+    <p>The frozen-backbone bargain has a price. Its accuracy ceiling is set entirely by how well the base representation already separates classes it was never trained on; if a new fault sound lives in a region the encoder collapsed, no prototype can pull it apart. This is why the backbone should be pretrained to be <em>transferable</em>, not merely accurate on base classes, which is the case for contrastive and self-supervised encoders (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) and sensor foundation models. Three practical failure modes follow. <strong>Class imbalance in the score:</strong> base prototypes estimated from thousands of samples are crisp, while few-shot prototypes are noisy, so a cosine head can be biased; normalising embeddings and prototypes and tuning the softmax temperature largely fixes it. <strong>Prototype drift:</strong> if you ever do let the backbone move a little, old prototypes computed under the old features go stale, so either keep it frozen or recompute prototypes from a tiny stored exemplar set (the replay link to <a class="cross-ref" href="section-62.3.html">Section 62.3</a>). <strong>Overconfidence on novel input:</strong> a nearest-prototype rule always returns <em>some</em> class, so pair it with a distance threshold or a conformal wrapper (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) to say "none of the above" rather than confidently misfiling an unknown.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The strongest FSCIL results keep the backbone frozen but pre-shape it so incremental classes fit cleanly. FACT (Forward Compatible Training, Zhou et al., 2022) reserves "virtual" prototype slots during the base session so future classes have room; CEC (Continually Evolved Classifiers, Zhang et al., 2021) trains a graph attention module to adapt the classifier across sessions; TEEN and SAVC push prototype calibration and self-supervised augmentation further. On the embedded side, TinyOL (Ren et al., 2021) and its successors demonstrate on-device head training on Cortex-M hardware, and the live question is co-designing the quantised backbone (<a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>) with the incremental head so that 8-bit features stay separable enough for one-shot registration. The unsolved tension is the same one running through this chapter: a representation frozen for stability cannot itself adapt to genuinely out-of-distribution new classes, and knowing when to break the freeze and pay for a supervised update remains open.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using a pretrained image or audio encoder of your choice, build the <code>ImprintHead</code> from Listing 62.4.1. Run a 5-way base session, then three incremental sessions of 5-shot new classes each, and after every session record joint accuracy over <em>all</em> classes seen so far. Now add a competing baseline that instead fine-tunes the last two backbone layers on each new session's five shots. Plot both accuracy curves across sessions. Quantify how much the fine-tuning baseline's <em>base-class</em> accuracy drops per session (its forgetting), and explain why the imprinting head's base accuracy is flat. Finally, add a cosine-distance threshold so unknown inputs return "reject", and report how it changes precision on the known classes.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. FSCIL faces overfitting and forgetting at once. Explain how freezing the backbone and imprinting prototypes addresses both simultaneously, and name the single design choice responsible.</p>
+        <p class="quiz-question">2. Registering a new class in Listing 62.4.1 involves no optimiser or loss. What operation replaces gradient descent, and why does it guarantee that previously registered classes are unaffected?</p>
+        <p class="quiz-question">3. Give two situations in which a frozen-backbone, prototype-based FSCIL head will underperform, and state one concrete mitigation for each.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-62.5.html">Section 62.5</a>, we confront the resource that quietly bounds every technique in this chapter: energy. Imprinting a prototype is cheap, but even a frozen forward pass, a flash write, and a head update draw current from a battery that must last months. We put on-device training under an explicit energy budget, measure the joules a single <code>learn</code> step costs, and decide when adapting on-device is worth the charge it burns.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

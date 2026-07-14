@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 61.6: Firmware integration and testing on hardware. Building Sensory AI." name="description"/>
+<title>Section 61.6: Firmware integration and testing on hardware | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 61: TinyML and Microcontroller Sensor AI</a></div>
+<h1>Firmware integration and testing on hardware</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My accuracy on your laptop was a promise. My accuracy on the board is the only one you get to keep."</p>
+<cite>A Newly Deployed AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>A quantized network that scores 94 percent on your workstation is not yet a product; it is a file. Between that file and a shipping device sits the least glamorous and most failure-prone stretch of the whole TinyML pipeline: turning a model into firmware, linking it into a memory map that has no operating system to catch your mistakes, and proving on real silicon that it computes what the host said it would. This is where projects quietly die. The arena overflows a stack you forgot to size; the interrupt that feeds the sensor races the inference that reads the buffer; an operator falls back to a slower kernel and the 20 ms budget becomes 60. None of these appear in a Python notebook. They appear only when the code runs on the chip, at temperature, on battery, being fed by a real sensor that does not politely wait. This section is about crossing that gap deliberately: how to integrate the model into the build, how to verify bit-for-bit that on-device inference matches the host reference, and how to instrument and test the whole thing on hardware so that the numbers you measured survive contact with the physical world.</p>
+</div>
+
+<p>This section assumes the model and runtime of the earlier sections in <a class="cross-ref" href="index.html">this chapter</a>: a quantized network exported for a microcontroller runtime, and the memory and latency budgeting of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. It also depends on the timing and synchronization discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because on real hardware the model shares the processor with the interrupt-driven sampling that keeps it fed, and getting that handoff wrong corrupts the input long before the network is at fault. We are not retraining anything here. We are taking a frozen artifact and making it real, correct, and measurable on the device.</p>
+
+<h2>From artifact to firmware image</h2>
+<p>The first task is physical: the model's weights must end up in the microcontroller's flash, and its scratch memory must be carved out of a few tens of kilobytes of RAM that also hold your stack, your sensor buffers, and everything else. A microcontroller has no filesystem and no dynamic allocator you should trust, so the model is compiled <em>into</em> the image. The standard move is to serialize the flatbuffer to a C array (a <code>const unsigned char model[]</code> placed in read-only flash via the linker's <code>.rodata</code> section) and to give the runtime a single statically declared block of RAM, the <strong>tensor arena</strong>, from which it hands out every intermediate activation. There is no <code>malloc</code> at inference time; the interpreter is a bump allocator over that fixed arena. Two numbers therefore dominate integration. The <em>flash footprint</em> is the model array plus the runtime's operator kernels, and it must fit the part's program memory. The <em>arena size</em> is the peak simultaneous activation memory, and it must fit RAM alongside everything else. Both are known before you flash: the model array size is just the file, and the runtime reports the arena high-water mark after the first inference. Undersize the arena and allocation fails at init; oversize it and you have stolen RAM from the sensor ring buffer you will need in the next subsection. This is a static jigsaw, and it is solvable precisely because nothing about it is dynamic.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The stack is the memory you forgot to count</h3>
+<p>Engineers budget flash and arena carefully and then get bitten by the one region no tool prints for you by default: the call stack. Deeply nested kernels, large on-stack temporaries, and interrupt handlers that fire mid-inference all draw from the same stack, and a microcontroller has no guard page to trap an overflow. It simply overwrites whatever lives below the stack, often your model array's shadow copy or a DMA buffer, and the failure surfaces later as a garbage inference or a hard fault with no obvious cause. The defense is to measure, not assume: paint the stack region with a known byte pattern (0xAA) at boot, run the worst-case path including a sensor interrupt landing during the heaviest layer, then read back how far down the pattern was overwritten. That high-water mark, not a guess, is your stack budget. On a part with kilobytes to spare, an unmeasured stack is the single likeliest reason a model that "worked" corrupts itself in the field.</p>
+</div>
+
+<h2>Bit-exactness and the host-to-target gap</h2>
+<p>The most important test in embedded ML answers one question: does the network on the chip compute the same output as the network on the host? It is tempting to assume yes, because quantized integer arithmetic is deterministic. In practice the two can diverge, and the causes are specific. A runtime may resolve an operator to a different kernel on the target (a CMSIS-NN optimized path versus the reference kernel the host used), and although both are correct to the specification, rounding in intermediate accumulation can differ by a least-significant bit. A float preprocessing step (a mean subtraction, a window function from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>) may run in double precision on the host and single precision on the Cortex-M, shifting the quantized input by one level. An operator you assumed was supported may silently fall back or, worse, not exist in the target build. The discipline that catches all of this is <strong>golden-vector testing</strong>: fix a set of representative inputs, run them through the trusted host interpreter, record the exact output tensors, embed those references in the firmware, and have the device assert on first boot that its own outputs match within a tiny tolerance. The harness below generates such vectors from a LiteRT model so the same numbers can be compiled into the on-device self-test.</p>
+
+<pre><code class="language-python">import numpy as np, tensorflow as tf
+
+# Load the exact .tflite that will be flashed, and probe its I/O quantization.
+interp = tf.lite.Interpreter(model_path="motion_int8.tflite")
+interp.allocate_tensors()
+inp, out = interp.get_input_details()[0], interp.get_output_details()[0]
+in_scale, in_zp = inp["quantization"]           # int8 <-> real mapping
+
+rng = np.random.default_rng(0)                   # fixed seed: reproducible vectors
+vectors = []
+for _ in range(16):                              # a handful of golden cases
+    x = rng.integers(-128, 128, size=inp["shape"], dtype=np.int8)
+    interp.set_tensor(inp["index"], x)
+    interp.invoke()
+    y = interp.get_tensor(out["index"]).astype(np.int8)
+    vectors.append((x.flatten(), y.flatten()))
+
+# Emit a C header the firmware compiles into its power-on self-test.
+with open("golden_vectors.h", "w") as f:
+    f.write(f"// scale={in_scale:.8f} zero_point={in_zp}\n")
+    f.write(f"#define N_GOLDEN {len(vectors)}\n")
+    for i, (x, y) in enumerate(vectors):
+        xs = ",".join(str(int(v)) for v in x)
+        ys = ",".join(str(int(v)) for v in y)
+        f.write(f"static const int8_t gx_{i}[] = {{{xs}}};\n")
+        f.write(f"static const int8_t gy_{i}[] = {{{ys}}};\n")
+print("wrote golden_vectors.h from the flashed model")
+</code></pre>
+<div class="code-caption">Generating golden input and output vectors from the exact quantized model that will be flashed. The device recomputes each <code>gx_i</code> through its own interpreter at boot and compares against <code>gy_i</code>; any mismatch beyond one quantization level flags an operator-kernel or preprocessing divergence before the model is ever trusted with a real sensor reading. Seeding the generator keeps the vectors reproducible across builds so a regression is unambiguous.</div>
+
+<p>Running that self-test on the target is what converts "the host says 94 percent" into "this specific board computes the reference outputs." When it fails, the failure is a gift: it localizes the divergence to preprocessing, to a specific operator, or to input quantization, long before you waste days chasing a field accuracy drop that was really a one-bit rounding difference multiplied through a deep network. Leakage-safe evaluation from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> applies here too: the golden inputs must be held out from any data used to pick the operating threshold, or the self-test merely confirms you memorized your own calibration set.</p>
+
+<h2>Instrumenting the target: latency, memory, and power</h2>
+<p>Correctness is necessary but not sufficient; the model must also fit its real-time and energy budget on the actual part, and those numbers cannot be extrapolated from a host. Three measurements matter and each has a right way to take it. <em>Latency</em> is read from the core's own cycle counter (the DWT <code>CYCCNT</code> register on Cortex-M), sampled immediately before and after <code>invoke()</code>, and converted to time by the clock frequency; wall-clock over a debugger's <code>printf</code> is worthless because the transport dominates. You want worst-case latency, not average, because a real-time deadline is missed by the slow tail, so profile with caches cold and with a sensor interrupt contending. <em>Memory</em> is the arena high-water mark the runtime reports plus the stack high-water mark you painted for earlier, together against the RAM map. <em>Power</em> is measured on the bench, not modeled: a current probe or a sense resistor on the supply, capturing the sleep floor, the wake transient, and the active draw across a full inference, integrated to energy per inference. That energy per inference, multiplied by the inference rate, is what actually sets battery life, and it routinely surprises people because the wake transient and the memory traffic, not the multiply-accumulates, dominate on a small network.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wearable fall detector that passed on the bench and failed on the wrist</h3>
+<p>A team building an inertial fall detector, a wearable in the family of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>, verified their int8 model with golden vectors (it matched the host to the bit) and measured 12 ms inference against a 50 ms budget. On the wrist it missed falls. The model was innocent. The accelerometer was sampled by a DMA-fed ring buffer, and the inference task read a window from that buffer without disabling the transfer, so on some invocations the DMA overwrote the oldest samples mid-read and the network saw a window spliced from two different moments. The bug never appeared on the bench because the bench fed clean, statically prepared windows through the same golden-vector path that had passed. It appeared only with a live sensor and real interrupt timing. The fix was a double-buffer handoff: the DMA fills buffer B while inference reads the completed buffer A, and the two swap only at a window boundary under a brief critical section. The lesson generalizes: on hardware the model is the easy part, and the integration around it (interrupts, DMA, buffer ownership) is where the real defects live. Testing the model in isolation cannot find them; only testing the model fed by the real sensor path can.</p>
+</div>
+
+<h2>Hardware-in-the-loop and on-device regression testing</h2>
+<p>The wearable story motivates the last practice: automated testing that exercises the firmware on real or faithfully emulated hardware, not just the model on a host. A <strong>hardware-in-the-loop</strong> (HIL) rig connects the target board to a test host that plays recorded or synthetic sensor streams into the device (over the real bus, or by driving the sensor's stimulus) and reads back the device's decisions, so every commit can be checked against known-answer sensor traces on the actual silicon. This catches the timing and buffer-ownership class of bug that unit tests on the model can never see. Where a physical board in the loop is too slow or too scarce for continuous integration, full-system emulators run the identical firmware binary, peripherals and all, so the golden-vector self-test and even interrupt-timing scenarios execute in a cloud CI job with no board attached. The goal is the same discipline that fleet operations in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a> demand: no firmware ships unless the exact binary passed its golden vectors, its latency and memory budgets, and a replay of representative sensor traces, on hardware or a faithful model of it. That gate is what lets you update a model across a fleet (the subject of the next section) without gambling that the new artifact still fits, still computes correctly, and still meets its deadline on every deployed part.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Emulate the whole board with Renode instead of babysitting a bench</h3>
+<p>Hand-building an HIL rig (a host program that sequences a logic analyzer, a signal generator, and a serial capture, then diffs results) is hundreds of lines of glue per board and needs the physical hardware present for every test run. Antmicro's <strong>Renode</strong> emulates the full microcontroller, its peripherals, and attached sensors, and runs the unmodified firmware ELF. A short platform script plus a test scenario boots the image, feeds a recorded sensor trace into the emulated peripheral, and asserts on the device's UART output:</p>
+<pre><code class="language-python"># renci test: boot the real firmware image in a fully emulated board
+mach create "node"
+machine LoadPlatformDescription @stm32_sensor.repl
+sysbus LoadELF @build/firmware.elf
+# replay a captured accelerometer window into the emulated I2C sensor
+i2cSensor FeedSamplesFromFile @traces/fall_event.csv
+start
+# assert the device emitted the expected decision on its UART
+sysbus.uart WaitForLine "DECISION: FALL"
+</code></pre>
+<div class="code-caption">A Renode test scenario boots the exact firmware ELF in an emulated board and replays a recorded sensor trace through an emulated peripheral, asserting on the device's own output. This replaces a per-board physical HIL rig (a bench of instruments plus hundreds of lines of orchestration) with a scripted job that runs in ordinary CI, so golden-vector and timing regressions are caught on every commit without a board attached.</div>
+<p>The emulator handles the memory map, interrupt controller, and peripheral timing that you would otherwise wire by hand; you supply the platform description and the sensor traces. Physical boards still validate the last mile (real sleep currents, analog front-ends, temperature), but the bulk of regression testing moves into CI where it is fast and repeatable.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Toward continuous, deterministic on-device CI</h3>
+<p>The current best practice for embedded ML testing is converging on running the identical firmware binary through full-system emulation (Renode, and QEMU for cores it models) in continuous integration, backed by physical HIL farms for final validation, and reporting cycle-accurate latency and arena footprint as first-class build artifacts. The frontier is pushing three ways at once. Cycle-accurate co-simulation aims to make emulated latency trustworthy enough to gate on, so a real-time deadline regression fails CI before any board is touched. On-device fuzzing feeds adversarial and boundary sensor traces to surface the interrupt-race and buffer-ownership bugs that fixed golden vectors miss by construction, connecting to the robustness and functional-safety concerns of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>. And standardized, reproducible on-hardware benchmarking, the methodology formalized by MLPerf Tiny and taken up in the next section, is turning "it was fast on my board" into a comparable, audited measurement. The open problem is closing the emulation-to-silicon gap for power and analog behavior, which no digital emulator yet reproduces, so the bench current probe remains irreplaceable for the numbers that decide battery life.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: build a power-on self-test and a latency gate</h3>
+<p>Take a quantized sensor classifier you have exported for a microcontroller runtime (or a faithful emulation of one). First, use the golden-vector harness above to generate sixteen input/output pairs from the exact model file, compile them into a firmware self-test that runs at boot, and deliberately break the match: change the input quantization scale by one level in the host preprocessing and confirm the on-device self-test catches the divergence. Second, wrap <code>invoke()</code> in cycle-counter reads and record worst-case latency over a hundred runs with a periodic timer interrupt firing during inference; report how much the contended tail exceeds the average and whether it still meets a 30 ms budget. Finally, paint the stack at boot and report the high-water mark after the worst-case path, and state how much RAM remains for a sensor ring buffer once the arena and stack are accounted for.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why can a quantized model that is bit-exact on the host still produce different outputs on the target, and what specific divergences does golden-vector testing localize?</li>
+<li>Why is a stack overflow on a microcontroller so much more dangerous than on a host, and how do you measure the true stack high-water mark rather than guess it?</li>
+<li>The bench measured 12 ms latency and bit-exact outputs, yet the fall detector missed falls on the wrist. What class of bug caused this, and why could no test of the model in isolation have found it?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-61.7.html">Section 61.7</a>, we take the tested firmware into the field: how to update a model on deployed devices safely, roll back when an update misbehaves, and measure all of this with the standardized MLPerf Tiny benchmark so that "it works on my board" becomes a comparable, audited claim across the whole fleet.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

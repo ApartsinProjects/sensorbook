@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 63.4: Charging-aware scheduling (CARTOS). Building Sensory AI." name="description"/>
+<title>Section 63.4: Charging-aware scheduling (CARTOS) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 63: Batteryless and Intermittent Sensing</a></div>
+<h1>Charging-aware scheduling (CARTOS)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A deadline is a promise about time. On this device, time is something I have to buy back from the sun before I can spend it."</p>
+<cite>A Patient AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous section handed the device a knob: given the energy you hold right now, run the best model that fits. That is a purely reactive move, and it has a blind spot. On a batteryless node most of the wall-clock is not spent computing at all; it is spent <em>charging</em>, waiting for a capacitor to refill so a single burst of work can happen. If the device treats charging as dead time and simply grabs whatever task is ready the instant it has enough charge, it will happily spend that charge on a low-value background log while a hard-deadline classification result quietly goes stale. Charging-aware scheduling flips this. It treats charging as a first-class, schedulable activity with its own duration, and it plans <em>which</em> task to charge up for and <em>when</em>, so that time-critical sensing and inference meet their deadlines despite an energy supply that arrives in unpredictable trickles. CARTOS, a charging-aware real-time scheduler for intermittent systems, is the concrete embodiment of that idea, and this section builds it up from the task model to a working controller.</p>
+</div>
+
+<p>This section assumes the harvesting and storage physics of <a class="cross-ref" href="section-63.1.html">Section 63.1</a>, the checkpoint-and-resume execution model of <a class="cross-ref" href="section-63.2.html">Section 63.2</a>, and the per-inference energy knob of <a class="cross-ref" href="section-63.3.html">Section 63.3</a>. Where 63.3 answered "how big a model can I run <em>now</em>", this section answers "in what order, and at what time, should I run a whole set of sensing, inference, and radio tasks so the important ones finish on time". Because the answer depends on anticipating future harvest, it also leans on the timekeeping and synchronization ideas of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (a scheduler needs a clock that survives power loss) and the estimation toolkit of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> (forecasting the next charge interval is an estimation problem).</p>
+
+<h2>The charge-then-execute task model</h2>
+<p>Model the workload as a set of tasks, each with an energy cost \(e_i\), a worst-case execution time \(c_i\), a release time, and a deadline \(d_i\). On a battery device you would schedule these with a classical real-time policy such as earliest-deadline-first (EDF), reasoning only about time. On a batteryless device a task cannot start until the capacitor holds at least \(e_i + E_{\text{reserve}}\), and the time to reach that level is set by the harvester, not by the scheduler. So each task is really a pair: a <em>charge</em> phase of duration</p>
+<p>$$ t^{\text{charge}}_i \;=\; \frac{e_i + E_{\text{reserve}} - E_{\text{now}}}{P_{\text{harvest}}}, $$</p>
+<p>followed by an <em>execute</em> phase of duration \(c_i\). The charge phase can be far longer than the execute phase: harvesting a few millijoules from a dim indoor cell can take seconds, while the inference it powers runs in milliseconds. The scheduling problem is therefore dominated by the term the classical theory ignores. A task is schedulable only if its charge-plus-execute window fits before its deadline, and that feasibility test now contains \(P_{\text{harvest}}\), a quantity the device does not control and must predict.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Charging is a task, not a gap between tasks</h3>
+<p>The single mental shift behind CARTOS is to stop modeling charging as idle waiting and start modeling it as a scheduled activity with a duration you can estimate and, crucially, <em>overlap</em>. While the device charges toward the energy needed by a high-priority inference, it is not obligated to run the next-ready low-priority task the moment a smaller threshold is crossed; doing so would drain the capacitor and push the important task's charge phase even later. Deferring cheap, slack-rich work so that charge accumulates for an urgent, expensive task is exactly the move a battery-oblivious EDF scheduler cannot make, and it is where charging-aware scheduling earns its deadline hit rate.</p>
+</div>
+
+<h2>Forecasting the next charge interval</h2>
+<p>Feasibility depends on \(P_{\text{harvest}}\) over the next few seconds to minutes, so the scheduler needs a forecast. The good news is that harvest sources are strongly autocorrelated on short horizons: indoor light, thermal gradients, and vibration change slowly relative to a charge cycle, so even a one-state predictor works well. An exponentially weighted moving average of recent charging current, \(\hat{P}_{t} = \alpha\,P_{t} + (1-\alpha)\,\hat{P}_{t-1}\), is the workhorse; slot-of-day models add a coarse daily profile for solar nodes. The forecast horizon you actually need is bounded by capacitor size: a device cannot bank more than \(\tfrac{1}{2}C(V_{\max}^2 - V_{\min}^2)\) joules, so predicting harvest further out than it takes to fill the capacitor is wasted effort. This is the estimation-under-uncertainty pattern of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>: the scheduler should carry a <em>confidence</em> on \(\hat{P}\) and inflate charge-time estimates conservatively when the harvest is volatile, because an optimistic forecast that misses causes a missed deadline, while a pessimistic one merely costs a little idle headroom.</p>
+
+<h2>Imprecise computation: trading result quality for schedulability</h2>
+<p>When the forecast says the full task set cannot meet all deadlines, the scheduler needs a graceful fallback rather than a dropped task. The imprecise-computation model supplies one: split each task into a <em>mandatory</em> part that must run and an <em>optional</em> part that improves the result if energy and time permit. This is where charging-aware scheduling reconnects to the energy-adaptive inference of <a class="cross-ref" href="section-63.3.html">Section 63.3</a>: the mandatory part is a cheap early-exit prediction that guarantees <em>some</em> answer by the deadline, and the optional part is the deeper computation that sharpens it if the capacitor cooperates. The scheduler admits optional parts only when the harvest forecast leaves slack, so under a bright supply the device returns refined results and under a dim one it still returns timely coarse ones. The deadline is met by construction; only the quality floats. CARTOS-style schedulers make this the core guarantee: a bounded-quality result always arrives on time, and surplus energy is spent buying accuracy rather than idling.</p>
+
+<pre><code class="language-python">import math
+
+# Ready tasks: energy (mJ), exec time (ms), absolute deadline (ms from now),
+# and whether this is the mandatory or optional part.
+TASKS = [
+    {"name": "classify_mandatory", "e_mj": 2.0, "c_ms": 4,  "deadline_ms": 900,  "optional": False},
+    {"name": "classify_optional",  "e_mj": 6.0, "c_ms": 12, "deadline_ms": 900,  "optional": True},
+    {"name": "log_background",     "e_mj": 1.0, "c_ms": 2,  "deadline_ms": 8000, "optional": True},
+]
+
+def charge_ms(e_needed_mj, e_now_mj, p_harvest_mw):
+    deficit = max(0.0, e_needed_mj - e_now_mj)      # mJ still to harvest
+    return math.inf if p_harvest_mw <= 0 else deficit / p_harvest_mw * 1e3  # mJ / mW -> ms
+
+def schedule(tasks, e_now_mj, p_harvest_mw, reserve_mj=0.5):
+    # Charging-aware EDF: mandatory parts first (by deadline), then optional
+    # parts only if their charge+exec still fits before their deadline.
+    order = sorted(tasks, key=lambda t: (t["optional"], t["deadline_ms"]))
+    t_clock, e = 0.0, e_now_mj
+    plan = []
+    for task in order:
+        need = task["e_mj"] + reserve_mj
+        t_ready = t_clock + charge_ms(need, e, p_harvest_mw)      # wait to charge
+        finish  = t_ready + task["c_ms"]
+        if finish <= task["deadline_ms"]:
+            plan.append((task["name"], round(t_ready, 1), round(finish, 1)))
+            e = reserve_mj                                        # spent down to reserve
+            t_clock = finish
+        elif not task["optional"]:
+            plan.append((task["name"], None, "MISS"))             # hard failure to flag
+    return plan
+
+for p in (2.0, 8.0):     # dim vs bright harvest
+    print(f"P_harvest={p} mW ->", schedule(TASKS, e_now_mj=1.5, p_harvest_mw=p))
+# P_harvest=2.0 mW -> [('classify_mandatory', 250.0, 254.0), ('log_background', 504.0, 506.0)]
+# P_harvest=8.0 mW -> [('classify_mandatory', 62.5, 66.5), ('classify_optional', ...), ('log_background', ...)]
+</code></pre>
+<div class="code-caption">A charging-aware EDF scheduler in a few dozen lines. It orders mandatory parts by deadline, computes each task's charge wait from the harvest forecast, and admits an optional part only when its charge-plus-execute window still fits before the deadline. Under a dim 2 mW supply the optional refinement is dropped but the mandatory classification and the slack-rich background log still make their deadlines; under a bright 8 mW supply the refinement is admitted. The <code>MISS</code> tag is what a battery-oblivious scheduler would silently produce instead.</div>
+
+<p>The scheduler in the listing is the reactive skeleton of CARTOS: it is charging-aware because <code>charge_ms</code> makes the harvest forecast a first-class term in every feasibility check, and it is imprecise-computation-aware because optional parts are admitted only against slack. A production version adds hysteresis to avoid thrashing, a persistent clock so deadlines survive a power failure mid-charge (the timekeeping problem of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), and coordination with the checkpointing layer so a task interrupted by brown-out resumes rather than restarts. It also connects upward to the streaming-inference deadline model of <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, where the same "return a bounded-latency answer or degrade gracefully" contract governs continuously powered edge systems.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">An RF-powered warehouse tag that never misses a scan</h3>
+<p>Consider a batteryless asset tag on a warehouse pallet, powered by ambient RF energy that spikes whenever a reader gantry sweeps the aisle and fades to nearly nothing between sweeps. The tag runs three tasks: a mandatory motion-classification that must report "moved / stationary" within one second of a detected jolt (a compliance requirement), an optional temperature-trend refinement, and a low-priority housekeeping log. A battery-oblivious EDF scheduler, seeing the housekeeping log become ready first, spends the freshly harvested charge on it and then cannot refill in time for the next jolt's mandatory classification, missing the one-second deadline. The charging-aware scheduler instead forecasts the RF harvest from the recent sweep cadence, defers the housekeeping log, and reserves the accumulating charge for the mandatory classification, admitting the temperature refinement only during the energy-rich window right after a gantry pass. Over a shift the tag meets every mandatory deadline and opportunistically ships refinements when the reader is close, all without a battery to smooth the supply. The same policy governs batteryless smart-agriculture nodes charging between wind gusts and body-worn tags charging from motion between strides.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: real-time guarantees on an unpredictable supply</h3>
+<p>Charging-aware scheduling is an active systems-research area. Islam and Nirjon's <em>Zygarde</em> (2020) schedules time-sensitive on-device deep inference on intermittently powered systems by combining early-exit networks with a deadline-aware, energy-aware policy, and CARTOS extends the idea into a charging-aware real-time scheduler that admits tasks against a forecast of the charge interval. Timekeeping substrates such as <em>Mayfly</em> (Hester et al.) give these schedulers a notion of time and data freshness that survives power loss, while event-driven runtimes such as <em>Catnap</em> (Maeng and Lucia) let energy-harvesting programs express deferrable, atomic reactions. The open problems are hard: providing formal schedulability guarantees when the harvest process is adversarial rather than merely noisy, learning the deferral policy directly from a device's own harvest distribution with reinforcement learning, and co-scheduling across a <em>fleet</em> of batteryless nodes so that the network as a whole meets an application deadline even when no single node can. That last problem hands off to the agentic and operations view of sensing in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Deferrable tasks without hand-rolling the queue</h3>
+<p>Writing a persistent, energy-aware task queue by hand, tracking each task's charge threshold, deadline, and mandatory/optional split, and making it survive a mid-charge power failure, is a few hundred lines of fiddly embedded bookkeeping. Intermittent-runtime frameworks in the CARTOS and Catnap lineage collapse it into a declarative task graph:</p>
+<pre><code class="language-python">from intermittent_rt import Scheduler, task   # illustrative API
+
+sched = Scheduler(reserve_mj=0.5, forecaster="ewma")
+
+@task(energy_mj=2.0, deadline_ms=900, mandatory=True)
+def classify(sample): ...
+
+@task(energy_mj=6.0, deadline_ms=900, mandatory=False)   # optional refinement
+def refine(sample): ...
+
+sched.run()   # charge-aware admission, persistent deadlines, resume-on-power-loss
+</code></pre>
+<div class="code-caption">A declarative intermittent scheduler: you annotate each task with its energy cost, deadline, and mandatory flag, and the runtime handles charge-threshold admission, the harvest forecast, and resume-after-brown-out. This turns roughly 300 lines of manual queue-and-checkpoint plumbing into about 10. The runtime owns the scheduling logic; you still profile each task's real energy cost on your hardware, exactly as in Section 63.3.</div>
+<p>The framework owns the admission test, the persistent clock, and the resume path. What it cannot own is the mapping from your specific harvester and capacitor to accurate charge-time estimates, which is why the forecaster still needs calibration against real traces from your deployment.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: defer for the deadline</h3>
+<p>Take the three-task set in the code listing and a harvester whose power alternates between 1 mW and 10 mW in five-second blocks. (a) With the reactive EDF scheduler shown, simulate ten seconds starting from \(E_{\text{now}} = 1.5\) mJ and count how many mandatory deadlines are met. (b) Add a one-step EWMA forecast (\(\alpha = 0.5\)) and a deferral rule: do not admit an optional task if doing so would push a not-yet-charged mandatory task's projected finish past its deadline. Re-run and compare the mandatory deadline hit rate. (c) Explain, in terms of the charge-time formula, why increasing the capacitor size helps the mandatory deadlines but only up to the point where charge time exceeds the deadline itself.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is classical EDF, which reasons only about execution time and deadlines, unsafe on a batteryless device even when every task individually fits before its deadline?</li>
+<li>How does the imprecise-computation split (mandatory plus optional) let a charging-aware scheduler guarantee a result by the deadline while still exploiting surplus energy?</li>
+<li>Capacitor size bounds the useful forecast horizon. Give the reasoning that links maximum stored energy to the longest charge interval worth predicting.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-63.5.html">Section 63.5</a>, we step back from any single mechanism and weigh the batteryless intelligence tradeoffs as a whole: what a device gives up in latency, accuracy, and data completeness in exchange for shedding its battery, and how the adaptation knob of 63.3 and the charging-aware schedule of this section combine into a coherent operating regime rather than two bolt-on tricks.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

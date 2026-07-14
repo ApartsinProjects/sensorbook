@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 64.2: Federated learning (FedAvg family) and non-IID sensors. Building Sensory AI." name="description"/>
+<title>Section 64.2: Federated learning (FedAvg family) and non-IID sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 64: Federated and Privacy-Preserving Sensor AI</a></div>
+<h1>Federated learning (FedAvg family) and non-IID sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You told me to learn from a thousand people without meeting any of them. So I asked each to teach me privately, then quietly averaged what they said. The trouble was, no two of them lived in the same world."</p>
+        <cite>A Diplomatic AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can train a neural model with minibatch SGD and read a training curve (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>), and that you accept the premise of the previous section, <a class="cross-ref" href="section-64.1.html">Section 64.1</a>: raw sensor data may not leave the device. It leans on the idea of distribution shift between data sources, treated in general in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, and on leakage-safe, per-subject evaluation splits (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The mathematics is elementary: weighted averages and the SGD update rule.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Section 64.1 established the constraint: the data stays on the device. This section supplies the mechanism that lets you still train one shared model from it. Federated learning ships the model to the data instead of the data to the model. Each device improves the model locally on its own sensor stream, and a server averages those improvements without ever seeing a raw sample. The canonical recipe, FedAvg, is deceptively simple, and it works beautifully when every client sees the same kind of data. Sensors break that assumption harder than almost any other data source: your gait is not mine, a phone in a pocket reads differently from one on an armband, and a warehouse robot and a home robot inhabit different physical worlds. That statistical heterogeneity, called non-IID data, is the central difficulty of federated sensing, and the FedAvg <em>family</em> exists to tame it. When you finish, you will be able to run a federated training round in your head, diagnose why it stalls on skewed sensor data, and name the fix.</p>
+    </div>
+
+    <h2>FedAvg: ship the model, average the updates</h2>
+    <p>The global objective is an average of per-client losses. With \(K\) clients, client \(k\) holding \(n_k\) local samples and \(n = \sum_k n_k\), federated training minimizes</p>
+    \[ F(w) = \sum_{k=1}^{K} \frac{n_k}{n}\, F_k(w), \qquad F_k(w) = \frac{1}{n_k}\sum_{i \in \mathcal{D}_k} \ell(w; x_i, y_i). \]
+    <p>The <em>what</em> of FedAvg (McMahan et al., AISTATS 2017) is a communication-round loop. In each round the server broadcasts the current weights \(w^t\) to a sampled subset of clients. Each selected client runs \(E\) local epochs of SGD on its own data, producing \(w_k^{t+1}\). The clients send back only those updated weights (or the delta), and the server forms the next global model as a size-weighted average,</p>
+    \[ w^{t+1} = \sum_{k \in S_t} \frac{n_k}{\sum_{j\in S_t} n_j}\, w_k^{t+1}. \]
+    <p>The <em>why</em> is communication. Naive distributed SGD would exchange a gradient after every minibatch, which over a cellular link is prohibitive (recall the radio-energy argument of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>). By letting each client take many local steps (\(E\) epochs) before synchronizing, FedAvg trades computation, which is cheap and local, for communication, which is expensive and shared. The <em>when</em>: use it whenever the data is partitioned across many devices that cannot pool it, and a single global model is still the goal. That is exactly the shape of a wearable fleet, a network of factory sensors, or a set of phones.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The number of local epochs \(E\) is the master dial of federated learning. Large \(E\) means fewer communication rounds and cheaper training, which is what you want. But each extra local step lets a client drift further toward <em>its own</em> optimum before the average pulls it back. When clients disagree about where the optimum is, averaging models that each ran far into their own valley can land the global model in a worse place than any of them started. Communication cost and statistical heterogeneity therefore pull \(E\) in opposite directions, and the whole FedAvg family is a search for a setting of \(E\) that is both cheap and stable.</p>
+    </div>
+
+    <h2>Why sensor fleets are aggressively non-IID</h2>
+    <p>Averaging assumes the things being averaged point roughly the same way. That holds when every client draws from the same distribution (independent and identically distributed, IID). Sensor fleets violate it along several axes at once, and understanding which axis you face determines the fix.</p>
+    <p><strong>Feature skew</strong> is the most physical. The same activity produces different signals depending on sensor placement, body, and hardware: a phone in a trouser pocket, a smartwatch, and a chest strap record walking as three distinct accelerometer signatures (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). <strong>Label skew</strong> is quantity imbalance: an office worker's wearable logs almost no swimming, an athlete's logs little sitting, so each client's label histogram \(P_k(y)\) is wildly different. <strong>Concept drift across clients</strong> means \(P_k(y \mid x)\) itself differs, for instance the same heart-rate pattern signaling exertion in one user and arrhythmia risk in another. On top of statistical heterogeneity sits <strong>systems heterogeneity</strong>: devices differ in speed, battery, and availability, so clients complete different numbers of local steps and some drop out mid-round.</p>
+    <p>The consequence has a name: <em>client drift</em>. When \(P_k\) differ, each client's local optimum \(w_k^\star\) sits somewhere different, and the FedAvg average of far-run local models is biased away from the true global optimum \(w^\star\). Empirically this shows up as an accuracy curve that climbs, then oscillates or plateaus well below what centralized training on the pooled data would reach. Non-IID data does not merely slow federated learning; past a point it caps the achievable accuracy.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: keyboard-free fall detection across a care-home fleet</h4>
+        <p>A vendor deploys wrist wearables to a thousand elderly residents to detect falls from IMU data. Falls are rare and personal: a frail resident who shuffles produces motion statistics nothing like an active one, and a genuine fall looks different from a controlled sit-down that a brisk resident performs a hundred times a day. Under plain FedAvg with a generous \(E\), the global model swung toward whichever residents happened to be sampled each round, and its false-alarm rate lurched between deployments. The team diagnosed classic client drift from label and feature skew. They cut \(E\), added a proximal term to keep each local model near the global one (FedProx, below), and evaluated with a strictly subject-disjoint split so no resident appeared in both training and test (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The oscillation flattened, and the shared model finally beat the per-device models it had been losing to.</p>
+    </div>
+
+    <h2>The FedAvg family: correcting client drift</h2>
+    <p>The family keeps FedAvg's ship-model-average-updates skeleton and adds a term that fights drift. <strong>FedProx</strong> (Li et al., MLSys 2020) is the gentlest: each client minimizes its local loss plus a proximal penalty \(\tfrac{\mu}{2}\lVert w - w^t \rVert^2\) that anchors the local model to the broadcast global weights, so no client wanders too far in \(E\) epochs. It also tolerates stragglers by accepting partial local work. <strong>SCAFFOLD</strong> (Karimireddy et al., ICML 2020) is more surgical: it maintains control variates, per-client and global correction vectors that estimate the drift direction and subtract it from each local update, in effect variance-reducing the client updates. It converges in far fewer rounds on heterogeneous data at the cost of communicating and storing an extra vector the size of the model. <strong>FedAvgM</strong> (Hsu et al., 2019) simply applies momentum on the server when aggregating updates, which smooths the noisy round-to-round direction that skew induces. The <em>how you choose</em>: start with FedProx for a cheap, robust default; reach for SCAFFOLD when communication rounds are the binding cost and you can afford the extra state; add server momentum when the global curve is jittery.</p>
+
+    <p>The listing below simulates FedAvg versus FedProx on a deliberately skewed two-client problem so you can see drift and its correction without any networking. It is referenced in the discussion that follows.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+# Two clients, opposite feature skew: same task, shifted inputs (non-IID).
+def make_client(shift, n=400):
+    X = rng.normal(shift, 1.0, size=(n, 2))
+    y = (X[:, 0] + X[:, 1] > 2 * shift).astype(float)   # local decision boundary
+    return X, y
+
+clients = [make_client(-1.5), make_client(+1.5)]
+
+def local_train(w, X, y, w_glob, mu, epochs=5, lr=0.1):
+    for _ in range(epochs):
+        z = X @ w
+        p = 1 / (1 + np.exp(-z))
+        grad = X.T @ (p - y) / len(y) + mu * (w - w_glob)  # mu>0 => FedProx
+        w = w - lr * grad
+    return w
+
+def federated(mu, rounds=30):
+    w = np.zeros(2)
+    for _ in range(rounds):
+        updates = [local_train(w.copy(), X, y, w, mu) for X, y in clients]
+        w = np.mean(updates, axis=0)          # size-weighted avg (equal here)
+    return w
+
+def acc(w):
+    correct = sum(((X @ w > 0).astype(float) == y).mean() for X, y in clients)
+    return correct / len(clients)
+
+print(f"FedAvg  (mu=0.0): global acc = {acc(federated(0.0)):.3f}")
+print(f"FedProx (mu=0.5): global acc = {acc(federated(0.5)):.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 64.2.1.</strong> A 40-line federated simulation with two feature-skewed clients. Setting the proximal weight \(\mu = 0\) recovers plain FedAvg, whose averaged model is pulled apart by the opposing local optima; \(\mu = 0.5\) is FedProx, whose anchor term keeps each local model near the global one and recovers a boundary that serves both clients. Running it shows FedProx reaching a higher global accuracy on this deliberately non-IID split.</div>
+
+    <p>As Listing 64.2.1 makes concrete, the only structural change from FedAvg to FedProx is one extra term in the gradient. That is the family's design signature: the communication loop is sacred; the correction lives inside the local objective or the aggregation step. Note also that this simulation, like all federated evaluation, must be read against a per-client, subject-disjoint test set, or the reported accuracy is an illusion, a theme <a class="cross-ref" href="section-64.7.html">Section 64.7</a> makes rigorous.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not build the client-sampling, serialization, and aggregation machinery by hand. Flower (<code>flwr</code>) provides FedAvg, FedProx, and FedAvgM as drop-in strategies; you supply a <code>NumPyClient</code> that trains locally, and the framework runs the rounds across processes or real devices.</p>
+        <pre class="language-python"><code class="language-python">import flwr as fl
+
+class SensorClient(fl.client.NumPyClient):
+    def get_parameters(self, config):        return get_weights(model)
+    def fit(self, parameters, config):
+        set_weights(model, parameters)
+        train_one_round(model, local_loader)   # your normal training loop
+        return get_weights(model), len(local_loader.dataset), {}
+    def evaluate(self, parameters, config):
+        set_weights(model, parameters)
+        return local_loss(model), len(val_loader.dataset), {"acc": local_acc(model)}
+
+fl.simulation.start_simulation(
+    client_fn=lambda cid: SensorClient(),
+    num_clients=1000,
+    strategy=fl.server.strategy.FedProx(proximal_mu=0.1),  # swap to FedAvg/FedAvgM freely
+)</code></pre>
+        <div class="code-caption"><strong>Listing 64.2.2.</strong> A full 1000-client federated simulation in roughly a dozen lines. Flower handles round orchestration, client sampling, weight (de)serialization, straggler timeouts, and the weighted aggregation. Hand-rolling that transport and strategy layer is hundreds of lines; here changing the algorithm is one constructor swap.</div>
+        <p>Listing 64.2.2 removes the plumbing, not the science: which strategy and what \(E\), \(\mu\), and client-sampling rate keep your skewed sensor fleet stable is still an experiment you own.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current work pushes past a single global model. FedProx and SCAFFOLD remain the reference drift correctors, but on heavily non-IID sensor data the field increasingly concedes that one model cannot fit every user and turns to personalization (Ditto, and per-client fine-tuning; the subject of <a class="cross-ref" href="section-64.3.html">Section 64.3</a>) and to clustered federated learning that discovers device sub-populations and trains a model per cluster. A second frontier is communication efficiency at foundation-model scale: federated fine-tuning of large sensor and wearable backbones (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) by exchanging only low-rank adapters rather than full weights, cutting per-round traffic by orders of magnitude. The open question that ties the two together is how to certify that an averaged or personalized model is safe and calibrated per client (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) when the server never sees the data it was evaluated on.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 64.2.1 to sweep the local-epoch count \(E \in \{1, 5, 20\}\) at \(\mu = 0\) (plain FedAvg) and plot global accuracy versus communication rounds for each. Then repeat at \(\mu = 0.5\). Confirm two predictions from this section: that large \(E\) speeds convergence when clients agree but destabilizes it when they are skewed, and that the proximal term buys back stability at large \(E\). Report the \((E, \mu)\) pair that reaches target accuracy in the fewest rounds, and state which force, communication or heterogeneity, was binding.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In one sentence each, state what FedAvg ships from server to client and what it ships back, and why this is cheaper than distributed SGD.</p>
+        <p class="quiz-question">2. Name the three axes of non-IID sensor data (feature, label, concept) and give a wearable example of each.</p>
+        <p class="quiz-question">3. FedProx and SCAFFOLD both fight client drift. Where does each place its correction (local objective vs. update direction), and what extra cost does SCAFFOLD pay for its faster convergence?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-64.3.html">Section 64.3</a>, we take seriously the admission this section ended on: when clients are heterogeneous enough, no single averaged model is the right answer. We turn from forcing everyone onto one global model to personalization and local adaptation, giving each device a model that starts from the shared knowledge but bends to fit its own wearer, placement, and hardware.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

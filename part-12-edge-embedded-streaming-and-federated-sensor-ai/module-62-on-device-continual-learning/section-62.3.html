@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.3: Latent and quantized replay. Building Sensory AI." name="description"/>
+<title>Section 62.3: Latent and quantized replay | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Latent and quantized replay</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You asked me to remember last month without keeping last month. So I kept a compressed rumor of it, and rehearsed the rumor."</p>
+<cite>A Parsimonious AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous section showed that a model updated on a stream of new sensor data forgets its past with alarming speed. The oldest and most reliable cure is <em>replay</em>: keep a small buffer of past examples and interleave them with the new data during each update, so the gradients that carve out the new task cannot quietly erase the old one. On a server this is trivial; on a wearable or a microcontroller it collides with two hard walls. Raw sensor windows are large (a few seconds of multi-axis IMU or PPG is kilobytes each, an image far more), and storing raw user data on the device is a privacy liability that a regulator will not overlook. This section develops the two moves that make replay fit inside an edge budget: store activations from an intermediate layer instead of raw inputs (<strong>latent replay</strong>), and compress those activations to a few bits each (<strong>quantized replay</strong>). Together they shrink the rehearsal buffer by one to two orders of magnitude while keeping the anti-forgetting benefit almost intact.</p>
+</div>
+
+<p>This section assumes you understand catastrophic forgetting from <a class="cross-ref" href="section-62.2.html">Section 62.2</a>, the idea of an intermediate feature representation from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and post-training quantization from <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, whose int8 machinery we reuse here to compress stored activations. We build on the online-update loop of <a class="cross-ref" href="../module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>; the difference is that we now feed each update a deliberate mixture of present and past.</p>
+
+<h2>Replay, and why raw replay does not fit on the edge</h2>
+<p>Experience replay answers forgetting directly. Maintain a buffer \(\mathcal{B}\) of past samples; on each learning step, draw a minibatch that is part new data and part replay, and minimize a combined objective</p>
+<p>$$ \mathcal{L} = \mathcal{L}_{\text{new}}(\theta) + \lambda\, \mathcal{L}_{\text{replay}}(\theta), \qquad \mathcal{L}_{\text{replay}} = \frac{1}{|\mathcal{S}|}\sum_{(x,y)\in\mathcal{S}\subset\mathcal{B}} \ell\big(f_\theta(x), y\big). $$</p>
+<p>The replay term pins the model to behavior it must not lose, and \(\lambda\) trades stability against plasticity. The design question is entirely <em>what goes in \(\mathcal{B}\), and how big is each entry</em>. A naive raw buffer stores full inputs. For a fall detector holding \(N=500\) windows of 3-axis accelerometer at 100 Hz over 3 seconds, each window is \(3\times300\) float32 values, about 3.5 KB, so the buffer alone is 1.7 MB. On a Cortex-M microcontroller (<a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>) with a few hundred kilobytes of RAM, that buffer does not exist. Worse, it is a store of identifiable raw user signal sitting in flash, exactly the artifact privacy law treats as sensitive.</p>
+
+<h2>Latent replay: freeze the bottom, store the middle</h2>
+<p>Latent replay, introduced by Pellegrini and colleagues, splits the network at a chosen <em>replay layer</em>. Everything below it (the feature extractor \(g\)) is <strong>frozen</strong>; everything above it (the head \(h\)) keeps learning. Instead of storing the raw input \(x\), you store the activation \(z = g(x)\) at the replay layer. During an update you replay stored latents straight into the head, skipping the frozen bottom entirely. Two things improve at once. First, \(z\) is typically far smaller than \(x\): after several downsampling stages a 3.5 KB window becomes a 256-value feature vector, a 3.4x reduction before any bit-compression. Second, and this is the load-bearing insight, storing latents is only valid if the layers that produced them do not change. Freezing \(g\) guarantees exactly that: a latent captured last month still means the same thing this month, because the function that made it is fixed.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Frozen features are what make a stored latent honest</h3>
+<p>A stored latent is a promise: "if you had run the current feature extractor on that old input, this is what you would have gotten." Fine-tuning the layers below the replay layer breaks the promise, because the old latents were minted by a now-obsolete extractor, a mismatch called <em>representation drift</em>. Latent replay resolves the tension by construction: freeze the bottom, and the promise holds forever. The price is plasticity. A frozen extractor cannot learn genuinely new low-level features, so latent replay adapts well to new <em>classes</em> and new <em>users</em> that reuse existing features, and poorly to new <em>sensors</em> or radically new signal morphology. Choosing the replay layer is choosing this trade: deeper means smaller, cheaper latents and less adaptable representation; shallower means bigger latents and more of the network left plastic.</p>
+</div>
+
+<h2>Quantized replay: a few bits per activation</h2>
+<p>Latent replay shrinks each entry by lowering its dimension; quantized replay shrinks it further by lowering its precision. Since the buffer only ever feeds training (never inference of record), it tolerates aggressive lossy compression. The cheapest scheme is symmetric int8: per stored vector, keep one float32 scale \(s = \max|z| / 127\) and the rounded codes \(q = \mathrm{round}(z/s)\), reconstructing \(\hat z = s\,q\) on read. The buffer memory becomes</p>
+<p>$$ M = N\left(\frac{d\,b}{8} + c\right)\ \text{bytes}, $$</p>
+<p>for \(N\) entries, latent dimension \(d\), \(b\) bits per code, and \(c\) bytes of per-entry overhead (the scale, the label). At \(d=256\), int8 (\(b=8\)) with \(c=8\) gives 264 bytes per entry versus 1024 bytes for float32 latents and 3584 bytes for the raw window: a 13x saving over raw, and enough to hold 500 rehearsal examples in about 130 KB. Push to 4-bit codebook (vector or product) quantization and the entry drops below 150 bytes. Ravaglia and colleagues showed on a parallel ultra-low-power (PULP) microcontroller that int8 and even sub-byte quantized latent replay recovers nearly all of full-replay accuracy while cutting rehearsal memory by roughly an order of magnitude, the result that made continual learning realistic on milliwatt hardware.</p>
+
+<pre><code class="language-python">import numpy as np
+
+class QuantizedLatentReplay:
+    """Int8 latent buffer with reservoir sampling: O(capacity) memory, unbiased."""
+    def __init__(self, capacity, latent_dim):
+        self.codes  = np.zeros((capacity, latent_dim), dtype=np.int8)   # quantized latents
+        self.scales = np.zeros(capacity, dtype=np.float32)             # one scale per entry
+        self.labels = np.zeros(capacity, dtype=np.int64)
+        self.capacity, self.seen = capacity, 0
+
+    def _quantize(self, z):
+        s = np.abs(z).max() / 127.0 + 1e-8          # symmetric int8 scale
+        return np.round(z / s).astype(np.int8), np.float32(s)
+
+    def add(self, z, y):                            # reservoir sampling over the stream
+        if self.seen < self.capacity:
+            i = self.seen
+        else:
+            i = np.random.randint(0, self.seen + 1)
+            if i >= self.capacity:                  # entry not retained
+                self.seen += 1; return
+        self.codes[i], self.scales[i], self.labels[i] = (*self._quantize(z), y)
+        self.seen += 1
+
+    def sample(self, n):                            # dequantize on read
+        m = min(self.seen, self.capacity)
+        idx = np.random.randint(0, m, size=n)
+        z = self.codes[idx].astype(np.float32) * self.scales[idx, None]
+        return z, self.labels[idx]
+
+buf = QuantizedLatentReplay(capacity=500, latent_dim=256)   # ~130 KB total
+</code></pre>
+<div class="code-caption">A quantized latent-replay buffer in about 25 lines. It quantizes each 256-d latent to int8 with a per-entry scale, admits samples by reservoir sampling (so a long stream is represented uniformly with fixed memory), and dequantizes only when a rehearsal batch is drawn. Storing int8 latents rather than float32 raw windows is the 13x memory cut computed above.</div>
+
+<p>The buffer above raises the second design question after "how small is an entry": <em>which</em> entries to keep. Reservoir sampling, used in the code, gives every streamed example an equal chance of surviving with only fixed memory, which is the right default for a slowly drifting stream. When classes are imbalanced or you must guarantee coverage of every known class, swap it for class-balanced reservoir or herding selection (the iCaRL strategy keeps the latents closest to each class mean), so a rare fault class is not statistically erased by a flood of normal data.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A continuous glucose monitor that learns a new meal without a data center</h3>
+<p>Consider a body-worn continuous glucose monitor whose on-device model flags rapid-rise events from an electrochemical signal. A user adopts a new diet, and a food type the model never saw well starts producing a glucose curve it misreads. Retraining in the cloud would mean shipping weeks of raw glucose traces off the body, precisely the health data the device is contracted never to export. Instead the device runs latent replay: a frozen convolutional front end (trained once, in the factory, on a large multi-user corpus) turns each 30-minute window into a 128-d latent, and only the small classifier head adapts on-device. A 400-entry int8 latent buffer (about 55 KB) holds a rehearsal sample of the user's own history; each nightly update interleaves the misread new curves with replayed latents so the device sharpens on the new meal without forgetting hypoglycemia. No raw trace leaves the skin, the buffer fits beside the model in flash, and the personalization we develop in <a class="cross-ref" href="section-62.6.html">Section 62.6</a> becomes a local, private act rather than a cloud round trip.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Avalanche gives you replay as a training plugin</h3>
+<p>Hand-rolling the buffer, the interleaving, the class balancing, and the train loop is a few hundred lines that are easy to get subtly wrong (a leaky sampler double-counts recent data; a mis-set \(\lambda\) starves plasticity). The Avalanche continual-learning library from ContinualAI ships replay, latent replay, and the herding buffers as composable strategy plugins:</p>
+<pre><code class="language-python">from avalanche.training.plugins import ReplayPlugin
+from avalanche.training.storage_policy import ClassBalancedBuffer
+from avalanche.training import Naive
+
+strategy = Naive(
+    model, optimizer, criterion,
+    plugins=[ReplayPlugin(mem_size=500,
+                          storage_policy=ClassBalancedBuffer(max_size=500))])
+for experience in benchmark.train_stream:   # a stream of new tasks
+    strategy.train(experience)              # replay + interleaving handled inside
+</code></pre>
+<div class="code-caption">Roughly 6 lines configure a class-balanced replay strategy that streams through a sequence of tasks; Avalanche owns the buffer, the sampler, and the interleaved gradient step. The hand-written loop it replaces is about 200 lines.</div>
+<p>The library handles buffer management, the mixed minibatch, and the metrics that expose forgetting per task. You still choose the replay layer and the quantization, because those are device-budget decisions the library cannot make for you.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the frontier is</h3>
+<p>The reference result for quantized latent replay on constrained hardware is Ravaglia and colleagues' <em>A TinyML Platform for On-Device Continual Learning with Quantized Latent Replays</em> (IEEE JETCAS, 2021), demonstrating int8 and sub-byte latent rehearsal on a RISC-V PULP microcontroller within a few-hundred-kilobyte budget. Active directions push three fronts: learned codebook (product-quantized) latents that reach 2 to 4 bits with negligible accuracy loss; generative replay, where a tiny model <em>synthesizes</em> pseudo-latents so no real user data is stored at all; and drift-aware replay layers that let the frozen boundary move slowly, re-encoding a fraction of the buffer to bound representation drift. The open tension is the frozen-extractor ceiling: none of these yet let an edge device learn a genuinely new low-level sensor feature while keeping replay cheap, which keeps the class-incremental methods of <a class="cross-ref" href="section-62.4.html">Section 62.4</a> essential.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: size and place the buffer</h3>
+<p>You are adding on-device continual learning to a smartwatch gesture recognizer with a frozen feature extractor emitting 512-d latents, and a RAM budget of 96 KB for the entire rehearsal buffer. (1) Using \(M = N(db/8 + c)\) with \(c = 12\) bytes, find the largest \(N\) for float32 latents, for int8 latents, and for 4-bit codebook latents. (2) The watch must retain 8 gesture classes; argue why reservoir sampling alone is risky here and what storage policy you would use instead. (3) Your product team asks to move the replay layer one block <em>shallower</em> so the model adapts to a new wristband sensor. State two costs of that move, one in memory and one in the validity of already-stored latents, and how you would mitigate the second.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does latent replay require the layers below the replay point to be frozen, and what specific failure appears if you fine-tune them anyway?</li>
+<li>Quantizing stored latents to int8 is acceptable even when you would never quantize activations that aggressively at inference. Why does the buffer tolerate more loss?</li>
+<li>Give one sensor-domain scenario where latent replay adapts well and one where it fails, and tie each to the frozen-extractor property.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-62.4.html">Section 62.4</a>, we confront the case replay handles least well: learning a brand-new class from only a handful of examples, on the device, without disturbing what is already known. We develop few-shot class-incremental learning and the TinyOL approach, where a frozen backbone meets a tiny, cheap-to-update head, the natural partner to the frozen extractor you just met here.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

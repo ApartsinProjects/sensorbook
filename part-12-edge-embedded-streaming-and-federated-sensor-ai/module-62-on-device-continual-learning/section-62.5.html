@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.5: Energy budgets for on-device training. Building Sensory AI." name="description"/>
+<title>Section 62.5: Energy budgets for on-device training | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Energy budgets for on-device training</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"On the cloud they measure my learning in dollars per GPU-hour. Here, on a coin cell, I measure it in days of life I will never get back. Every gradient I take is a gradient stolen from tomorrow's inference."</p>
+        <cite>A Thrifty AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every continual-learning method in this chapter, replay in <a class="cross-ref" href="section-62.3.html">Section 62.3</a>, prototype imprinting in <a class="cross-ref" href="section-62.4.html">Section 62.4</a>, assumes the device can afford to run the update. On a wall-powered server that assumption is free. On a battery, it is the whole design. Training draws two to five times the current of inference for the same window, writing an adapted weight to flash costs orders of magnitude more energy than reading it, and a device that trains too eagerly simply dies before its warranty. This section treats energy as a hard budget, not an afterthought. We build a joule ledger for a learning device, show why memory traffic and not multiply-accumulates usually dominates the bill, and turn "should the model adapt right now?" into an arithmetic decision: does the expected accuracy gain justify the charge it will burn? Get this wrong and on-device learning is a liability; get it right and a model improves itself for months on a cell you never replace.</p>
+    </div>
+
+    <p>This section assumes you can read a model's compute cost in multiply-accumulate operations and understand quantisation, from <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, and the microcontroller memory hierarchy (SRAM, flash, external DRAM) from <a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>. Where energy comes from a harvester rather than a fixed cell, the accounting connects directly to <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>.</p>
+
+    <h2>Why a gradient step costs far more than a forward pass</h2>
+    <p>Start with the compute asymmetry. Backpropagation runs the forward pass, then a backward pass of comparable arithmetic, then a weight-update pass. A rule of thumb that holds across most architectures is that a full training step costs roughly \(2\times\) to \(3\times\) the multiply-accumulates of inference on the same input. But <em>arithmetic is the cheap part</em>. Training also needs to keep every layer's activations in memory to compute gradients, so peak RAM balloons from the single largest activation (inference) to the sum of all activations (training), often \(10\times\) larger. On an embedded part that difference decides whether the update fits in SRAM at all or spills to external DRAM, and every off-chip access is where the joules hide.</p>
+
+    <p>Model the energy of one learn step as the sum of a compute term and a memory term:</p>
+    \[ E_{\text{step}} = N_{\text{mac}}\, e_{\text{mac}} \;+\; \sum_{k} B_k\, e_{\text{mem},k}, \]
+    <p>where \(N_{\text{mac}}\) is the operation count, \(e_{\text{mac}}\) the energy per multiply-accumulate, \(B_k\) the bytes moved at memory level \(k\), and \(e_{\text{mem},k}\) its per-byte energy. The numbers that matter are the ratios. On a modern low-power process, a 32-bit floating-point multiply-accumulate costs a few picojoules, an SRAM access costs several times more per byte, an off-chip DRAM access costs one to two <em>orders of magnitude</em> more, and writing a byte to NOR flash to persist an updated weight can cost several orders of magnitude more still and wears the cell after limited erase cycles. This is why the intuition "training is 2-3x inference" is dangerously optimistic: measured in energy, a training step that spills activations to DRAM and then commits new weights to flash can cost \(20\times\) or more the energy of the inference it improves.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>On-device training is a <em>memory-energy</em> problem disguised as a compute problem. The floating-point math is nearly free; the bill is paid moving activations off-chip and committing weights to non-volatile storage. Every design lever that reduces the energy of a learn step, freezing the backbone so activations need not be stored (<a class="cross-ref" href="section-62.4.html">Section 62.4</a>), latent replay so you train on small cached embeddings instead of raw windows (<a class="cross-ref" href="section-62.3.html">Section 62.3</a>), updating one small head instead of the whole network, batching many samples before a single flash commit, works by cutting bytes moved, not by cutting arithmetic. Design for the memory hierarchy first and the FLOP count second.</p>
+    </div>
+
+    <h2>A joule ledger: budgeting learning against battery life</h2>
+    <p>Turn the physics into a budget. A battery stores a fixed charge; multiply capacity in ampere-hours by nominal voltage to get energy in joules. A CR2032 coin cell holds roughly 220 mAh at 3 V, about 2400 J of usable energy. From that single number you can bound how much learning a device can afford over its target lifetime. If the device must live \(L\) days and inference plus sensing already consumes a baseline power \(P_{\text{base}}\), the energy left for adaptation is</p>
+    \[ E_{\text{learn budget}} = E_{\text{battery}} - P_{\text{base}}\, L, \]
+    <p>and if each learn step costs \(E_{\text{step}}\), the device can afford at most \(E_{\text{learn budget}} / E_{\text{step}}\) updates across its whole life. Divide by \(L\) and you get a daily update quota. This is the number that should govern the continual-learning policy: not "adapt whenever new data arrives" but "adapt at most \(n\) times per day, and spend those updates where they buy the most accuracy." The listing below computes this ledger for a wearable so the design tradeoff is concrete rather than hand-waved.</p>
+
+    <pre class="language-python"><code class="language-python"># Energy ledger for on-device learning on a coin-cell wearable
+mAh, volts = 220.0, 3.0                     # CR2032 coin cell
+E_battery = mAh/1000 * 3600 * volts         # joules  = A.s.V = J  -> ~2376 J
+lifetime_days = 180
+
+# Baseline: always-on inference + sensing draws a steady average current
+P_base_uW = 55.0                            # microwatts, measured on the board
+E_base = P_base_uW * 1e-6 * lifetime_days * 86400
+
+# One TinyOL-style head update: forward + backward + one flash commit
+E_compute = 1.4e-3                          # joules of MAC + SRAM traffic
+E_flash   = 2.1e-3                          # joules to persist the updated head
+E_step = E_compute + E_flash               # ~3.5 mJ per learn step
+
+E_learn_budget = E_battery - E_base
+max_updates = E_learn_budget / E_step
+print(f"battery            : {E_battery:8.1f} J")
+print(f"baseline draw      : {E_base:8.1f} J over {lifetime_days} d")
+print(f"budget for learning: {E_learn_budget:8.1f} J")
+print(f"affordable updates : {max_updates:8.0f} total "
+      f"({max_updates/lifetime_days:.0f} per day)")</code></pre>
+    <div class="code-caption"><strong>Listing 62.5.1.</strong> A back-of-the-envelope energy ledger. Plugging in measured baseline power and a per-step cost turns "can we afford to learn on this device?" into a printed daily update quota. Note that the flash-commit term rivals the entire compute term, the memory-energy insight in code.</div>
+
+    <p>As Listing 62.5.1 shows, the affordable-updates figure is exquisitely sensitive to \(P_{\text{base}}\): if baseline sensing already eats most of the cell, the learning budget collapses toward zero and continual learning must be reserved for rare, high-value moments. It is also sensitive to the flash-commit term, which is why batching updates and persisting weights infrequently (say, once a day rather than once a sample) can multiply the number of gradient steps a device can afford.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-instrumenting a training loop to attribute energy across compute and memory is hundreds of lines of platform-specific profiling. On mobile and edge SoCs, the CodeCarbon and Zeus libraries wrap a training run and report joules and estimated emissions from the on-die power counters in about five lines, roughly a 20-to-1 reduction over rolling your own RAPL or INA226 reader, and they separate the components for you. On bare-metal microcontrollers there is no such counter, so the honest measurement still comes from a shunt resistor and a power analyser (covered below); the library saves you on anything that runs Linux, and nothing saves you from measuring the real board when picojoules matter.</p>
+    </div>
+
+    <h2>Deciding when to spend a learn step</h2>
+    <p>A fixed daily quota is only half the policy; the other half is <em>gating</em>, spending each precious update where it earns its charge. The decision rule is a simple expected-value test. Let \(\Delta a\) be the expected accuracy gain from adapting on the current sample or buffer, \(v\) the value of an accuracy point in your application, and \(E_{\text{step}}\) the energy cost. Adapt only when</p>
+    \[ v\,\Delta a \;>\; \lambda\, E_{\text{step}}, \]
+    <p>where \(\lambda\) is a price on energy that you raise as the battery drains. In practice \(\Delta a\) is unobservable before the fact, so it is proxied by cheap triggers computed during the forward pass you were running anyway: high predictive uncertainty (an entropy or margin threshold, tying to the calibration methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), a detected distribution shift, or an explicit user correction. When the trigger is quiet, the device stays in pure inference and the learning budget is preserved. This converts "always learning" into "learning on surprise," which is both more accurate and far cheaper. It also composes with duty cycling: defer the actual gradient step to the next scheduled wake or, on a harvested device, to the next moment the buffer is full and the supply is above the training threshold, the charging-aware scheduling idea developed in <a class="cross-ref" href="../module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a hearing aid that learns your rooms without draining by dinner</h4>
+        <p>A premium hearing aid runs a frozen acoustic scene classifier and a small adaptive head that personalises noise suppression to its wearer's environments. Its zinc-air cell holds only a few hundred joules and must last a full day, so continuous on-device fine-tuning is out of the question: measured on the board, one head update costs about 3 mJ, and thousands of them would visibly shorten the day. The firmware instead applies the gate above. It watches the classifier's margin during the forward pass it already runs for every audio frame; only when the wearer enters an acoustically novel room (low margin, sustained) does it cache a few seconds of latent features and, at the next low-load moment, take a single update and commit the head. Over a day that is a few dozen updates, not thousands, costing well under one percent of the cell while still personalising to the restaurant, the car, and the office. The same head, personalised per wearer, is exactly the subject of <a class="cross-ref" href="section-62.6.html">Section 62.6</a>.</p>
+    </div>
+
+    <h2>Measuring energy, not estimating it</h2>
+    <p>Every number above is a model, and models of embedded energy are wrong until validated against hardware. The gold standard is direct measurement: put a precise shunt resistor in series with the device supply (or use a source-measure unit or a coulomb counter such as an INA226), log current at high rate, and integrate \(P(t) = V(t)\,I(t)\) over the learn step to get joules. Isolate the step by toggling a GPIO pin high at the start and low at the end so the analyser trace segments cleanly into inference, forward-for-training, backward, and flash-commit phases; you will usually find the flash-commit and any DRAM spill are the tall spikes, confirming the memory-energy story and telling you exactly where to optimise. Datasheet "typical" figures and simulator estimates are for early design only; the moment silicon exists, they are superseded by the shunt. Report energy per learn step and projected days of life the way you would report accuracy, as a first-class metric with its own measurement protocol, so that an "improved" continual-learning method that quietly triples the flash writes cannot pass review as a win.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is making the gradient step itself intrinsically cheap. Sparse and structured backpropagation updates only a subset of weights per step, cutting both compute and the bytes committed to flash. Forward-only and perturbation-based learning schemes (the Forward-Forward algorithm and evolutionary or zeroth-order updates) avoid storing activations for a backward pass entirely, attacking the peak-memory term that dominates energy, at some cost in convergence. On the systems side, POET and similar frameworks schedule training on memory-constrained edge devices by paging and recomputing activations to trade a little compute for a large memory saving, and analog in-memory-compute accelerators promise weight updates at a fraction of today's per-byte energy. Across all of them the open question is the honest one for this whole chapter: for a given battery and a given data stream, is any on-device update worth its joules, or is the frugal choice to freeze the model and adapt only the cheap head? The answer is increasingly workload-specific, which is why the measurement discipline above matters more than any single technique.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a small classifier and a labelled sensor stream on any board you can instrument (a dev kit with a current-sense header, or a Linux SBC with Zeus). First, measure the energy of one inference and one full training step, and report the ratio; comment on whether it matches the 2-3x compute rule or exceeds it because of memory traffic. Second, build the energy ledger of Listing 62.5.1 with <em>your</em> measured \(E_{\text{step}}\) and a battery of your choice, and compute the affordable daily update quota. Third, implement the uncertainty-gated policy: adapt only when prediction margin falls below a threshold, and plot final accuracy versus total joules spent as you sweep the threshold from "never adapt" to "always adapt." Identify the knee of that curve, the point where more energy stops buying meaningful accuracy, and argue for the operating point you would ship.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A colleague estimates on-device training energy as "3x the inference FLOPs times the energy per FLOP." Give two reasons this can underestimate the real cost by an order of magnitude, and name the two energy terms that dominate.</p>
+        <p class="quiz-question">2. Using the ledger in Listing 62.5.1, explain why halving the baseline sensing power can increase the affordable number of learn steps far more than halving the per-step compute energy.</p>
+        <p class="quiz-question">3. Write down the expected-value gate for spending a learn step, define each symbol, and explain what practical proxy replaces the unobservable accuracy gain \(\Delta a\) at decision time.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-62.6.html">Section 62.6</a>, we spend the energy budget we just learned to protect on the payoff that most justifies it: personalization. The gated, frugal updates of this section are exactly the mechanism by which a shared model becomes <em>your</em> model, adapting to one wearer's gait, one machine's acoustics, one home's routine, without ever sending private sensor data off the device.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 64.3: Personalization and local adaptation. Building Sensory AI." name="description"/>
+<title>Section 64.3: Personalization and local adaptation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 64: Federated and Privacy-Preserving Sensor AI</a></div>
+<h1>Personalization and local adaptation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The fleet trained a model that is wrong about everyone equally. I kept a little of it for myself, adjusted the last layer to how <em>this</em> wrist actually moves, and suddenly the average stopped speaking for me."</p>
+        <cite>A Self-Interested AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on federated averaging and the non-IID sensor problem from <a class="cross-ref" href="section-64.2.html">Section 64.2</a>: read that first, because personalization is the answer to the pathology it diagnoses. You should be comfortable with fine-tuning a network by freezing some layers and training others (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>), with why sensor distributions differ across people and devices (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>), and with the subject-split evaluation discipline that keeps you honest (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The single code example uses only NumPy and closed-form least squares.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Federated averaging returns <em>one</em> model to a fleet whose clients disagree about what the data looks like. When wrists, gaits, skin tones, mounting angles, and label habits vary from person to person, that single global model is a compromise that can be worse for an individual than a model trained on that individual alone. Personalized federated learning refuses the false choice between "everybody's model" and "my model." It keeps the statistical strength of the fleet for the shared structure of the task, then bends the last mile toward the client in front of it. This section gives you the four workhorse strategies (partial-model personalization, regularized local training, meta-learning an easily-adapted initialization, and client clustering), a rule for choosing among them, and the traps that make personalization quietly backfire: catastrophic forgetting, cold-start clients, and evaluation that flatters itself. The payoff is concrete. On cross-person activity recognition, a few hundred local examples and a re-trained head routinely recover accuracy that the global model left on the table.</p>
+    </div>
+
+    <h2>Why one global model is the wrong deliverable</h2>
+    <p>Section 64.2 showed that under non-IID clients, the FedAvg objective minimizes a <em>weighted average</em> of local losses. The minimizer of an average is not the minimizer for any single term unless every term already agrees. In sensing, the terms rarely agree. Two people performing the "climbing stairs" activity produce accelerometer distributions with different means, variances, and even different dominant frequencies because of stride length, cadence, and where the phone sits in the pocket. A model forced to be good on average across both learns a decision boundary that sits between their clusters and slices through each of them.</p>
+    <p>The formal object we actually want is a family \(\{\theta_1, \dots, \theta_K\}\), one model per client \(k\), each minimizing that client's own risk while borrowing strength from the others. Personalization methods differ only in <em>how</em> they couple the shared and the private parts. Write each client objective as a shared term plus a local term,</p>
+    $$\theta_k^\star = \arg\min_{\theta}\; \underbrace{F_k(\theta)}_{\text{fit client } k} + \tfrac{\lambda}{2}\,\underbrace{\lVert \theta - w \rVert^2}_{\text{stay near the fleet } w},$$
+    <p>where \(w\) is the global model and \(\lambda\) sets how hard the fleet pulls the client back. At \(\lambda \to \infty\) you recover the single global model (pure FedAvg); at \(\lambda \to 0\) you recover fully local training with no sharing. Every method below is a way of picking, structuring, or annealing that coupling.</p>
+
+    <h2>The personalization toolbox</h2>
+    <p><strong>Partial-model personalization</strong> splits the network into a shared representation and a private head. The fleet federates the feature extractor (the layers that learn what a "step" or a "heartbeat" looks like in general), while each client keeps a locally trained classifier or a locally estimated normalization layer. FedPer keeps the head private; FedBN keeps each client's batch-normalization statistics local, which is remarkably effective precisely because normalization absorbs the per-device mean and scale shift that causes most of the non-IID pain. This is the cheapest option: the private part is small, it trains in seconds on-device, and it never leaves the device, so it adds no communication cost and improves privacy.</p>
+    <p><strong>Regularized local training</strong> keeps the whole model personal but tethers it to the global one, exactly the \(\lambda\)-penalized objective above. Ditto is the clean instance: run FedAvg to get \(w\), then have each client solve for its own \(\theta_k\) with the proximal pull toward \(w\). The knob \(\lambda\) is interpretable and per-client tunable, which matters when some users have thousands of labeled windows and others have twenty.</p>
+    <p><strong>Meta-learning</strong> reframes the goal: instead of shipping a model to use directly, ship an <em>initialization</em> that adapts to any client in one or two gradient steps. Per-FedAvg applies the MAML idea inside federation, optimizing \(w\) so that \(w - \alpha \nabla F_k(w)\) is good for every \(k\). The fleet learns "a place to start from" and the client finishes the job locally.</p>
+    <p><strong>Client clustering</strong> admits that clients fall into groups (left-handed versus right-handed, phone-in-pocket versus phone-in-hand, one wearable model versus another). IFCA alternates between assigning each client to its best-fitting cluster model and updating each cluster model from its members, yielding a handful of specialists instead of one generalist or thousands of loners.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Personalization is a bias-variance trade made per client. The global model is low variance (it averages over the whole fleet) but high bias for any individual. A purely local model is unbiased for that individual but high variance when local data is scarce. The coupling strength \(\lambda\), the size of the private head, or the number of local adaptation steps all slide you along this same curve. The right operating point is not global: a data-rich client should personalize aggressively (small \(\lambda\)); a client with a handful of examples should lean on the fleet (large \(\lambda\)). Any method that forces one setting on everyone leaves accuracy on the table at both ends.</p>
+    </div>
+
+    <h2>A minimal personalization head</h2>
+    <p>The code below strips the idea to its core so you can see the mechanism, not the framework. Two clients share a fixed random feature map (standing in for the federated backbone) but have opposite label conventions, the sharpest possible non-IID case. We compare a single global linear head fit on the pooled data against a per-client head fit locally on top of the same shared features. The shared features never move; only the tiny head is personalized.</p>
+
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+def features(X, W):                 # shared "federated" backbone (frozen)
+    return np.tanh(X @ W)
+
+d, h, n = 4, 32, 400
+W = rng.normal(size=(d, h))         # one representation for the whole fleet
+beta = rng.normal(size=d)           # the true concept, shared by all
+
+# Two clients with OPPOSITE label conventions (non-IID sign flip)
+def make_client(sign):
+    X = rng.normal(size=(n, d))
+    y = sign * (X @ beta)           # same task, flipped output convention
+    return X, y
+
+clients = [make_client(+1.0), make_client(-1.0)]
+Phi = [features(X, W) for X, _ in clients]
+
+# (a) One GLOBAL head fit on pooled features -> forced compromise
+Phi_all = np.vstack(Phi)
+y_all   = np.concatenate([y for _, y in clients])
+w_glob, *_ = np.linalg.lstsq(Phi_all, y_all, rcond=None)
+
+# (b) PERSONALIZED head per client on top of the SAME shared features
+def mse(P, y, w): return float(np.mean((P @ w - y) ** 2))
+for k, ((X, y), P) in enumerate(zip(clients, Phi)):
+    w_loc, *_ = np.linalg.lstsq(P, y, rcond=None)
+    print(f"client {k}: global MSE={mse(P, y, w_glob):6.3f}  "
+          f"personalized MSE={mse(P, y, w_loc):6.3f}")
+</code></pre>
+    <div class="code-caption">A frozen shared backbone with a swappable per-client head. The global head averages two contradictory clients into a near-useless compromise (high MSE for both); the personalized heads, fit locally on the identical features, drive the error toward zero. This is FedPer in ten lines: federate the representation, keep the head private.</div>
+    <p>Run it and the global head posts a large error for both clients while the personalized heads collapse to near zero. The sign flip is a caricature, but real fleets contain softer versions of it everywhere: a user who labels light jogging as "running," a chest strap mounted upside down, a glucose sensor with a personal calibration offset. The lesson transfers directly.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Rolling your own personalized federated loop (client sampling, partial-parameter aggregation, per-client proximal terms, cluster assignment) is a few hundred lines of careful bookkeeping. <code>Flower</code> exposes personalization through custom <code>Strategy</code> and <code>NumPyClient</code> classes where you simply mark which parameters aggregate and which stay local, turning FedPer or FedBN into roughly a dozen lines. <code>FedJAX</code> and <code>FedML</code> ship reference implementations of Ditto, Per-FedAvg, and IFCA you can call as configured algorithms. The framework handles the round orchestration, the partial-state serialization, and the straggler handling; you write only the split between shared and personal parameters.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: personalizing a wearable step-and-activity model</h3>
+        <p>A smartwatch vendor federates a human-activity-recognition model (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) across a million wrists. The global FedAvg model reaches 82 percent balanced accuracy on a held-out subject split, but underperforms badly on users with atypical gait: wheelchair users, people with a limp, and very tall or very short strides that shift cadence out of the fleet's dominant band. The team ships a FedBN-plus-head design. The convolutional backbone is federated once a day; each watch keeps its own batch-norm statistics and re-fits a two-layer head overnight on the wearer's last two weeks of confirmed activities (drawn from workout-app confirmations, so labels are cheap). Per-user accuracy on the atypical-gait cohort jumps from the low 60s into the high 70s, the personal head is under 8 KB so it costs nothing to store, and because the head never leaves the watch the personalization itself leaks no raw motion. Cold-start users default to the global head until they accumulate enough confirmations, then cross over automatically once the local head validates better on a held-out slice.</p>
+    </div>
+
+    <h2>When to personalize, and the traps</h2>
+    <p><strong>When.</strong> Personalize when three things hold: clients are genuinely heterogeneous (if they were IID, the global model would already be optimal and personalization only adds variance); each client has enough local labels to fit the private part without overfitting; and the per-client distribution is stable enough that yesterday's adaptation still helps today. If the client's distribution drifts within a session rather than differing between clients, you want test-time adaptation instead (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>), which reacts online without labels.</p>
+    <p><strong>The traps.</strong> First, <em>catastrophic forgetting</em>: aggressive local fine-tuning can erase the shared knowledge that made the fleet valuable, so the head that nails this week's activities forgets the rare fall it was meant to catch. The regularization tether \(\lambda\) and the on-device continual-learning defenses of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a> exist to prevent exactly this. Second, <em>cold start</em>: a brand-new client has no local data, so it must fall back to the global (or its cluster's) model until it earns the right to personalize. Third, and most dangerous, <em>self-flattering evaluation</em>. You must measure personalized accuracy on each client's own held-out future data, never on the data you adapted with, or you report memorization as generalization. Report the per-client accuracy <em>distribution</em>, not just the mean, because personalization that helps the average while hurting a vulnerable tail is a regression dressed as a win.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Current work pushes personalization toward parameter-efficient and privacy-aware forms. Adapter- and LoRA-style personal modules attach a few thousand trainable weights to a frozen federated backbone, echoing the foundation-model tuning of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>, which cuts on-device cost and keeps the shared model intact. Methods including Ditto, APFL, FedRep, kNN-Per, and pFedHN (hypernetworks that generate each client's weights) map the space between "one model" and "one per client," while FedBN remains a startlingly strong baseline for sensor shift. The open problems are honest ones: personalization interacts with the differential-privacy noise you will add in <a class="cross-ref" href="section-64.4.html">Section 64.4</a> (personal parameters have fewer contributors, so they are harder to protect), and fair personalization that does not widen the accuracy gap between majority and minority clients is still unsolved.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the code example into a Ditto-style comparison. Keep the shared random backbone, but now instead of a pure local head, fit each client's head by minimizing \(\lVert \Phi_k w - y_k \rVert^2 + \lambda \lVert w - w_{\text{glob}}\rVert^2\) for a sweep of \(\lambda \in \{0, 0.1, 1, 10, 100\}\). Plot per-client test MSE against \(\lambda\). Then reduce one client's training set to 15 examples and repeat. Confirm that the data-rich client prefers small \(\lambda\) while the data-poor client's optimal \(\lambda\) moves higher, the bias-variance story made numerical.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>FedAvg minimizes a weighted average of local losses. In one sentence, why does that make it a poor model for an individual client under non-IID data?</li>
+            <li>You have two clients: one with 5,000 labeled windows and one with 30. Which should use a smaller regularization strength \(\lambda\) (personalize harder), and why?</li>
+            <li>A colleague reports that their personalized models reach 97 percent accuracy, measured on the same local windows used to fit each personal head. What is wrong with this number, and what evaluation would you demand instead?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-64.4.html">Section 64.4</a>, we confront the uncomfortable fact that even model updates, not just raw data, can leak the individuals who produced them. We introduce differential privacy to bound that leakage formally and secure aggregation to hide any single client's contribution inside the sum, then measure the utility cost these guarantees impose, a cost that personalization, with its thinly-populated per-client parameters, makes especially sharp.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

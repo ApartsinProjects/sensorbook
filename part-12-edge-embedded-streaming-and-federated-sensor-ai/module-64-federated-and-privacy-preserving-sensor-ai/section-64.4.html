@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 64.4: Differential privacy and secure aggregation. Building Sensory AI." name="description"/>
+<title>Section 64.4: Differential privacy and secure aggregation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 64: Federated and Privacy-Preserving Sensor AI</a></div>
+<h1>Differential privacy and secure aggregation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Keeping the raw data on the phone feels safe until you remember the gradient is a lossy photograph of it."</p><cite>A Prudent AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Federated learning promises that raw sensor traces never leave the device, yet the model updates that do leave are not automatically private. A single gradient from a heart-rate window can be inverted to reveal the underlying signal; an aggregate can memorize one user's rare gait pattern. This section supplies the two mechanisms that turn "the data stayed local" into a defensible privacy guarantee: <strong>differential privacy (DP)</strong>, which bounds how much any one contributor can influence the released model, and <strong>secure aggregation (SecAgg)</strong>, which lets a server learn the sum of thousands of updates without seeing any single one. They answer different threats, they compose, and both cost you something. Understanding what each buys, and what it charges in utility, is what separates a privacy claim you can put in a datasheet from a marketing slogan.</p>
+</div>
+
+<p>This section assumes you have met the FedAvg training loop and the non-IID reality of sensor fleets from <a class="cross-ref" href="section-64.2.html">Section 64.2</a>, and the motivation for keeping raw traces on-device from <a class="cross-ref" href="section-64.1.html">Section 64.1</a>. The probability and estimation tools behind the noise mechanisms come from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the biometric-privacy stakes that make all of this matter are laid out in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+
+<h2>Why a gradient leaks</h2>
+
+<p><strong>What</strong> is the threat? Federated updates are functions of private data, and functions leak. Concretely, gradient-inversion attacks reconstruct input windows from a shared gradient by optimizing a dummy input until its gradient matches the observed one. On sensor data this is worse than on images: an accelerometer or PPG window is low-dimensional and smooth, so the reconstruction is often near-perfect. Membership-inference attacks ask a weaker but still damaging question, "was this specific person's data used?", and answer it from the model's confidence. A hospital that federates an ECG classifier across clinics may inadvertently let a curious clinic confirm that a named patient was in another clinic's cohort.</p>
+
+<p><strong>Why</strong> does keeping data local not fix this? Because the object you release, the update, is a compressed but information-rich summary of the batch that produced it. Locality controls <em>where</em> computation happens; it does not bound <em>how much</em> the output reveals. That bound is exactly what differential privacy provides.</p>
+
+<h2>Differential privacy: the contract and the dial</h2>
+
+<p><strong>What</strong> is DP? A randomized mechanism \(\mathcal{M}\) is \((\varepsilon, \delta)\)-differentially private if for any two datasets \(D, D'\) differing in one contributor's data, and any set of outcomes \(S\),</p>
+
+$$\Pr[\mathcal{M}(D) \in S] \le e^{\varepsilon}\,\Pr[\mathcal{M}(D') \in S] + \delta.$$
+
+<p>Read it as a contract: whether or not you are in the dataset, the distribution of published models is nearly identical, so no adversary, however clever or well-resourced later, can tell from the output that you participated. \(\varepsilon\) is the privacy budget (smaller is stronger; single-digit values are the usual target), and \(\delta\) is a small failure probability, conventionally set below \(1/N\) for a fleet of \(N\) users.</p>
+
+<p><strong>How</strong> do we achieve it in federated training? The workhorse is <strong>DP-SGD</strong> with two steps per update: clip each per-example (or per-user) gradient to a fixed \(\ell_2\) norm \(C\) so no single contributor can dominate, then add Gaussian noise calibrated to that sensitivity. The clipped, noised update is</p>
+
+$$\tilde{g} = \frac{1}{B}\left(\sum_{i} g_i \cdot \min\!\left(1, \frac{C}{\lVert g_i \rVert_2}\right) + \mathcal{N}(0, \sigma^2 C^2 I)\right).$$
+
+<p>The crucial design choice for sensor fleets is the <em>unit of privacy</em>. Protecting one training example is nearly useless when a wearable contributes thousands of correlated windows from the same person; you want <strong>user-level DP</strong>, where the neighboring datasets differ by removing all of one user's data. That is why federated DP clips and noises at the level of each client's total update, not each sample. A privacy accountant (Renyi DP or the numerically tighter PLD accountant) then tracks the cumulative \(\varepsilon\) as rounds accumulate, because privacy loss composes across every round a user is sampled into.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>DP and SecAgg protect against orthogonal adversaries, so a serious deployment uses both. SecAgg blinds the <em>server</em> to individual updates but does nothing about what the <em>final released model</em> memorizes; DP bounds what the released model reveals but, in its central form, trusts the server to add the noise honestly. Combine them, distributed DP where each client adds a share of the noise <em>inside</em> a secure aggregate, and you get a released model that is provably private even against a server that logs every message it receives.</p>
+</div>
+
+<h2>Secure aggregation: summing without seeing</h2>
+
+<p><strong>What</strong> is SecAgg? A cryptographic protocol that computes \(\sum_i u_i\) over client updates \(u_i\) such that the server learns only the sum, never any individual \(u_i\). <strong>How</strong>: each pair of clients agrees on a shared random mask (via Diffie-Hellman key exchange); client \(i\) adds masks for peers with higher IDs and subtracts masks for peers with lower IDs. When all updates are summed, every pairwise mask cancels exactly, leaving the clean total. Secret-sharing of the mask seeds lets the server recover the sum even when some phones drop out mid-round, a routine event for battery-powered sensors, without ever unmasking a survivor.</p>
+
+<p><strong>Why</strong> does this matter beyond DP? Because the honest-but-curious server is the most realistic adversary in a commercial fleet. SecAgg removes the individual update from the server's view entirely, so a subpoena, a breach, or an over-logging bug on the server exposes only aggregates. <strong>When</strong> to reach for it: any cross-device setting with an untrusted or semi-trusted coordinator, especially health and biometric data. Its cost is communication and a dropout-tolerance ceiling; classic SecAgg scales roughly quadratically in per-client cost with cohort size, so large cohorts use SecAgg+ or ring-based variants.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a sleep-staging watch</h3>
+<p>A wearables maker trains a sleep-staging model from accelerometer and PPG across two million watches. Raw signals never leave the wrist. Without protection, an engineer found that a reconstructed gradient from a single night recovered the wearer's heart-rate curve well enough to flag an arrhythmia, a data point the company was never licensed to hold. The fix shipped in two layers: SecAgg so the training server only ever sees sums over cohorts of 5,000 watches, and user-level DP-SGD with a target of \(\varepsilon \approx 6\), \(\delta = 10^{-7}\). Staging accuracy fell from 84.1% to 82.3%, under two points, in exchange for a guarantee the legal team could write into the privacy datasheet. The clipping norm \(C\) needed the most tuning: too tight and the non-IID night-owl minority stopped learning; too loose and the noise swamped the signal.</p>
+</div>
+
+<h2>Reading the utility cost, and tuning it</h2>
+
+<p>Privacy is never free, and the bill lands hardest exactly where sensor fleets are most heterogeneous. Gradient clipping disproportionately shrinks the large, informative updates from rare users (the night owls, the atypical gaits), so DP amplifies the fairness gap that non-IID data already creates. Three levers recover most of the lost utility: a <strong>larger cohort</strong> per round (privacy amplification by subsampling means more clients lets you add proportionally less noise for the same \(\varepsilon\)); a <strong>well-chosen clip norm</strong> (set \(C\) near the median un-clipped update norm, and consider adaptive clipping that tracks it); and <strong>fewer, higher-quality rounds</strong>, since every round a user participates in spends budget. The short program below shows the two DP-SGD operations in isolation so the mechanism is concrete before a library hides it.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def privatize_updates(client_updates, clip_norm=1.0, noise_mult=1.1):
+    """One user-level DP aggregation step: clip each client, sum, add noise."""
+    clipped = []
+    for u in client_updates:                    # u = one client's flat update vector
+        norm = np.linalg.norm(u)
+        clipped.append(u * min(1.0, clip_norm / (norm + 1e-12)))
+    summed = np.sum(clipped, axis=0)
+    sigma = noise_mult * clip_norm              # Gaussian std scales with sensitivity
+    noise = np.random.normal(0.0, sigma, size=summed.shape)
+    return (summed + noise) / len(client_updates)   # noised average update
+
+rng = np.random.default_rng(0)
+cohort = [rng.normal(0, s, size=8) for s in (0.3, 0.4, 2.5, 0.35)]  # one outlier user
+private_avg = privatize_updates(cohort, clip_norm=1.0, noise_mult=1.1)
+print(np.round(private_avg, 3))
+</code></pre>
+<div class="code-caption">A minimal user-level DP aggregation step: per-client \(\ell_2\) clipping caps any one contributor's influence (note how the outlier user is reined in), then calibrated Gaussian noise buys the \((\varepsilon,\delta)\) guarantee. Real deployments wrap this with a privacy accountant to report the cumulative \(\varepsilon\).</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>The hand-rolled clip-and-noise above, plus the parts that are genuinely hard (the Renyi/PLD accountant, per-sample gradient computation, and secure-aggregation transport), are production-ready in <strong>Opacus</strong> for the DP-SGD side and <strong>TensorFlow Federated</strong> or <strong>Flower</strong> for federated SecAgg. Wrapping a PyTorch model for user-level DP with a live \(\varepsilon\) readout is about 5 lines with <code>opacus.PrivacyEngine</code> versus the roughly 150 lines of correct per-sample clipping and accounting it replaces, and the accountant is the piece you least want to get subtly wrong.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>Current work targets the utility gap at strong \(\varepsilon\). <strong>Distributed DP with secure aggregation</strong> (the discrete Gaussian and Skellam mechanisms used in Google's production Gboard and explored for wearables) adds noise <em>inside</em> the secure sum so no party sees an un-noised update, removing the trusted-curator assumption of central DP. <strong>DP fine-tuning of sensor foundation models</strong> (see <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>) exploits the empirical finding that adapting a pretrained backbone tolerates DP noise far better than training from scratch, often recovering most of the accuracy at single-digit \(\varepsilon\). Open problems remain around auditing the <em>realized</em> privacy of a deployed system (empirical membership-inference lower bounds versus the theoretical \(\varepsilon\)) and fair DP under heavy non-IID sensor drift.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the sleep-staging setup from the practical example. (a) You must halve the noise standard deviation while keeping the same \((\varepsilon,\delta)\). Name two independent parameters you could change to achieve it and state the utility or systems cost of each. (b) Your legal team asks whether SecAgg alone, with no DP, is enough to claim the final released model does not memorize any individual. Answer yes or no and justify in two sentences. (c) Sketch how you would empirically test the DP claim rather than trusting the accountant's \(\varepsilon\).</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is example-level DP the wrong privacy unit for a wearable that streams thousands of windows per user, and what replaces it?</li>
+<li>SecAgg hides individual updates from the server. Explain in one sentence why that still leaves a privacy hole that DP must close.</li>
+<li>Gradient clipping is meant to bound sensitivity. Why does it also, as a side effect, worsen fairness for atypical users in a non-IID fleet?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-64.5.html">Section 64.5</a>, we turn from protecting the update to partitioning the model itself: split and split-federated learning cut the network between device and server so that neither holds the whole picture, trading a different slice of privacy, compute, and communication than the mechanisms in this section.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 62.7: Safety of self-updating models. Building Sensory AI." name="description"/>
+<title>Section 62.7: Safety of self-updating models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 62: On-Device Continual Learning</a></div>
+<h1>Safety of self-updating models</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Every night I taught myself something new. Nobody checked my homework. By spring I had quietly become a different model than the one they certified, and no one could say exactly when."</p>
+        <cite>An Unsupervised AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The whole chapter has been about giving a deployed model the right to change itself: to replay old data, imprint a new class, personalise to one wearer. That right is also the hazard. A model that updates in the field has no code review, no staging environment, and no on-call engineer watching the loss curve. It learns from whatever the sensor feeds it, including a mislabelled tap, a stuck accelerometer, a spoofed signal, or an adversary who has worked out that six confident examples will register a new prototype. The update that was supposed to keep the model fresh can instead silently degrade it, forget a safety-critical class, drift outside its certified envelope, or absorb a poisoned label, and because it happened autonomously across a fleet of thousands, nobody notices until the field failures roll in. Safety of self-updating models is the discipline of granting that right conditionally: an update is accepted only if it passes a gate, its effect is bounded, and it can always be undone. This section is about the machinery that turns "the device learns" into "the device learns safely."</p>
+    </div>
+
+    <p>This section closes Chapter 62 by adding guardrails around every mechanism the earlier sections built: the replay of <a class="cross-ref" href="section-62.3.html">Section 62.3</a>, the prototype imprinting of <a class="cross-ref" href="section-62.4.html">Section 62.4</a>, and the personalisation of <a class="cross-ref" href="section-62.6.html">Section 62.6</a>. It assumes you are comfortable with calibrated confidence and rejection (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) and with distribution shift as a first-class problem (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>). It sets up the fleet-scale and functional-safety treatments of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a> and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+
+    <h2>The threat model: what can go wrong when a model teaches itself</h2>
+    <p>Name the failures before defending against them. On-device self-updating faces four distinct hazards, and they demand different countermeasures. <strong>Silent degradation</strong> is the base case: honest data, honest labels, but the update overfits a personalisation quirk or amplifies catastrophic forgetting (<a class="cross-ref" href="section-62.2.html">Section 62.2</a>) so that overall accuracy quietly falls. <strong>Label poisoning</strong> is adversarial: a wearer, or an attacker with physical access to the sensor, supplies inputs whose accepted labels steer the model, for example registering the attacker's own gait as the authorised user, or teaching a fault detector that a real fault is "normal". <strong>Concept-drift capture</strong> is subtler: a genuinely shifted but transient input (a temporary sensor fault, an unusual environment) gets learned as if it were the new steady state. <strong>Envelope violation</strong> is the certification hazard: even a beneficial update moves a model that was validated and, in regulated domains, frozen at a specific version outside the state that a regulator or a functional-safety case signed off on. The unifying observation is that on-device learning removes the human gate that a normal MLOps pipeline (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>) relies on, so the gate has to be reconstructed in software, on the device, before the weights are allowed to move.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A safe self-update is defined by three properties, not by the learning rule that produced it. It is <em>gated</em>: the candidate weights are evaluated against a frozen, trusted sentinel set before they replace the live model, so an update that hurts is rejected rather than applied. It is <em>bounded</em>: the parameter change lives inside a trust region, so no single learning step can move the model arbitrarily far, which caps the damage a poisoned batch can do. And it is <em>reversible</em>: the previous known-good checkpoint is retained, so any regression detected later can be rolled back atomically. Continual learning gives you plasticity; safety is the machinery that makes plasticity conditional, bounded, and undoable. If an update cannot be evaluated, limited, and reverted, it should not be allowed to happen autonomously.</p>
+    </div>
+
+    <h2>The accept-or-reject gate and the sentinel set</h2>
+    <p>The central mechanism is a validation gate. The device keeps a small, immutable <strong>sentinel set</strong>: a few dozen to a few hundred labelled examples, curated at build time to cover the safety-critical classes and the base distribution, stored in read-only flash so no field process can alter it. An update is never applied in place. Instead the candidate weights \(\theta'\) are computed off to the side, scored on the sentinel set, and adopted only if they do not regress it. Formally, accept \(\theta'\) over the incumbent \(\theta\) only when</p>
+    \[ \mathcal{A}_{\text{sent}}(\theta') \;\ge\; \mathcal{A}_{\text{sent}}(\theta) - \varepsilon, \]
+    <p>where \(\mathcal{A}_{\text{sent}}\) is accuracy (or a cost-weighted metric that punishes false negatives on critical classes) and \(\varepsilon\) is a small tolerance, often zero for safety-critical classes and slightly positive elsewhere to allow benign noise. The sentinel set is deliberately not the personalisation stream: it is the memory of what the model must never lose. Because it is leakage-safe by construction (curated once, never touched by field data, echoing the split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), a pass on the sentinel is trustworthy evidence that the update did not trade away known competence for a few new samples. To bound the update, clip the parameter delta to a trust region of radius \(\rho\), \(\lVert \theta' - \theta \rVert_2 \le \rho\); to detect poisoning, require that accepted new examples clear a confidence or conformal-rejection threshold (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) so that a wildly out-of-distribution "teaching" sample is refused rather than learned.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def safe_update(theta, learn_step, sentinel_X, sentinel_y,
+                rho=0.5, eps=0.0):
+    """Gate + bound + rollback around one on-device learning step."""
+    base_acc = accuracy(theta, sentinel_X, sentinel_y)   # score incumbent
+
+    theta_new = learn_step(theta)                        # candidate weights
+
+    delta = theta_new - theta                            # bound the change
+    norm = np.linalg.norm(delta)
+    if norm > rho:                                       # trust region clip
+        theta_new = theta + delta * (rho / norm)
+
+    new_acc = accuracy(theta_new, sentinel_X, sentinel_y)
+    if new_acc >= base_acc - eps:                        # gate on sentinel
+        return theta_new, "accepted"                     # commit new checkpoint
+    return theta, "rejected: sentinel regression"        # roll back to known-good
+
+def gate_sample(x, conf, tau=0.9):                       # poisoning guard
+    return conf >= tau        # only confidently-labelled samples may teach
+</code></pre>
+    <div class="code-caption"><strong>Listing 62.7.1.</strong> A minimal safe-update wrapper. <code>safe_update</code> scores the incumbent on the frozen sentinel set, produces a candidate, clips its parameter delta to a trust region of radius \(\rho\), and commits it only if sentinel accuracy does not regress by more than \(\varepsilon\); otherwise it returns the unchanged weights, which is the rollback. <code>gate_sample</code> refuses low-confidence inputs before they ever enter <code>learn_step</code>.</div>
+
+    <p>Listing 62.7.1 makes the three safety properties concrete in one function: the trust-region clip is the <em>bound</em>, the sentinel comparison is the <em>gate</em>, and returning the old <code>theta</code> on failure is the <em>reversibility</em>. Notice that the learning rule itself, <code>learn_step</code>, is a black box; the safety wrapper does not care whether it is a replay update, a prototype imprint, or a gradient step. That separation is what lets you bolt these guarantees onto any of the earlier sections' methods.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: a continuous glucose sensor that must never unlearn hypoglycaemia</h4>
+        <p>A wearable continuous glucose monitor personalises its trend model to each patient over weeks, exactly the on-device adaptation of <a class="cross-ref" href="section-62.6.html">Section 62.6</a>. The catastrophic failure is not a small trend error; it is failing to raise a low-glucose alarm at night. The device carries a sentinel set of curated hypoglycaemia episodes in read-only flash. Every nightly personalisation update is computed as a candidate, scored on that sentinel set, and committed only if its recall on the hypo episodes does not drop, with \(\varepsilon = 0\) for that class. One night the wearer's sensor develops a compression artefact that looks like a plunge; the candidate update tries to absorb it, sentinel recall falls, and the gate rejects the update and keeps the prior weights. The personalisation stalls for a day rather than silently degrading a life-safety alarm. Because the decision and its sentinel scores are logged, the clinical-validation and regulatory trail of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> stays intact even though the model changed in the field.</p>
+    </div>
+
+    <h2>Envelopes, logging, and knowing when to stop learning</h2>
+    <p>Gating each update is necessary but not sufficient, because many small accepted steps can drift a model a long way. Two additional controls matter. First, an <strong>update budget and drift monitor</strong>: track the cumulative parameter movement and the running sentinel margin, and when the model approaches the boundary of its validated envelope, freeze self-updating and require an authenticated over-the-air model from the fleet operator instead. This is where on-device learning hands back to fleet MLOps (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>). Second, an <strong>audit log</strong>: record for every update the timestamp, the number of samples, their gated confidences, the sentinel scores before and after, and the accept/reject decision, so that a field regression is diagnosable after the fact rather than a mystery. In functionally-safe domains the safest choice is often to let the model <em>propose</em> and a human or a fleet server <em>dispose</em>: the device accumulates candidate updates and evidence, but the certified weights change only through the governed channel, keeping the deployed model inside the envelope that ISO 26262 and the SOTIF framing of ISO 21448 (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) assume.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Rolling your own gate, trust-region clip, checkpoint store, and audit trail is a few hundred lines once you handle atomic checkpoint swaps, corrupted-write recovery, and structured logging. River (the online-learning library) supplies streaming metrics and drift detectors (ADWIN, Page-Hinkley) that raise the freeze signal for you, and MLflow or a lightweight model registry supplies versioned checkpoints with atomic promotion and rollback, so a sentinel gate plus drift-triggered freeze plus reversible checkpoints drops from several hundred lines to roughly thirty of glue. What no library decides for you is the content of the sentinel set and the value of \(\varepsilon\) per class: those encode which competencies are non-negotiable, and that is a safety judgement, not a default.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The open problem is certifying a model whose weights change after deployment. Classical functional-safety cases assume a frozen artifact; a self-updating model breaks that assumption, and regulators from the FDA (with its Predetermined Change Control Plan guidance for adaptive medical AI) to automotive safety bodies are actively defining what a "learning-enabled" system may change and still remain certified. On the technical side, current directions include provable-forgetting and machine-unlearning guarantees so a poisoned sample can be provably removed, robust aggregation and Byzantine-resilient on-device updates borrowed from federated learning (<a class="cross-ref" href="../module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>) to defend against poisoning at fleet scale, and formal runtime monitors that bound a network's output over a certified input region. The unresolved tension is the one running through this whole chapter: the plasticity that keeps a field model relevant is exactly what a safety case wants to eliminate, and the frontier is making adaptation auditable and bounded enough that a certifier will accept it rather than forbidding on-device learning outright.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the personalisation or imprinting head you built earlier in this chapter and wrap it with <code>safe_update</code> from Listing 62.7.1. Curate a sentinel set of 50 examples covering your base classes. Now stage two attacks: (a) a poisoning stream where 20% of "teaching" samples carry a flipped label, and (b) a transient-drift stream where a stuck-sensor pattern appears for 100 steps then vanishes. For each, run the model once with the gate disabled and once enabled, and plot sentinel accuracy over time. Report how much accuracy the gate preserves, how many updates it rejects, and the false-reject rate on genuinely helpful updates. Then sweep the trust-region radius \(\rho\) and the sample-confidence threshold \(\tau\) and describe the safety-versus-plasticity tradeoff you observe.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Name the three defining properties of a safe self-update and identify the line in Listing 62.7.1 that implements each.</p>
+        <p class="quiz-question">2. Why must the sentinel set be immutable and separate from the field data stream? What guarantee would be lost if field samples were allowed to enter it?</p>
+        <p class="quiz-question">3. Gating every individual update still lets a model drift far over time. What additional control stops this, and how does it decide when to hand control back to the fleet operator?</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 62</h3>
+        <p>Implement latent-replay continual learning for a wearable model under a memory/energy budget.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>, we drop the assumption that the device even has continuous power. When a sensor node harvests its energy and computes in intermittent bursts between brownouts, inference and learning must survive being interrupted mid-step, checkpoint their state, and resume, pushing the safety and continuity ideas of this chapter down to the level of a single capacitor's charge.</p>
+
+    <section class="bibliography" id="bibliography">
+    <h2 class="bibliography-title">Bibliography</h2>
+
+    <p class="bib-category">On-device and continual-learning safety</p>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://arxiv.org/abs/1708.06733">Gu, Dolan-Gavitt, and Garg (2017). BadNets: Identifying Vulnerabilities in the Machine Learning Model Supply Chain. arXiv.</a></p>
+    <p class="bib-annotation">The canonical demonstration that a few crafted training samples can implant a hidden backdoor, which is precisely the label-poisoning threat a self-updating field model faces without a gate.</p>
+    </div>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://arxiv.org/abs/2004.07211">Prabhu, Torr, and Dokania (2020). GDumb: A Simple Approach that Questions Our Progress in Continual Learning. ECCV.</a></p>
+    <p class="bib-annotation">Shows how easily continual-learning gains evaporate under honest evaluation, motivating the frozen sentinel set as an incorruptible measure of what an update must not lose.</p>
+    </div>
+
+    <p class="bib-category">Machine unlearning and reversibility</p>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://arxiv.org/abs/1912.03817">Bourtoule et al. (2019). Machine Unlearning. IEEE S&amp;P.</a></p>
+    <p class="bib-annotation">Introduces SISA training for efficiently removing the influence of specific data, the formal basis for provably rolling back a poisoned on-device update.</p>
+    </div>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://arxiv.org/abs/1612.00796">Kirkpatrick et al. (2017). Overcoming Catastrophic Forgetting in Neural Networks (EWC). PNAS.</a></p>
+    <p class="bib-annotation">Elastic Weight Consolidation constrains parameter movement to protect prior knowledge, the conceptual ancestor of the trust-region bound used here to cap update damage.</p>
+    </div>
+
+    <p class="bib-category">Poisoning, drift, and robust aggregation</p>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://arxiv.org/abs/1703.04730">Koh and Liang (2017). Understanding Black-box Predictions via Influence Functions. ICML.</a></p>
+    <p class="bib-annotation">Quantifies how a single training example shifts a model's predictions, the analytical tool for reasoning about how much one gated sample may move an on-device model.</p>
+    </div>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://proceedings.mlr.press/v70/blanchard17a.html">Blanchard et al. (2017). Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent (Krum). NeurIPS.</a></p>
+    <p class="bib-annotation">Byzantine-resilient aggregation that filters malicious updates, directly applicable when self-updating devices contribute to a fleet or federated model.</p>
+    </div>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://link.springer.com/article/10.1007/s10994-013-5320-4">Gama et al. (2014). A Survey on Concept Drift Adaptation. ACM Computing Surveys.</a></p>
+    <p class="bib-annotation">The reference survey on detecting and reacting to drift (ADWIN, Page-Hinkley), the signal that tells a self-updating device when to freeze and hand back to the operator.</p>
+    </div>
+
+    <p class="bib-category">Regulation and functional safety of adaptive AI</p>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://www.fda.gov/medical-devices/software-medical-device-samd/predetermined-change-control-plans-machine-learning-enabled-medical-devices">U.S. FDA (2024). Predetermined Change Control Plans for Machine Learning-Enabled Medical Devices. Guidance.</a></p>
+    <p class="bib-annotation">Regulatory template for pre-authorising bounded, specified model changes after deployment, the governance frame a self-updating medical sensor must fit inside.</p>
+    </div>
+    <div class="bib-entry-card">
+    <p class="bib-ref"><a href="https://www.iso.org/standard/77490.html">ISO (2022). ISO 21448: Road Vehicles - Safety of the Intended Functionality (SOTIF).</a></p>
+    <p class="bib-annotation">Defines safety for correctly-functioning systems facing unforeseen conditions, the standard whose validated envelope an on-device update must not silently leave.</p>
+    </div>
+
+    </section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

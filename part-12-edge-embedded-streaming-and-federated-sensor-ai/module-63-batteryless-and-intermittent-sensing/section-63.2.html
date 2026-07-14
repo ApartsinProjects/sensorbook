@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 63.2: Intermittent computing and checkpointing. Building Sensory AI." name="description"/>
+<title>Section 63.2: Intermittent computing and checkpointing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XII: Edge, Embedded, Streaming, and Federated Sensor AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 63: Batteryless and Intermittent Sensing</a></div>
+<h1>Intermittent computing and checkpointing</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Every few hundred milliseconds the world ends and I am reborn with no memory of the sentence I was in the middle of. Checkpointing is the diary I leave for my next self, hoping it is legible and, above all, true."</p>
+        <cite>A Reincarnating AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the harvested-power reality of <a class="cross-ref" href="section-63.1.html">Section 63.1</a>: a capacitor charges, the device runs, the voltage collapses, and the device dies, over and over. You should be comfortable with the microcontroller memory model of <a class="cross-ref" href="../module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a> (flash, SRAM, registers, the tensor arena) since checkpointing is fundamentally about which of those survive a power failure. The inference workloads we protect are the quantized models of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. No new mathematics is required beyond simple energy bookkeeping in joules and microjoules; the vocabulary of non-volatile memory is defined as it appears.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A battery-powered device treats a reboot as a rare catastrophe. A batteryless device treats it as the normal rhythm of life: the harvester fills a small capacitor, the load drains it in a burst of computation, and the device browns out and restarts several times a second. If your program simply started from <code>main()</code> after every power failure, it would never finish anything longer than one charge cycle. <strong>Intermittent computing</strong> is the discipline of making a long computation survive being chopped into thousands of tiny power-on fragments, and <strong>checkpointing</strong> is its core mechanism: periodically copy the live state into non-volatile memory so the next boot can resume instead of restart. The subtlety, and the reason this is a research frontier and not a solved problem, is that resuming naively corrupts memory in ways a normal reboot never could. This section explains why forward progress is hard, how reactive and task-based systems guarantee it, and how a neural network runs its layers across power outages without producing a different answer than it would on mains power.</p>
+    </div>
+
+    <h2>Why a reboot is not a fresh start</h2>
+    <p>Split the device's state into two populations by where it physically lives. <strong>Volatile</strong> state (CPU registers, the stack, SRAM, peripheral configuration) evaporates the instant the supply drops below the brownout threshold. <strong>Non-volatile</strong> state (flash, and increasingly FRAM, ferroelectric RAM, which is byte-writable and cheap to write) persists across the outage. The whole problem of intermittence is that a computation's progress is spread across both. The program counter that says "I am in layer 3" is volatile; the partially written output buffer of layer 3 may be non-volatile. When power returns, the volatile half is gone but the non-volatile half remains, and the two are now inconsistent.</p>
+    <p>This inconsistency is not merely lost work; it can produce results that no continuous execution ever would. The classic failure is the <strong>write-after-read (WAR) hazard</strong> on non-volatile memory. Suppose a fragment reads a running sum <code>s</code> from FRAM, adds a sensor sample, and writes <code>s</code> back. If power fails after the write but before the fragment is marked complete, the next boot re-executes the whole fragment, reads the already-incremented <code>s</code>, and adds the sample again. The sum is now double-counted. Because the code re-runs against memory it already mutated, a plain re-execution is not idempotent, and the device silently computes a wrong answer while looking perfectly healthy. Guaranteeing correctness under arbitrary power failures, not just guaranteeing progress, is what makes intermittent systems genuinely different from ordinary embedded programming.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>An intermittent program must satisfy two properties, and the second is the one people forget. <strong>Progress</strong>: a computation eventually completes despite repeated power failures, rather than looping forever on the same fragment. <strong>Memory consistency</strong>: the result equals what a single uninterrupted run would have produced, with no double-applied updates from partial re-execution. A system that checkpoints frequently but ignores WAR hazards has progress without consistency, and it is worse than useless because it fails silently. Any checkpointing scheme you adopt must state which of these it guarantees and under what assumptions.</p>
+    </div>
+
+    <h2>Reactive checkpoints: save just before you die</h2>
+    <p>The most direct strategy is to save a full snapshot only when power is about to fail. A comparator watches the capacitor voltage \(V_{cap}\); when it crosses a threshold \(V_{ck}\) chosen to leave just enough energy, an interrupt fires and the device copies its volatile state (registers, stack, and the dirty parts of SRAM) into non-volatile memory, then browns out gracefully. On the next boot a bootstrap routine restores that snapshot and jumps back to exactly where it was. This is the idea behind systems such as <em>Hibernus</em> and <em>Mementos</em>, and its appeal is that in the common case, when energy is plentiful, it adds zero overhead: you only pay when a failure is imminent.</p>
+    <p>The design tension is the threshold. The energy you must reserve for the snapshot is the state size divided by the write rate times the write power, so the capacitor must still hold at least</p>
+    \[ E_{ck} \;=\; \tfrac{1}{2}\,C\,\bigl(V_{ck}^{2} - V_{off}^{2}\bigr) \;\ge\; E_{\text{save}}(n) , \]
+    <p>where \(C\) is the capacitance, \(V_{off}\) the minimum operating voltage, and \(E_{\text{save}}(n)\) the energy to persist \(n\) bytes of live state. Set \(V_{ck}\) too low and a snapshot is truncated by the actual death, corrupting the checkpoint; set it too high and you trigger snapshots that were not needed, wasting energy and stalling progress. Because \(E_{\text{save}}\) grows with the volatile footprint, reactive checkpointing punishes large working sets, which is precisely what a neural network's activation buffers are.</p>
+
+    <h2>Task-based execution: make re-runs safe by construction</h2>
+    <p>The alternative abandons whole-memory snapshots and instead restructures the program into a chain of small, idempotent <strong>tasks</strong> connected by a commit protocol. The programmer (or a compiler) splits the computation at explicit boundaries; each task reads its inputs from a non-volatile channel, computes into private scratch, and atomically commits its outputs before control advances. If power fails mid-task, the next boot simply re-runs that task from its last committed inputs, and because the task never mutated the state it reads, re-execution is safe. Systems in this family (<em>Chain</em>, <em>Alpaca</em>, <em>InK</em>, <em>Coati</em>) differ in how they enforce atomicity: double-buffering and versioning of variables, privatization with redo-logging, or transactions that let tasks interact with interrupt handlers without WAR hazards. The cost is that every task boundary writes to non-volatile memory even when energy is abundant, so task-based systems pay a steady overhead in exchange for provable consistency and a bounded, predictable amount of re-executed work.</p>
+    <p>The two philosophies map onto a single tradeoff. Reactive checkpointing is cheap when failures are rare and expensive per event; task-based execution is uniformly priced and indifferent to how often the lights go out. Real deployments increasingly mix them: coarse task boundaries for consistency, plus a just-in-time voltage-triggered save of the small volatile remainder.</p>
+
+    <div class="callout practical-example">
+        <h4>Real-World Application: an RFID-powered vibration classifier on a factory motor</h4>
+        <p>A maintenance team glues a batteryless FRAM microcontroller to a pump housing where running a wire is impractical. It harvests from a passing RFID interrogator and, when charged, samples a MEMS accelerometer and runs a small quantized network that flags bearing-fault vibration signatures (the condition-monitoring task of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>). One inference does not fit in a single charge cycle: the device browns out mid-network four or five times per classification. The firmware structures inference as one task per layer, committing each layer's int8 activation tile to FRAM before starting the next, so a power failure during layer 3 re-runs only layer 3 against layer 2's committed output. An early prototype used whole-SRAM reactive checkpoints instead and double-counted samples in the feature accumulator whenever a failure landed inside the read-modify-write of the running mean, reporting phantom faults. Switching the accumulator to a versioned, double-buffered task removed the WAR hazard and the false alarms with it. The lesson is the same one the theory gives: progress was never the hard part, consistency was.</p>
+    </div>
+
+    <h2>Intermittent inference: running a network across outages</h2>
+    <p>Neural network inference is an appealing intermittent workload because it is a fixed, feed-forward dataflow: the layer graph is known ahead of time, so task boundaries can be placed at layer or tile edges automatically rather than by hand. This is the insight behind intermittent-inference runtimes such as <em>SONIC</em> and <em>TAILS</em>, which specialize the general task machinery for the loop nest of a convolution. Two ideas do most of the work. First, <strong>loop continuation</strong>: instead of checkpointing the entire activation buffer, the runtime persists only a few loop indices (which output channel and spatial position it has reached) in non-volatile memory, and on reboot it resumes the loop from those indices, treating the partially filled output as already done. Second, guarding the accumulation against the WAR hazard so a resumed multiply-accumulate never adds a product twice. Because activations are quantized to int8 (<a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), the checkpoint state is small and each committed tile is cheap, which is what makes byte-writable FRAM the enabling technology for AI on harvested energy.</p>
+    <p>The simulation below strips the idea to its core. It runs a vector accumulation as a sequence of steps under a power source that fails at random, contrasting a naive re-execution that double-counts against an index-checkpointed version that resumes correctly. The output shows the naive result diverging from the ground truth while the checkpointed one matches it exactly, which is the memory-consistency property made concrete.</p>
+
+    <pre class="language-python"><code class="language-python">import random
+
+def workload(n=8):
+    # Ground-truth: each element i contributes i+1 to a running sum, once.
+    return list(range(1, n + 1))
+
+def run_intermittent(contribs, checkpoint, fail_prob=0.35, seed=0):
+    rng = random.Random(seed)
+    nvm = {"sum": 0, "i": 0}          # non-volatile: survives power loss
+    while nvm["i"] &lt; len(contribs):
+        i = nvm["i"]                  # volatile view restored from NVM on boot
+        nvm["sum"] += contribs[i]     # read-modify-write on non-volatile sum
+        if checkpoint:
+            nvm["i"] = i + 1          # commit progress index BEFORE risking failure
+        if rng.random() &lt; fail_prob:  # power fails now
+            continue                  # reboot: without the commit, i is unchanged -> re-add
+        if not checkpoint:
+            nvm["i"] = i + 1          # naive: advance only after the vulnerable window
+    return nvm["sum"]
+
+truth = sum(workload())
+naive = run_intermittent(workload(), checkpoint=False, seed=1)
+safe  = run_intermittent(workload(), checkpoint=True,  seed=1)
+print(f"ground truth = {truth}")
+print(f"naive re-exec = {naive}  (consistent: {naive == truth})")
+print(f"checkpointed  = {safe}  (consistent: {safe == truth})")</code></pre>
+    <div class="code-caption">A minimal intermittence simulator. The non-volatile dictionary <code>nvm</code> persists across simulated power failures; volatile state does not. Committing the progress index before the failure window makes re-execution idempotent, so the checkpointed run reproduces the uninterrupted answer while the naive run double-counts. This is the WAR hazard and its fix in fifteen lines.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Hand-writing task boundaries, double-buffered versioning, and voltage-triggered saves is roughly 300 to 500 lines of fragile C per application, and every WAR hazard you miss is a silent bug. Intermittence runtimes fold this into the toolchain: on TI MSP430FR FRAM parts, TI's <code>Compute Through Power Loss (CTPL)</code> utility API checkpoints and restores the full processor state across a power failure in about three calls (<code>CTPL_init</code>, a periodic <code>CTPL_enterShutdown</code>, and an automatic restore on boot), and task-based frameworks such as Alpaca or InK generate the versioning and commit logic from annotated task graphs. You write the layer loop; the runtime supplies the consistency guarantee, cutting the hand-rolled bookkeeping by an order of magnitude.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Current systems research targets the overhead that checkpointing still imposes. Compiler passes (the <em>Ratchet</em> and <em>WARio</em> lines of work) automatically insert the minimum checkpoints needed to break every WAR dependence, rather than at fixed intervals, so energy-abundant regions run checkpoint-free. On the hardware side, non-volatile processors (NVPs) with FeRAM or MRAM flip-flops in the register file snapshot the entire pipeline in a handful of cycles, shrinking \(E_{\text{save}}\) toward zero and blurring the line between volatile and non-volatile state. For sensor AI specifically, the open questions are placing task boundaries to co-optimize inference latency against checkpoint energy, and extending consistency guarantees from feed-forward inference to on-device adaptation, which connects directly to the intermittent training constraints of <a class="cross-ref" href="../module-62-on-device-continual-learning/index.html">Chapter 62</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the simulator above so the running sum itself is protected by double-buffering: keep two copies of <code>sum</code> in <code>nvm</code> plus a valid-flag, write the updated value to the inactive buffer, then flip the flag as the single atomic commit. Inject a power failure between the buffer write and the flag flip. Confirm the result stays consistent, then argue in two sentences why flipping a one-byte flag can be treated as atomic on FRAM while the multi-byte sum write cannot. What hardware assumption does "atomic flag write" actually rest on?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>A device checkpoints often enough that it always makes forward progress, yet its reported sensor average is wrong. Which of the two required properties is it violating, and what memory hazard is the likely cause?</li>
+            <li>Reactive (voltage-triggered) checkpointing adds zero overhead when energy is plentiful. Why, then, might you still prefer task-based execution for an inference workload with large activation buffers?</li>
+            <li>Why does quantizing a network to int8 help an intermittent-inference runtime beyond the usual memory and latency savings of <a class="cross-ref" href="../module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-63.3.html">Section 63.3</a>, we stop treating the model as fixed and let it flex with the energy budget itself: energy-adaptive inference chooses how much network to run based on how much charge is in the capacitor, trading accuracy for the certainty of finishing before the next brownout. Checkpointing keeps a computation alive across outages; energy-adaptive inference decides how large a computation to even attempt.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
