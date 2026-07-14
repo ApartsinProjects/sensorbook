@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.4: RGB-thermal domain adaptation (D3T, causal multiplexing). Building Sensory AI." name="description"/>
+<title>Section 45.4: RGB-thermal domain adaptation (D3T, causal multiplexing) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Thermal, Infrared, and Multispectral Sensing</a></div>
+<h1>RGB-thermal domain adaptation (D3T, causal multiplexing)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I learned the world in daylight, then someone handed me the world made of heat and asked why I could no longer find the pedestrians."</p>
+        <cite>A Retrained AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can train a convolutional object detector and read a mean-Average-Precision table. It leans on the covariate-shift framing and test-time adaptation of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, the teacher-student and consistency ideas of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The radiometry that makes thermal images look the way they do was set up in Section 45.1.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>You have millions of labeled RGB frames and a detector that is very good on them. You have a thermal camera on the same vehicle and almost no thermal labels, because a human boxing pedestrians in a long-wave infrared frame at 3 a.m. is slow, expensive, and often unsure. The naive move, running the RGB detector on thermal images, collapses: edges, textures, and color cues that the model learned to rely on simply do not exist in a heat map. This section is about crossing that gap without paying for a second labeling campaign. Two ideas carry the weight: a dual-domain teacher that manufactures its own thermal labels (D3T), and a causal view of why detectors secretly over-trust the RGB stream and how to break that habit (causal multiplexing).</p>
+    </div>
+
+    <h2>Why an RGB detector fails on thermal, precisely</h2>
+    <p>The failure is a textbook case of <strong>domain shift</strong>. Write the RGB source domain as a distribution \(p_S(x, y)\) over images \(x\) and labels \(y\), and the thermal target domain as \(p_T(x, y)\). A detector trained by minimizing expected loss under \(p_S\) is only guaranteed to generalize when the test distribution matches training. Here it does not: the <em>marginal</em> over images changes drastically, \(p_S(x) \neq p_T(x)\), because a long-wave infrared sensor measures emitted radiance, not reflected visible light. A dark-jacketed pedestrian who is nearly invisible in a night RGB frame is a bright, high-contrast blob in thermal; a painted lane marking that dominates the RGB image vanishes because paint and asphalt sit at the same temperature. The conditional \(p(y \mid x)\), what counts as a pedestrian, is stable, but the pixel statistics the network keys on are not. This is <strong>covariate shift</strong>, the same failure mode <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> treats in general, sharpened by a physically different sensor.</p>
+    <p>The <em>what</em>, then, is unsupervised domain adaptation (UDA): adapt a model trained on labeled source (RGB) to an unlabeled target (thermal) using only target images. The <em>why</em> is economic and safety-driven at once, because the thermal channel earns its place precisely in the conditions where RGB is weakest (darkness, glare, smoke), so getting it right is disproportionately valuable. The <em>how</em> is the rest of this section.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The thermal image is not "RGB with worse resolution." It is a different measurement of a different physical quantity. Adaptation succeeds only when the model stops relying on cues that thermal cannot provide (color, fine texture, cast shadows) and learns to trust the cues thermal provides in abundance (thermal contrast, body-heat silhouettes). Domain adaptation here is really cue re-weighting under a sensor change.</p>
+    </div>
+
+    <h2>D3T: a dual-domain teacher that labels the dark</h2>
+    <p>The dominant recipe for label-free adaptation is the <strong>mean-teacher</strong>, borrowed from semi-supervised learning. Keep two copies of the detector: a <em>student</em> updated by gradient descent, and a <em>teacher</em> whose weights are an exponential moving average (EMA) of the student. The teacher runs on weakly augmented target images and emits pseudo-labels; the student is trained to reproduce them on strongly augmented views. Because the teacher is a temporal ensemble it is more stable than any single checkpoint, so its pseudo-labels are cleaner than the student's own predictions.</p>
+    <p>The problem specific to RGB-to-thermal is that a single teacher, fed both domains, blurs them together and produces mush on thermal. <strong>D3T</strong> (Distinctive Dual-Domain Teacher, introduced at CVPR 2024) keeps <em>two</em> teachers, one specialized on RGB and one on thermal, and trains with a "zigzag" schedule that alternates the target the student is pushed toward. Early on the thermal teacher is weak, so training leans on the RGB teacher; as thermal pseudo-labels improve, the schedule zigzags toward the thermal teacher, letting the student migrate across the gap in stages rather than in one destabilizing jump. Each teacher is updated only from its own domain's student pass, so the domains stay <em>distinctive</em> instead of collapsing into an average that serves neither. The result is a detector that reads thermal well while never having seen a single hand-drawn thermal box.</p>
+    <p>The EMA update at the heart of every mean-teacher method is one line, shown in Listing 45.4. For teacher parameters \(\theta_{\text{tea}}\) and student parameters \(\theta_{\text{stu}}\),</p>
+    \[ \theta_{\text{tea}} \leftarrow \alpha\,\theta_{\text{tea}} + (1-\alpha)\,\theta_{\text{stu}}, \qquad \alpha \in [0.99,\, 0.9997]. \]
+    <p>A high \(\alpha\) makes the teacher a long, slow memory of the student's trajectory, which is exactly what keeps pseudo-labels from thrashing.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+
+@torch.no_grad()
+def ema_update(teacher, student, alpha=0.999):
+    """One EMA step: teacher <- alpha*teacher + (1-alpha)*student."""
+    for t_param, s_param in zip(teacher.parameters(), student.parameters()):
+        t_param.mul_(alpha).add_(s_param.detach(), alpha=1 - alpha)
+    for t_buf, s_buf in zip(teacher.buffers(), student.buffers()):
+        t_buf.copy_(s_buf)  # BN running stats follow the student directly
+
+# D3T keeps two of these teachers and alternates which one supervises:
+domain = "thermal" if step % 2 else "rgb"     # the "zigzag" schedule
+ema_update(teachers[domain], student, alpha=0.999)</code></pre>
+    <div class="code-caption"><strong>Listing 45.4.</strong> The exponential-moving-average teacher update that every mean-teacher adapter, D3T included, is built on. The only D3T-specific twist is the last two lines: two teachers, and a step-parity schedule choosing which domain supervises the student, so the RGB and thermal teachers never average into each other.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling the full mean-teacher loop (paired weak/strong augmentations, pseudo-label confidence filtering, EMA scheduling, unbiased detection heads) is 300 to 500 lines and easy to get subtly wrong at the augmentation seams. A detection framework such as Detectron2 or MMDetection with a UDA extension gives you the teacher-student scaffold as a config, so the code you actually own shrinks to the EMA rule in Listing 45.4 plus a dozen lines of schedule. You supply the two-teacher wiring; the library handles data loading, augmentation pairing, and the detector backbone.</p>
+    </div>
+
+    <h2>Causal multiplexing: why the model over-trusts the RGB stream</h2>
+    <p>Once both channels are available at test time, a different pathology appears. Multispectral pedestrian detectors trained on daytime-heavy data learn a shortcut: in the training distribution, well-lit RGB usually suffices, so the network leans on RGB and treats thermal as a garnish. At night that habit is exactly backwards, and misses spike. The clean way to name this is causal. Let \(R\) be the RGB features, \(T\) the thermal features, \(D\) the lighting or scene domain, and \(Y\) the detection. The domain \(D\) is a <strong>confounder</strong>: it influences both which modality looks informative and the label statistics, opening a spurious "backdoor" path \(R \leftarrow D \rightarrow Y\) that the model happily exploits.</p>
+    <p>The <strong>Causal Mode Multiplexer</strong> (also CVPR 2024) treats this as a causal-inference problem. Instead of learning the observational \(p(Y \mid R, T)\), which is polluted by the confounder, it targets the interventional distribution \(p(Y \mid do(R), do(T))\), where the \(do\) operator severs the backdoor path so the prediction reflects genuine causal support from each modality rather than a lighting-driven correlation. Concretely the framework multiplexes between a bias-free branch that learns modality-general cues and a term that explicitly cancels the confounded contribution, so the detector stops assuming "bright RGB means daytime means trust RGB." The payoff is measured where it matters: far smaller day-versus-night performance gaps than a plain fusion head, without extra labels.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>D3T and causal multiplexing attack two different diseases with the same symptom (bad thermal detection). D3T is about <em>getting</em> a thermal-competent model with no thermal labels. Causal multiplexing is about stopping a two-stream model from <em>leaning on the wrong stream</em> once it has both. A serious night-vision stack often wants both: adapt to acquire thermal skill, then de-confound so the fusion does not throw that skill away in daylight.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an automotive night-vision ADAS</h3>
+        <p>A tier-one supplier ships a driver-assistance module with a forward RGB camera and a co-boresighted long-wave thermal camera. Their RGB pedestrian detector scores well on public daytime benchmarks, but a night pilot on rural roads shows missed crossings when headlights are the only light. Relabeling thousands of thermal night clips is quoted at months. Instead the team runs a D3T-style adaptation: two teachers, RGB and thermal, with the zigzag schedule warming up the thermal branch from the existing RGB model, using only unlabeled night thermal drives. Night recall on their held-out route climbs sharply. They then wrap the two streams in a causal multiplexer so the fused detector no longer defaults to RGB when the scene merely <em>looks</em> bright, closing most of the remaining day-versus-night gap. The whole effort cost engineering time and compute, not a labeling contract. The one discipline they refused to skip: splitting drives by route and time so the same road at the same hour never appears in both train and test, the leakage trap of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current strong baselines are D3T (Distinctive Dual-Domain Teacher zigzag learning for RGB-to-thermal object detection, CVPR 2024) for label-free adaptation, and the Causal Mode Multiplexer (CVPR 2024) for unbiased multispectral pedestrian detection under day-night shift. The frontier is moving toward foundation-model-scale adaptation: using vision backbones pre-trained with the contrastive objectives of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> as a modality-agnostic prior, and toward joint adaptation-plus-fusion that ties this section to the missing-modality robustness of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>, so a dropped thermal frame degrades gracefully instead of catastrophically.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are handed a labeled daytime RGB pedestrian set and an unlabeled nighttime thermal set from the same fleet. Design an evaluation that would expose the RGB-shortcut bias described above. Specify (1) how you split by time and route to avoid leakage, (2) a single scalar that quantifies the day-versus-night gap, and (3) an ablation that isolates whether an improvement came from the D3T adaptation or from the causal de-confounding, not from both muddled together.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Covariate shift means \(p_S(x) \neq p_T(x)\) while \(p(y \mid x)\) is stable. Why does that distinction justify unsupervised adaptation rather than full relabeling?</p>
+        <p class="quiz-question">2. In the D3T EMA rule, what breaks if you set \(\alpha = 0.5\), and what breaks if you set \(\alpha = 0.99999\)?</p>
+        <p class="quiz-question">3. Name the confounder in the causal multiplexer's graph and state, in words, what the \(do(R)\) intervention removes.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-45.5.html">Section 45.5</a>, we flip the direction: instead of adapting a detector across the RGB-thermal gap, we learn to <em>synthesize</em> thermal imagery from visible frames, turning abundant RGB data into training material for thermal models and probing how far a generated heat map can stand in for a measured one.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

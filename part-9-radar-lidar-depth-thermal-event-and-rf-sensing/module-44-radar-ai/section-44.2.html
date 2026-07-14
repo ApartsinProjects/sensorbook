@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 44.2: FMCW/mmWave signal chain. Building Sensory AI." name="description"/>
+<title>Section 44.2: FMCW/mmWave signal chain | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 44: Radar AI</a></div>
+<h1>FMCW/mmWave signal chain</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You keep calling it a raw radar tensor. There is nothing raw about it. By the time that cube reaches my first convolution, a chirp generator, a mixer, and three FFTs have already made a dozen decisions about what I am allowed to see."</p>
+<cite>A Chirping AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the range, Doppler, and angle definitions built in <a class="cross-ref" href="section-44.1.html">Section 44.1</a>: range comes from a time delay, radial velocity from a Doppler shift, and angle from a phase difference across antennas. It leans hard on the sampling, Nyquist, and aliasing vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because the whole FMCW trick is to turn a target's distance into a frequency you then sample, and on the FFT and windowing machinery of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. The forward-model habit from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> is the frame: the network never sees the world, only a heavily processed proxy. You need the speed of light \(c \approx 3\times10^{8}\,\text{m/s}\) and complex exponentials. What the finished data cube <em>becomes</em>, the range-Doppler and micro-Doppler images, is deferred to <a class="cross-ref" href="section-44.3.html">Section 44.3</a>; here we build the pipeline that produces the cube.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why the plumbing decides what the model can perceive</h3>
+<p>A millimeter-wave radar hands your network a tidy three-dimensional array and it is tempting to treat it like an image: just another tensor to convolve. That framing hides the most consequential engineering in the whole pipeline. Unlike a camera, an FMCW radar never samples the returning wave directly; the wave oscillates tens of billions of times per second and no affordable converter can digitize it. Instead the sensor performs a clever act of frequency arithmetic on-chip, mixing the echo against the signal it just transmitted so that a target at 30 m becomes a low audio-band tone your ADC can comfortably sample. Every parameter of that trick, the chirp bandwidth, its slope, the number of chirps per frame, the number of transmit and receive antennas, silently sets the range resolution, the maximum unambiguous velocity, the angular sharpness, and the blind spots your detector will inherit. This section walks the signal from a voltage-controlled oscillator to the finished radar data cube, block by block, so that when a later model mysteriously cannot separate two pedestrians or folds a fast car onto a slow one, you know which knob upstream is responsible.</p>
+</div>
+
+<h2>The chirp and the dechirp: turning range into a tone</h2>
+<p><strong>What</strong> an FMCW radar transmits is not a pulse but a <em>chirp</em>: a sinusoid whose frequency ramps linearly from a start frequency \(f_c\) (77 GHz on automotive chips) upward across a bandwidth \(B\) over a duration \(T_c\), giving a slope \(S = B/T_c\). The echo from a target at range \(R\) is a delayed copy of that same ramp, delayed by the round-trip time \(\tau = 2R/c\). <strong>Why</strong> this is the whole game is the <em>dechirp</em>, also called stretch processing: the receiver mixes (multiplies) the incoming echo against a copy of the currently transmitted chirp. Because both are ramping in parallel but offset in time, their instantaneous frequency difference is a constant tone, the <strong>beat</strong> or intermediate-frequency (IF) signal, whose frequency is directly proportional to range:</p>
+$$f_b = S\,\tau = \frac{2 S R}{c}.$$
+<p><strong>How</strong> this reshapes the engineering is dramatic. A 77 GHz carrier is undigitizable, but a target at 50 m with a typical slope produces a beat tone of only a few megahertz, trivially sampled. Range measurement has become frequency estimation, which is why a single Fourier transform along the fast samples of one chirp recovers every target's range at once. The bandwidth alone sets how finely two targets separate in range:</p>
+$$\Delta R = \frac{c}{2B}.$$
+<p>A 4 GHz sweep gives about 3.75 cm of range resolution, independent of distance. This is the first place the signal chain constrains the model: no downstream network can split two reflectors closer than \(\Delta R\), because the physics merged them into one beat tone before sampling.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">FMCW moves the hard problem out of the ADC and into the DSP</h3>
+<p>A pulsed radar needs a converter fast enough to sample the returning wave in time; at millimeter wavelengths that is ruinous. FMCW pays a different currency. By mixing echo against transmit, it converts <em>range into frequency</em> and <em>velocity into a slow phase progression across chirps</em>, so a cheap megahertz-rate ADC suffices and all the intelligence lives in Fourier transforms afterward. The consequence for AI practitioners is that a radar's raw tensor is already a spectral estimate, not a raw waveform. When you window, zero-pad, or swap the FFT for a learned front end, you are editing a measurement whose noise structure and sidelobes were set by the mixer and the chirp geometry, not by the scene.</p>
+</div>
+
+<h2>The signal chain block by block</h2>
+<p><strong>What</strong> sits between the antenna and your tensor is a short, unforgiving chain. A frequency synthesizer (a phase-locked loop driving a voltage-controlled oscillator) generates the chirp; a power amplifier drives the transmit antenna; the echo enters the receive antenna, passes a low-noise amplifier, and reaches the <strong>mixer</strong> that performs the dechirp; a low-pass IF filter and an anti-alias filter clean the beat signal; and an ADC samples it. <strong>Why</strong> each block matters to perception is that each imposes a ceiling. The IF filter's cutoff, together with the ADC sample rate \(F_s\), caps the highest beat frequency the sensor can record, and therefore the <em>maximum range</em>: any target beyond \(R_{\max} = F_s\,c/(2S)\) either vanishes or, worse, aliases back to a false near range. The chirp slope trades this maximum range against range resolution, so the two constants your model implicitly assumes are set by an analog filter and a clock. <strong>How</strong> the data becomes a tensor is a nested loop familiar from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Within one chirp, the \(N\) ADC samples form the <strong>fast-time</strong> axis and carry range. A <strong>frame</strong> repeats \(M\) chirps a few microseconds apart; comparing the same fast-time sample across chirps forms the <strong>slow-time</strong> axis, whose phase progression carries Doppler. Each receive antenna contributes its own copy, forming the antenna axis that carries angle. The result is a three-dimensional array indexed by (fast-time, slow-time, antenna), the raw radar cube.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The parking radar that saw a ghost car in the bushes</h3>
+<p>A team bringing up a 77 GHz corner radar on a Texas Instruments AWR1843 chip for low-speed parking chased a phantom: a strong reflector reported at 4 m that no camera could corroborate, appearing only near a metal fence 30 m away. The cause was upstream of every learned block. Their chirp slope and 5 MHz ADC rate set \(R_{\max}\) near 25 m, but the fence at 30 m produced a beat tone above the Nyquist frequency, and the anti-alias IF filter had a gentle roll-off that let it leak through, folding the far fence onto a false 4 m target. The fix was pure signal chain, not machine learning: steepen the IF filter and lower the slope so genuine far returns fell inside the unambiguous window. The lesson generalizes past parking sensors; whenever a radar model hallucinates a solid object at a fixed close range, audit \(R_{\max}\) and the anti-alias filter before you touch the network. The same aliasing logic, applied to slow-time instead of fast-time, is what folds a fast vehicle onto a wrong velocity.</p>
+</div>
+
+<h2>MIMO and the virtual array: manufacturing an aperture</h2>
+<p><strong>What</strong> gives a millimeter-wave chip its angular resolution without a physically large antenna is <strong>MIMO</strong> (multiple-input, multiple-output). A chip with \(N_{\text{tx}}\) transmitters and \(N_{\text{rx}}\) receivers synthesizes a <em>virtual array</em> of \(N_{\text{tx}} \times N_{\text{rx}}\) elements: if the transmitters can be told apart, every transmit-receive pair samples the wavefront at a distinct effective position, so three transmitters and four receivers behave like a twelve-element array. <strong>Why</strong> this is worth the trouble is that angular resolution scales with aperture, and a wider synthetic aperture from the same tiny silicon means the difference between resolving two pedestrians and smearing them into one blob. <strong>How</strong> the transmitters are separated is usually <strong>time-division multiplexing</strong> (TDM-MIMO): they fire in a repeating round-robin, one per chirp, so the receiver always knows which transmitter it is hearing. That convenience carries a tax the AI engineer must respect. Because the transmitters are staggered in time, a moving target accrues extra phase between them, coupling velocity into the angle estimate; uncorrected, a fast car appears at the wrong bearing. Production stacks apply a Doppler-based phase correction before the angle FFT, and getting it wrong is a common source of angle errors that look, to a downstream detector, like sensor noise rather than a fixable pipeline bug.</p>
+
+<p>Code 44.2.1 makes the core dechirp concrete: it synthesizes the beat signal from two targets and recovers their ranges with a single FFT, the exact operation the mixer plus range FFT perform on-chip.</p>
+
+<pre><code class="language-python">import numpy as np
+
+c = 3e8
+B = 4e9            # chirp bandwidth (Hz)  -> range resolution c/(2B) = 3.75 cm
+Tc = 40e-6         # chirp duration (s)
+S = B / Tc         # slope (Hz/s)
+N = 512            # fast-time samples per chirp
+Fs = N / Tc        # ADC sample rate (Hz)
+
+t = np.arange(N) / Fs
+ranges = [5.0, 5.30]                   # two targets 30 cm apart (> 3.75 cm)
+beat = np.zeros(N, dtype=complex)
+for R in ranges:
+    f_b = 2 * S * R / c                # beat frequency for this range
+    beat += np.exp(1j * 2 * np.pi * f_b * t)
+
+spec = np.fft.fft(beat * np.hanning(N))          # range FFT with a window
+freqs = np.fft.fftfreq(N, d=1 / Fs)
+range_axis = freqs * c / (2 * S)                 # map frequency -> range
+peaks = np.argsort(np.abs(spec))[-2:]
+print("recovered ranges (m):", sorted(round(range_axis[p], 2) for p in peaks))
+# recovered ranges (m): [4.99, 5.29]
+</code></pre>
+<div class="code-caption">Code 44.2.1: The dechirp-plus-range-FFT core of an FMCW receiver. Two reflectors 30 cm apart, comfortably beyond the 3.75 cm resolution set by \(B = 4\) GHz, resolve into two distinct beat tones. Shrink the gap below \(c/(2B)\) and the two peaks merge into one, a limit no downstream model can undo.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: from ADC cube to detections in a few lines</h3>
+<p>Hand-rolling the full chain, range FFT, Doppler FFT, TDM phase correction, virtual-array construction, angle FFT, and CFAR thresholding, is several hundred lines of index-juggling and calibration bookkeeping. The open-source <code>OpenRadar</code> (PreSense) library collapses it: <code>radar_cube = dsp.range_processing(adc)</code>, then <code>dsp.doppler_processing(radar_cube)</code> yields the range-Doppler map, and <code>dsp.ca_cfar(...)</code> returns detections, roughly five calls replacing the pipeline of this section. Texas Instruments' mmWave SDK and <code>pymmw</code> stream calibrated cubes straight off AWR/IWR evaluation boards, and <code>radarsimpy</code> simulates them for training data. You still own the two things the library cannot guess: the chirp configuration that set your resolutions, and the TDM correction that keeps angle honest for moving targets.</p>
+</div>
+
+<h2>The finished cube: what the network actually ingests</h2>
+<p><strong>What</strong> leaves the signal chain is the radar data cube, and it is worth being precise about its axes because the whole of <a class="cross-ref" href="section-44.3.html">Section 44.3</a> operates on it. After the range FFT along fast-time and the Doppler FFT along slow-time, the cube is indexed by (range bin, Doppler bin, virtual antenna); a third FFT (or a super-resolution estimator) across the antenna axis adds angle. <strong>Why</strong> this matters for model design is that the cube is not an image and pretending it is throws away structure: its axes are physically meaningful and non-interchangeable, its dynamic range spans many orders of magnitude (a truck versus a bicycle), and it is dominated by empty bins. Some pipelines threshold early with CFAR to produce a sparse point cloud like the lidar clouds of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>; others feed the dense complex cube to a network to preserve weak returns the threshold would discard. <strong>When</strong> to choose which is the central architecture decision of radar AI, and it is set here, at the boundary between classical DSP and learning. The dense path keeps more information for the network but costs memory and compute that pressure the edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>; the sparse path is cheap but bakes the threshold's mistakes into every subsequent layer.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the signal chain is being rewritten</h3>
+<p>The clean split between fixed DSP and a learned back end is dissolving. <strong>Differentiable signal processing</strong> makes the range and Doppler FFTs, the windowing, and even CFAR trainable layers, so gradients flow from a detection loss back into front-end parameters; several 4D imaging-radar stacks now learn to reconstruct the angle spectrum end to end rather than trusting a fixed FFT, recovering resolution the classical pipeline discards. On the hardware side, cascaded and single-chip imaging radars (Texas Instruments' cascaded AWR2243 boards, Arbe's and Uhnder's high-channel-count digital-code-modulation designs) push virtual arrays into the hundreds of elements, and <em>phase-modulated</em> continuous wave (PMCW) is emerging as an interference-robust alternative to FMCW as radar density on the road climbs. For representation learning the open question echoes the one in lidar: how best to pretrain on raw or lightly processed complex cubes, a frontier connected to the broader RF sensing of <a class="cross-ref" href="../module-47-rf-and-wireless-sensing/index.html">Chapter 47</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: size a chirp for a use case</h3>
+<p>You are configuring a 77 GHz radar for an indoor fall-detection sensor that must resolve a person's limbs (targets as close as 4 cm apart) out to 8 m. (1) Using \(\Delta R = c/(2B)\), pick the minimum bandwidth \(B\), and comment on whether it fits inside the 4 GHz band available at 77 GHz. (2) Given your slope, use \(R_{\max} = F_s\,c/(2S)\) to find the ADC sample rate needed so 8 m falls inside the unambiguous range. (3) The sensor has 3 transmit and 4 receive antennas in TDM-MIMO; state the size of the virtual array and explain, in one sentence, why a person waving an arm could be placed at the wrong bearing if you skip the Doppler phase correction. (4) Modify Code 44.2.1 to add a third target 3 cm from one of the existing two and confirm it fails to resolve; then raise \(B\) until it succeeds. The contactless-vitals context for this sensor is developed in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A colleague proposes sampling the 77 GHz echo directly to "keep the raw signal." Explain in one or two sentences why FMCW mixes the echo against the transmit chirp first, and what a target's range becomes after that mixing.</p>
+<p>2. Two radars have identical chirp durations, but one sweeps 1 GHz and the other 4 GHz. Which resolves two closely spaced reflectors better, and which physical quantity in the cube is unaffected by this choice?</p>
+<p>3. A TDM-MIMO radar reports a fast-moving car at a bearing that drifts with the car's speed but is correct when the car is stationary. Name the coupling responsible and the correction that removes it.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-44.3.html">Section 44.3</a>, we take the radar data cube this section produced and turn it into the two image-like representations that machine learning actually consumes: the range-Doppler map, where every moving target draws a bright signature at its range and velocity, and the micro-Doppler spectrogram, where the fine limb and rotor motions of a walking person or a spinning drone leave a recognizable time-frequency fingerprint. Those representations are where radar perception starts to feel like vision, and where the signal-chain constraints we just built quietly define what the classifier can learn.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

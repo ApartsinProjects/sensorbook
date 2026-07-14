@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.6: Self-supervised lidar pretraining (ALSO, LISO). Building Sensory AI." name="description"/>
+<title>Section 42.6: Self-supervised lidar pretraining (ALSO, LISO) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>Self-supervised lidar pretraining (ALSO, LISO)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They asked me to label ten thousand boxes. Instead I asked the laser where the empty air was, and where the world moved. The laser had already labeled everything."</p><cite>An Unsupervised AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every backbone in <a class="cross-ref" href="section-42.3.html">Section 42.3</a> and <a class="cross-ref" href="section-42.4.html">Section 42.4</a> is hungry for annotated 3D boxes and per-point labels, and those annotations are the single most expensive line item in a lidar program: a human drawing an oriented 3D box in a spinning point cloud is roughly an order of magnitude slower than drawing a 2D image box. Meanwhile a robotaxi or a warehouse robot streams unlabeled scans by the terabyte, for free, every hour it drives. Self-supervised lidar pretraining exists to close that gap: it manufactures a learning signal from the raw geometry and motion of the scans themselves, so a network arrives at fine-tuning already knowing what surfaces, free space, and moving objects look like. This section studies two influential and complementary answers. ALSO learns a <em>representation</em> by reconstructing the scene's surface from its own points, then hands that representation to a downstream head that needs only a fraction of the usual labels. LISO goes further and learns to <em>detect objects with no human labels at all</em>, by treating motion as the annotator.</p>
+</div>
+
+<p>This section assumes you understand the pretext-task idea and contrastive learning from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, the sparse and transformer backbones from Sections 42.3 and 42.4 (the thing being pretrained), and the leakage-safe splitting discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Our narrow job here is the pretext design: what signal a lidar scan hands you for free, and how ALSO and LISO turn that signal into a trained backbone or a label-free detector.</p>
+
+<h2>Why lidar has a free label hiding in every scan</h2>
+
+<p>Image self-supervision usually relies on augmentation invariance or masked reconstruction because a photo carries no explicit geometry. A lidar scan is different: it is already a metric measurement of the world, and two physical facts come attached to every return at no cost. First, <strong>every returned point lies on a solid surface</strong>: the beam stopped there because something was there. Second, and more powerfully, <strong>the entire ray from the sensor origin to that return passed through empty air</strong>: had anything intervened, the beam would have stopped sooner. So each of the roughly \(10^5\) returns in a scan certifies one occupied location and a whole line segment of free space. That is dense, geometrically exact supervision that no human ever touched, and it is the seed ALSO grows into a representation. Motion supplies a second free signal, exploited by LISO: across consecutive scans of a static world, the ground and buildings hold still under ego-motion compensation, so any cluster of points that consistently moves relative to that static background is, almost by definition, an object worth detecting.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The two dominant lidar pretext signals are <em>occupancy</em> (where is the surface, and where is the certified-empty free space along each ray) and <em>motion</em> (what moves against a static background). Neither requires an annotator because both are consequences of how a time-of-flight beam physically interacts with the scene. ALSO mines the first; LISO mines the second. A good mental model: image SSL invents a pretext to compensate for missing geometry, whereas lidar SSL simply reads the geometry the sensor already recorded.</p>
+</div>
+
+<h2>ALSO: reconstruct the surface, keep the encoder</h2>
+
+<p>ALSO (Automotive Lidar Self-supervision by Occupancy estimation; Boulch et al., CVPR 2023) turns the occupancy signal into a pretraining objective built on an encoder-decoder. The backbone you actually care about (a sparse-conv or point-transformer encoder from earlier sections) ingests the raw scan and produces a per-point feature field. A lightweight decoder then answers a purely geometric question: given an arbitrary 3D query location \(\mathbf{q}\), is it occupied or empty? This is an implicit-surface formulation, the same neural-occupancy idea developed for <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>, repurposed here not to render a surface but to force the encoder to build features from which the surface is recoverable.</p>
+
+<p>The supervision is exactly the free-label of the previous section. Positive (occupied) queries are the returned points themselves. Negative (empty) queries are sampled along the sensor rays, between the origin and just short of each hit. The decoder predicts an occupancy probability \(\hat{o}(\mathbf{q}) \in [0,1]\) and the network minimizes a binary cross-entropy over the mixed query set,</p>
+
+$$ \mathcal{L}_{\text{ALSO}} = -\frac{1}{|\mathcal{Q}|}\sum_{\mathbf{q}\in\mathcal{Q}} \Big[ o(\mathbf{q})\log\hat{o}(\mathbf{q}) + (1-o(\mathbf{q}))\log\big(1-\hat{o}(\mathbf{q})\big) \Big], $$
+
+<p>where \(o(\mathbf{q})\in\{0,1\}\) is the free target (1 on a surface hit, 0 in certified free space). To solve this the encoder must learn that surfaces are locally planar, that objects have coherent extent, and that free space is contiguous, precisely the priors a detection or segmentation head wants. After pretraining the decoder is discarded and only the encoder is fine-tuned on whatever labeled subset you have. The code below constructs the ALSO query set from a single scan so the mechanism is concrete.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def also_queries(points, sensor_origin=np.zeros(3),
+                 n_free_per_ray=3, surface_eps=0.15, rng=None):
+    """Build ALSO-style occupancy queries from one lidar scan.
+    Returns query xyz and binary occupancy targets (1=surface, 0=free)."""
+    rng = rng or np.random.default_rng(0)
+    # Occupied queries: the returns themselves lie on a surface.
+    occ_q = points
+    occ_y = np.ones(len(points))
+    # Free queries: sample along each ray, short of the hit point.
+    dirs = points - sensor_origin                 # ray vectors
+    depth = np.linalg.norm(dirs, axis=1, keepdims=True)
+    unit = dirs / np.clip(depth, 1e-6, None)
+    # fractions in (0,1): stop before the surface by surface_eps meters
+    t = rng.random((len(points), n_free_per_ray))
+    t *= np.clip(depth - surface_eps, 0, None) / depth   # scale to pre-hit span
+    free_q = (sensor_origin
+              + (t[..., None] * depth[:, None]) * unit[:, None, :]).reshape(-1, 3)
+    free_y = np.zeros(len(free_q))
+    q = np.vstack([occ_q, free_q])
+    y = np.concatenate([occ_y, free_y])
+    return q, y
+
+pts = np.random.default_rng(0).random((20000, 3)) * 40.0 - 20.0
+q, y = also_queries(pts)
+print(f"{len(q)} queries: {int(y.sum())} occupied, {int((1 - y).sum())} free")</code></pre>
+<div class="code-caption">Constructing ALSO's self-supervised occupancy targets from a raw scan. Each return contributes one occupied query and several free queries sampled along its ray, so the labels come entirely from sensor geometry. The decoder (omitted) predicts occupancy at these locations; the gradient flows back into the encoder you keep.</div>
+
+<p>As the snippet shows, one scan yields hundreds of thousands of labeled queries for free. The reported payoff is <strong>label efficiency</strong>: an ALSO-pretrained backbone reaches the accuracy of a from-scratch model using a small fraction of the annotations, and it lifts fully-supervised runs by a point or two of detection and segmentation accuracy on nuScenes and SemanticKITTI. The gain is largest exactly where you are label-starved, which is the regime most real programs live in.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: bootstrapping a new delivery-robot city</h3>
+<p>A sidewalk-delivery-robot company expands to a new city whose streets, curbs, and pedestrian mix look nothing like its training data, and it has budget to annotate only 5% of the new scans. Rather than fine-tune the old detector directly, the team first runs ALSO pretraining on the full unlabeled fleet log from the new city (a few days of driving, entirely unlabeled), then fine-tunes on the small annotated slice. Because the occupancy pretext already taught the encoder the local geometry of the new city's narrow sidewalks and planter boxes, the fine-tuned detector matches what previously took roughly four times as many labels. The annotation team is redirected to the genuinely hard long-tail cases (strollers, scooters) instead of re-teaching the network what a curb is.</p>
+</div>
+
+<h2>LISO: let motion draw the boxes</h2>
+
+<p>ALSO still needs labels to fine-tune. LISO (Lidar-only Self-Supervised 3D object detection; Baur, Moosmann, and Geiger, ECCV 2024) removes them entirely for the moving-object case, using motion as the annotator. The pipeline is a loop. First a <strong>self-supervised scene-flow network</strong> estimates per-point motion between consecutive ego-motion-compensated scans, the same flow-and-registration machinery that underlies <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>. Points whose motion departs from the static background are clustered into candidate objects, and an oriented bounding box is fit to each cluster. Crucially, LISO then <strong>tracks these boxes over time</strong> and uses temporal consistency to clean them up: a real vehicle produces a smooth, physically plausible trajectory, so tracking filters spurious clusters and stabilizes box size and heading. These trajectory-regularized boxes become <strong>pseudo-labels</strong> that train a standard detector (a CenterPoint-style head from Section 42.3). The trained detector then proposes better boxes, which re-seed the next round of pseudo-labels, and the loop iterates. The result is a competent object detector produced without a single human annotation.</p>
+
+<p>The catch is intrinsic to the signal: motion only labels things that <em>moved</em> in the training logs. A parked car that never budges emits no flow and gets no pseudo-label, so pure LISO under-detects static instances of otherwise-mobile classes and cannot discover truly static categories at all. In practice teams use LISO to slash annotation cost on dynamic traffic and reserve a thin label budget for the static long tail.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026, occupancy-style pretraining (ALSO and successors such as masked-occupancy and 4D point-forecasting objectives) and motion-mined label-free detection (LISO and follow-ups like OYSTER and UNION) are the two active fronts in lidar self-supervision, and they are beginning to merge: reconstruct-the-scene pretraining that also predicts <em>future</em> occupancy folds motion into the geometric pretext, blurring the line between the two paradigms and connecting directly to the occupancy forecasting of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>. The open question is whether a single self-supervised objective can subsume both representation quality and label-free discovery, and whether image-lidar cross-modal distillation (freezing a 2D foundation model to supervise the 3D encoder) will out-scale the lidar-only route.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not build the pretext plumbing from scratch. The ALSO authors ship a reference implementation that plugs into Pointcept and OpenPCDet backbones: pretraining is a config that swaps in the occupancy decoder and the ray-sampling data transform, roughly 30 lines of YAML versus the several hundred lines of encoder-decoder, ray sampler, and query-batching code a from-scratch build demands. The scene-flow and tracking stages LISO depends on likewise come from released flow checkpoints and trackers, so a label-free detection loop is an orchestration script over existing modules rather than a research codebase you write yourself.</p>
+</div>
+
+<h2>Choosing a scheme, and evaluating it without self-deception</h2>
+
+<p>Reach for <strong>ALSO-style occupancy pretraining</strong> whenever you have plentiful unlabeled scans and a modest, growing annotation budget: it is the safe, general default because it improves both semantic segmentation and detection and never depends on objects moving. Reach for <strong>LISO-style motion mining</strong> when annotation is the binding constraint and your task is dominated by dynamic traffic, accepting that you will patch the static long tail separately. The two compose well: pretrain the encoder with ALSO, then generate LISO pseudo-labels, then fine-tune.</p>
+
+<p>Evaluation is where lidar SSL quietly goes wrong. Both methods pretrain on unlabeled logs, and if those logs overlap in place and time with your test set, the "self-supervised" backbone has effectively memorized the test geography, inflating every downstream number. Enforce the geographically and temporally disjoint splits of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> across the <em>pretraining pool as well as the fine-tuning set</em>, and report the full label-efficiency curve (accuracy versus fraction of labels) rather than a single operating point, since the whole promise of pretraining is what happens in the low-label regime.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using <code>also_queries</code>, (a) verify the free targets are physically valid: confirm every free query lies strictly between the sensor origin and its ray's return, and measure the mean distance from free queries to the nearest surface point (it should be non-trivial). (b) The sampler uses uniform \(t\) along each ray, which over-samples free space near the sensor where rays are dense. Modify the sampling so free queries are roughly uniform in 3D space instead, and argue in two sentences why that could change what the encoder learns. (c) Sketch how you would turn LISO's dependency on motion into an evaluation: design a test that separately reports detection accuracy on moving versus parked instances of the same class, and predict which will be worse and why.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>What two physical facts does a single lidar return certify, and which one supplies the bulk of ALSO's training signal?</li>
+<li>ALSO trains an encoder-decoder but you keep only the encoder. Why, and what does the decoder's occupancy task force the encoder to learn?</li>
+<li>Why does LISO systematically under-detect parked cars, and what practical step recovers them?</li>
+<li>Name the specific leakage that can silently inflate a self-supervised lidar result, and where in the pipeline you must enforce the split to prevent it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-42.7.html">Section 42.7</a>, we confront what happens when the clean scans behind these pretraining schemes meet rain, snow, fog, and a sensor the model never trained on: weather-induced noise, cross-sensor domain shift, and the latency and memory constraints that decide which of the backbones and pretraining strategies from this chapter can actually ship on a vehicle.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

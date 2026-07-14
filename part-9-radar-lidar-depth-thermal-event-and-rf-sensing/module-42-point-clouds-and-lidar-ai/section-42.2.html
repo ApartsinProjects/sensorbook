@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.2: Point-cloud representations; voxelization and pillars. Building Sensory AI." name="description"/>
+<title>Section 42.2: Point-cloud representations; voxelization and pillars | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>Point-cloud representations; voxelization and pillars</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A point cloud is a bag of numbers that refuses to sit still on a grid. Half of lidar research is politely convincing it to."</p><cite>A Tidying-Up AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A lidar sweep hands you an unordered set of tens or hundreds of thousands of 3D points, with no fixed count, no grid, and no canonical order. Every powerful perception backbone you know, from convolutional networks to transformers, was built for tensors on a regular lattice. The gap between those two facts is the single most important design decision in lidar AI: how do you turn a formless point set into something a network can convolve or attend over, without throwing away the geometry that makes lidar valuable? This section lays out the three answers the field converged on, points, voxels, and pillars, and shows why pillars in particular became the workhorse of real-time autonomous driving. Choose the representation well and a detector runs at 60 Hz on an embedded GPU; choose badly and it either drowns in empty 3D cells or blurs away the small objects you most needed to see.</p>
+</div>
+
+<p>This section builds directly on the raw point-cloud data structure from <a class="cross-ref" href="section-42.1.html">Section 42.1</a> and on the general idea, introduced in <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, that 3D measurements can live either on an image-like grid or as free-floating points. We assume the neural-representation vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>: embeddings, pooling, and why a network must respect the symmetries of its input. Our job here is narrow and load-bearing: define the encodings, derive the pillar pipeline that the sparse-convolution backbones of <a class="cross-ref" href="section-42.3.html">Section 42.3</a> and the transformers of <a class="cross-ref" href="section-42.4.html">Section 42.4</a> consume, and name the tradeoffs that decide which one you ship.</p>
+
+<h2>Why raw points resist standard networks</h2>
+
+<p>A point cloud \(P = \{\mathbf{p}_i\}_{i=1}^{N}\) has three properties that break naive convolution. It is <strong>unordered</strong>: any function that consumes it must be invariant to permutations of the \(N\) points, so a network cannot simply flatten the list into a vector. It is <strong>variable in size</strong>: \(N\) changes every frame, from a dense near-field return to a sparse distant one. And it is <strong>irregularly sampled</strong>: density falls off roughly as \(1/r^2\) with range and clusters along scan lines, so there is no fixed neighbor stencil. PointNet-style architectures address permutation invariance directly by applying a shared multilayer perceptron to each point and then pooling with a symmetric operator such as max, but pure point methods struggle to scale to the full-scene, hundred-thousand-point clouds of automotive lidar. The dominant alternative is to <em>discretize</em>: impose a grid, and let each cell aggregate the points that fall inside it. That single move restores order, fixes size, and regularizes density, at the cost of quantization.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Discretization is a bargain, not a free lunch. Voxelizing trades the exact continuous position of each point for the grid-friendliness a convolution needs. The art is choosing the cell size that keeps the geometry that matters: too coarse and two pedestrians merge into one occupied cell; too fine and 99 percent of your cells are empty, wasting memory and compute on nothing. Every representation in this section is a different point on that resolution-versus-emptiness curve.</p>
+</div>
+
+<h2>Voxelization: a 3D grid of learned cell features</h2>
+
+<p>Voxelization partitions space into a regular 3D lattice of cubic cells (voxels) of side \(v_x \times v_y \times v_z\) over a defined range, then assigns each point to the voxel containing it. The voxel index of a point is simply</p>
+
+$$ \left( \left\lfloor \frac{x - x_{\min}}{v_x} \right\rfloor,\; \left\lfloor \frac{y - y_{\min}}{v_y} \right\rfloor,\; \left\lfloor \frac{z - z_{\min}}{v_z} \right\rfloor \right). $$
+
+<p>The influential VoxelNet architecture (Zhou and Tuzel, 2018) turned each non-empty voxel into a learned feature vector with a <strong>Voxel Feature Encoding</strong> (VFE) layer: a small PointNet applied to the points inside that voxel, producing one fixed-length embedding per occupied cell. The result is a sparse 4D tensor (three spatial axes plus channels) that a 3D convolutional network can process. The decisive practical fact is <strong>sparsity</strong>: in a typical outdoor scene, well over 90 percent of voxels are empty, because lidar only sees surfaces, not filled volume. Running dense 3D convolutions over that mostly-empty grid is ruinously expensive, which is exactly the problem that sparse convolution, the subject of <a class="cross-ref" href="section-42.3.html">Section 42.3</a>, was invented to solve. For now, hold onto the shape of the output: a set of occupied cells, each carrying a coordinate and a feature vector.</p>
+
+<h2>Pillars: collapse the vertical axis and go 2D</h2>
+
+<p>PointPillars (Lang et al., 2019) made a shrewd simplification. Instead of dividing height into many voxels, it uses a single voxel that spans the full vertical extent: a <strong>pillar</strong>, an infinitely tall column with a small \(x\)-\(y\) footprint. Every point is binned into one pillar by its horizontal position alone. A PointNet-style encoder turns the points in each pillar into a feature vector, and those vectors are scattered back to their \((x, y)\) locations to form a dense 2D <strong>pseudo-image</strong>: a bird's-eye-view feature map with channels where a camera image would have RGB. The payoff is enormous. A 2D backbone, the same kind of efficient convolutional network the rest of computer vision has spent a decade optimizing, now does the heavy lifting, and there is no expensive 3D convolution anywhere in the pipeline. The bird's-eye-view output feeds naturally into the shared BEV representation developed in <a class="cross-ref" href="../module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>.</p>
+
+<p>The cost of pillars is vertical resolution: by collapsing the \(z\) axis into learned channels rather than explicit cells, the network must infer height structure from the pooled features instead of reading it off a grid. For road scenes, where objects sit on a roughly flat ground plane and their footprint is highly discriminative, this loss barely hurts. For scenes with rich vertical stacking, or for tasks needing fine height detail, keeping explicit voxels pays off. That is the whole voxel-versus-pillar decision in one sentence: pillars win on speed and simplicity; voxels win when vertical geometry carries signal.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def scatter_to_pillars(points, x_range=(0, 70), y_range=(-40, 40),
+                       cell=0.16, max_points=32):
+    """Bin an (N,4) xyz+intensity cloud into a BEV pillar grid.
+    Returns a dense (C, H, W) pseudo-image of simple hand-crafted
+    per-pillar features (a real net replaces these with a PointNet)."""
+    xs, ys = points[:, 0], points[:, 1]
+    keep = ((xs >= x_range[0]) & (xs < x_range[1]) &
+            (ys >= y_range[0]) & (ys < y_range[1]))
+    pts = points[keep]
+    gx = ((pts[:, 0] - x_range[0]) / cell).astype(np.int64)
+    gy = ((pts[:, 1] - y_range[0]) / cell).astype(np.int64)
+    W = int((x_range[1] - x_range[0]) / cell)
+    H = int((y_range[1] - y_range[0]) / cell)
+    flat = gy * W + gx                       # one id per pillar
+    C = 4                                     # count, mean-z, max-z, mean-intensity
+    img = np.zeros((C, H * W), dtype=np.float32)
+    order = np.argsort(flat)
+    flat, pts = flat[order], pts[order]
+    ids, start = np.unique(flat, return_index=True)
+    for k, s in zip(ids, start):
+        e = start[np.searchsorted(start, s) + 1] if s != start[-1] else len(flat)
+        col = pts[s:e][:max_points]           # cap points per pillar
+        img[0, k] = len(col)
+        img[1, k] = col[:, 2].mean()
+        img[2, k] = col[:, 2].max()
+        img[3, k] = col[:, 3].mean()
+    return img.reshape(C, H, W)
+</code></pre>
+<div class="code-caption">A minimal pillar scatter: horizontal binning, a per-pillar point cap, and four aggregated channels standing in for the learned PointNet features of PointPillars. The two ideas that make the real method fast, binning by \((x,y)\) only and capping points per pillar, are both visible here.</div>
+
+<p>The code above strips PointPillars to its skeleton so the moving parts are explicit. Real implementations replace the four hand-crafted channels with a learned encoder and augment each point with its offset from the pillar center and from the pillar's mean, which restores some of the sub-cell position the binning discarded. But the control flow, bin horizontally, cap per pillar, scatter to a dense BEV image, is exactly what ships.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You never hand-roll the scatter loop above in production. The <code>spconv</code> library provides <code>PointToVoxel</code>, which turns a raw cloud into voxel or pillar tensors (indices, features, and per-cell point counts) in a single fused CUDA call, and OpenPCDet wires that straight into VoxelNet, PointPillars, and their successors behind a config file. What takes roughly 40 lines of careful NumPy indexing here becomes a two-line transform plus a YAML entry, and the library handles the GPU hashing, the deterministic point cap, and the coordinate bookkeeping that quietly corrupts a from-scratch version. Reach for the manual code only to understand the mechanism, then let the library own the hot path.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery robot at a crosswalk</h3>
+<p>An urban sidewalk-delivery robot runs a 32-beam lidar and must clear intersections without stalling. Its team first tried a fine voxel grid with a 3D convolutional detector; accuracy on parked cars was excellent, but the model ran at 8 Hz on the robot's embedded GPU, too slow to react to a cyclist entering the crossing. Switching to a PointPillars encoder with a 0.16 m pillar footprint moved all convolution into 2D, lifted throughput past 35 Hz, and left latency budget for tracking. The one regression: short children close to the sensor were occasionally missed, because collapsing height merged a small standing figure with the ground return in the same pillar. The fix was not to abandon pillars but to shrink the pillar footprint near the robot and add the point-to-center offset features, recovering the small-object recall without giving back the speed. The representation choice, not the detector head, set the entire operating point.</p>
+</div>
+
+<h2>Range images and choosing among the three</h2>
+
+<p>A fourth encoding deserves mention: the <strong>range image</strong>, which exploits the fact that a spinning lidar naturally produces an organized grid indexed by beam elevation and azimuth. Unprojecting is unnecessary; the sensor already hands you a dense 2D array whose pixels are ranges, so an ordinary 2D convolutional network applies directly and runs very fast. The catch is that objects change apparent size and shape with distance in a range image, and neighboring pixels can be far apart in 3D, which hurts the metric reasoning that bird's-eye-view representations make easy. In practice: reach for <strong>pillars</strong> as the default for real-time BEV detection on a compute budget; escalate to <strong>voxels</strong> with sparse convolution when vertical structure or fine localization matters and you can afford the 3D backbone; consider <strong>range images</strong> when raw latency dominates and your task tolerates their view-dependent geometry; and keep <strong>point-native</strong> methods (Chapters <a class="cross-ref" href="section-42.4.html">42.4</a>) for indoor or object-scale clouds where \(N\) is modest and every point counts.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The voxel-versus-pillar dichotomy is softening. VoxelNeXt (2023) shows that a fully sparse voxel backbone can predict directly from sparse voxel features without ever forming a dense BEV map, closing much of the speed gap that once favored pillars, and it is the backbone we study in <a class="cross-ref" href="section-42.3.html">Section 42.3</a>. In parallel, Point Transformer v3 (2024) demonstrates that serializing points along space-filling curves lets a transformer process raw points at voxel-backbone scale, questioning whether an explicit grid is needed at all. The current frontier treats the representation as learnable and hybrid rather than a fixed upstream choice.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Consider a detection range of \([0, 70]\) m in \(x\) and \([-40, 40]\) m in \(y\). (a) With a pillar footprint of 0.16 m, how many pillars does the BEV grid contain? (b) A frame returns 90,000 points inside this range; if points were spread uniformly, what fraction of pillars would be occupied? Real lidar is far sparser than uniform, so treat your answer as a generous upper bound and explain why the true occupancy is lower. (c) You halve the pillar size to 0.08 m to sharpen small-object localization. State the two costs this incurs and which one dominates on an embedded GPU. Relate your reasoning to the model-optimization tradeoffs of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Name the three properties of a raw point cloud that prevent a standard convolution from consuming it directly, and state how discretization neutralizes each.</li>
+<li>What exactly does PointPillars collapse relative to VoxelNet, and what does the network gain and lose by doing so?</li>
+<li>Why is sparsity, more than resolution, the property that makes dense 3D convolution over a voxel grid impractical for automotive scenes?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-42.3.html">Section 42.3</a>, we confront the sparsity we kept flagging head-on. Sparse-convolution backbones such as CenterPoint and VoxelNeXt compute only on occupied cells, skipping the empty 90 percent entirely, which is what makes voxel-based detection fast enough to matter. We will see how the occupied-cell tensors defined in this section become the input to those backbones and how a fully sparse pipeline predicts objects without ever paying for the empty air between them.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

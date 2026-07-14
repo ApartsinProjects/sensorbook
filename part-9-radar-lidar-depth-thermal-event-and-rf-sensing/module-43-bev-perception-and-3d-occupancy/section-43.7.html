@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.7: Benchmarks and metrics. Building Sensory AI." name="description"/>
+<title>Section 43.7: Benchmarks and metrics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>Benchmarks and metrics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me a metric that rewards thick walls and I will paint you the thickest, most confident, most wrong wall you have ever scored ninety percent on."</p><cite>An Adversarially Honest AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Everything earlier in this chapter built representations: the shared bird's-eye grid, camera-to-BEV lifting, multi-sensor fusion, and dense 3D occupancy. None of it means anything until a number tells you whether one design beats another, and the wrong number can send a whole research program in the wrong direction. This section is about the numbers. It covers the three benchmark families that BEV and occupancy work lives or dies on, the composite metrics that grade them (nuScenes NDS, voxel mIoU, semantic scene completion, and the ray-based metrics that recently exposed a decade-old flaw in how we scored occupancy), and the evaluation hygiene that keeps a leaderboard honest: geographic splits, camera-visibility masks, and deliberate missing-sensor stress tests. A metric is a contract with reality. Choose it carelessly and your model optimizes the contract instead of the road.</p>
+</div>
+
+<p>This section is the accounting department for the whole chapter. It assumes you know what a BEV feature map and a 3D occupancy grid are (Sections 43.1 through 43.4), and it leans hard on two foundations from elsewhere in the book: the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, and the calibration and uncertainty view of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, because a confident occupancy prediction that is systematically overconfident games most volumetric metrics. Our narrow job here: name the datasets, define the metrics precisely enough to compute them, and expose the failure modes that make a good-looking score untrustworthy.</p>
+
+<h2>Three tasks, three metric families</h2>
+
+<p>BEV perception is not one benchmark. It splits into three tasks that are scored in genuinely different ways, and confusing them is the most common way to misread a paper's table.</p>
+
+<p><strong>3D object detection</strong> asks for oriented boxes with a class, position, size, heading, and velocity. It is scored on <strong>nuScenes</strong> (Caesar et al., 2020), <strong>Waymo Open</strong> (Sun et al., 2020), and <strong>Argoverse 2</strong>. <strong>BEV map segmentation</strong> asks for a rasterized top-down semantic map (drivable area, lane divider, pedestrian crossing) and is scored with per-class intersection-over-union. <strong>3D semantic occupancy</strong>, the task of Sections 43.4 and 43.5, asks for a dense voxel grid where every cell is empty or carries a semantic label, and is scored on <strong>Occ3D-nuScenes</strong>, <strong>Occ3D-Waymo</strong> (Tian et al., 2023), <strong>SurroundOcc</strong> (Wei et al., 2023), and the older <strong>semantic scene completion</strong> track of <strong>SemanticKITTI</strong> (Behley et al., 2019). Each family has a signature metric, and the rest of this section takes them one at a time.</p>
+
+<h2>Detection: why nuScenes replaced plain mAP with NDS</h2>
+
+<p>Classical detection uses mean average precision, where a prediction counts as a true positive if its box overlaps a ground-truth box above an IoU threshold. In 3D that overlap is brittle: a box off by half a meter in a busy scene can flip from hit to miss on a threshold you did not choose for a good reason. The nuScenes benchmark made two decisions that the field has largely adopted. First, it matches predictions to ground truth by <strong>2D center distance</strong> on the ground plane (thresholds of 0.5, 1, 2, and 4 meters) rather than by IoU, decoupling the match decision from box shape. Mean average precision is then averaged over those four distance thresholds and over classes.</p>
+
+<p>Second, and more important, nuScenes recognized that a detector can hit the right center yet be wrong about everything else, so it added five <strong>true-positive error metrics</strong> computed over matched boxes: translation (mATE), scale (mASE), orientation (mAOE), velocity (mAVE), and attribute (mAAE) error. These combine with mAP into the <strong>nuScenes Detection Score</strong>,</p>
+
+$$ \text{NDS} = \frac{1}{10}\Big[\, 5\,\text{mAP} + \sum_{\text{mTP}\in\mathbb{TP}} \big(1 - \min(1,\, \text{mTP})\big) \Big], $$
+
+<p>where \(\mathbb{TP}\) is the set of five error metrics. The weighting is deliberate: mAP carries half the score, and the five geometric and dynamic errors share the other half. A model that finds objects but misjudges their heading or velocity is penalized in a way plain mAP never captured, which matters because a self-driving planner acts on velocity and heading, not on the fact that something is roughly there.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>NDS is a composite because perception is not one skill. Reporting a single mAP hides whether your gains came from finding more objects or from placing the ones you found more precisely. Always read the true-positive error columns before believing an NDS improvement; a jump driven entirely by mAVE means your temporal fusion improved, not your spatial detector, and that distinction changes what you build next.</p>
+</div>
+
+<h2>Occupancy: voxel mIoU and the thickness it silently rewards</h2>
+
+<p>The default occupancy metric is <strong>mean intersection-over-union over voxels</strong>. For each semantic class \(c\), count voxels that are correctly predicted as \(c\) (true positives \(TP_c\)), predicted \(c\) but actually not (false positives \(FP_c\)), and actually \(c\) but predicted otherwise (false negatives \(FN_c\)), then</p>
+
+$$ \text{mIoU} = \frac{1}{|C|}\sum_{c \in C} \frac{TP_c}{TP_c + FP_c + FN_c}. $$
+
+<p>SemanticKITTI's semantic scene completion track reports this alongside a class-agnostic <strong>completion IoU</strong> that scores only occupied-versus-empty geometry, so you can see whether errors are about <em>where</em> the surface is or <em>what</em> it is. Voxel mIoU is intuitive and it is what Occ3D and SurroundOcc leaderboards rank on. It also has a quietly serious flaw, discovered when researchers looked closely at what high-scoring models actually predict.</p>
+
+<p>Occupancy ground truth is built by accumulating lidar sweeps, so surfaces are labeled a few voxels deep. A model can inflate its IoU by predicting surfaces <em>thicker</em> than they are: extra occupied voxels behind a true wall overlap nothing visible from the sensor, cost little in false positives relative to the true-positive mass they add, and are never penalized because the ground truth behind the wall is unobserved. The result is a leaderboard that rewards puffy, over-confident geometry that would wreck a planner trying to thread a gap. The <strong>RayIoU</strong> metric of SparseOcc (Liu et al., 2024) fixes this by scoring along sensor rays: it casts query rays into the predicted volume, finds the first occupied voxel each ray hits, and compares that depth-and-label to the ground truth along the same ray. A wall that is too thick no longer helps, because only the first hit counts, and depth error is measured directly. This is the same "score what the sensor could actually observe" principle that runs through <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def occupancy_miou(pred, gt, num_classes, visible_mask=None, empty_id=0):
+    """Semantic mIoU over a voxel grid, restricted to observed voxels.
+
+    pred, gt: int arrays of the same shape, class id per voxel.
+    visible_mask: bool array, True where the voxel is camera-observed.
+    empty_id is excluded so 'guess empty everywhere' cannot win.
+    """
+    if visible_mask is not None:            # do not score behind occluders
+        pred, gt = pred[visible_mask], gt[visible_mask]
+    ious = []
+    for c in range(num_classes):
+        if c == empty_id:
+            continue
+        p, g = (pred == c), (gt == c)
+        inter = np.logical_and(p, g).sum()
+        union = np.logical_or(p, g).sum()
+        if union == 0:                      # class absent from this scene
+            continue
+        ious.append(inter / union)
+    return float(np.mean(ious)) if ious else 0.0</code></pre>
+<div class="code-caption">A minimal, leaderboard-faithful voxel mIoU. Two design choices carry the honesty: the <code>visible_mask</code> restricts scoring to camera-observed voxels (the Occ3D convention), and skipping <code>empty_id</code> stops a model that predicts "empty everywhere" from scoring well on the dominant free class. The RayIoU discussed above replaces this volumetric overlap with a first-hit-along-ray comparison.</div>
+
+<p>The code above shows why the <strong>camera-visibility mask</strong> that Occ3D ships is not a detail. Without it, a model is graded on voxels behind walls and outside any sensor's view, which no method can predict from evidence, so the metric measures dataset priors instead of perception. Occ3D reports mIoU both with and without the mask; always check which one a table uses before comparing across papers.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a warehouse AMR that aced the leaderboard and clipped a rack</h3>
+<p>A robotics team deploying autonomous mobile robots (AMRs) in a distribution center trained a surround-view occupancy model and were thrilled: 42 percent voxel mIoU, comfortably above their lidar-only baseline. In the field the robot kept braking a hand's width too late near shelving uprights and once scraped a rack leg. Re-scoring with RayIoU told the real story: the model had learned to render thin steel uprights as fat blocks, which padded voxel mIoU by adding overlapping true positives but pushed the <em>first-hit surface</em> outward by 10 to 15 centimeters, exactly the margin the planner trusted. Switching the training and validation metric to RayIoU, and adding a thickness penalty, cost two points of voxel mIoU and eliminated the clipping. The number they had been optimizing was not the number the robot needed.</p>
+</div>
+
+<h2>Evaluating for the real world: leakage, robustness, and missing sensors</h2>
+
+<p>A metric is only as trustworthy as the split it runs on. nuScenes, Waymo, and Argoverse partition by <strong>scene and location</strong> so that consecutive frames from one drive cannot straddle train and test; without that, temporally adjacent frames leak and every score inflates. This is the geographic and session-level splitting rule of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applied to driving logs, and it is the first thing to verify before trusting any custom occupancy benchmark you build in-house.</p>
+
+<p>Second, an averaged score hides where a model breaks. Report per-class mIoU (occupancy leaderboards are dominated by "drivable surface" and "car"; rare classes like "bicycle" or "traffic cone" are where fusion earns its keep) and slice detection results by range, night versus day, and rain. Third, and central to this chapter's lab, evaluate under <strong>missing-sensor conditions</strong>. A fused BEV model should be graded not only in the all-sensors-healthy case but with a camera blinded or the lidar dropped, because that is a real failure mode on a real vehicle. Robustness curves of this kind belong to the distribution-shift toolkit of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, and they routinely reorder a leaderboard whose top entry was quietly leaning on one modality.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026 the occupancy community is mid-migration from volumetric voxel mIoU to ray-based scoring. RayIoU (SparseOcc, 2024) is the reference, and Occ3D-style leaderboards increasingly report it alongside mIoU; occupancy-flow tracks add a velocity term (per-voxel mean absolute velocity error) so that dynamic scenes are graded on motion, not just geometry. The open problems are agreeing on a single ray-sampling protocol so numbers are comparable across papers, scoring long-tail and small-object classes fairly under heavy class imbalance, and building metrics that reward well-calibrated occupancy probabilities rather than binary confidence, tying occupancy evaluation back to the calibration methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not implement NDS, per-class mIoU, or RayIoU by hand for a real submission. The <code>nuscenes-devkit</code> evaluation module computes the full NDS composite (mAP over four distance thresholds plus all five true-positive error terms) from a results JSON in a single <code>DetectionEval(...).main()</code> call, and the <code>mmdetection3d</code> occupancy metrics module provides masked voxel mIoU and RayIoU as configured evaluator hooks. That is roughly 400 to 600 lines of matching, thresholding, and ray-casting logic (all of it easy to get subtly wrong) reduced to a config entry and one call. Reserve a hand-rolled metric like the snippet above for unit tests and intuition, and let the devkit produce any number you report against a public leaderboard, so your score is bit-for-bit comparable with everyone else's.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a trained occupancy model (or synthetic predictions) on an Occ3D-nuScenes validation scene. (1) Compute masked voxel mIoU with the snippet above. (2) Artificially dilate every occupied voxel by one cell (a morphological dilation) to simulate "thicker" surfaces and recompute mIoU. Does the score go up or down? (3) Explain in two sentences why RayIoU would react to the same dilation differently, and which metric a motion planner should trust.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Two detectors report identical mAP on nuScenes but one has much lower mAVE. Which is the better perception input for a planner, and why does plain mAP miss the difference?</li>
+<li>Why does the camera-visibility mask change occupancy mIoU, and what does an unmasked score actually measure?</li>
+<li>Give one concrete way a model can inflate voxel mIoU without improving real geometry, and name the metric that closes that loophole.</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 43</h3>
+<p>Train a BEV or occupancy model on an Occ3D benchmark subset; evaluate under a missing-sensor condition. Report masked voxel mIoU and RayIoU for the all-sensors case, then re-evaluate with the lidar stream zeroed and the cameras blinded in turn, and plot the robustness curve. Discuss which metric moved most and whether your fused model degraded gracefully or collapsed to a single-modality baseline.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Detection benchmarks and composite metrics</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1903.11027">Caesar, H. et al. (2020). nuScenes: A Multimodal Dataset for Autonomous Driving. CVPR.</a></p>
+<p class="bib-annotation">Defines the NDS composite, center-distance matching, and the five true-positive error metrics that this section builds on; the reference benchmark for camera and fusion BEV detection.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1912.04838">Sun, P. et al. (2020). Scalability in Perception for Autonomous Driving: Waymo Open Dataset. CVPR.</a></p>
+<p class="bib-annotation">Large-scale detection benchmark whose LET-3D and range-sliced protocols complement nuScenes and underpin Occ3D-Waymo occupancy labels.</p>
+</div>
+
+<p class="bib-category">Occupancy and semantic scene completion benchmarks</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2304.14365">Tian, X. et al. (2023). Occ3D: A Large-Scale 3D Occupancy Prediction Benchmark for Autonomous Driving. NeurIPS.</a></p>
+<p class="bib-annotation">Introduces the Occ3D-nuScenes and Occ3D-Waymo benchmarks and the camera-visibility mask convention that makes masked voxel mIoU meaningful.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2303.09551">Wei, Y. et al. (2023). SurroundOcc: Multi-Camera 3D Occupancy Prediction for Autonomous Driving. ICCV.</a></p>
+<p class="bib-annotation">Dense occupancy benchmark and label-generation pipeline; a standard mIoU leaderboard for surround-view occupancy.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1904.01416">Behley, J. et al. (2019). SemanticKITTI: A Dataset for Semantic Scene Understanding of LiDAR Sequences. ICCV.</a></p>
+<p class="bib-annotation">Origin of the semantic scene completion task, reporting completion IoU and semantic mIoU separately, the template later benchmarks follow.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2112.00726">Cao, A. and de Charette, R. (2022). MonoScene: Monocular 3D Semantic Scene Completion. CVPR.</a></p>
+<p class="bib-annotation">First monocular SSC baseline; its evaluation protocol popularized reporting geometry (IoU) and semantics (mIoU) as a pair.</p>
+</div>
+
+<p class="bib-category">Metric design and its pitfalls</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2312.17118">Liu, H. et al. (2024). Fully Sparse 3D Occupancy Prediction (SparseOcc). ECCV.</a></p>
+<p class="bib-annotation">Introduces RayIoU, the ray-based occupancy metric that penalizes surface-thickness inflation and depth error, exposing a flaw in volumetric voxel mIoU.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2302.13130">Huang, Y. et al. (2023). Tri-Perspective View for Vision-Based 3D Semantic Occupancy Prediction (TPVFormer). CVPR.</a></p>
+<p class="bib-annotation">A widely benchmarked occupancy method whose reported numbers illustrate how architecture choices interact with the mIoU protocol used to score them.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>, we leave the camera-and-lidar world for radar, a sensor that sees through fog and rain and measures velocity directly but paints the scene in sparse, noisy, low-resolution returns. We will build learning systems on radar tensors and point clouds, and you will see the benchmark discipline of this section reappear immediately, because radar's failure cases and its natural metrics differ enough from lidar's that borrowing nuScenes numbers uncritically is its own kind of leakage.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

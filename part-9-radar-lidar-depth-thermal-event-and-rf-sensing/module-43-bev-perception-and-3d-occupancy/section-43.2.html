@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.2: Camera-to-BEV lifting and BEVFormer-style attention. Building Sensory AI." name="description"/>
+<title>Section 43.2: Camera-to-BEV lifting and BEVFormer-style attention | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>Camera-to-BEV lifting and BEVFormer-style attention</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A camera insists everything it sees lies on a ray. My job is to argue back, politely, about how far."</p><cite>A Perspective-Weary AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A surround-view rig of six cameras gives you six perspective images and no metric geometry: pixels are angles, not positions. Yet the planner behind an autonomous vehicle wants a single top-down map where a car is a car whether it is 5 or 50 meters away. Bridging that gap is the central problem of camera-to-BEV perception, and the field split into two elegant answers. One <em>pushes</em> pixels outward along their rays and drops them into a bird's-eye grid (Lift-Splat-Shoot). The other <em>pulls</em>: it plants a grid of learnable queries in BEV space and lets each query attend back into the images to gather what it needs (BEVFormer). Understanding both, and why the pull-based transformer eventually dominated the leaderboards, is the key that unlocks the multi-sensor fusion and 3D occupancy of the rest of this chapter.</p>
+</div>
+
+<p>This section assumes the shared bird's-eye-view representation motivated in <a class="cross-ref" href="section-43.1.html">Section 43.1</a>: a metric \((x, y)\) grid, ego-centered, where geometry is Euclidean and fusion is easy. It also assumes the pinhole camera model and the intrinsic and extrinsic matrices from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, the transformer and attention vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and an appreciation, from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-41-monocular-depth-foundation-models/index.html">Chapter 41</a>, of just how ambiguous monocular depth really is. Our job is narrow: define the two lifting paradigms, derive their mechanics, and name the tradeoffs that decide which one you deploy.</p>
+
+<h2>The lifting problem: one pixel, a whole ray of candidates</h2>
+
+<p>Project a 3D point \(\mathbf{p} = (X, Y, Z)\) in the camera frame to a pixel with the intrinsic matrix \(K\):</p>
+
+$$ d \begin{bmatrix} u \\ v \\ 1 \end{bmatrix} = K \begin{bmatrix} X \\ Y \\ Z \end{bmatrix}, \qquad d = Z. $$
+
+<p>The forward map is exact, but it destroys one number: the depth \(d\). Inverting it, going from pixel \((u, v)\) back to 3D, requires \(d\), and a single image simply does not contain it. Every pixel corresponds not to a point but to a ray, a one-parameter family of candidate positions. Camera-to-BEV lifting is, at heart, the discipline of resolving or hedging that missing depth so that image content can be placed on the ground plane. The two paradigms differ in exactly how they handle the ambiguity: one represents it explicitly as a distribution, the other sidesteps it by asking the grid what it wants.</p>
+
+<h2>Lift-Splat-Shoot: push pixels along a depth distribution</h2>
+
+<p>Lift-Splat-Shoot (LSS), introduced by Philion and Fidler in 2020, refuses to commit to a single depth. For each pixel it predicts a <strong>categorical distribution over a discrete set of depth bins</strong> \(\{d_1, \dots, d_D\}\), typically a few dozen bins spanning 1 to 60 meters. The image backbone emits, per pixel, both a context feature vector \(\mathbf{c} \in \mathbb{R}^{C}\) and a depth probability vector \(\boldsymbol{\alpha} \in \Delta^{D-1}\). The <strong>lift</strong> step forms a frustum of \(D\) points along the ray and weights the context feature by the depth probability at each bin:</p>
+
+$$ \mathbf{f}_{u,v,j} = \alpha_j \, \mathbf{c}_{u,v}, \qquad j = 1, \dots, D. $$
+
+<p>This outer product is the trick. A confident pixel concentrates its feature at one depth; an ambiguous one smears it softly across several. No hard decision is ever made, so gradients flow and the network learns depth as a byproduct of the downstream task. The <strong>splat</strong> step then uses the known camera geometry to place each of these \(H \times W \times D\) frustum features at its 3D location, drops them into BEV grid cells, and sum-pools everything landing in the same cell, a scatter operation identical in spirit to the pillar scatter of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. Multiple cameras splat into the same shared grid, which is why LSS handles a full surround rig natively. The <strong>shoot</strong> in the original name refers to a motion-planning head; in modern usage LSS means the lift-and-splat encoder.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>LSS turns an ill-posed inverse problem into a soft, differentiable forward one. Instead of asking "how far is this pixel?" (a question with no unique answer) it asks "how should this pixel's feature be spread over depth?" and lets the BEV task supervise the answer. The soft depth distribution is the whole idea: it is what makes the geometry end-to-end trainable rather than a fixed, error-prone preprocessing step. Its weakness is equally clear: if the predicted depth is wrong, the feature lands in the wrong cell, and BEVDepth (2022) showed that adding explicit lidar depth supervision to that \(\boldsymbol{\alpha}\) head is one of the largest single accuracy gains available to a camera-only detector.</p>
+</div>
+
+<h2>BEVFormer: pull features into learnable BEV queries</h2>
+
+<p>BEVFormer (Li et al., 2022) inverts the data flow. Rather than pushing pixels out, it starts from the destination: a grid of \(H_{\text{bev}} \times W_{\text{bev}}\) learnable <strong>BEV queries</strong>, one per ground cell. Each query is responsible for gathering the image evidence relevant to its patch of the world, using two attention mechanisms.</p>
+
+<p><strong>Spatial cross-attention</strong> lets a BEV query at ground location \((x, y)\) reach into the camera images. Because the query knows its own \((x, y)\) and a small set of candidate heights (pillars of reference points), it uses the camera extrinsics and intrinsics to project those 3D reference points into whichever images actually see them, then samples features there. Crucially, BEVFormer uses <strong>deformable attention</strong>: each projected point attends to only a handful of learned offset locations around its projection, not the whole image, which keeps cost linear rather than quadratic in image size. This is the inverse of LSS: instead of every pixel guessing its depth, every BEV cell already knows its geometry and asks the images a precise question.</p>
+
+<p><strong>Temporal self-attention</strong> is the second pillar and a genuine advantage of the query design. The previous frame's BEV features, warped into the current ego frame using the vehicle's motion, become keys and values that current queries attend to. This gives the model a short memory: it can infer velocity, carry information about objects momentarily occluded, and stabilize the map across frames, all things a single-frame LSS pass cannot do. The temporal recurrence is why BEVFormer and its successors excel at the velocity and attribute metrics of the nuScenes benchmark, not just position.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The push-versus-pull distinction is now a design axis, not a rivalry. BEVFormer v2 (2023) reintroduces a perspective-view detection head to give the backbone stronger geometric supervision, and BEVDepth injects lidar-supervised depth into the LSS push path; both are borrowing from the other side. FB-BEV (2023) fuses <em>forward</em> (LSS-style) and <em>backward</em> (BEVFormer-style) projection in one network, arguing each fixes the other's blind spots: forward projection leaves BEV cells empty where no pixel projects, while backward projection can hallucinate features into cells with no real support. On the current nuScenes camera-only leaderboards, these hybrid query-plus-depth designs, together with strong pretrained backbones, define the state of the art. Sparse-query successors such as SparseBEV and the query-based detector Sparse4D drop the dense grid entirely for efficiency, a direction covered further when we reach occupancy in <a class="cross-ref" href="section-43.4.html">Section 43.4</a>.</p>
+</div>
+
+<h2>A minimal splat: the geometric core in code</h2>
+
+<p>The distinctive engineering of LSS is the geometry, not the network. The snippet below builds the frustum of 3D points for one camera and shows how each pixel-depth pair maps to a world coordinate ready for the BEV scatter. Seeing the coordinate transform explicitly demystifies what both paradigms ultimately rely on.</p>
+
+<pre><code class="language-python">import torch
+
+def frustum_to_ego(depths, H, W, K, cam_to_ego):
+    """Map every (pixel u, v, depth d) to a 3D point in the ego frame.
+    depths: (D,) depth-bin centers. K: (3,3) intrinsics.
+    cam_to_ego: (4,4) camera-to-ego extrinsic. Returns (D,H,W,3)."""
+    us = torch.arange(W).view(1, 1, W).expand(len(depths), H, W)
+    vs = torch.arange(H).view(1, H, 1).expand(len(depths), H, W)
+    ds = depths.view(-1, 1, 1).expand(len(depths), H, W)
+    # back-project pixels to camera-frame rays, scaled by depth d
+    ones = torch.ones_like(us)
+    pix = torch.stack([us * ds, vs * ds, ds], dim=-1).float()   # (D,H,W,3)
+    cam_pts = pix @ torch.inverse(K).T                          # undo intrinsics
+    hom = torch.cat([cam_pts, ones.unsqueeze(-1).float()], dim=-1)
+    ego = hom @ cam_to_ego.T                                    # to shared frame
+    return ego[..., :3]                                         # drop homog. w
+</code></pre>
+<div class="code-caption">The lift geometry of Lift-Splat-Shoot for one camera: each depth bin \(d\) scales the ray so that inverting \(K\) yields a metric camera-frame point, and the extrinsic sends it to the shared ego frame. A real LSS encoder weights these points by the predicted depth probabilities and scatters them into a BEV grid; this function is the coordinate skeleton underneath that step.</div>
+
+<p>The function above is the exact transform every BEV cell in BEVFormer also computes, run in reverse: BEVFormer projects known 3D reference points <em>into</em> the image with \(K\) and the extrinsic, where LSS projects image pixels <em>out</em> to 3D. Same geometry, opposite direction of travel.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not hand-build the frustum, the CUDA scatter, or the deformable-attention kernel in production. MMDetection3D and the BEVFormer and BEVDet reference repositories package the full lift-splat encoder and the spatial and temporal attention blocks behind a config file: swapping backbone, BEV grid resolution, depth-bin range, or the number of temporal frames is a few YAML lines. The optimized <code>bev_pool_v2</code> scatter alone replaces roughly 150 lines of fragile index arithmetic and a naive scatter that is 10x slower, and the library owns the mixed-precision and coordinate bookkeeping that quietly breaks a from-scratch version. Reach for the manual code above to learn the geometry, then let the library own the hot path.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery pod reading a busy loading dock</h3>
+<p>Consider a low-speed autonomous delivery pod with four fisheye cameras navigating a warehouse loading dock, with no lidar to keep the bill of materials low. A single-frame LSS encoder places pallets and forklifts onto its BEV map well enough when they are clearly visible, but it flickers: a forklift half-occluded behind a stack of crates vanishes for a frame, and the planner brakes needlessly. Switching to a BEVFormer-style encoder with temporal self-attention lets the current BEV queries attend to the warped previous-frame map, so the forklift's last known position and inferred velocity persist through the brief occlusion. The pod stops jerking. The lesson generalizes: when the sensor suite is camera-only and the scene has occlusion and motion, the temporal memory of the pull-based design buys robustness that a per-frame push cannot. When lidar is present to nail depth, the choice matters far less, which is exactly the fusion story of the next section.</p>
+</div>
+
+<h2>Choosing between push and pull</h2>
+
+<p>The decision reduces to a few honest tradeoffs. LSS is conceptually simple, embarrassingly parallel, and fast, but its accuracy is hostage to the predicted depth distribution, and depth supervision (from lidar, when available) is close to mandatory for competitive results. BEVFormer needs no explicit depth, spends its capacity on attention rather than a depth head, and gains a temporal memory almost for free, at the cost of a heavier deformable-attention kernel and more careful engineering. In practice, camera-only detectors trending toward the top of public benchmarks blend the two: a depth-supervised forward projection to guarantee every cell has support, plus query-based backward attention and temporal fusion to refine and remember. Both feed the same downstream consumer, the shared BEV feature map, which is precisely why the next section can fuse a camera BEV stream with a lidar BEV stream without either encoder knowing the other exists.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a synthetic 200 x 200 BEV grid and a single virtual pinhole camera with known \(K\) and extrinsic. (a) Implement the LSS lift for 24 depth bins from 2 to 50 meters using the <code>frustum_to_ego</code> function above, assign each pixel a one-hot depth (pick a ground-truth depth per pixel), and scatter a constant feature into the grid; visualize which cells receive support and which stay empty. (b) Now replace the one-hot depth with a softmax over three neighboring bins and observe how the splatted footprint blurs. (c) Argue, from your empty-cell map in (a), why a purely forward-projection encoder benefits from a backward-projection companion.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does projecting a pixel back to 3D require a depth value, and what specific quantity does the pinhole projection discard? 2. In Lift-Splat-Shoot, what is the shape and meaning of the per-pixel outer product between the context feature and the depth distribution, and why must it be soft rather than a hard depth pick? 3. Name the two attention mechanisms in BEVFormer and state which one gives it a capability that a single-frame LSS pass fundamentally lacks.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-43.3.html">Section 43.3</a>, we cash in the shared bird's-eye-view representation that both paradigms produce. Because a camera BEV stream and a lidar BEV stream now live on the same metric grid, fusing them (the BEVFusion recipe) becomes a matter of concatenating feature maps rather than wrestling with cross-modal geometry, and we will see why that simple move is so robust when one sensor degrades or drops out entirely.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

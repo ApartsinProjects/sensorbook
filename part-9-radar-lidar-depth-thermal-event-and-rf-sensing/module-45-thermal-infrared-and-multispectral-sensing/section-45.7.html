@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.7: Multispectral fusion. Building Sensory AI." name="description"/>
+<title>Section 45.7: Multispectral fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Thermal, Infrared, and Multispectral Sensing</a></div>
+<h1>Multispectral fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me one band and I will guess. Give me twelve and I can tell a green leaf from green paint, and a warm rock from a person pretending to be one."</p><cite>A Multispectral AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A single RGB camera samples the world through three broad, overlapping windows in the visible spectrum. The physical world radiates and reflects across a far wider range: near-infrared (NIR) reveals chlorophyll and moisture, short-wave infrared (SWIR) separates materials that look identical to the eye, and long-wave infrared (LWIR) reports temperature directly. Multispectral fusion is the discipline of combining several spectral bands, each a genuine physical measurement, into one representation that a perception model can reason over. Done well, it turns ambiguity into evidence: a shadow stops looking like an object, camouflage stops matching the foliage it hides in, and a healthy crop separates cleanly from a stressed one. This section covers what to fuse, how to align bands that never share a sensor, which fusion architecture to pick, and the failure modes that make a naive channel-stack worse than the best single band.</p>
+</div>
+
+<p>This section assumes you can read each band as a calibrated physical quantity: reflectance for the reflective bands and apparent temperature for the thermal band, the radiometric story from <a class="cross-ref" href="section-45.1.html">Section 45.1</a> and the sensor-model intuition of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Multispectral fusion is a special, physically grounded case of the general fusion machinery in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>; here the modalities are wavelengths rather than whole sensors, which changes the alignment problem and the failure modes but not the underlying early/middle/late taxonomy.</p>
+
+<h2>What the extra bands buy you</h2>
+<p>The value of a band is the discriminative information it carries that the others do not. Two surfaces can be metamers in RGB, identical to three broadband detectors, yet diverge sharply once you look at their reflectance at 850 nm or 1600 nm. Vegetation is the canonical example: healthy leaves absorb red and reflect NIR strongly, so the normalized difference vegetation index</p>
+$$\mathrm{NDVI} = \frac{\rho_{\text{NIR}} - \rho_{\text{red}}}{\rho_{\text{NIR}} + \rho_{\text{red}}}$$
+<p>separates living canopy from soil, roads, and green-painted surfaces that would fool an RGB classifier. Bands are not equally useful, and they are highly correlated: a hyperspectral cube with 200 contiguous bands typically has an effective dimensionality of a handful, so the first job is often band selection or a projection (PCA, minimum-noise-fraction) that keeps the informative axes and discards the redundant ones, exactly the dimensionality-reduction reasoning from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>. Choose bands for complementarity (they disagree usefully) and redundancy (they agree when one is degraded), the two mechanisms that make any fusion pay off.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Fusion only helps when bands fail independently. RGB drowns in low light, NIR sees through haze but not through a warm-on-warm background, LWIR reports temperature but is blind to color and texture. Because their failure modes are uncorrelated, a fused estimate stays confident when any one band collapses. If two bands fail together (a hyperspectral cube saturating in bright sun across all reflective channels), stacking them buys nothing. Audit the correlation of errors, not just the correlation of signals.</p>
+</div>
+
+<h2>Registration: the problem before the model</h2>
+<p>Bands rarely share a focal plane. A multispectral rig may use a filter wheel (bands captured at different times), a beam-splitter array, or entirely separate cameras for RGB and LWIR with different resolutions, fields of view, and optical centers. Before any pixel-level fusion, the bands must be co-registered so that a pixel means the same physical point across all channels. This is a warping problem: estimate a homography or a dense flow that maps each band onto a common frame. Cross-spectral registration is genuinely hard because intensity does not correspond across the visible-to-thermal gap; a bright edge in RGB may be invisible in LWIR. Practitioners key on structural cues (gradients, mutual information, edge maps) rather than raw intensity, and calibrate the extrinsics once with a target that is visible in every band (a heated checkerboard works for RGB-plus-thermal). Misregistration is the single most common reason a fused model underperforms its best single band: a two-pixel shift between NIR and red turns a clean NDVI edge into a colored fringe of false anomalies.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: Cross-Spectral Registration</h3>
+<p>A hand-rolled mutual-information registration loop (build joint histograms, optimize a homography, warp, resample) is roughly 120 lines and easy to get subtly wrong at the resampling step. <code>kornia.geometry</code> plus its feature-matching module reduces the aligned-warp step to about 10 lines, and <code>rasterio</code> or <code>GDAL</code> handles the geo-referenced resampling of multispectral tiles in 3 to 4 lines with correct nodata handling. Let the library own the interpolation and coordinate bookkeeping; spend your effort on choosing the registration cue that survives your spectral gap.</p>
+</div>
+
+<h2>Early, middle, and late fusion of bands</h2>
+<p>The same three-level taxonomy from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> applies. <em>Early (pixel-level) fusion</em> concatenates registered bands into an \(N\)-channel tensor and feeds a single network; it is simple and preserves fine spatial detail, but it demands near-perfect registration and forces all bands through one shared stem. <em>Middle (feature-level) fusion</em> runs a lightweight encoder per band, then merges the feature maps, which tolerates small misalignments and lets each band learn a native front end; this is where illumination-aware gating lives, learning to down-weight RGB at night and lean on LWIR. <em>Late (decision-level) fusion</em> runs a full detector per band and combines outputs, which is the most robust to a dead sensor but throws away cross-band interactions. For thermal-plus-RGB perception, middle fusion with a learned per-pixel gate is the workhorse, and it connects directly to the missing-modality robustness techniques of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>: train with band dropout so the network never assumes every wavelength is present.</p>
+
+<p>The code below shows the core idea of illumination-aware weighting without a training loop. It estimates a per-pixel confidence for the reflective bands from local brightness and contrast, then blends a normalized reflective feature with a thermal feature so that dark, low-contrast regions defer to LWIR. This is the classical prior that a learned gate rediscovers, and it is worth building by hand once to see why the gate helps.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def illumination_aware_fuse(rgb, nir, lwir, eps=1e-6):
+    """Blend reflective and thermal features by per-pixel illumination confidence.
+    rgb: HxWx3 reflectance in [0,1]; nir, lwir: HxW (lwir = apparent temp, C)."""
+    lum = rgb.mean(axis=2)                                  # scene brightness proxy
+    local_contrast = np.abs(lum - lum.mean())              # cheap global-contrast term
+    # confidence in the visible/NIR bands: bright AND textured -> trust them
+    conf_vis = np.clip(lum, 0, 1) * (0.5 + 0.5 * np.tanh(4 * local_contrast))
+    conf_vis = conf_vis[..., None]
+
+    ndvi = (nir - rgb[..., 0]) / (nir + rgb[..., 0] + eps)  # a reflective feature
+    vis_feat = np.stack([rgb.mean(2), ndvi], axis=-1)       # HxWx2
+    therm_feat = np.stack([(lwir - lwir.min()) /
+                           (lwir.ptp() + eps)] * 2, axis=-1)  # HxWx2, normalized
+
+    fused = conf_vis * vis_feat + (1 - conf_vis) * therm_feat
+    return fused, conf_vis[..., 0]
+
+H, W = 4, 4
+rgb = np.full((H, W, 3), 0.05); rgb[:, :2] = 0.8           # left half bright, right dark
+nir = np.full((H, W), 0.6);     lwir = np.full((H, W), 22.0); lwir[1:3, 2:4] = 31.0
+fused, conf = illumination_aware_fuse(rgb, nir, lwir)
+print(conf.round(2))            # high on the lit left, near-zero on the dark right
+</code></pre>
+<div class="code-caption">Illumination-aware band fusion: a per-pixel confidence turns down the reflective bands where the scene is dark and low-contrast, letting the warm person on the dark right side survive through the thermal channel. A learned gate replaces the hand-tuned <code>tanh</code> with trained weights, but the inductive bias is identical.</div>
+
+<p>Evaluate fused models with the same care as any multi-sensor system. Split by capture site or session, never by random frame, so aligned band tuples from one scene cannot straddle train and test; that is the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, and it bites harder here because tightly registered bands make near-duplicate leakage almost invisible. Always report the fused model against the best single-band baseline; fusion that does not beat its strongest ingredient is usually a registration or gating bug, not a data limitation.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Precision Agriculture from a Drone</h3>
+<p>An agronomy startup flies a quadcopter carrying a five-band multispectral camera (blue, green, red, red-edge, NIR) plus a radiometric LWIR core over a vineyard. The reflective bands give per-vine NDVI and a red-edge chlorophyll index that flags nitrogen stress two weeks before it is visible to the eye; the thermal band gives canopy temperature, and canopy-minus-air temperature is a direct proxy for water stress because a well-watered vine transpires and stays cool. Fusing them resolves an ambiguity neither band can settle alone: a low-NDVI patch that is also hot is drought, while a low-NDVI patch that is cool is disease or nutrient deficiency. The pipeline registers the six bands to the NIR frame (heated-target calibration on the ground), computes indices, and feeds a middle-fusion segmentation model that outputs a per-vine stress map the irrigation controller acts on. The win comes from the fusion, not any single index.</p>
+</div>
+
+<h2>Where fusion pays and where it does not</h2>
+<p>Multispectral fusion earns its complexity when the extra bands change the decision, not merely decorate the image. It shines in remote sensing and agriculture (material and health discrimination), automotive night perception (RGB-plus-LWIR pedestrian detection through the domain-adaptation lens of <a class="cross-ref" href="section-45.4.html">Section 45.4</a>), medical imaging (oxygenation from spectral reflectance), and security (camouflage and spoof detection). It underperforms when bands are cheap to add but carry no independent signal, when registration cannot be held to sub-pixel accuracy, or when the added channels balloon compute past the platform budget. On an edge device, the honest tradeoff is bands versus latency: every extra channel costs bandwidth, storage, and inference time, so band selection is a deployment decision, not only a modeling one, and it connects to the on-device optimization of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a co-registered RGB-plus-NIR-plus-LWIR dataset (for example KAIST Multispectral Pedestrian). (1) Train three single-band pedestrian detectors and record AP for each. (2) Build an early-fusion 5-channel model and a middle-fusion model with a learned per-pixel gate. (3) Stratify the test set by ambient illumination and by \(\Delta T\) between people and background. Report AP per stratum. Where does each fusion strategy beat the best single band, and where does it fall behind? (4) Inject a 2-pixel registration error into the NIR band and re-evaluate the early-fusion model. Quantify how much AP you lose, and explain why middle fusion degrades more gracefully.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why can two surfaces be indistinguishable in RGB yet separable in SWIR, and what property of the reflectance spectra makes this possible?</p>
+<p>2. You stack four bands and the fused detector scores below your best single band. Name the two most likely causes and how you would tell them apart.</p>
+<p>3. Explain why late (decision-level) fusion survives a dead sensor better than early (pixel-level) fusion, and what it gives up in exchange.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 45</h3>
+<p>build a thermal anomaly/pedestrian detector with an RGB&rarr;thermal domain-adaptation step.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Multispectral perception and benchmarks</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://openaccess.thecvf.com/content_cvpr_2015/html/Hwang_Multispectral_Pedestrian_Detection_2015_CVPR_paper.html">Hwang, Park, Kim, Choi, and Kweon (2015). Multispectral Pedestrian Detection: Benchmark Dataset and Baseline. CVPR.</a></p><p class="bib-annotation">The KAIST dataset that made aligned RGB-plus-thermal pedestrian detection a standard task; the reference for day and night cross-spectral evaluation.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/8578775">Liu, Zhang, Wang, and Metaxas (2016). Multispectral Deep Neural Networks for Pedestrian Detection. BMVC.</a></p><p class="bib-annotation">Compares early, middle, and late fusion of color and thermal streams, and shows middle (halfway) fusion of features is the strongest general choice.</p></div>
+
+<p class="bib-category">Image and band fusion methods</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.sciencedirect.com/science/article/abs/pii/S1566253518305505">Ma, Ma, and Li (2019). Infrared and Visible Image Fusion Methods and Applications: A Survey. Information Fusion.</a></p><p class="bib-annotation">Broad, well-cited survey of the pixel and feature-level fusion techniques that underpin RGB-thermal and multispectral combination.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/9151265">Zhang, Xu, Xiao, Guo, and Ma (2020). Rethinking the Image Fusion: A Fast Unified Image Fusion Network. AAAI (IFCNN / PMGI line).</a></p><p class="bib-annotation">A unified learned fusion network that generalizes across infrared-visible, multi-focus, and multi-exposure fusion; a strong modern feature-fusion baseline.</p></div>
+
+<p class="bib-category">Registration and remote-sensing indices</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1163974">Viola and Wells (1997). Alignment by Maximization of Mutual Information. International Journal of Computer Vision.</a></p><p class="bib-annotation">The foundational mutual-information registration method that makes cross-spectral alignment possible when intensities do not correspond.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ntrs.nasa.gov/citations/19740022614">Rouse, Haas, Schell, and Deering (1974). Monitoring Vegetation Systems in the Great Plains with ERTS. NASA/Goddard.</a></p><p class="bib-annotation">The original NDVI formulation; the canonical example of a two-band spectral index that discriminates what a single band cannot.</p></div>
+
+<p class="bib-category">Software</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1910.02190">Riba, Mishkin, Ponsa, Rublee, and Bradski (2020). Kornia: an Open Source Differentiable Computer Vision Library for PyTorch. WACV.</a></p><p class="bib-annotation">Differentiable geometry and feature matching used here for cross-spectral warping and registration inside a training graph.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>, we leave the intensity image behind entirely. Event cameras report per-pixel brightness changes asynchronously, at microsecond latency and enormous dynamic range, trading the dense frame for a sparse stream of events. We will see how to represent that stream, reconstruct video from it, and fuse it with frames and inertial data, a different answer to the same question this chapter has been asking: how do you perceive when the ordinary camera runs out of physics?</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

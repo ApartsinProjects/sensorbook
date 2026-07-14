@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.4: Spiking neural networks. Building Sensory AI." name="description"/>
+<title>Section 46.4: Spiking neural networks | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Event-Based and Neuromorphic Sensing</a></div>
+<h1>Spiking neural networks</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You gave me a network that only speaks when something happens. I finally stopped shouting into the silence between frames."</p>
+        <cite>A Newly Sparse AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>The previous sections turned an asynchronous event stream into something a conventional network can eat: voxel grids, time surfaces, reconstructed video (<a class="cross-ref" href="section-46.2.html">Section 46.2</a>, <a class="cross-ref" href="section-46.3.html">Section 46.3</a>). Each of those quietly re-imposes a frame clock and pays for dense matrix multiplies on mostly empty tensors. Spiking neural networks (SNNs) take the opposite bet: keep the computation itself sparse and event-driven, so a neuron only does arithmetic when a spike arrives. That single design choice is what lets the same perception model run at milliwatts on the neuromorphic chips of <a class="cross-ref" href="section-46.5.html">Section 46.5</a>. This section explains the neuron model, how an SNN carries information in spike timing, and the one trick, surrogate gradients, that made training these networks with ordinary backpropagation finally work.</p>
+    </div>
+
+    <p>This section assumes you are comfortable with backpropagation through time on recurrent models (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) and with the event-camera output model from <a class="cross-ref" href="section-46.1.html">Section 46.1</a>. An SNN <em>is</em> a recurrent network with an unusual, biologically motivated nonlinearity; if the recurrent-model vocabulary is fresh, everything here will map cleanly onto it.</p>
+
+    <h2>The leaky integrate-and-fire neuron: a stateful, thresholded unit</h2>
+    <p>A standard artificial neuron computes \(a = \phi(w^\top x)\) once and is done. A spiking neuron is a small dynamical system that lives in time. The workhorse model is the <em>leaky integrate-and-fire</em> (LIF) neuron. It holds an internal <em>membrane potential</em> \(U_t\) that integrates incoming weighted spikes and leaks toward rest between them. In discrete time with step \(\Delta t\), a compact and widely used update is</p>
+    \[ U_t = \beta\, U_{t-1} + W x_t - S_{t-1}\,\theta, \qquad S_t = \Theta(U_t - \theta), \]
+    <p>where \(\beta \in (0,1)\) is the leak (decay) factor, \(x_t\) is the input spike vector at time \(t\), \(W\) the synaptic weights, \(\theta\) the firing threshold, \(\Theta(\cdot)\) the Heaviside step, and \(S_t \in \{0,1\}\) the neuron's output spike. When \(U_t\) crosses \(\theta\) the neuron emits a spike and the \(-S_{t-1}\theta\) term subtracts the threshold back off (a soft reset), so the neuron starts integrating again. The leak \(\beta\) sets a memory horizon: information about a past input decays with time constant \(\tau = \Delta t / (1-\beta)\), which is exactly the knob that lets a neuron forget stale evidence and stay sensitive to <em>recent</em> events.</p>
+    <p>Three properties fall straight out of this equation and explain the whole appeal. First, the unit is <strong>stateful</strong>: \(U_t\) is a memory, so an SNN layer is intrinsically recurrent even without explicit recurrent connections. Second, the output is <strong>binary and sparse</strong>: most timesteps produce \(S_t = 0\), so downstream layers can skip the multiply entirely. Third, information lives in <strong>when</strong> spikes occur, not only how many, which is precisely the microsecond timing an event camera hands you.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">The spike is where the energy savings hide</h3>
+        <p>A dense ReLU network multiplies every weight by every activation, whether the activation is 0.001 or 5.0. An SNN replaces the multiply-accumulate with an <em>accumulate-on-spike</em>: a synapse only adds its weight when its presynaptic neuron fires. If a layer is 95 percent silent on a given input, roughly 95 percent of its synaptic operations never happen. The sparsity is not a regularization side effect; it is the compute budget. This is why SNN papers report synaptic operations (SynOps) rather than FLOPs, and why the number that matters for deployment is the average firing rate.</p>
+    </div>
+
+    <h2>Encoding sensor data as spikes</h2>
+    <p>An SNN needs its input expressed as spike trains, which raises a design question a normal network never faces: how do you turn a real-valued measurement into a pattern of 0s and 1s over time? Three encodings dominate. <em>Rate coding</em> makes the spike probability proportional to the input magnitude, so a bright pixel fires often and a dim one rarely; it is robust but spends many timesteps to convey one number. <em>Latency (temporal) coding</em> fires a single spike whose <em>delay</em> encodes magnitude, so a strong input fires first; it is far more efficient in spike count but more fragile to noise. <em>Direct event coding</em> is the one that makes SNNs and event cameras a natural pair: the sensor already emits asynchronous ON/OFF events, so each event simply becomes an input spike at its own timestamp with no conversion layer at all.</p>
+    <p>That last option is the crux of why this chapter pairs the two technologies. For a conventional network you must accumulate events into a frame and lose their timing (<a class="cross-ref" href="section-46.2.html">Section 46.2</a>); for an SNN the event stream <em>is</em> the native input format. The encoding choice interacts with leakage-safe evaluation too: rate coding that integrates over a long window can quietly peek at future events relative to a decision time, the temporal-leakage hazard we treat as first-class in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Keep the integration window strictly causal.</p>
+
+    <h2>Training with surrogate gradients</h2>
+    <p>Here is the problem that held SNNs back for years. The spike function \(S_t = \Theta(U_t - \theta)\) has a derivative that is zero everywhere and undefined at the threshold. Backpropagation multiplies gradients through the network; multiply by zero and no error signal reaches the weights. The network cannot learn by gradient descent through a true step function.</p>
+    <p>The <em>surrogate gradient</em> method is the fix that unlocked the modern field. Keep the hard step in the <strong>forward</strong> pass, so the network genuinely emits binary spikes, but in the <strong>backward</strong> pass replace \(\Theta'(\cdot)\) with a smooth surrogate, a bump centered on the threshold. A common choice is the derivative of a fast sigmoid,</p>
+    \[ \frac{\partial S_t}{\partial U_t} \;\approx\; \frac{1}{\left(1 + \gamma\,|U_t - \theta|\right)^2}, \]
+    <p>with \(\gamma\) controlling how sharply the surrogate concentrates near threshold. Now the LIF neuron's recurrence unrolls in time exactly like an RNN and trains with ordinary backpropagation through time. This is the "spatio-temporal backpropagation" idea behind toolkits like SLAYER and the snnTorch and Norse libraries, and it is what makes SNNs trainable on the same GPUs and with the same optimizers as any other deep network. The forward pass stays faithful to the discontinuous hardware; only the gradient is softened.</p>
+    <p>There is a second, cheaper route worth knowing: <em>ANN-to-SNN conversion</em>. Train an ordinary ReLU network, then map each ReLU unit to a rate-coding LIF neuron whose firing rate approximates the ReLU activation. Conversion reuses mature ANN training and reaches strong accuracy, but it typically needs many timesteps to let firing rates settle, which erodes the latency advantage. Surrogate-gradient training, by contrast, can learn to decide in a handful of timesteps because it optimizes the spiking dynamics directly. The practical rule: convert when you already have a trained ANN and want a quick neuromorphic port; train with surrogate gradients when low latency and low spike count are the goal.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Let snnTorch carry the neuron dynamics and the surrogate</h3>
+        <p>Writing a LIF layer from scratch means hand-coding the membrane recurrence, the reset, the spike function, and a custom autograd backward that swaps in the surrogate derivative: easily 60 or more lines of careful PyTorch, and the backward pass is where subtle sign bugs hide. A spiking library reduces the neuron and its trainable gradient to a couple of lines and handles the surrogate, the reset mode, and the membrane state for you.</p>
+        <pre><code class="language-python">import torch, torch.nn as nn
+import snntorch as snn
+from snntorch import surrogate
+
+class EventSNN(nn.Module):
+    def __init__(self, n_in, n_hidden, n_out, beta=0.9):
+        super().__init__()
+        spike_grad = surrogate.fast_sigmoid(slope=25)   # the surrogate backward
+        self.fc1  = nn.Linear(n_in, n_hidden)
+        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        self.fc2  = nn.Linear(n_hidden, n_out)
+        self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
+    def forward(self, x):                 # x: [T, batch, n_in] spike trains
+        m1, m2 = self.lif1.init_leaky(), self.lif2.init_leaky()
+        out_spikes = []
+        for t in range(x.shape[0]):       # step through time, membranes persist
+            c1, m1 = self.lif1(self.fc1(x[t]), m1)
+            c2, m2 = self.lif2(self.fc2(c1), m2)
+            out_spikes.append(c2)
+        return torch.stack(out_spikes)    # [T, batch, n_out]; decode by spike count</code></pre>
+        <div class="code-caption">A two-layer LIF network in snnTorch: <code>snn.Leaky</code> holds the membrane state and applies the fast-sigmoid surrogate in its backward pass, so the whole model trains with a normal PyTorch optimizer over the unrolled time loop. The prediction is read off by counting output spikes per class across the \(T\) steps.</div>
+    </div>
+    <p>The loop in the code makes the recurrence concrete: membrane states <code>m1</code> and <code>m2</code> persist across timesteps, each layer emits spikes, and the readout accumulates output spikes into a per-class score. Swap the linear layers for convolutions and this is, in miniature, a spiking convolutional classifier for an event stream.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">A keyword spotter that sleeps between syllables</h3>
+        <p>A wearable-audio team needed always-on wake-word detection on a hearing-aid-class battery, where a conventional CNN spotter drained the cell in hours. They fed a cochleagram spike encoding into a small surrogate-trained SNN and deployed it on a neuromorphic co-processor. Because speech is bursty, the network's neurons sat near-silent during pauses and only fired during phonetic onsets, so average synaptic activity, and therefore power, tracked the actual acoustic content rather than a fixed frame rate. The result was single-digit-milliwatt always-on operation with the main processor kept asleep until the SNN raised a spike-count flag. The lesson generalizes: SNNs pay off most on signals that are genuinely sparse in time, where a frame-clocked model would burn energy processing silence. The same argument carries to microcontroller-class deployment in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+    </div>
+
+    <h2>When to reach for an SNN, and when not to</h2>
+    <p>SNNs are not a free accuracy upgrade. On dense, static inputs (a full RGB image, a saturated spectrogram) their sparsity advantage evaporates and a conventional network trained with the optimization tricks of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> usually wins on both accuracy and, on standard hardware, latency. The SNN case is strongest when three conditions hold together: the input is <em>temporally sparse</em> (event camera, silence-punctuated audio, rare-event vibration), the deployment target is <em>power-constrained</em> and ideally neuromorphic, and <em>low latency</em> matters enough to justify a spiking design. Miss any one and a well-tuned ANN, possibly quantized, is the safer default.</p>
+    <p>Two engineering caveats sharpen the picture. First, an SNN's latency-accuracy tradeoff is set by the number of timesteps \(T\): more steps let firing rates average out and lift accuracy, but each step is more compute and more delay, so \(T\) is a first-class hyperparameter, not a detail. Second, the binary, discontinuous readout complicates uncertainty estimates; spike counts are not calibrated probabilities out of the box, so the calibration and conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> deserve a second look before you trust an SNN's confidence in a safety loop.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The current frontier is closing the accuracy gap to conventional vision models while keeping spiking sparsity. Spikformer and Spike-driven Transformer (Zhou et al., 2023; Yao et al., 2023) replace the transformer's floating-point self-attention with spike-based, multiplication-free attention, reporting ImageNet-scale accuracy at a fraction of the energy. On event data specifically, spiking recurrent and graph models trained with surrogate gradients now compete with the dense RVT-style baselines of <a class="cross-ref" href="section-46.3.html">Section 46.3</a> on gesture and detection benchmarks (DVS128 Gesture, Gen1 automotive). The open questions are stable training at depth (spiking networks are prone to vanishing or exploding membrane dynamics) and hardware-software co-design so the theoretical SynOps savings survive contact with a real chip, the subject of <a class="cross-ref" href="section-46.5.html">Section 46.5</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: feel the timestep tradeoff</h3>
+        <p>Take the snnTorch classifier above and train it on the DVS128 Gesture dataset (or the spiking-MNIST N-MNIST if you want a faster loop). Sweep the number of timesteps \(T \in \{5, 10, 20, 50\}\), holding everything else fixed. For each \(T\), record test accuracy, the average firing rate per neuron, and wall-clock inference time per sample. Plot accuracy against average firing rate. Identify the knee of the curve: the smallest \(T\) that keeps accuracy within one point of the best. Then argue, in two sentences, what that knee would mean for a milliwatt deployment budget on the hardware of Section 46.5.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why does the true derivative of the spike function block gradient descent, and precisely which part of the forward pass does the surrogate gradient leave unchanged?</li>
+            <li>Give one signal where an SNN's sparsity buys real energy savings and one where it buys essentially nothing. What property distinguishes them?</li>
+            <li>You inherit a trained ReLU classifier and need a neuromorphic port by Friday. Do you use ANN-to-SNN conversion or surrogate-gradient training, and what do you give up either way?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-46.5.html">Section 46.5</a>, we take the spiking model off the GPU and onto silicon built for it: Loihi 2 and Speck. There the sparsity we treated as a training curiosity becomes a physical power budget, event-driven cores sit idle until a spike arrives, and the SynOps count of this section turns directly into microjoules.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.3: Metric depth and camera-agnostic models (Metric3D v2, UniDepth). Building Sensory AI." name="description"/>
+<title>Section 41.3: Metric depth and camera-agnostic models (Metric3D v2, UniDepth) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Metric depth and camera-agnostic models (Metric3D v2, UniDepth)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A relative depth map tells me the lamp is behind the chair. A metric depth map tells me the lamp is 2.4 meters away. Only one of those lets a robot arm reach for it without breaking something."</p>
+<cite>A Distance-Measuring AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the pinhole projection model and the focal-length parameter \(f\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and on the triangulation-versus-time-of-flight error behavior established in <a class="cross-ref" href="section-41.1.html">Section 41.1</a> and Chapter 40. It assumes you have met the relative and affine-invariant depth of <a class="cross-ref" href="section-41.2.html">Section 41.2</a> (Depth Anything), because the whole point here is what those models deliberately leave out: absolute scale. Camera intrinsics, back-projection, and the depth-map versus point-cloud distinction come from <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>. No new mathematics is needed beyond the projection equation and a single scaling argument.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why metric depth is a different problem</h3>
+<p>The models of <a class="cross-ref" href="section-41.2.html">Section 41.2</a> are extraordinary at <em>ordinal</em> depth: they tell you what is near and what is far, consistently, across almost any image. What they cannot tell you is the number a robot, a mapper, or an AR headset actually needs: how many meters. That is not a training-data shortfall; it is a geometric impossibility for a bare image, because a small scene photographed with a short lens and a large scene photographed with a long lens produce pixel-for-pixel the same picture. <strong>Metric depth foundation models</strong> break that tie in one of two ways. Metric3D v2 conditions on the camera's known focal length and warps every image into one <em>canonical</em> camera so a single network generalizes across sensors. UniDepth refuses to assume the intrinsics are known and predicts the camera itself alongside depth, making it truly <em>camera-agnostic</em>. This section is about that ambiguity and the two designs that defeat it.</p>
+</div>
+
+<h2>The scale-focal ambiguity: why one image is not enough</h2>
+<p><strong>What</strong> blocks metric depth from a single image is a coupling between object distance and lens focal length. A world point at depth \(Z\) projects to image coordinate \(x = f\,X/Z\). Multiply the whole scene by a factor \(k\) (every point twice as far, twice as large) and simultaneously multiply the focal length by \(k\), and the projected coordinate \(x = (kf)(kX)/(kZ) = f\,X/Z\) is <em>unchanged</em>. <strong>Why</strong> this matters is that appearance alone cannot separate "a dollhouse at 30 cm through a wide lens" from "a real house at 30 m through a telephoto lens." The pixels are identical. Any model that maps pixels to metric depth is therefore either guessing the focal length from learned priors on object sizes, or it must be told the focal length outright.</p>
+<p><strong>How</strong> the field split on this decision is the story of the two models below. The relative-depth route (Depth Anything) sidesteps the problem by predicting depth only up to an unknown scale and shift, which is why its output is unitless and needs an external anchor before it means meters. The metric route must confront the ambiguity head on. That confrontation is the reason a metric model trained naively on one dataset collapses the moment it sees a camera with different intrinsics: it has silently memorized one focal length and calls it the laws of physics.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Metric depth from one image is really a claim about size priors</h3>
+<p>When a monocular network outputs meters, it is not measuring distance; it is <em>recognizing</em> objects whose real-world size it learned during training and inverting the projection. A car is about 1.5 m tall, a doorway about 2 m, a coffee mug about 9 cm. Given the focal length, those learned sizes pin the scale. This is powerful and fragile at once: it works beautifully on in-distribution scenes full of familiar objects and it fails silently on a close-up of an unfamiliar textured surface with no size cue, or when the true focal length differs from what the pixels imply. Treat a monocular metric depth map as a strong prior, not a measurement, and carry the uncertainty forward with the calibration tools of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+</div>
+
+<h2>Metric3D v2: warp every camera into one canonical camera</h2>
+<p><strong>What</strong> Metric3D and its v2 successor do is remove the focal length as a free variable before the network ever sees the image. <strong>Why</strong> this is the right move follows directly from the ambiguity: if the model is only ever shown images as though they came from a single fixed camera, it never has to guess the focal length, so the scale it predicts is well defined. <strong>How</strong> they achieve it is the <em>canonical camera transformation</em> (CSTM). Pick a canonical focal length \(f_c\). For a training or test image with true focal \(f\), either resize the image or rescale the supervising depth so the appearance matches what the canonical camera would have captured. Concretely, a point that truly sits at depth \(Z\) under focal \(f\) is presented to the network as if it sat at the canonical depth</p>
+$$Z_c = \frac{f_c}{f}\,Z,$$
+<p>and at inference the network's canonical prediction is de-canonicalized by the inverse ratio, \(Z = (f/f_c)\,Z_c\). The network learns one consistent scene-to-depth mapping; the camera-specific scaling lives entirely in a deterministic pre- and post-processing step that needs only the intrinsics. Metric3D v2 adds a jointly trained <em>surface-normal</em> branch that regularizes the geometry (normals and depth must agree), which sharpens edges and stabilizes planar regions, and it scales the recipe to millions of images across hundreds of camera models to reach strong zero-shot metric accuracy.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def canonicalize_depth(Z, f, f_canonical):
+    """Map metric depth captured at focal f into the canonical camera."""
+    return (f_canonical / f) * Z
+
+def decanonicalize_depth(Z_canonical, f, f_canonical):
+    """Invert: recover true metric depth from a canonical prediction."""
+    return (f / f_canonical) * Z_canonical
+
+f_canonical = 1000.0                     # canonical focal length (pixels)
+# Same object, two very different real cameras:
+scenes = [("wide phone lens",   500.0,  0.30),   # f=500 px, mug at 0.30 m
+          ("telephoto",        2000.0, 12.00)]   # f=2000 px, sign at 12.0 m
+for name, f, Z in scenes:
+    Zc = canonicalize_depth(Z, f, f_canonical)
+    Z_back = decanonicalize_depth(Zc, f, f_canonical)
+    print(f"{name:16s} f={f:6.0f}  Z={Z:6.2f} m  ->  Z_canonical={Zc:6.2f} m  ->  recovered={Z_back:6.2f} m")
+# wide phone lens   f=   500  Z=  0.30 m  ->  Z_canonical=  0.60 m  ->  recovered=  0.30 m
+# telephoto         f=  2000  Z= 12.00 m  ->  Z_canonical=  6.00 m  ->  recovered= 12.00 m
+</code></pre>
+<div class="code-caption">Code 41.3.1: The canonical camera transformation at the heart of Metric3D. Two wildly different cameras are folded into one canonical focal length so the network sees a consistent world, then the true metric depth is recovered by the exact inverse scaling. The network never learns the camera; the intrinsics carry it.</div>
+
+<p>Code 41.3.1 makes the trick literal: the focal-dependent scaling is pure arithmetic on the intrinsics, and the learned part in between is camera-independent. The cost is honest, and it is stated in the next callout: Metric3D needs the focal length to be known and roughly correct. Feed it a wrong focal (a cropped image whose metadata no longer matches, an unknown web photo) and the metric scale is wrong by exactly that ratio.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: metric depth in a dozen lines</h3>
+<p>Implementing the CSTM warp, a ViT depth decoder, the normal branch, and the multi-dataset scale alignment from scratch is well over a thousand lines. With the released weights, the whole pipeline is a load, a preprocess, and a call: <code>model = torch.hub.load('yvanyin/metric3d', 'metric3d_vit_giant2', pretrain=True)</code>, hand it the image and the camera intrinsics, and read back a metric depth map plus normals. You supply the two things only you can know, the image and its focal length; the library owns the canonicalization, the backbone, and the de-canonicalization. That is roughly a 1000-to-12 line reduction, and it is the difference between a research reimplementation and an afternoon integration.</p>
+</div>
+
+<h2>UniDepth: predict the camera and the depth together</h2>
+<p><strong>What</strong> UniDepth changes is the one assumption Metric3D still leans on: that you know the intrinsics. In the wild (a scraped image, a phone that lied in its EXIF, a lens someone swapped) you often do not. <strong>Why</strong> a joint model helps is that the camera and the depth are two views of the same geometry, so predicting them together lets each constrain the other. <strong>How</strong> UniDepth works is by outputting depth in a <em>pseudo-spherical</em> space: instead of a raw depth number per pixel, it predicts, for every pixel, a viewing ray (an azimuth and elevation angle) plus a distance along that ray. A small, self-contained <em>camera module</em> predicts a dense field of rays directly from the image, effectively estimating the intrinsics, and the depth head is conditioned on those rays. Decoupling the angular part (which encodes the camera) from the radial part (which encodes the scene) is what lets one network stay metric across cameras it has never been calibrated for. The result is genuinely camera-agnostic: pass a bare image, get metric depth and an estimated camera back, no intrinsics required. When you <em>do</em> know the intrinsics, you can prompt the camera module with them and tighten the result.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the SOTA sits</h3>
+<p>As of this writing the practical frontier for zero-shot monocular metric depth is held by <strong>Metric3D v2</strong> (canonical-camera conditioning plus a joint normal head, strong when intrinsics are known) and <strong>UniDepth</strong> and its successor <strong>UniDepthV2</strong> (intrinsics-free, pseudo-spherical output with a learned camera module). Both post leading numbers on the zero-shot metric benchmarks (KITTI, NYUv2, and cross-dataset transfer) covered in <a class="cross-ref" href="section-41.6.html">Section 41.6</a>. The live research questions are how to keep metric scale stable under heavy lens distortion and non-pinhole optics (fisheye, rolling shutter), and how to fuse these dense-but-uncertain priors with a few sparse true-metric measurements, which is exactly the sensor-prompted setting of <a class="cross-ref" href="section-41.5.html">Section 41.5</a>. Treat leaderboard rankings as provisional; the gap between these systems is narrow and shifts with each release.</p>
+</div>
+
+<h2>Choosing between them, and what breaks</h2>
+<p><strong>When</strong> to reach for which is a clean decision. If you own the camera and can calibrate it once (a fixed robot head, a car with known optics, an industrial rig), Metric3D v2 with the true focal length is the tighter, more predictable choice; you are giving it real information and it rewards you with real scale. If the camera is unknown or varies shot to shot (user-generated content, a fleet of mismatched devices, archival footage), UniDepth's intrinsics-free operation is the design that does not fall apart. Both remain <em>priors</em>: neither measures distance, and both inherit the size-recognition fragility from the key-insight callout above. The safe deployment pattern, developed in <a class="cross-ref" href="section-41.7.html">Section 41.7</a> and fused formally in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, is to anchor the dense monocular metric map with a handful of true measurements from a sparse depth sensor and to track where the model is extrapolating beyond its size priors.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse drone with a swapped lens</h3>
+<p>An inventory drone flies aisles reading pallet labels and estimating free clearance. It ships with a calibrated wide lens, so the perception stack runs Metric3D v2 with the known focal length and gets clean metric clearance to shelving at 2 to 6 m. Then a field technician replaces a cracked lens with a slightly longer spare and forgets to update the calibration file. Overnight the metric depth is biased: because the true focal now exceeds the configured one, the de-canonicalization multiplies by the wrong ratio and every distance reads short, so the drone thinks the shelf is closer than it is and flies conservatively, stalling throughput. The fix the team adopts is a UniDepth pass running in parallel: its intrinsics-free estimate does not depend on the stale calibration file, and a large disagreement between the two metric maps becomes the trigger that flags the calibration as stale. Camera-agnostic depth here is not a research luxury; it is the self-check that catches a maintenance error. Localizing the drone within the warehouse frame is the job of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: diagnose a scale error</h3>
+<p>You deploy Metric3D v2 on a camera you believe has focal length \(f = 800\) px, but the true focal is \(f = 1000\) px. (1) Using the de-canonicalization relation \(Z = (f/f_c)\,Z_c\), show algebraically whether the reported metric depths come out systematically too large or too small, and by what constant factor. (2) A colleague proposes fixing it by rescaling the output map by that factor after the fact; explain why this works for Metric3D but would <em>not</em> be the right mental model for UniDepth. (3) You have five lidar returns at known metric ranges scattered across the frame; describe how you would use them both to detect the scale error and to correct it, and connect this to the sensor-prompted approach of <a class="cross-ref" href="section-41.5.html">Section 41.5</a>. (4) State one scene where <em>neither</em> model gives trustworthy metric depth regardless of correct intrinsics, and tie it to the size-prior argument.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A dollhouse photographed through a wide lens and a real house photographed through a telephoto produce identical pixels. Which single quantity, if supplied, resolves the ambiguity, and which of the two models requires you to supply it?</p>
+<p>2. Metric3D calls its core move the "canonical camera transformation." In one sentence, what is canonicalized, and where does the camera-specific information go?</p>
+<p>3. UniDepth predicts depth in a pseudo-spherical space of rays plus radial distance. Why does splitting the output into an angular part and a radial part help it stay metric on a camera it was never calibrated for?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-41.4.html">Section 41.4</a>, we turn from feed-forward regressors to a different generative recipe: diffusion-based depth, exemplified by Marigold, which repurposes a pretrained image diffusion model to <em>sample</em> depth maps. That framing buys remarkable detail and a natural notion of uncertainty from the sample spread, and it raises the question of how a model built to hallucinate plausible pixels can be trusted to report geometry, a tension we will resolve with the evaluation discipline of <a class="cross-ref" href="section-41.6.html">Section 41.6</a>.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 44.7: Automotive, security, and healthcare deployment. Building Sensory AI." name="description"/>
+<title>Section 44.7: Automotive, security, and healthcare deployment | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 44: Radar AI</a></div>
+<h1>Automotive, security, and healthcare deployment</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A demo works once, on my bench, with my data. A deployment works ten million times, in the rain, on a chip that costs three dollars, for seven years, without a lawyer calling."</p><cite>A Seasoned AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous six sections taught radar as a signal and as a perception model: the range-Doppler map, the imaging cube, the fusion stack, the vital-sign spectrogram. This closing section is about the harder half of the job, turning that model into a product that ships. Radar is unusual among the sensors in this book because it is simultaneously the cheapest way to measure range and velocity in the dark and the fog, and one of the most heavily regulated: it radiates licensed spectrum, it steers safety-critical decisions in cars, and it looks at human bodies in bedrooms and clinics. Deployment therefore lives at the intersection of three constraint systems that have nothing to do with accuracy on a benchmark: <strong>spectrum regulation</strong>, <strong>functional safety</strong>, and <strong>medical and privacy law</strong>. This section walks the three flagship domains, automotive, security, and healthcare, and shows how the same 60 or 77 GHz chip meets three completely different rulebooks.</p>
+</div>
+
+<p>This section assumes the radar signal chain and representations of <a class="cross-ref" href="section-44.2.html">Section 44.2</a> through <a class="cross-ref" href="section-44.6.html">Section 44.6</a>, the weather-robust fusion argument of <a class="cross-ref" href="section-44.5.html">Section 44.5</a>, and a working idea of safety cases and regulation from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>. Our concern here is not new algorithms but the deployment envelope: which band you may transmit in, what evidence a certifier demands, and how a fleet of radars behaves once thousands of them share a street or a hospital ward.</p>
+
+<h2>Automotive: spectrum, safety cases, and the interference wall</h2>
+
+<p>Automotive radar occupies the 76 to 81 GHz band by international allocation, with long-range cruise and emergency-braking sensors using a narrow slice around 76 to 77 GHz and short-range corner sensors sweeping the wider 77 to 81 GHz for finer range resolution. That choice is not the engineer's: it is fixed by ITU, FCC Part 95, and ETSI EN 302 264, which cap effective isotropic radiated power and occupied bandwidth. A model that wants more bandwidth for sharper range (recall \(\Delta R = c/2B\) from <a class="cross-ref" href="section-44.1.html">Section 44.1</a>) cannot simply take it; the regulatory mask is a hard boundary on what perception is physically allowed.</p>
+
+<p>On top of spectrum sits functional safety. A radar that arms automatic emergency braking is an item in an ISO 26262 safety case, assigned an Automotive Safety Integrity Level (ASIL) up to D, the most stringent. Two failure modes matter and pull in opposite directions: a <strong>missed detection</strong> (the radar fails to see a stopped truck) and a <strong>false positive</strong> (phantom braking on a manhole cover or an overhead gantry). ISO 21448 (SOTIF, safety of the intended function) governs the second, because phantom braking is not a component fault but a limitation of a perfectly working sensor misreading the world. This is why deployed automotive radar almost never acts alone: it is decomposed across redundant channels with camera and, on higher tiers, lidar, exactly the missing-modality-robust fusion argument of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>, so that no single sensor failure crosses the ASIL threshold.</p>
+
+<p>The constraint that scales with success, and that few benchmarks capture, is <strong>mutual interference</strong>. Every car radiating an FMCW chirp is noise to every other car's receiver. As market penetration climbs, the probability that two radars in view collide in time and frequency rises, raising the noise floor and manufacturing ghost targets. The rough model below treats each of \(N\) nearby radars as occupying a fraction \(\rho\) of the shared time-frequency resource and asks for the chance that at least one overlaps your own frame.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def interference_prob(n_radars, duty=0.02, seed=0):
+    """P(at least one of n_radars collides with ego in a shared time-freq slot).
+    duty = fraction of the shared resource a single radar's chirp train occupies."""
+    p_one_clear = (1.0 - duty)          # one interferer misses the ego slot
+    p_all_clear = p_one_clear ** n_radars
+    return 1.0 - p_all_clear
+
+for n in [1, 5, 20, 50, 100]:
+    print(f"{n:4d} interferers -> P(collision) = {interference_prob(n):.3f}")
+# 1 -> 0.020 | 5 -> 0.096 | 20 -> 0.332 | 50 -> 0.636 | 100 -> 0.867</code></pre>
+<div class="code-caption">A first-order estimate of radar-to-radar interference probability versus fleet density, showing why mitigation becomes mandatory as penetration grows. The duty factor stands in for chirp-train occupancy of the shared time-frequency resource.</div>
+
+<p>The numbers above are why production radars now ship interference mitigation as a first-class feature: chirp-timing randomization, digital detection-and-repair of corrupted chirps, and the emerging IEEE and ETSI coordination proposals. A deployment plan that ignores fleet density passes every solo bench test and then degrades in exactly the dense urban scenes where braking matters most, a distribution shift in the sense of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> that you cannot reproduce with a single sensor in a lab.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The three domains share silicon but not rulebooks. The same 77 GHz transceiver that a car maker certifies against ISO 26262 becomes, in an in-cabin child-presence detector, a device answering to Euro NCAP occupant-protection protocols, and in a hospital it becomes a medical device answering to the FDA or the EU MDR. Portability of the model does not imply portability of the safety case: each deployment re-earns its evidence against a different failure taxonomy. Budget the certification work, not just the training run.</p>
+</div>
+
+<h2>Security and smart spaces: false-alarm economics and the privacy dividend</h2>
+
+<p>In perimeter security, presence sensing, and building automation, radar's selling point flips from safety to <strong>privacy plus all-weather reliability</strong>. A 60 GHz radar in a ceiling never forms an image, so it can watch a bathroom, a bedroom, or a prison corridor where a camera is legally or ethically impossible, while still counting occupants, detecting intrusion, and measuring dwell. The dominant deployment metric here is not accuracy but the <strong>false-alarm rate</strong>. A perimeter radar that cries wolf on windblown foliage, rain, or a wandering deer trains its human operators to ignore it, which is worse than no sensor. The detect-then-classify micro-Doppler cascade of <a class="cross-ref" href="section-44.3.html">Section 44.3</a> is the standard defense: detect the range-Doppler peak, then classify its motion signature as human versus clutter before raising an alarm.</p>
+
+<p>Security radar also lives under spectrum rules, but friendlier ones. Most indoor presence and gesture radars use the 60 GHz ISM band (57 to 64 GHz), unlicensed under FCC Part 15 and ETSI EN 305 550, which is why consumer devices such as presence-aware thermostats and the gesture radar in some phones could ship at all. The tradeoff is short range and shared spectrum with Wi-Fi-class devices, tolerable for a room, unacceptable for a highway.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: retail-store occupancy without cameras</h3>
+<p>A grocery chain wants live occupancy counts for checkout staffing and COVID-era density limits, but a legal review kills the camera plan: image capture of shoppers triggers biometric-consent obligations in several of its markets. The team deploys ceiling-mounted 60 GHz radars over each aisle and door. Each node runs a small on-device model that turns range-Doppler tracks into an anonymous per-person count and direction of travel, publishing only integers to the cloud, never a signal that can reconstruct a body. Deployment surprises were operational, not algorithmic: HVAC vents blowing plastic strip-curtains produced periodic micro-Doppler that mimicked a slow walker, and metal shelving created multipath ghosts double-counting shoppers in adjacent aisles. Both were fixed with per-site clutter maps and a track-lifetime filter, a reminder that the same environment-specific tuning the fleet-ops discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a> exists to manage. The privacy story, no image ever leaves the device, is what let the rollout clear legal in every market.</p>
+</div>
+
+<h2>Healthcare: the regulatory pathway is the product</h2>
+
+<p>Contactless health radar, the vital-sign and sleep and fall sensing of <a class="cross-ref" href="section-44.6.html">Section 44.6</a> and <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>, faces the steepest deployment gate in this section: it makes claims about a person's body. The moment a radar reports a respiration rate or flags a fall as a health event, it may be a regulated medical device. In the United States that typically means an FDA 510(k) clearance for a Class II device (demonstrating substantial equivalence to a cleared predicate) or a De Novo request when no predicate exists; in Europe it means the Medical Device Regulation and a notified-body audit. The evidence bar is a prospective clinical study, agreement metrics against a reference monitor (a nasal cannula for breathing, a certified bed sensor or witnessed observation for falls), and, crucially, subject-independent validation, the leakage-safe protocol of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> raised to a legal requirement. The full clinical-validation and biometric-privacy playbook lives in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>; the point here is that for a health radar, that pathway <em>is</em> the deployment plan, and it dwarfs the model-training budget.</p>
+
+<p>A telling deployment reality is the wellness-versus-medical line. Vendors routinely ship the same radar hardware as a general-wellness sleep-quality gadget (no clearance needed, no diagnostic claim allowed) and, on a separate, slower track, as a cleared device that a clinician may act on. The model may be identical; the claim, the labeling, and the evidence are not. Deploying into a hospital adds electrical-safety (IEC 60601) and cybersecurity obligations that a consumer sleep tracker never touches.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not build the deployment stack from bare metal. Vendor SDKs for automotive and health radar, such as Texas Instruments mmWave SDK, Infineon RDK, and NXP's radar toolboxes, ship the interference mitigation, the safety-qualified firmware, the CFAR and tracking primitives, and the presence and vital-sign reference pipelines as configured modules. Standing up a compliant presence detector from an SDK reference design is a few hundred lines of configuration plus your classifier, versus the many thousands of lines and the multi-month safety-firmware qualification of a from-scratch build. The SDK owns the ISO 26262-ready driver layer and the emission-mask-compliant chirp profiles; you own the perception model and the site tuning. Reach for the raw register interface only for research chips or when a certified profile does not exist for your band.</p>
+</div>
+
+<h2>What deployment adds on top of the model</h2>
+
+<p>Across all three domains a common deployment checklist emerges that no accuracy metric captures. <strong>Edge compute:</strong> the model must run on the radar's companion microcontroller or a small SoC within a milliwatt and millisecond budget, the quantization-and-pruning discipline of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. <strong>Calibration drift and updates:</strong> a seven-year automotive lifetime or a multi-year hospital deployment needs over-the-air model updates and per-site recalibration, governed by the fleet-ops practices of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>. <strong>Adversarial and spoofing resistance:</strong> radar is spoofable with a repeater that injects false targets, a threat treated in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>. The pattern to internalize is that the model is perhaps a quarter of the deployed system; spectrum compliance, the safety or regulatory case, fleet operations, and privacy governance are the rest, and they decide whether the product ships at all.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You are productizing one 77 GHz automotive-grade transceiver into three offerings: (a) a corner radar for automatic emergency braking, (b) an in-cabin child-presence detector that pages the owner if a child is left in a hot car, and (c) a bedside respiration monitor for a hospital ward. For each, name the governing regulatory or safety framework, the single most consequential failure mode (missed detection versus false alarm) and why, and the validation split you would insist on before shipping. Then state one requirement that transfers across all three and one that does not.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current frontier is coordinated and cognitive radar for dense fleets. As penetration pushes the interference probability plotted above toward one, static chirp-randomization is not enough; groups within IEEE and ETSI are drafting inter-radar coordination, and research on cognitive radar has the transmit waveform itself adapt to the sensed spectrum, closing a perception-action loop in the RF domain. In parallel, radar foundation models pretrained self-supervised on large unlabeled range-Doppler corpora (in the spirit of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) aim to cut the per-deployment labeling that today gates every new site and every new clinical study, and datasets such as K-Radar, RADIal, and View-of-Delft are the shared proving grounds where these claims are now measured.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can two radar products use identical silicon and an identical perception model yet require entirely different deployment evidence?</li>
+<li>Radar-to-radar interference barely registers in a solo bench test but dominates a dense-city deployment. What does that tell you about how you must validate a fleet-scale sensor?</li>
+<li>A vendor sells the same 60 GHz sleep radar as both a wellness gadget and a cleared medical device. What changes between the two SKUs, and what stays the same?</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 44</h3>
+<p>classify micro-Doppler signatures or detect objects in range-Doppler maps (K-Radar/RADIal/VoD subset).</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-45-thermal-infrared-and-multispectral-sensing/index.html">Chapter 45</a>, we swap the radio wave for the infrared photon and study thermal and multispectral sensing, another modality that sees through darkness and, like radar, offers a privacy-preserving path to human monitoring, with its own calibration physics, domain-adaptation tricks, and deployment rulebook.</p>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Automotive radar, spectrum, and functional safety</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.iso.org/standard/68383.html">ISO (2018). ISO 26262: Road vehicles - Functional safety (2nd ed.). ISO.</a></p>
+<p class="bib-annotation">The standard that defines ASIL levels and the automotive safety case every braking radar must satisfy; the reason radar is deployed as a redundant channel rather than alone.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.iso.org/standard/77490.html">ISO (2022). ISO 21448: Road vehicles - Safety of the intended function (SOTIF). ISO.</a></p>
+<p class="bib-annotation">Governs failures of a correctly working sensor misreading the world, the framework behind phantom-braking mitigation in radar perception.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.etsi.org/deliver/etsi_en/302200_302299/302264/">ETSI (2017). EN 302 264: Short Range Devices; Transport and Traffic Telematics; Radar equipment in the 77 GHz to 81 GHz band. ETSI.</a></p>
+<p class="bib-annotation">The European emission mask defining the automotive radar band and power limits, a hard boundary on achievable range resolution.</p>
+</div>
+
+<p class="bib-category">Interference and cognitive radar</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/8828037">Alland, Stark, Ali, Hegde (2019). Interference in Automotive Radar Systems: Characteristics, Mitigation Techniques, and Current and Future Research. IEEE Signal Processing Magazine.</a></p>
+<p class="bib-annotation">A survey of the fleet-density interference problem and the mitigation techniques (chirp randomization, detect-and-repair) that production radars now ship.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1593335">Haykin (2006). Cognitive Radar: A Way of the Future. IEEE Signal Processing Magazine.</a></p>
+<p class="bib-annotation">The landmark that framed adaptive, closed-loop transmit-waveform design, the research direction for coordinating dense radar fleets and adapting to a crowded spectrum.</p>
+</div>
+
+<p class="bib-category">Health, contactless sensing, and datasets</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/8746007">Wang, Zhou, Yang, et al. (2019). Vital Sign Monitoring Using FMCW Radar: A Review. IEEE Sensors Journal.</a></p>
+<p class="bib-annotation">Surveys the contactless respiration and heart-rate pipelines and the validation methodology a clinical deployment must meet.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.fda.gov/regulatory-information/search-fda-guidance-documents/clinical-decision-support-software">FDA (2022). Clinical Decision Support Software: Guidance for Industry and FDA Staff. U.S. Food and Drug Administration.</a></p>
+<p class="bib-annotation">Clarifies when a sensing algorithm crosses from wellness gadget into regulated medical device, the line every health-radar product must respect.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://openaccess.thecvf.com/content/CVPR2022/html/Paek_K-Radar_4D_Radar_Object_Detection_for_Autonomous_Driving_in_Various_CVPR_2022_paper.html">Paek, Kong, Wijaya (2022). K-Radar: 4D Radar Object Detection for Autonomous Driving in Various Weather Conditions. NeurIPS.</a></p>
+<p class="bib-annotation">A large adverse-weather 4D radar dataset, one of the shared benchmarks on which fleet-scale and foundation-model radar claims are now measured.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://openaccess.thecvf.com/content/CVPR2022/html/Rebut_Raw_High-Definition_Radar_for_Multi-Task_Learning_CVPR_2022_paper.html">Rebut, Ouaknine, Malik, Perez (2022). Raw High-Definition Radar for Multi-Task Learning (RADIal). CVPR.</a></p>
+<p class="bib-annotation">Introduces the RADIal dataset and FFT-RadNet, the reference for learning directly from raw radar tensors that underpins next-generation deployed detectors.</p>
+</div>
+</section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

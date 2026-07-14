@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.7: Weather, domain shift, and deployment constraints. Building Sensory AI." name="description"/>
+<title>Section 42.7: Weather, domain shift, and deployment constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>Weather, domain shift, and deployment constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"My mean average precision was flawless on the sunny validation split. Then it snowed, and every flake became a pedestrian who never moved."</p><cite>An Overconfident AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The backbones and heads of the previous six sections were trained and scored on curated clear-weather scans from a handful of cities. Deploy that same detector on a real vehicle and it meets fog that swallows returns, snow that manufactures ghost points a meter off the bumper, a lidar with a different beam count than the training rig, and a compute budget that forbids the A100 you trained on. Each of these is a distribution shift: the test-time point cloud is drawn from a different generating process than the training one, and a model that memorized the training distribution degrades silently rather than loudly. This section is about the three shifts that break lidar perception in the field: weather, sensor and geography, and the deployment envelope itself. It is the bridge from leaderboard numbers to a system you would let drive. The running lesson: robustness is engineered before deployment (through physics-aware augmentation, domain adaptation, and honest evaluation), not patched after the first crash.</p>
+</div>
+
+<p>This section builds on the detection, segmentation, and tracking heads of <a class="cross-ref" href="section-42.5.html">Section 42.5</a> and the lidar measurement physics of <a class="cross-ref" href="section-42.1.html">Section 42.1</a>; if the beam equation and return intensity are hazy, revisit <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> first. The general theory of distribution shift, out-of-distribution detection, and test-time adaptation lives in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>; here we make it concrete for point clouds.</p>
+
+<h2>How weather corrupts a lidar scan</h2>
+
+<p>A lidar measures range by timing photons that leave, scatter off a surface, and return. Any airborne particle between the sensor and the target intercepts that beam, and this is exactly what fog, rain, and snow are: clouds of scatterers. Three failure modes follow directly from the physics. First, <strong>attenuation</strong>: the medium absorbs and scatters the outgoing and returning energy, so the received power along a clear-air path of range \(R\) is discounted by the Beer-Lambert factor</p>
+
+$$ P_{\text{rx}}(R) = P_0\, \frac{\rho}{R^2}\, \exp\!\big(-2\,\alpha\, R\big), $$
+
+<p>where \(\alpha\) is the extinction coefficient of the medium (near zero in clear air, large in dense fog) and \(\rho\) is target reflectivity. The factor of two accounts for the round trip. Attenuation shrinks the effective range: distant cars simply stop returning enough photons to clear the detection threshold, and the point cloud thins with distance far faster than in clear air. Second, <strong>backscatter and clutter</strong>: a snowflake or dense fog droplet close to the sensor returns a strong echo of its own, injecting spurious points that no object explains. Third, <strong>attenuated or split returns</strong>: a partially-transmitting droplet produces multiple weak echoes, so a single beam reports several jittered ranges. The net effect on the cloud is a triad the model has never seen in clear-weather training: missing points on real objects, added points on nothing, and displaced points near real ones.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Weather does not add uniform Gaussian noise to lidar; it applies a structured, physics-determined corruption. Attenuation is range-dependent and multiplicative on intensity, snow clutter is dense and near-field, and split returns are correlated with true surfaces. This is why generic data augmentation (random jitter, dropout) helps only marginally, while augmentation that respects the extinction physics closes most of the gap. Model the mechanism, not the symptom.</p>
+</div>
+
+<h2>Naming the shifts, and the benchmarks that expose them</h2>
+
+<p>Weather is one axis of a broader problem. A lidar model faces at least three distinct shifts, and conflating them is a common way to ship a fragile system. <strong>Weather shift</strong> is the corruption above. <strong>Sensor shift</strong> is a change in the acquisition device: a 64-beam Velodyne and a 32-beam solid-state lidar produce clouds with different vertical density, range, and intensity calibration, so a model trained on one has a genuinely different input manifold on the other, even in identical scenes. <strong>Geographic and layout shift</strong> is the change from one city's road furniture, vegetation, and driving culture to another's. Each demands different mitigation, and each needs a benchmark that isolates it. Robo3D (Kong et al., 2023) is the standard corruption suite: it applies eight physics-motivated corruptions (fog, wet ground, snow, motion blur, beam missing, crosstalk, incomplete echo, cross-sensor) at graded severities to SemanticKITTI and nuScenes, and reports a mean corruption error alongside a resilience score, so you can read robustness as a curve rather than a single clean-weather number. For real (not simulated) adverse conditions, the Seeing Through Fog / DENSE dataset (Bijelic et al., 2020) and the Canadian Adverse Driving Conditions dataset (Pitropov et al., 2021) supply labeled snow and fog captured on the road.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery robot that stopped for snowflakes</h3>
+<p>An autonomous sidewalk-delivery startup validated its lidar pedestrian detector at 0.94 average precision on a clean urban split and shipped to a winter pilot city. In the first snowfall the fleet ground to a halt: the detector fired on dense near-field snow clutter, and the safety layer treated each phantom cluster as a stationary pedestrian to yield to. Post-mortem showed two compounding shifts. The training data had almost no snow, so near-field clutter was out-of-distribution, and the pilot lidar was a lower-beam-count unit than the mapping rig, thinning distant returns further. The fix was not more clean data; it was retraining with physics-based snowfall augmentation (below) plus a lightweight near-field clutter filter that rejects clusters with intensity and geometry consistent with precipitation. Phantom-stop rate fell by an order of magnitude, and the team added a Robo3D-style corruption gate to their release checklist so the regression could never ship again.</p>
+</div>
+
+<h2>Closing the gap: physics-based augmentation and domain adaptation</h2>
+
+<p>The most reliable lever is <strong>physics-based weather augmentation</strong>: take clean labeled scans and synthetically corrupt them with a model of the medium, so the network trains on realistic fog and snow without anyone driving through a blizzard with a labeling team. Hahner et al. built the reference simulators: a fog simulation on real point clouds (2021) that applies the extinction model above per beam, and a snowfall simulation (2022) that samples flakes in each beam's cone and computes the resulting attenuated or clutter return. LISA (Kilic et al., 2021) packages rain, fog, and snow models into one augmentation library. Training a segmenter or detector on a mix of clean and simulated-adverse scans routinely recovers most of the accuracy lost to real fog and snow, because the simulated corruption matches the real one where it counts: range-dependent thinning and near-field clutter. The snippet below implements the core of a fog augmentation so the mechanism is not a black box.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def foggify(points, alpha=0.06, p_clutter=0.01, max_range=80.0, rng=None):
+    """Apply a Beer-Lambert fog model to a lidar scan.
+    points: (N,4) array of x,y,z,intensity. alpha: extinction coeff (1/m)."""
+    rng = rng or np.random.default_rng(0)
+    xyz, inten = points[:, :3], points[:, 3].copy()
+    r = np.linalg.norm(xyz, axis=1)
+
+    # 1. Range-dependent attenuation of returned intensity (round trip -> 2*alpha).
+    inten *= np.exp(-2.0 * alpha * r)
+
+    # 2. Dropout: points whose attenuated intensity falls below detection keep prob.
+    keep_prob = np.clip(inten / (points[:, 3] + 1e-6), 0.0, 1.0)
+    keep = rng.random(len(r)) < keep_prob
+    kept = np.column_stack([xyz[keep], inten[keep]])
+
+    # 3. Near-field backscatter clutter: spurious points at short range.
+    n_clutter = rng.binomial(len(r), p_clutter)
+    cr = rng.uniform(1.0, 15.0, n_clutter)              # meters, close to sensor
+    theta = rng.uniform(0, 2 * np.pi, n_clutter)
+    phi = rng.uniform(-0.05, 0.05, n_clutter)
+    clutter = np.column_stack([
+        cr * np.cos(theta) * np.cos(phi),
+        cr * np.sin(theta) * np.cos(phi),
+        cr * np.sin(phi),
+        rng.uniform(0.1, 0.4, n_clutter)])              # low intensity
+    return np.vstack([kept, clutter])
+
+clean = np.load  # placeholder: your (N,4) scan loader
+scan = np.column_stack([np.random.randn(20000, 3) * 15, np.random.rand(20000)])
+fog = foggify(scan, alpha=0.08)
+print(f"clean points: {len(scan)}  ->  foggy points: {len(fog)}")</code></pre>
+<div class="code-caption">A minimal fog augmentation: exponential range attenuation of intensity, probabilistic dropout of weakened returns, and injected near-field backscatter clutter. Mixing scans processed this way into training recovers accuracy that generic jitter cannot, because the corruption is range-structured exactly as real fog is.</div>
+
+<p>When you cannot simulate the target (a genuinely new sensor or city), the tool is <strong>unsupervised domain adaptation</strong>: adapt a model trained on a labeled source to an unlabeled target. CoSMix (Saltori et al., 2022) mixes source and target points with a teacher-student sample-mixing scheme for point-cloud segmentation; the earlier Complete-and-Label line (Yi et al., 2021) recovers a canonical dense surface to bridge sensor gaps. These pair naturally with the test-time adaptation methods of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, which update batch-norm statistics or a small adapter online as the domain drifts.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026 the strongest all-weather stacks combine three ingredients: a physics-based augmentation curriculum (Hahner-style fog and snow), a robust backbone such as Point Transformer v3 from <a class="cross-ref" href="section-42.4.html">Section 42.4</a> or a robust sparse-conv net, and sensor fusion that leans on radar when lidar degrades, because radar's longer wavelength largely ignores fog and snow (developed in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>). Robo3D and the nuScenes-C / SemanticKITTI-C corruption benchmarks are the accepted robustness yardsticks, and the open frontier is closing the sim-to-real gap: learned, differentiable weather simulators and generative corruption models that produce adverse scans indistinguishable from real captures, so a network never needs a human to drive through the storm. Self-supervised pretraining from <a class="cross-ref" href="section-42.6.html">Section 42.6</a> is increasingly the initialization that makes this adaptation data-efficient.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not hand-roll fog, snow, and cross-sensor corruptions for evaluation. The Robo3D toolkit ships all eight corruptions at graded severities with the mean-corruption-error and resilience metrics precomputed, and OpenPCDet plus MMDetection3D expose weather augmentation transforms and cross-sensor configs. Wiring a full corruption-robustness evaluation is on the order of 15 lines of config against these tools versus the several hundred lines of physics simulators, severity schedules, and metric bookkeeping it would take from scratch.</p>
+</div>
+
+<h2>The deployment envelope: latency, memory, and knowing when you are blind</h2>
+
+<p>A robust model that misses its frame deadline is still a failed system. Lidar runs at 10 to 20 Hz, so the full detect-track pipeline has roughly 50 to 100 milliseconds per sweep on an embedded automotive computer, not a datacenter GPU. This forces the edge-AI toolkit of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>: quantization to INT8, pruning, and the pillar or sparse-conv backbones of <a class="cross-ref" href="section-42.2.html">Section 42.2</a> that were designed for exactly this budget. Voxel resolution and detection range become tunable knobs traded against latency. Two deployment concerns are specific to lidar. First, <strong>degradation detection</strong>: the system should recognize when weather has blinded the sensor and fall back (slow down, hand to radar, request human takeover) rather than emit confident garbage; a simple, effective monitor watches the fraction of near-field low-intensity returns and the drop in maximum reliable range against a clear-air baseline. Second, <strong>functional safety</strong>: a perception stack that faces adverse conditions falls under ISO 21448 (Safety Of The Intended Functionality), which requires you to identify the triggering conditions (fog density, snow rate) under which performance degrades and to bound the residual risk. Calibrated uncertainty from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> and the spoofing and safety analysis of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> turn "the model is unsure" into an auditable safety argument. The unifying discipline across all of this is leakage-safe, geography-split evaluation: if train and test tiles overlap or share weather, your robustness numbers are fiction.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a clean lidar scan (any SemanticKITTI sweep) and a detector from OpenPCDet. (a) Sweep the extinction coefficient \(\alpha\) in <code>foggify</code> from 0 to 0.15 and plot detection average precision versus \(\alpha\); identify the severity at which AP falls below 0.5. (b) Retrain or fine-tune the detector on a 50/50 mix of clean and foggy scans and replot; report how far right the collapse point moves. (c) Build a one-number degradation monitor from the ratio of near-field low-intensity points to total points, and show it rises monotonically with \(\alpha\), so it could trigger a safety fallback before AP collapses.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Name the three physical failure modes weather imposes on a lidar scan and tie each to a term in the Beer-Lambert return equation or to backscatter.</li>
+<li>Why do weather shift, sensor shift, and geographic shift each need a different mitigation, and which benchmark isolates the first?</li>
+<li>What does a degradation monitor buy you that a more accurate detector alone does not, and how does it connect to ISO 21448?</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 42</h3>
+<p>build a point-cloud detection/segmentation pipeline on a public dataset subset with OpenPCDet/Pointcept.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Robustness benchmarks and adverse-weather datasets</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2303.17597">Kong, Liu, Li, et al. (2023). Robo3D: Towards Robust and Reliable 3D Perception against Corruptions. ICCV.</a></p><p class="bib-annotation">Defines the eight-corruption robustness suite (fog, snow, wet ground, beam-missing, cross-sensor, and more) with graded severities and the mean-corruption-error metric that this section treats as the standard yardstick.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1902.08913">Bijelic, Gruber, Mannan, et al. (2020). Seeing Through Fog Without Seeing Fog: Deep Multimodal Sensor Fusion in Unseen Adverse Weather. CVPR.</a></p><p class="bib-annotation">The DENSE dataset and fusion baseline: real labeled fog, snow, and rain captured on the road, the reference for evaluating on genuine (not simulated) adverse weather.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2001.10117">Pitropov, Garcia, Rebello, et al. (2021). Canadian Adverse Driving Conditions Dataset. IJRR.</a></p><p class="bib-annotation">Labeled lidar and camera captured in snowfall, providing the winter-weather test distribution that clear-weather benchmarks lack.</p></div>
+
+<p class="bib-category">Physics-based weather simulation and augmentation</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2108.05249">Hahner, Sakaridis, Dai, Van Gool (2021). Fog Simulation on Real LiDAR Point Clouds for 3D Object Detection in Adverse Weather. ICCV.</a></p><p class="bib-annotation">The reference fog augmentation: applies the extinction model per beam to clean scans and shows training on the result recovers real-fog accuracy.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2203.15118">Hahner, Sakaridis, Bijelic, et al. (2022). LiDAR Snowfall Simulation for Robust 3D Object Detection. CVPR.</a></p><p class="bib-annotation">Models snowflake sampling and attenuated or clutter returns per beam, the snowfall analog to the fog simulator used in this section's augmentation.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2107.07004">Kilic, Hegde, Sindagi, et al. (2021). LISA: Lidar Snowfall, Rain and Fog Simulation. arXiv.</a></p><p class="bib-annotation">A single augmentation library packaging rain, fog, and snow scattering models, convenient for building an adverse-weather training curriculum.</p></div>
+
+<p class="bib-category">Domain adaptation for point clouds</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2207.09778">Saltori, Galasso, Fiameni, et al. (2022). CoSMix: Compositional Semantic Mix for Domain Adaptation in 3D LiDAR Segmentation. ECCV.</a></p><p class="bib-annotation">A teacher-student sample-mixing method for unsupervised adaptation across sensors and domains, the go-to when the target has no labels.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2007.08488">Yi, Gong, Funkhouser (2021). Complete and Label: A Domain Adaptation Approach to Semantic Segmentation of LiDAR Point Clouds. CVPR.</a></p><p class="bib-annotation">Bridges sensor-density gaps by recovering a canonical dense surface before labeling, a foundational take on cross-sensor lidar adaptation.</p></div>
+
+<p class="bib-category">Toolkits</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://github.com/open-mmlab/OpenPCDet">OpenPCDet Contributors (2020 to present). OpenPCDet: Open-source toolbox for lidar-based 3D detection.</a></p><p class="bib-annotation">Reference detector zoo with weather augmentation and cross-sensor configs, the practical substrate for the exercise and Lab 42.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>, we lift the per-object detections of this chapter into a shared bird's-eye-view and a dense 3D occupancy grid, the representation where lidar, camera, and radar meet and where the weather-robust fusion teased above is actually built.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

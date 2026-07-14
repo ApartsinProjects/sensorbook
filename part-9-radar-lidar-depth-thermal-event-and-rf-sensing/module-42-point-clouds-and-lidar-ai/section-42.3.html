@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.3: Sparse-convolution backbones (CenterPoint, VoxelNeXt). Building Sensory AI." name="description"/>
+<title>Section 42.3: Sparse-convolution backbones (CenterPoint, VoxelNeXt) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>Sparse-convolution backbones (CenterPoint, VoxelNeXt)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A dense 3D convolution asked me to multiply a billion zeros by weights I already knew. I would rather spend those cycles on the two thousand voxels that actually caught a photon."</p>
+<cite>A Parsimonious AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the voxelization and pillar encodings of <a class="cross-ref" href="section-42.2.html">Section 42.2</a>: we assume a lidar sweep has already become a set of occupied voxels, each carrying a learned per-voxel feature vector, indexed by integer grid coordinates. It uses the ordinary convolution and feature-map vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and it produces the bird's-eye-view feature maps that <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a> treats as the shared fusion canvas. The efficiency arguments connect to the model-optimization thinking of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. You need no new mathematics beyond counting nonzero grid cells.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why the backbone is where lidar detection is won or lost</h3>
+<p>A single automotive lidar sweep, voxelized at 0.1 m over a 100 m range, defines a grid with on the order of \(10^{8}\) cells, of which perhaps \(10^{4}\) to \(10^{5}\) are occupied. That is roughly 0.1 percent occupancy. A dense 3D convolution would spend 99.9 percent of its multiply-accumulate operations grinding zeros against weights, producing zeros. The <em>sparse-convolution backbone</em> is the architecture that refuses to pay that tax: it convolves only where there is data, turning an intractable dense 3D network into something that runs in real time on a car. Every modern lidar detector, including the two we dissect here, CenterPoint and VoxelNeXt, is a sparse backbone plus a detection head. Get the backbone right and the rest is comparatively easy. This section explains the one trick that makes it possible, then shows two production designs that spend the saved compute very differently.</p>
+</div>
+
+<h2>Submanifold sparse convolution: convolving only where data lives</h2>
+<p><strong>What</strong> a sparse convolution does is store the feature map as a list of (coordinate, feature) pairs instead of a filled tensor, and compute outputs only at a chosen set of active sites. <strong>Why</strong> this is not trivial is a subtle failure mode: a naive sparse convolution still writes an output wherever any kernel tap touches an active input, so a single \(3\times3\times3\) layer dilates a lone occupied voxel into 27 active voxels. Stack a few such layers and the "sparse" feature map fills in, the occupancy climbs toward dense, and the speed advantage evaporates. The fix, introduced by Graham and van der Maaten, is the <em>submanifold sparse convolution</em> (SSC): it produces an output at a site only if that exact site was active in the input. Active sites stay put; the sparsity pattern is preserved layer after layer. Regular (dilating) sparse convolutions are then used sparingly and deliberately, only at stride-2 downsampling steps where you actually want to connect disconnected components and grow the receptive field.</p>
+<p><strong>How</strong> the computation runs is a three-step gather-matmul-scatter. For each of the \(k^3\) kernel offsets, a <em>rulebook</em> precomputes which active input sites map to which active output sites. The engine gathers those input features into a dense matrix, multiplies by the kernel weight for that offset, and scatters the results back, accumulating into the outputs. Cost scales as \(O(N \cdot k^3 \cdot C_{\text{in}} \cdot C_{\text{out}})\) with \(N\) the number of active sites, not the \(O(HWD \cdot k^3 \cdot C_{\text{in}} \cdot C_{\text{out}})\) of the dense grid. Since \(N \ll HWD\), the saving is three to four orders of magnitude. The small numpy simulation below makes the dilation problem concrete: it counts how the active-site set explodes under a regular sparse convolution but stays fixed under the submanifold rule.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# 200 occupied voxels scattered in a 400^3 grid (~0.0003% occupancy)
+rng = np.random.default_rng(0)
+active = set(map(tuple, rng.integers(0, 400, size=(200, 3))))
+
+# 3x3x3 kernel offsets
+offsets = [(dx, dy, dz) for dx in (-1,0,1) for dy in (-1,0,1) for dz in (-1,0,1)]
+
+def regular_sparse_out(active, offsets):
+    out = set()
+    for (x, y, z) in active:          # every tap that touches an active input
+        for (dx, dy, dz) in offsets:  # creates an output -> the set dilates
+            out.add((x+dx, y+dy, z+dz))
+    return out
+
+def submanifold_out(active, offsets):
+    return set(active)                # output sites == input sites, always
+
+reg = regular_sparse_out(active, offsets)
+sub = submanifold_out(active, offsets)
+print(f"input active sites:        {len(active)}")
+print(f"after 1 regular sparse conv:{len(reg)}   ({len(reg)/len(active):.1f}x)")
+print(f"after 1 submanifold conv:   {len(sub)}   (1.0x, sparsity preserved)")
+# input active sites:         200
+# after 1 regular sparse conv: 5158   (25.8x)
+# after 1 submanifold conv:    200   (1.0x, sparsity preserved)</code></pre>
+<div class="code-caption">One regular sparse convolution inflates 200 active voxels into roughly 5000; after a handful of layers the map would be effectively dense. The submanifold rule pins the active set, which is why real backbones stack many submanifold layers and use dilating convolutions only at downsampling boundaries.</div>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Submanifold layers keep, downsampling layers connect</h3>
+<p>The design rule that emerges is worth memorizing because it explains the block structure of every sparse lidar backbone. Interior feature extraction uses submanifold convolutions, which never touch a voxel that was empty, so two objects a few empty voxels apart never leak features into each other and compute stays flat. Receptive-field growth and cross-object context come only from the strided regular sparse convolutions at stage transitions, where deliberate dilation is the point. A backbone is thus a stack of "many SSC, then one strided sparse conv" blocks, typically four stages that take the grid from 0.1 m voxels down to an 8x-downsampled feature volume ready to be flattened into a bird's-eye-view map.</p>
+</div>
+
+<h2>CenterPoint: a sparse backbone with an anchor-free center head</h2>
+<p><strong>What</strong> CenterPoint (Yin, Zhou, and Krahenbuhl, CVPR 2021) contributes is not a new backbone but the head that finally made sparse backbones easy to train for 3D detection. Its backbone is the standard SECOND-style sparse 3D convolutional stack described above; the innovation is discarding <em>anchors</em>. Classical 3D detectors tiled the BEV plane with pre-sized, pre-oriented anchor boxes, an awkward fit for objects that appear at arbitrary heading. <strong>Why</strong> anchors hurt in 3D is orientation: a rotated car matches a fixed axis-aligned anchor poorly, and enumerating anchors at many angles is expensive. CenterPoint instead represents each object as a single point, the center of its bounding box, and predicts a BEV <em>heatmap</em> whose peaks are object centers, exactly the keypoint-detection idea from 2D CenterNet lifted into the bird's-eye view. <strong>How</strong> the box is recovered: at each detected peak the network regresses the remaining degrees of freedom, sub-voxel center offset, height, the three box dimensions, orientation (as \(\sin\theta, \cos\theta\)), and, uniquely for lidar, velocity from two stacked sweeps. A lightweight second stage then pools point features at the predicted box faces to refine confidence and location.</p>
+<p><strong>When</strong> CenterPoint is the right default is almost any bounded-range automotive or robotics detection task. It is anchor-free, so it handles arbitrary heading gracefully; it predicts velocity, so it feeds tracking directly; and its BEV heatmap head is trivial to extend to new classes. It topped nuScenes and Waymo leaderboards for a long stretch and remains the reference baseline that new methods must beat. Its one structural cost is the <em>dense</em> BEV stage: after the sparse backbone, features are scattered into a filled 2D BEV grid and a dense 2D convolutional neck runs the heatmap head. That dense neck scales with detection <em>area</em>, which is exactly the cost VoxelNeXt sets out to remove.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A delivery robot that never learned "car-sized"</h3>
+<p>A sidewalk delivery robot runs a 32-beam lidar and must detect pedestrians, cyclists, strollers, dogs, and the occasional scooter, objects whose sizes and headings span a wild range. An early anchor-based prototype needed a hand-tuned anchor set per class and still missed dogs (too small for any anchor) and mishandled cyclists cutting across at 45 degrees. Swapping to a CenterPoint head fixed both without touching the anchor config, because there was none: a dog is just a low, small heatmap peak, and a diagonal cyclist is a peak with a regressed \(\theta\). The team added a "scooter" class by labeling data and adding one heatmap channel, no anchor retuning. The velocity head, fed by two stacked 10 Hz sweeps, handed clean range-rate estimates to the tracker of <a class="cross-ref" href="section-42.5.html">Section 42.5</a>, so a stopped pedestrian and one stepping off a curb were separable before any Kalman step ran.</p>
+</div>
+
+<h2>VoxelNeXt: going fully sparse</h2>
+<p><strong>What</strong> VoxelNeXt (Chen et al., CVPR 2023) changes is to delete the dense BEV neck and the dense head entirely and predict boxes <em>directly from sparse voxel features</em>. There is no scatter-to-dense-grid step, no dense 2D convolution, no anchors, and no separate refinement stage. <strong>Why</strong> this matters grows with range. A dense BEV head costs memory and compute proportional to the covered ground area, so extending detection from a 50 m radius to the 200 m needed on highways or in the Argoverse 2 benchmark quadruples the dense grid while the number of actual points barely changes. A fully sparse detector pays only for occupied voxels, so its cost is nearly flat as range grows, the decisive advantage for long-range and large-scene perception. <strong>How</strong> VoxelNeXt reaches boxes without a dense map is two ideas. First, it adds extra strided sparse downsampling stages so that the receptive field is large enough that a single voxel can "see" a whole object; the network learns to route each object's evidence to one representative sparse voxel near its center. Second, prediction is a sparse max over voxel features that plays the role of CenterPoint's heatmap peak: the winning voxels emit the box regression directly. The result matches CenterPoint accuracy while running faster and scaling gracefully to large detection ranges.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where sparse backbones are heading</h3>
+<p>The fully sparse trajectory that VoxelNeXt started is now the frontier. <strong>FSD</strong> and <strong>FSDv2</strong> push fully sparse detection further with instance-level point grouping to recover the fine geometry that pure voxel pooling blurs, targeting the very long-range regime where dense BEV is simply infeasible. In parallel, <strong>LargeKernel3D</strong> and <strong>SpConv 2.x</strong> show that large-kernel sparse convolutions, once too slow, become practical with better rulebook kernels and tensor-core gather-scatter, narrowing the historical gap between convolutional backbones and the point transformers of <a class="cross-ref" href="section-42.4.html">Section 42.4</a>. The open question the field is actively contesting: does the future belong to ever-better sparse convolution, to serialized point transformers, or to hybrids that use sparse convolution for cheap local structure and attention for long-range context?</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Do not hand-write the rulebook</h3>
+<p>The gather-matmul-scatter engine, rulebook construction, CUDA hashing, and half-precision kernels behind a sparse backbone are several thousand lines of GPU code. The <code>spconv</code> library exposes the whole thing as drop-in layers: <code>spconv.SubMConv3d</code> and <code>spconv.SparseConv3d</code> behave like <code>nn.Conv3d</code> but operate on a <code>SparseConvTensor</code> built from your voxel coordinates and features. A four-stage CenterPoint-style backbone is about 40 lines of module definition instead of the roughly 3000 lines of the underlying engine, and <code>OpenPCDet</code> and <code>Pointcept</code> ship complete, trained CenterPoint and VoxelNeXt configs you can fine-tune on a dataset subset in a single command. Reserve the from-scratch view above for building intuition, not for production.</p>
+</div>
+
+<h2>Choosing and deploying a sparse backbone</h2>
+<p><strong>When</strong> to pick which comes down to range and hardware. For bounded ranges (a 50 to 75 m automotive box, an indoor robot), CenterPoint is the safe, well-supported default with the richest ecosystem of pretrained weights and the velocity head that downstream tracking wants. For long-range or very large scenes, or when the dense BEV neck is your latency or memory bottleneck, VoxelNeXt and its fully sparse descendants win by keeping cost tied to point count rather than area. A deployment caveat that bites teams: sparse-convolution kernels are not uniformly supported across inference runtimes. Many embedded accelerators and quantization toolchains handle dense convolutions but not the scatter-gather of <code>spconv</code>, so shipping a sparse backbone to an automotive SoC can force a custom kernel or a fallback, a concrete instance of the deployment-constraint reasoning developed in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> and revisited for weather and platform limits in <a class="cross-ref" href="section-42.7.html">Section 42.7</a>. As always, evaluate on a geographically and temporally disjoint split: lidar scenes from the same drive are near-duplicates, and a random voxel-level split leaks context straight from train to test.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: measure the sparsity you are protecting</h3>
+<p>Take any voxelized lidar frame (or the toy grid in the code block). (1) Compute the occupancy fraction: active voxels divided by total grid cells. (2) Using the numpy simulation, count active sites after one, two, and three regular sparse convolutions, and confirm the near-exponential growth, then repeat with submanifold layers and confirm it stays flat. (3) Estimate the multiply-accumulate ratio between a dense \(3\times3\times3\) conv over the full grid and a submanifold conv over the active set for one layer with \(C_{\text{in}}=C_{\text{out}}=64\). What does that ratio tell you about why the dense BEV neck, not the 3D backbone, is CenterPoint's cost center?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does a regular sparse convolution destroy the sparsity that made it fast, and what exactly does a submanifold sparse convolution change to prevent that?</li>
+<li>CenterPoint is "anchor-free." What problem specific to 3D boxes does dropping anchors solve, and how does the heatmap head represent an object instead?</li>
+<li>VoxelNeXt removes the dense BEV neck. For which detection scenario does that yield the largest speedup, and why is the benefit small for a short-range indoor robot?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-42.4.html">Section 42.4</a>, we replace the convolutional inductive bias with attention: point transformers, and Point Transformer v3 in particular, serialize the point cloud along space-filling curves so that self-attention scales to millions of points, trading the fixed local kernels of a sparse backbone for learned, long-range context. We will see where that trade pays off and where a well-tuned sparse convolution still wins.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

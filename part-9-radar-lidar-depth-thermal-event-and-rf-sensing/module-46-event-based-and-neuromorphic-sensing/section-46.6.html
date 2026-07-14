@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.6: Event-frame-IMU fusion. Building Sensory AI." name="description"/>
+<title>Section 46.6: Event-frame-IMU fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Event-Based and Neuromorphic Sensing</a></div>
+<h1>Event-frame-IMU fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The event stream told me exactly when the world moved, the frame told me what grey it was, and the IMU told me how far I had turned while both of them were still arguing about it. My job was to make all three agree on a single clock they never shared."</p>
+<cite>A Triangulating AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Three sensors, three failure modes, one trajectory</h3>
+<p>No single visual sensor survives every regime a moving robot passes through. A conventional camera goes blind in a dark tunnel and blurs when the platform jerks; an event camera (<a class="cross-ref" href="section-46.1.html">Section 46.1</a>) reports nothing when the platform holds still and cannot read absolute brightness; an inertial measurement unit (IMU) is never blind but drifts without bound the moment you stop correcting it. The engineering insight of the last decade is that their weaknesses are almost perfectly disjoint, so a system that fuses all three keeps working through low light, glare, high speed, and stillness where any one of them alone fails. This section is about that fusion: how the DAVIS-class sensor that co-packages events, frames, and inertial data feeds a single state estimator, why the microsecond asynchrony of events breaks the frame-synchronous math you learned for the Kalman filter, and how continuous-time trajectories and factor graphs put the three streams back on speaking terms. It is the payoff of everything the chapter has built and the direct enabler of the low-latency edge systems in <a class="cross-ref" href="section-46.7.html">Section 46.7</a>.</p>
+</div>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section fuses three threads. From <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> you need the IMU measurement model (accelerometer plus gyroscope, bias, and noise) and from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a> the way inertial integration drifts. The estimator backbone is the Kalman family of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and the factor-graph smoothing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. The timing discipline, hardware timestamping and clock alignment, comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. You should already understand what an event and an event representation are from Sections 46.1 and 46.2.</p>
+</div>
+
+<h2>The complementary triangle</h2>
+<p><strong>What</strong> each modality contributes is best read as a table of who covers whom. The <em>event stream</em> gives microsecond-latency motion cues with no blur and 120 dB of dynamic range, but carries no absolute intensity and dies when nothing moves. The <em>intensity frame</em> gives dense texture and absolute grey values that anchor recognition and loop closure, but blurs under fast motion and saturates in glare. The <em>IMU</em> gives metric scale, a gravity direction, and a high-rate motion prior (200 Hz to 1 kHz) that never blinks, but its double integration turns small bias errors into runaway position drift within seconds. <strong>Why</strong> fuse rather than pick one: the union covers the whole operating envelope. When the frame blurs, the events stay sharp; when the events fall silent because the platform paused, the frame and the still-integrating IMU hold the pose; when both cameras are starved of texture in a blank corridor, inertial dead reckoning bridges the gap until features return.</p>
+
+<p><strong>How</strong> the hardware makes this practical is the DAVIS sensor (Dynamic and Active-pixel VIsion Sensor): iniVation's DAVIS346 places an event circuit and a conventional active-pixel-sensor frame readout behind the <em>same</em> pixel array, and mounts an IMU on the same board with a shared hardware clock. Because events and frames come from identical optics and one timestamp source, you skip the extrinsic-calibration and clock-drift nightmare that plagues a bolted-together multi-camera rig (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>). That single-aperture design is why event-frame-IMU fusion is a real product category and not just a paper idea.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The failures are disjoint, so the union is robust</h3>
+<p>Sensor fusion usually fights correlated failure: rain blinds a camera and a lidar at once. Event-frame-IMU fusion is unusually strong because the three failure modes barely overlap. High speed <em>breaks</em> the frame but is exactly where events shine. Stillness <em>silences</em> events but is trivial for the frame and the IMU. Darkness and glare defeat the frame's limited dynamic range but the logarithmic event pixel sails through. There is no single physical condition that takes down all three at once, which is why fused event-inertial odometry keeps a valid pose through a car exiting a tunnel at speed, a regime where a frame-only visual-inertial system produces a blurred, saturated, tracking-lost mess.</p>
+</div>
+
+<h2>Time is the hard part: asynchronous measurements</h2>
+<p><strong>What</strong> makes this fusion genuinely harder than stacking cameras is that the three streams do not share a rate. Events arrive asynchronously at microsecond resolution, the IMU ticks at a fixed few hundred hertz, and frames land at 20 to 60 Hz. The Kalman filter of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> assumes a state defined at discrete synchronized instants; here no two measurements share an instant. <strong>Why</strong> this is not a formality: if you naively bin events into pseudo-frames to force synchrony, you throw away the temporal precision that was the entire reason to use an event camera, and you reintroduce the motion blur you paid to avoid.</p>
+
+<p><strong>How</strong> the field solves it comes in two flavors. The first is a <em>continuous-time</em> state: represent the camera trajectory as a smooth function of time, typically a cumulative cubic B-spline over \(SE(3)\), so the pose is queryable at the exact timestamp of <em>any</em> measurement, event or frame or inertial. A single event at time \(t_k\) then contributes a residual evaluated at \(T(t_k)\), no binning required. The second is <em>IMU preintegration</em> (Forster and colleagues, 2017): rather than re-integrate the inertial stream every time the optimizer nudges a pose, you pre-summarize all IMU samples between two keyframes into a single relative-motion factor with an analytic covariance, so the high-rate inertial data becomes one cheap constraint in a factor graph (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>). Both hinge on getting the timestamps right in the first place, which is why hardware-synchronized capture and the clock-alignment methods of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> are load-bearing, not optional.</p>
+
+<h2>Fusion architectures, from warping to factor graphs</h2>
+<p>The classic and still-instructive move is <em>IMU-aided motion compensation</em>. Because a blurry event image is just events smeared along the motion they were generated by, and the IMU tells you the camera's angular velocity almost instantly, you can warp each event backward along the rotation the gyroscope measured to the moment it fired, collapsing a motion-smeared cloud into a sharp edge image. This is a cheap, feed-forward way to let the IMU sharpen the events before any feature extraction, and it is the seed of the contrast-maximization family of methods. The snippet below performs exactly this rotational warp.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def imu_warp_events(xy, t, omega, K, t_ref):
+    """Warp events to a reference time using the IMU's angular velocity.
+
+    xy    : (N, 2) event pixel coordinates [x, y].
+    t     : (N,) event timestamps (seconds).
+    omega : (3,) constant body angular velocity from the gyro (rad/s).
+    K     : (3, 3) camera intrinsics.
+    t_ref : reference timestamp to warp every event onto.
+    Returns (N, 2) motion-compensated pixel coordinates.
+    """
+    Kinv = np.linalg.inv(K)
+    ones = np.ones((xy.shape[0], 1))
+    rays = (Kinv @ np.hstack([xy, ones]).T).T          # back-project to bearing rays
+    warped = np.empty_like(xy)
+    for i, (r, dt) in enumerate(zip(rays, t_ref - t)):
+        th = omega * dt                                # small-angle rotation vector
+        wx, wy, wz = th
+        R = np.array([[1, -wz, wy], [wz, 1, -wx], [-wy, wx, 1]])  # 1st-order SO(3)
+        p = K @ (R @ r)
+        warped[i] = p[:2] / p[2]
+    return warped
+
+K = np.array([[200., 0., 160.], [0., 200., 120.], [0., 0., 1.]])
+xy = np.array([[170., 120.], [175., 121.], [180., 122.]])   # a smeared edge
+t  = np.array([0.000, 0.002, 0.004])
+omega = np.array([0.0, 0.8, 0.0])                            # 0.8 rad/s pan
+print(imu_warp_events(xy, t, omega, K, t_ref=0.0).round(2))
+</code></pre>
+<div class="code-caption">IMU-aided motion compensation: three events spread across 4 ms of a 0.8 rad/s pan are warped back onto a common reference time, pulling the smeared edge into near-alignment. A first-order \(SO(3)\) approximation is used because the inter-event interval is tiny; the gyro supplies \(\omega\) directly, so no optimization is needed for the rotational part.</div>
+
+<p>Motion compensation is feed-forward and does not estimate a pose. The <em>tightly coupled</em> systems that do treat every modality as a residual in one optimizer. The landmark is <strong>Ultimate SLAM</strong> (Vidal, Rebecq, Horstschaefer, and Scaramuzza, IEEE RA-L 2018), which tracks features on <em>both</em> motion-compensated event images and standard frames, then fuses those visual tracks with preintegrated IMU factors in a keyframe optimizer, reporting large accuracy gains over frame-plus-IMU alone in high-speed and HDR scenes. Feature tracking across the two visual modalities is itself a research thread: EKLT (Gehrig and colleagues, 2020) tracks a frame-defined patch asynchronously through the event stream, giving the optimizer sub-frame-rate updates. The common shape is the factor graph: nodes are poses and velocities and IMU biases; edges are visual reprojection factors from events and frames plus preintegrated inertial factors; a smoother solves for the whole trajectory. This is the same machinery as visual-inertial SLAM in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, with events added as one more factor type.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A racing drone through a doorway</h3>
+<p>An autonomous-drone team building an aggressive-flight platform kept losing state estimation at the worst moment: the instant the drone pitched hard to shoot a gap, the downward frame camera smeared and the visual-inertial estimator diverged, leaving inertial dead reckoning to drift the drone into the frame. Swapping in a DAVIS sensor and an Ultimate-SLAM-style fused estimator changed the outcome. During the violent pitch, the frame went useless but the event stream stayed razor sharp and the gyro-warped event images kept feeding crisp feature tracks to the optimizer, while IMU preintegration carried metric scale and gravity through the maneuver. Pose held to a few centimeters through motions that blurred the frame beyond use. The complementary payoff was visible on the timeline: the frame factors dominated in the slow hover before the gap, the event factors dominated through the fast pitch, and the inertial factors stitched the two regimes together without a seam.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Preintegration and the graph you do not hand-roll</h3>
+<p>Writing the inertial preintegration math, the \(SE(3)\) trajectory Jacobians, and a sliding-window nonlinear solver from scratch is several hundred lines of error-prone manifold calculus. A factor-graph library such as GTSAM gives you <code>ImuFactor</code> / <code>CombinedImuFactor</code> plus <code>PreintegratedImuMeasurements</code>, and an incremental smoother (<code>ISAM2</code>) that re-linearizes only the affected part of the graph. You add a preintegrated IMU factor and your event and frame reprojection factors as a few objects and call <code>update()</code>; the library owns the manifold retractions, the covariance propagation, and the sparse linear algebra. That is roughly a 300-line hand-rolled estimator collapsed into 30 lines of factor construction, and it is the same backbone Chapters <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">11</a> and <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">52</a> lean on.</p>
+</div>
+
+<h2>Learned fusion and where it is heading</h2>
+<p>The classical pipeline hand-designs every stage: warp, track, optimize. The current research push replaces stages, or the whole pipeline, with learned components. <strong>What</strong> is new is end-to-end event-inertial odometry networks that ingest an event representation (voxel grid or time surface, Section 46.2) alongside raw IMU samples and regress relative pose directly, with recurrent or transformer temporal cores from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. <strong>Why</strong> this is attractive on the edge is that a single learned model can absorb the timestamp bookkeeping and the modality weighting that the classical stack splits across hand-tuned modules, and it degrades more gracefully when one modality drops out, which connects to the missing-modality robustness ideas of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. <strong>When</strong> the classical estimator still wins is whenever you need certified, interpretable uncertainty and loop closure, which the factor graph gives you for free and the black box does not.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">State of the art in fused event-inertial estimation</h3>
+<p>The benchmark reference points are the DSEC and MVSEC driving datasets and the UZH-FPV drone-racing set, all of which ship synchronized events, frames, and IMU. On the classical side, Ultimate SLAM (2018) remains the canonical tightly coupled event-frame-IMU system and ESVIO-style stereo-event-inertial pipelines extend it to metric stereo. On the learned side, recent recurrent event-inertial odometry networks (the DEVO and RAMP-VO line of work, 2023 to 2024) show that a trained model can match or beat hand-built pipelines on the fast, HDR sequences where frame-only visual-inertial odometry collapses, while remaining competitive on easy sequences. The open problems are honest ones: robust automatic time-offset calibration between the streams, learned models that expose calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), and running the whole fused estimator inside the milliwatt budget of neuromorphic silicon (<a class="cross-ref" href="section-46.5.html">Section 46.5</a>).</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: let the gyro sharpen the picture</h3>
+<p>Take a short synthetic event burst generated by a pure camera pan (reuse the simulator from Section 46.1 and translate a textured pattern). Accumulate the raw events into an image and observe the motion smear. Now apply <code>imu_warp_events</code> with the true angular velocity to warp all events to the burst's midpoint and re-accumulate. Measure sharpness as the image-variance (contrast) before and after warping, and report the ratio. Then corrupt \(\omega\) with a 10% gyro-bias error and show how the sharpness gain degrades, motivating why real systems estimate the IMU bias jointly rather than trusting the raw gyro.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Name the physical condition each of the three modalities fails in, and explain why no single condition takes down all three at once.</li>
+<li>Why can you not simply run a standard discrete-time Kalman filter over events, frames, and IMU samples as if they were synchronized measurements? Name the two devices (continuous-time trajectory, IMU preintegration) that fix it and what each one buys.</li>
+<li>In the racing-drone story, which modality dominated the estimate during the fast pitch and which during the slow hover, and what did the IMU contribute across both?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-46.7.html">Section 46.7</a>, we step back from any single fusion recipe to weigh the modality as a whole: the genuine low-latency, low-power, high-dynamic-range advantages that make event sensing compelling at the always-on edge, set squarely against its limits in cost, tooling maturity, noise, and the sheer scarcity of trained engineers. It is the chapter's closing argument about when to reach for an event camera and when a boring frame sensor is still the right tool.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

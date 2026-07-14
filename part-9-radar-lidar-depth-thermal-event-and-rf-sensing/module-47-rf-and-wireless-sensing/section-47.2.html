@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 47.2: Device-free human activity and presence. Building Sensory AI." name="description"/>
+<title>Section 47.2: Device-free human activity and presence | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 47: RF and Wireless Sensing</a></div>
+<h1>Device-free human activity and presence</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Nobody handed me a wristband to read. A person walked between the router and the laptop, jostled a few hundred multipath echoes, and now you expect me to say whether they were falling or just reaching for the remote. Fine. But do not call the signal clean."</p>
+<cite>An Uninvited AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the channel state information (CSI) vocabulary of <a class="cross-ref" href="section-47.1.html">Section 47.1</a>: subcarriers, the complex per-subcarrier gain \(H_k = |H_k| e^{j\angle H_k}\), and why raw phase is corrupted by clock and frequency offsets. It leans on the time-frequency machinery of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, because a moving body writes its signature into a Doppler spectrogram, and on the sampling and synchronization discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. The classification and windowing ideas here are the RF twin of the inertial activity recognition in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>; the difference is that no sensor rides on the person. Wi-Fi pose and vital-sign reconstruction, which need the same raw CSI, are deferred to <a class="cross-ref" href="section-47.3.html">Section 47.3</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Perception with no sensor on the target</h3>
+<p>Every other modality in this book puts a transducer somewhere near what it measures: a camera faces the scene, an IMU rides on the wrist, a radar aims its own beam. Device-free RF sensing does something stranger. It exploits a wireless link that already exists for communication, a Wi-Fi router talking to a laptop, and reads the human body as an <em>uninvited perturbation</em> of that link. A person standing in the room reflects, absorbs, and shadows the propagating wave; when they move, the tangle of multipath echoes arriving at the receiver shifts in amplitude and phase from packet to packet. The receiver was only trying to decode data, but the channel estimate it computes for free, the CSI, is a fingerprint of who is in the room and what their body is doing. This is why the field is called device-free: the target carries nothing, installs nothing, and often does not know it is being sensed. That last clause is also why <a class="cross-ref" href="section-47.7.html">Section 47.7</a> is a privacy section, not a footnote. Here we build the sensing itself, from the physics of the perturbation to a working activity classifier.</p>
+</div>
+
+<h2>What the moving body does to the channel</h2>
+<p><strong>What</strong> a device-free system observes is the change in CSI over time, not any single snapshot. Recall from <a class="cross-ref" href="section-47.1.html">Section 47.1</a> that the received signal is a sum over propagation paths, each with its own attenuation and delay. Some paths are static (the direct line, reflections off walls and furniture) and some are dynamic (reflections off a moving person). <strong>Why</strong> motion is legible is that a body moving with radial velocity \(v\) relative to a path imposes a Doppler frequency shift on that path's contribution,</p>
+$$f_D = \frac{v}{c}\,f_c \approx \frac{v}{\lambda},$$
+<p>where \(f_c\) is the carrier (about 5.8 GHz on 802.11ac, so \(\lambda \approx 5.2\) cm) and \(c\) the speed of light. A hand moving at 1 m/s writes roughly a 19 Hz tone into the channel; a walking torso, a slower and stronger one. <strong>How</strong> this appears in the data is a slow beating in the CSI amplitude and phase as the dynamic paths drift in and out of phase with the static ones. The static paths form a large constant offset, so the useful signal is the small, structured variation riding on top. Two consequences follow immediately and shape every pipeline. First, presence and coarse motion live in the <em>variance</em> of CSI amplitude over a short window: an empty room gives a nearly flat channel, a moving person makes it fluctuate. Second, the <em>kind</em> of activity lives in the frequency content of that fluctuation, which is why the Doppler spectrogram, not the raw CSI, is the representation activity classifiers usually consume.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The signal is a difference, and the phase is a liability until you fix it</h3>
+<p>Device-free sensing is a change-detection problem wearing a classification costume. The absolute channel encodes the furniture as loudly as the human, so the informative quantity is how the channel <em>moves</em>. That reframing explains the standard toolkit: subtract or high-pass the static component, then characterize the residual. It also explains why raw CSI phase is nearly useless off the shelf. As <a class="cross-ref" href="section-47.1.html">Section 47.1</a> established, unsynchronized transmitter and receiver clocks inject a random phase offset and a linear-across-subcarrier slope into every packet, swamping the millimeter-scale body motion you want. The workhorse fix is the <strong>CSI ratio</strong>: divide the complex CSI of one receive antenna by another on the same card. Both share the same clock error, so the offset cancels in the quotient while the antennas' differing geometry preserves the motion. This one trick turns phase from noise into one of the most sensitive motion features available, and it costs a single division.</p>
+</div>
+
+<h2>From CSI stream to activity: the standard pipeline</h2>
+<p><strong>What</strong> a device-free activity recognizer does is map a short window of multi-antenna, multi-subcarrier CSI to a label such as walk, sit, fall, or empty. <strong>How</strong> it gets there is a pipeline that has stabilized across the literature into four stages. (1) <em>Denoise and sanitize</em>: low-pass or bandpass the amplitude to the human-motion band (roughly 0.3 to 80 Hz), and repair phase either by the CSI ratio above or by linear-fit removal of the per-subcarrier slope, drawing on the filtering discipline of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>. (2) <em>Extract a time-frequency representation</em>: compute a short-time Fourier transform or a principal-component projection to expose the Doppler signature, the Doppler Frequency Shift (DFS) spectrogram. (3) <em>Represent invariantly</em> where possible: the strongest systems convert the DFS into a feature that does not depend on where the person stood or which way they faced. (4) <em>Classify</em> with a CNN, an LSTM, or a CNN-LSTM hybrid, exactly the temporal models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. <strong>Why</strong> stage (3) carries so much weight is the single hardest fact about this modality: a model trained in one room, with the link along one axis and the person at one spot, collapses when any of those change. The multipath that makes sensing possible is also what makes it fragile, and <a class="cross-ref" href="section-47.6.html">Section 47.6</a> is devoted to the resulting cross-environment generalization problem.</p>
+
+<p>The landmark response is <strong>Widar3.0</strong> (Zhang and colleagues, 2019), the dataset and method behind this chapter's lab. Its contribution is the <strong>Body-coordinate Velocity Profile (BVP)</strong>: from CSI collected across several spatially separated links, it estimates the distribution of body-part velocities in a coordinate frame anchored to the person rather than to the router, cancelling much of the orientation and position dependence. A gesture becomes the same BVP whether performed facing north or east, so a classifier trained on BVP transfers across rooms far better than one trained on raw DFS. Other reference datasets frame the problem differently: <strong>SignFi</strong> targets 276 sign-language gestures, and <strong>UT-HAR</strong> provides a simple continuous-CSI activity benchmark that is a common first stop. Widar3.0 remains the canonical cross-domain testbed.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The eldercare pilot that heard a fall through the drywall</h3>
+<p>A digital-health group piloting in-home fall detection for independent-living seniors wanted no wearable, because the residents most at risk of falling were the ones most likely to leave a pendant on the nightstand. They mounted a single commodity 802.11ac access point and a small CSI-logging receiver in a one-bedroom apartment and trained a CNN-LSTM on sanitized CSI-ratio spectrograms. In the lab it was excellent. In the apartment it fired on the resident's cat and missed a slow slump-to-the-floor that lacked the sharp Doppler burst of a trip. Two fixes mattered, and neither was a bigger network. First, they added a presence-gate front end (the amplitude-variance detector of the next section's code) so the classifier only ran when something human-sized was moving, cutting the cat's lighter perturbation. Second, they moved from raw spectrograms toward a BVP-style velocity feature so the fall signature, a rapid downward body velocity, survived the resident standing in a different spot than the training subject. The contactless-vitals framing that complements this, breathing and heart rate from the same link, belongs to <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>.</p>
+</div>
+
+<h2>A presence detector you can run today</h2>
+<p>Before any deep model, the cheapest and most robust device-free primitive is <em>presence</em>: is anyone moving in the coverage area? Code 47.2.1 implements it end to end on a stream of CSI amplitudes. It bandpasses each subcarrier to the human-motion band, measures the short-window variance, and declares presence when the variance across subcarriers exceeds a floor learned from an empty room. This is the gate that fronted the eldercare classifier above, and it is referenced there.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.signal import butter, filtfilt
+
+def motion_bandpass(csi_amp, fs, lo=0.3, hi=40.0):
+    # csi_amp: (T packets, K subcarriers) amplitude stream
+    b, a = butter(4, [lo, hi], btype="band", fs=fs)
+    return filtfilt(b, a, csi_amp, axis=0)
+
+def presence(csi_amp, fs, win_s=1.0, empty_var=None, margin=4.0):
+    x = motion_bandpass(csi_amp, fs)
+    w = int(win_s * fs)
+    # per-window energy: mean over subcarriers of windowed variance
+    T = x.shape[0]
+    scores = np.array([x[i:i+w].var(axis=0).mean() for i in range(0, T - w, w)])
+    if empty_var is None:                      # calibrate on the quietest window
+        empty_var = np.percentile(scores, 10)
+    return scores > margin * empty_var, scores
+
+fs = 100.0                                     # CSI packet rate (Hz)
+rng = np.random.default_rng(0)
+empty = 0.02 * rng.standard_normal((1500, 30)) # quiet channel
+walk  = empty.copy()
+walk[500:1000] += 0.15 * np.sin(2*np.pi*1.2*np.arange(500)[:, None]/fs)  # a body Doppler beat
+flags, scores = presence(np.abs(np.vstack([empty[:0], walk])), fs)
+print("windows flagged as occupied:", np.flatnonzero(flags).tolist())
+# windows flagged as occupied: [5, 6, 7, 8, 9]
+</code></pre>
+<div class="code-caption">Code 47.2.1: A device-free presence detector. The motion band-pass isolates human-induced fluctuation, the windowed variance scores each second, and a room-calibrated threshold flags occupancy. The injected 1.2 Hz beat (a torso swaying at the walking cadence) lights up windows 5 through 9; the quiet channel stays silent. This variance gate is the front end that keeps the eldercare classifier from firing on an empty room.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: parsing and featurizing CSI without the bit-twiddling</h3>
+<p>The tedious half of device-free sensing is not the model, it is turning a vendor's binary CSI dump into a clean tensor: parsing the Intel 5300 or Atheros or ESP32 frame format, unpacking per-subcarrier complex values, aligning antennas, and forming the CSI ratio. Rolling that yourself is a few hundred lines of format-specific byte handling. The <code>csiread</code> library reads all the common logger formats into NumPy arrays in one call (<code>csidata = csiread.Intel(fname); csidata.read()</code>), and the <code>SignFi</code> and <code>Widar3.0</code> toolkits ship loaders plus reference DFS and BVP extractors, so the pipeline of this section collapses from roughly 300 lines to about 30. What no library hands you is the room-specific calibration and the cross-environment split; those you still own, and <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> explains why splitting by environment rather than by packet is the difference between an honest number and a leaked one.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where device-free sensing is headed</h3>
+<p>Three fronts are active. <strong>Domain-invariant representation learning</strong> pushes past hand-built BVP toward learned features that generalize: adversarial domain-adaptation and self-supervised CSI encoders (in the spirit of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) aim to strip environment identity while keeping activity identity, so a model trained in a lab survives a living room. <strong>Foundation-scale CSI models</strong> pretrain on large unlabeled multi-environment CSI corpora, chasing the transfer that has reshaped the wearable models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>. <strong>Standardized sensing</strong> is arriving through IEEE 802.11bf, covered in <a class="cross-ref" href="section-47.5.html">Section 47.5</a>, which for the first time defines a sensing measurement inside the Wi-Fi standard itself rather than scavenging CSI meant for communication. The open problem underneath all three is the same one the eldercare pilot hit: making a device-free model that a customer can install in an unseen room and trust on day one.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: from presence to a two-class activity gate</h3>
+<p>Extend Code 47.2.1. (1) Replace the scalar variance score with a per-window short-time Fourier transform of one denoised subcarrier and plot the resulting Doppler spectrogram; confirm the injected 1.2 Hz beat appears as a band. (2) Add a second synthetic class, a faster 3 Hz "wave" beat, and train a tiny logistic regression on the mean and peak Doppler frequency of each window to separate walk from wave. (3) Now the hard part: regenerate the "walk" signal with a different amplitude and a small frequency drift (simulating a person standing 1 m to the side) and report how much accuracy you lose. (4) In two sentences, explain why a Body-coordinate Velocity Profile would recover the accuracy that raw Doppler features lose, and connect this to the leakage-safe, split-by-environment evaluation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A colleague plots raw CSI phase from a single antenna and finds it jumps randomly every packet. Name the two hardware offsets responsible and the one-line operation that cancels them while preserving body motion.</p>
+<p>2. Why is presence detection built on amplitude <em>variance</em> rather than amplitude itself, and what does an empty room's CSI look like in this view?</p>
+<p>3. Widar3.0's BVP transfers across rooms far better than a raw Doppler spectrogram. In one sentence, what does the BVP anchor its coordinate frame to, and why does that choice cancel orientation dependence?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-47.3.html">Section 47.3</a>, we push device-free sensing from a handful of activity labels to dense structured output: reconstructing full human pose and even a DensePose-style body-surface map from Wi-Fi alone (DensePose-from-WiFi, WiPose), and reading the millimeter chest motion of breathing and heartbeat off the same CSI stream. The presence and Doppler foundations built here are exactly what those systems amplify, first into a skeleton, then into a vital sign.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

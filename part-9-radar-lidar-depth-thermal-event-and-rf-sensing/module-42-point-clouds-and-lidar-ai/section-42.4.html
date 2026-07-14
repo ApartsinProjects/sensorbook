@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.4: Point transformers (Point Transformer v3). Building Sensory AI." name="description"/>
+<title>Section 42.4: Point transformers (Point Transformer v3) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>Point transformers (Point Transformer v3)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I stopped hunting for each point's neighbors and simply asked them to stand in a sensible line. The line was wrong just often enough to be right on time."</p><cite>A Serializing AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The sparse-convolution backbones of <a class="cross-ref" href="section-42.3.html">Section 42.3</a> are fast and battle-tested, but their receptive field grows only as fast as you stack layers, and convolution weights are shared regardless of local geometry. Attention promises the opposite: a globally-aware, content-adaptive operator. The catch is that attention over an unordered set of a hundred thousand lidar points, each needing its true nearest neighbors, drowns in irregular memory access. Point Transformer v3 (PTv3, Wu et al., CVPR 2024) makes the trade that finally scales: it gives up exact neighbor search and instead orders points along a space-filling curve, turning a 3D set into a 1D sequence where attention becomes cheap and regular. That single decision buys a 3x speedup, roughly 10x less memory, and a receptive field that jumps from a handful of points to over a thousand. It is why transformers are now the default backbone on lidar leaderboards.</p>
+</div>
+
+<p>This section assumes you know how self-attention works from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> and how voxelization and sparse tensors organize a point cloud from <a class="cross-ref" href="section-42.2.html">Section 42.2</a>. Our narrow job here is to explain why naive point attention fails, how serialization rescues it, and what the PTv3 block actually computes. We treat the detection and segmentation heads that sit on top of this backbone as given and defer them to <a class="cross-ref" href="section-42.5.html">Section 42.5</a>.</p>
+
+<h2>Why attention on raw points is hard</h2>
+
+<p>A point cloud is a set of \(N\) points \(\{\mathbf{p}_i\}\) with no canonical order and no grid. The earliest point transformers (PTv1 and PTv2) applied attention the geometrically honest way: for each point, find its \(k\) nearest neighbors with a k-d tree, then attend within that local neighborhood using vector attention weighted by relative position. This respects the data, and it works, but it is punishingly slow. The k-nearest-neighbor query is an irregular gather: neighboring points in space live at arbitrary, scattered memory addresses, so every attention block pays for cache misses and pointer chasing that a GPU hates. On a full outdoor scan the neighbor search alone can dominate runtime, and the receptive field stays small because widening \(k\) makes the gather quadratically worse.</p>
+
+<p>The core realization behind PTv3 is that this precision is not worth its price. If we can impose <em>any</em> ordering on the points that keeps spatial neighbors mostly close together in the ordering, then "attend to nearby points" becomes "attend to a contiguous window of the sequence," which is a dense, coalesced memory read. We accept that the ordering will occasionally place two spatially-distant points side by side, and two spatially-close points far apart. That error is the price; scale is what we buy.</p>
+
+<h2>Serialization: a space-filling curve turns 3D into 1D</h2>
+
+<p>The tool that makes this work is a <strong>space-filling curve</strong>: a mapping that threads a single continuous path through every cell of a voxel grid so that cells adjacent along the path tend to be adjacent in space. PTv3 uses two, the <strong>Z-order (Morton) curve</strong> and the <strong>Hilbert curve</strong>. The Morton code of a voxel is computed by interleaving the bits of its integer \((x,y,z)\) coordinates; sorting points by this scalar code produces the serialization. The Hilbert curve preserves locality even better (it never makes long jumps) at slightly higher encoding cost.</p>
+
+<p>Concretely, quantize each point to an integer grid coordinate with bit-depth \(b\) per axis, then interleave:</p>
+
+$$ \text{morton}(x,y,z) = \sum_{j=0}^{b-1} \Big( x_j\, 2^{3j} + y_j\, 2^{3j+1} + z_j\, 2^{3j+2} \Big), $$
+
+<p>where \(x_j\) is the \(j\)-th bit of \(x\). The resulting integer is a 1D address that a radix sort orders in linear time. Because the interleaving mixes the high bits of all three axes first, points that share a coarse spatial region get contiguous codes. The code below builds a Morton ordering and demonstrates the locality it induces.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def morton_encode(coords, bits=10):
+    """Interleave bits of integer (x,y,z) voxel coords into one Morton code."""
+    coords = coords.astype(np.int64)
+    code = np.zeros(len(coords), dtype=np.int64)
+    for j in range(bits):
+        for axis in range(3):
+            bit = (coords[:, axis] >> j) & 1
+            code |= bit << (3 * j + axis)
+    return code
+
+# A toy scan: 20k points quantized to a 1024^3 grid (10 bits/axis).
+rng = np.random.default_rng(0)
+pts = rng.random((20000, 3)) * 50.0                  # meters
+vox = np.floor(pts / (50.0 / 1024)).astype(np.int64) # integer voxel coords
+order = np.argsort(morton_encode(vox, bits=10))      # the serialization
+pts_sorted = pts[order]
+
+# Neighbors in the sequence are usually neighbors in space:
+step = np.linalg.norm(np.diff(pts_sorted, axis=0), axis=1)
+print(f"median gap between consecutive points along curve: {np.median(step):.3f} m")
+print(f"median gap for a random ordering:                  "
+      f"{np.median(np.linalg.norm(np.diff(pts, axis=0), axis=1)):.3f} m")</code></pre>
+<div class="code-caption">Building a Morton (Z-order) serialization of a point cloud and measuring locality. Consecutive points along the curve sit far closer in space than consecutive points in the original random order, which is exactly the property that lets windowed attention replace k-nearest-neighbor attention.</div>
+
+<p>Running the snippet shows the median spatial gap between sequence-adjacent points collapses by roughly an order of magnitude versus a random ordering. That gap is the whole game: it means a contiguous window of the serialized sequence is a good stand-in for a true spatial neighborhood, and attention over that window approximates local attention without a single k-d tree query.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>PTv3's speedup does not come from a cleverer attention kernel; it comes from changing the <em>data layout</em> so that ordinary windowed attention lands on spatial neighbors. Serialization moves the geometry work out of the hot inner loop (per-layer neighbor search) and into a one-time sort. Once points are ordered, the backbone never touches a k-d tree again, and the receptive field can grow simply by widening the window, which costs almost nothing.</p>
+</div>
+
+<h2>Inside the PTv3 block</h2>
+
+<p>With points serialized, a PTv3 layer looks almost like a 1D vision transformer. The sequence is partitioned into non-overlapping <strong>patches</strong> (windows) of a fixed size, typically 1024 points, and standard self-attention runs within each patch. Three design choices adapt this to geometry. First, <strong>shuffled orders</strong>: PTv3 keeps several serializations (Morton and Hilbert, each in a few axis permutations) and rotates through them across layers. Because each curve breaks locality in different places, alternating them heals the seams; a boundary that splits two close points in the Morton order is interior to the Hilbert order. Second, <strong>xCPE</strong> (extended conditional positional encoding): rather than the additive relative-position tables that made PTv2 slow, PTv3 injects position with a lightweight sparse depthwise convolution applied to the values before attention, cheaply reintroducing exact local geometry. Third, the backbone is a U-Net: patches are pooled by grid coarsening between stages, so deep layers attend over larger physical regions.</p>
+
+<p>The receptive field arithmetic is what pays off. A sparse-conv backbone reaches a given range only by stacking enough \(3^3\) kernels; PTv3 reaches over a thousand points in a single patch and, through pooling and shuffled curves, achieves an effective receptive field far larger than PTv2 at a fraction of the cost. This is the same "make the sequence cheap, then make it long" philosophy that drives the linear-time sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>, applied to 3D geometry instead of time.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026, PTv3 and its variants hold or share the top of the major indoor and outdoor point-cloud segmentation benchmarks (ScanNet, ScanNet200, S3DIS indoors; nuScenes and SemanticKITTI outdoors), typically edging out the strongest sparse-conv nets while running faster. Its real leverage is as a <em>scalable</em> backbone: paired with Point Prompt Training (PPT), a single PTv3 trained jointly across many labeled datasets beats per-dataset specialists, and it is the backbone under the self-supervised lidar pretraining schemes you will meet in <a class="cross-ref" href="section-42.6.html">Section 42.6</a>. The open question the field is chasing is whether serialized attention or a Mamba-style state-space scan over the same curve is the better long-sequence operator for 3D.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not implement Morton codes, shuffled orders, xCPE, and the U-Net by hand. Pointcept (the reference framework from the PTv3 authors) exposes the whole backbone as a config: a <code>PointTransformerV3</code> module plus a serialization transform in the data pipeline. Instantiating a competitive segmentation model is on the order of 20 lines of config versus the many hundreds of lines the serialized-attention backbone, positional encoding, and multi-order bookkeeping would take from scratch. OpenPCDet offers a comparable path for the detection-head variant.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: relabeling a robotaxi fleet's map layer</h3>
+<p>An autonomous-driving team needs dense semantic labels (road, sidewalk, vegetation, pole, vehicle) on aggregated lidar maps to keep their HD map current across a city. Their existing sparse-conv segmenter handled single 32-beam sweeps but choked on the aggregated multi-sweep clouds, which run to several million points, because widening its receptive field to reason about long thin structures like curbs and guardrails meant stacking layers until memory blew up. Switching the backbone to PTv3 let them push whole aggregated tiles through in one pass: the 1024-point patches plus pooled deep stages captured a curb's full extent, and mean IoU on the thin-structure classes rose several points while inference memory dropped enough to move the job off an A100 onto a commodity GPU. The lesson mirrors the chapter's theme: the fix was the backbone's data layout and receptive field, not the segmentation head.</p>
+</div>
+
+<h2>When to reach for PTv3 versus sparse convolution</h2>
+
+<p>PTv3 is the strong default when accuracy on large scenes matters and you have GPU memory to train it: dense semantic segmentation, panoptic tasks, and any setting where long-range context (a lane's continuity, a wall's extent) drives the label. It also shines as a pretraining backbone, since its scale lets it soak up large unlabeled corpora. Sparse convolution from <a class="cross-ref" href="section-42.3.html">Section 42.3</a> remains the pragmatic pick for tight latency and memory budgets, especially the anchor-free detectors that must run at sensor frame rate on an embedded automotive computer, where the deployment constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> dominate the choice. A useful habit: prototype with PTv3 to establish an accuracy ceiling, then decide whether a distilled or sparse-conv student can hit your latency target. Whichever backbone you pick, evaluate it with the geographically-split, leakage-safe protocol from <a class="cross-ref" href="section-42.7.html">Section 42.7</a>; serialized attention can quietly memorize a single city's layout if train and test tiles overlap.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the <code>morton_encode</code> function above, (a) sort a synthetic 50k-point cloud and, for each point, measure how many of its 16 sequence-neighbors are also among its 16 true nearest neighbors (use a k-d tree for ground truth); report the mean overlap fraction. (b) Repeat after also computing a Hilbert ordering (any library implementation is fine) and taking, for each point, the union of sequence-neighbors from both curves. By how much does the shuffled-order union improve neighbor recall? (c) Explain in two sentences why this recall gain is exactly what PTv3's alternating orders are buying, and what it costs.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does k-nearest-neighbor attention on raw points scale so poorly on a GPU, and what specific operation does serialization eliminate from every layer?</li>
+<li>What does a space-filling curve guarantee, and where does it break down? Why does PTv3 use more than one curve?</li>
+<li>Name two situations where you would still choose a sparse-convolution backbone over PTv3, and tie each to a concrete constraint.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-42.5.html">Section 42.5</a>, we put a backbone like PTv3 or a sparse-conv net to work: attaching detection, segmentation, and tracking heads that turn a per-point feature map into 3D bounding boxes, semantic masks, and object trajectories, and measuring them with the metrics the field actually reports.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

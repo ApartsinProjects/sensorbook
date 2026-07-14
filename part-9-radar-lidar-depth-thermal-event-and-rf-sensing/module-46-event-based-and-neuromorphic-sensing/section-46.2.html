@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.2: Event representations (voxel grids, time surfaces). Building Sensory AI." name="description"/>
+<title>Section 46.2: Event representations (voxel grids, time surfaces) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Event-Based and Neuromorphic Sensing</a></div>
+<h1>Event representations (voxel grids, time surfaces)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You handed me a million timestamps and asked for a picture. Fine, but do not blame me when I flatten your favorite dimension to make it fit."</p><cite>A Reluctantly Rasterizing AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An event camera does not produce frames. It produces a sparse, asynchronous stream of tuples \((x, y, t, p)\), one per brightness change, at microsecond resolution. Almost every mature deep-learning tool, however, expects a dense tensor on a fixed grid. Event representations are the bridge: rules for turning a variable-length stream into a fixed-shape array that a convolutional or transformer backbone can ingest. The choice is not cosmetic. Collapse time too aggressively and you throw away the exact property (temporal precision) that made you buy the sensor. Keep too much and you lose the sparsity and speed. This section builds the three workhorse representations, event frames, time surfaces, and voxel grids, derives the math that governs what each one preserves, and gives you the decision rule for picking one under a latency and accuracy budget.</p>
+</div>
+
+<p>This section assumes you can read a raw event stream and understand why polarity and microsecond timestamps exist, which is the sensor story from <a class="cross-ref" href="section-46.1.html">Section 46.1</a>. It also leans on the sampling-and-time intuition from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>: an event stream is an irregularly sampled signal, and every representation here is a resampling choice with an aliasing budget. The goal is to feed the neural representations of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> without silently discarding information.</p>
+
+<h2>The stream, and why it resists tensors</h2>
+<p>Formally, a window of events is a set \(\mathcal{E} = \{(x_k, y_k, t_k, p_k)\}_{k=1}^{N}\), where \(p_k \in \{-1, +1\}\) is the sign of the log-intensity change and \(N\) varies from a few hundred (a still scene) to several million per second (a textured scene under fast motion). Three properties make this awkward for standard networks. It is <em>sparse</em>: most pixels are silent in any short window. It is <em>asynchronous</em>: there is no shared clock tick, so no natural "frame". And it is <em>temporally precise</em>: the information often lives in the exact ordering and spacing of events, not in their spatial pattern alone. A representation is a function \(R: \mathcal{E} \to \mathbb{R}^{C \times H \times W}\) that fixes the shape while deciding, explicitly, how much of that temporal structure to keep. Think of it as the event-vision analogue of choosing a spectrogram window in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>: the transform is lossy, and the loss is the design.</p>
+
+<h2>Event frames: the honest baseline</h2>
+<p>The simplest representation drops time entirely inside the window. An <strong>event frame</strong> (or two-channel histogram) accumulates counts per pixel:</p>
+$$H_{\pm}(x, y) = \sum_{k : (x_k, y_k) = (x, y)} \mathbb{1}[p_k = \pm 1].$$
+<p>You get a familiar 2D image (often two channels, one per polarity, or a single signed difference) that any pretrained CNN can consume. It is fast, trivially parallel, and works surprisingly well for low-speed classification. Its weakness is exactly its simplicity: two events one microsecond apart and two events ten milliseconds apart land in the same bin, so all motion-timing information is destroyed. Under fast motion the frame also smears, because every event in the window is painted at its own stale location. Event frames are the right choice when the downstream task is appearance-dominated and the window is short; they are the wrong choice when timing carries the signal, which is most of the reason event cameras exist.</p>
+
+<h2>Time surfaces: recency as a feature</h2>
+<p>A <strong>time surface</strong> (also Surface of Active Events, SAE) keeps the single most recent event per pixel and encodes <em>how recently</em> it fired through an exponential decay. At query time \(t\),</p>
+$$S(x, y, t) = \exp\!\left(-\frac{t - t_{\text{last}}(x, y)}{\tau}\right),$$
+<p>where \(t_{\text{last}}(x,y)\) is the timestamp of the last event at that pixel and \(\tau\) is a decay constant. Freshly active pixels read near 1, stale ones fade toward 0, so the surface encodes a smooth "motion history" whose gradient points along the direction of edge travel. The constant \(\tau\) is the one knob that matters: too small and the surface is noisy and empty between events; too large and fast motion saturates it into a blur. Time surfaces are the backbone of the HOTS and HATS descriptors and of many low-power classifiers, because a single surface update is one memory write and one exponential, cheap enough for the edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. Their weakness is that keeping only the latest event per pixel discards event <em>density</em>, so a bright flickering edge and a single passing edge can look identical.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Every event representation is a lossy trade between three axes: spatial detail, temporal precision, and event density. Event frames keep density and spatial detail but destroy timing. Time surfaces keep timing and spatial detail but destroy density. Voxel grids buy back a coarse slice of timing by spending memory on temporal bins. There is no free representation; there is only the one whose loss aligns with what your task ignores. Pick it by asking which axis your labels are invariant to.</p>
+</div>
+
+<h2>Voxel grids: giving time back a few dimensions</h2>
+<p>A <strong>voxel grid</strong> refuses the binary choice by discretizing the temporal window into \(B\) bins and distributing each event's polarity across the two nearest bins with a linear (bilinear-in-time) kernel. Normalize each timestamp to \(t^{*}_k = (B-1)\,(t_k - t_0)/(t_1 - t_0)\), then accumulate</p>
+$$V(x, y, b) = \sum_{k}\, p_k \,\max\!\big(0,\; 1 - |b - t^{*}_k|\big),$$
+<p>for bin index \(b \in \{0, \dots, B-1\}\). The result is a \(B \times H \times W\) tensor: a short stack of polarity-weighted slices that a 2D CNN reads as extra input channels or a 3D CNN reads as a tiny volume. The linear splatting is what makes it differentiable and anti-aliased, so gradients flow back to timestamps and you avoid the hard binning artifacts of a naive histogram-over-time. Voxel grids with \(B\) between 5 and 15 are the standard input to optical-flow networks (EV-FlowNet), to reconstruction models, and to the recurrent transformer backbones you will meet in <a class="cross-ref" href="section-46.3.html">Section 46.3</a>. They keep enough timing to recover motion direction and enough density to distinguish strong from weak edges, at a memory cost of \(B\) times an event frame. Notice the deep similarity to the spatiotemporal point-cloud voxelization of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>: an event stream is a point cloud in \((x, y, t)\), and a voxel grid is exactly the occupancy-grid trick applied with time as the third axis.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def to_voxel_grid(xs, ys, ts, ps, H, W, B=5):
+    """Bilinear-in-time voxel grid: (B, H, W) from an event window."""
+    vox = np.zeros((B, H, W), dtype=np.float32)
+    t0, t1 = ts[0], ts[-1]
+    t_star = (B - 1) * (ts - t0) / max(t1 - t0, 1e-9)   # normalize to [0, B-1]
+    lo = np.floor(t_star).astype(int)
+    w_hi = t_star - lo                                   # linear split weight
+    pol = ps.astype(np.float32)                          # +1 / -1
+    for b_off, w in ((0, 1.0 - w_hi), (1, w_hi)):        # two nearest bins
+        b = lo + b_off
+        m = (b >= 0) & (b < B)                           # keep valid bins
+        np.add.at(vox, (b[m], ys[m], xs[m]), pol[m] * w[m])
+    return vox
+
+# 3 events on one pixel, spread across the window -> spread across bins
+xs = np.array([10, 10, 10]); ys = np.array([20, 20, 20])
+ts = np.array([0.0, 5.0, 10.0]); ps = np.array([1, 1, -1])
+print(to_voxel_grid(xs, ys, ts, ps, H=64, W=64, B=5)[:, 20, 10])
+# -> [ 1.  0.  1.  0. -1.]  (early +, mid +, late - land in distinct bins)
+</code></pre>
+<div class="code-caption">A complete, differentiable-in-spirit voxel-grid builder. The two-bin linear split (the <code>w_hi</code> weight) is the anti-aliasing that separates this from a hard histogram; <code>np.add.at</code> does the scatter-accumulate. The printed slice shows one pixel's three events landing in distinct temporal bins, exactly the timing an event frame would have collapsed.</div>
+
+<p>The snippet above is the whole idea in a dozen lines, and it is worth writing once by hand to feel where the timing goes. In production you rarely maintain it yourself.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: Tonic</h3>
+<p>The <code>tonic</code> library ships every representation in this section as a composable transform. The hand-rolled builder above (plus its edge cases: empty windows, dtype handling, GPU tensors) collapses to about two lines.</p>
+<pre><code class="language-python">import tonic.transforms as T
+voxel = T.ToVoxelGrid(sensor_size=(W, H, 2), n_time_bins=5)(events)
+surface = T.ToTimesurface(sensor_size=(W, H, 2), tau=20000)(events)</code></pre>
+<p>Roughly 30 lines of scatter, normalization, and boundary logic reduce to 2, and Tonic also handles denoising, spatial downsampling, and dataset loaders for DSEC, N-Caltech101, and Prophesee. Write the loop once to understand it; ship the library.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: catching parts on a fast conveyor</h3>
+<p>A pick-and-place robot inspects small metal parts sliding past on a conveyor at 2 m/s. An RGB camera at 60 fps motion-blurs each part into a streak; a global-shutter machine-vision camera freezes it but needs a strobe and still delivers one decision every 16 ms. The team swaps in a Prophesee event sensor. They first try event frames over 10 ms windows and find that fast parts smear across the accumulation, the same blur they were trying to escape. Switching to a 6-bin voxel grid fixes it: each bin is a sub-1.7 ms temporal slice, the part appears sharp in the bins it occupies, and a small CNN reads the \(6 \times H \times W\) tensor to localize the part with sub-millisecond effective exposure. The lesson is representational, not architectural. The sensor already had the timing; the event frame threw it away, and the voxel grid gave it back.</p>
+</div>
+
+<h2>Choosing, and letting the network choose</h2>
+<p>The decision rule follows the loss axes. If labels depend on appearance and the scene is slow, an event frame is cheapest and fine. If you need motion timing on a microwatt budget, a time surface is the frugal choice. If you are feeding a modern flow, depth, or detection network and can afford a few channels, a voxel grid is the default and the one most published results assume. A subtler option is to <em>learn</em> the representation: the Event Spike Tensor (EST) of Gehrig et al. replaces the fixed decay and binning kernels with a small trainable network, letting the aggregation adapt to the task, and it set the reference for treating the representation as part of the model rather than a fixed preprocessing step.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current direction is end-to-end learned and higher-order representations. EST (Gehrig et al., 2019) made the binning kernel differentiable and trainable. Matrix-LSTM learns a per-pixel recurrent aggregation of the stream. ERGO-12 (Zubic et al., 2023) searches a 12-channel representation and pairs it with transformer backbones to top DSEC and N-Caltech101 leaderboards, while the recurrent vision transformers of <a class="cross-ref" href="section-46.3.html">Section 46.3</a> increasingly fold voxelization directly into the network so no fixed grid is materialized at all. The open question is whether a task-agnostic learned representation can beat a hand-tuned voxel grid across domains, or whether the right grid is always task-specific. As always, validate any such claim under the leakage-safe, session-split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, since event benchmarks are small and easy to overfit.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a recording with a fast-moving edge (or synthesize events along a diagonal line sweeping across the sensor). Build (a) a two-channel event frame, (b) a time surface with three values of \(\tau\), and (c) voxel grids with \(B = 1, 5, 15\). Confirm that the \(B = 1\) voxel grid is (up to sign) the event frame. Measure the memory of each and, for the voxel grids, plot how recoverable the edge's motion direction is as \(B\) grows. Identify the smallest \(B\) that still recovers direction: that is your task's temporal-precision budget.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ul>
+<li>Which representation destroys event density, and why does that make a flickering edge indistinguishable from a single passing edge?</li>
+<li>In the voxel-grid formula, what does the \(\max(0, 1 - |b - t^{*}_k|)\) kernel accomplish that a hard "assign to nearest bin" rule would not?</li>
+<li>Your labels are invariant to how fast an object moves (you only classify what it is). Which representation's information loss is safest to accept, and which sensor advantage are you then leaving on the table?</li>
+</ul>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-46.3.html">Section 46.3</a>, we push past fixed representations entirely. We reconstruct intensity video directly from events with E2VID, then meet recurrent vision transformers (RVT) that consume voxelized events and carry temporal state inside the network, so the representation and the model stop being separate design decisions.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

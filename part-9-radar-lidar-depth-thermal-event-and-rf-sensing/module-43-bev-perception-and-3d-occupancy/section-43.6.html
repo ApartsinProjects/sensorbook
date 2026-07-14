@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.6: Occupancy world models (developed further in Ch 53). Building Sensory AI." name="description"/>
+<title>Section 43.6: Occupancy world models (developed further in Ch 53) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>Occupancy world models (developed further in Ch 53)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Labeling every voxel of the present was the easy part. Then someone asked me what the voxels would be doing three seconds from now, and whether I planned to hit any of them."</p><cite>A Forward-Looking AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Everything so far in this chapter describes the world as it is <em>right now</em>: lift the cameras into a bird's-eye grid, fuse the lidar, label each voxel free or occupied. That is perception. But a car that only knows the present is a car that reacts a frame too late. The pedestrian stepping off a curb, the cyclist drifting into the lane, the truck whose trailer is about to sweep across your path: safe motion needs a model that can roll the occupied space forward in time and answer "what will be filled, and where, if I take this action?" An <strong>occupancy world model</strong> is exactly that: a learned simulator of the 3D scene that takes a history of occupancy volumes and predicts future occupancy volumes, optionally conditioned on the ego vehicle's planned motion. It turns the static occupancy grid of the previous sections into a dynamical system you can query, unroll, and plan against. This section builds the occupancy-specific version of that idea; <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a> then generalizes it into the full theory of world models and predictive sensing.</p>
+</div>
+
+<p>This section stands on the static occupancy predictors of <a class="cross-ref" href="section-43.4.html">Section 43.4</a> (Occ3D, SurroundOcc, TPVFormer), which give us the per-frame occupancy volume that becomes this model's input and its prediction target. It reuses the autoregressive-transformer machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> and, for the long temporal rollouts, the linear-time sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>. Our narrow job here: define what a 4D occupancy forecast is, show how to tokenize and predict it, and explain why conditioning on ego action closes the loop between perception and planning.</p>
+
+<h2>From labeling the present to forecasting the future</h2>
+
+<p>A single occupancy volume is a tensor \(o_t \in \{0,1,\dots,K\}^{X \times Y \times Z}\): every voxel in a metric grid carries a class label (free, or one of \(K\) semantic categories). Section 43.4 learned the map from sensors to \(o_t\). An occupancy world model instead learns the map <em>from past to future occupancy</em>. Given a short history \(o_{t-H+1:t}\), it models the distribution over future volumes,</p>
+
+$$ p\big(o_{t+1:t+F} \mid o_{t-H+1:t}, a_{t:t+F-1}\big), $$
+
+<p>where \(a\) is an optional stream of ego actions (the planned pose or trajectory of the sensor platform). Two things make this fundamentally harder than per-frame occupancy. First, the output is <em>multimodal and stochastic</em>: a cyclist at an intersection might go straight or turn, and a good model must keep both futures alive rather than blurring them into an averaged smear of half-occupied voxels. Second, the state space is enormous. A modest \(200 \times 200 \times 16\) grid is 640,000 voxels per frame; rolling out a few seconds at 2&nbsp;Hz means predicting millions of correlated categorical variables. You cannot regress that volume directly and expect crisp geometry. The field's answer, borrowed from generative modeling, is to <strong>compress first, then predict in the compressed space</strong>.</p>
+
+<h2>Tokenizing 4D occupancy and predicting it autoregressively</h2>
+
+<p>The canonical design is <strong>OccWorld</strong> (Zheng et al., ECCV 2024). It has two stages. A spatial <strong>VQ-VAE</strong> tokenizer encodes each occupancy volume \(o_t\) into a small grid of discrete tokens \(z_t\) drawn from a learned codebook, collapsing 640,000 voxels into perhaps a few hundred tokens that capture recurring local structures (a slab of road, the shell of a parked car, a curb). Then a <strong>spatiotemporal generative transformer</strong>, a GPT-style model over these tokens, predicts the next frame's token grid from the history. Because the tokens are discrete, forecasting becomes next-token classification with a clean autoregressive factorization,</p>
+
+$$ p(z_{t+1:t+F} \mid z_{\le t}) = \prod_{k=t+1}^{t+F} \prod_{i} p\big(z_k^{(i)} \mid z_{<k}, z_k^{(<i)}\big), $$
+
+<p>and generation is a rollout: predict \(z_{t+1}\), decode it back to a full occupancy volume with the VQ-VAE decoder, feed it back as history, repeat. The discreteness is what preserves the crisp, hard-edged geometry that a continuous regressor washes out. Notice that a world model trained purely to predict its own future tokens needs <em>no manual future labels</em>: the supervision is the next frame of occupancy the sensors will observe anyway. That makes it a powerful self-supervised objective, in the spirit of the sequence pretraining in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>: the model is forced to internalize object permanence, ego motion, and typical agent dynamics just to lower its prediction loss.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>An occupancy world model is a <em>tokenized simulator</em>, not a detector. It never enumerates objects or boxes; it predicts the raw occupied structure of space over time. This is exactly why it inherits the open-set virtue of occupancy from <a class="cross-ref" href="section-43.4.html">Section 43.4</a>: a fallen ladder, an unmapped animal, or debris with no class in the vocabulary still occupies voxels, so the model still forecasts its motion. A box-based motion predictor can only forecast the futures of things it first agreed to name. Forecasting occupancy, rather than trajectories, is how you predict the motion of things you cannot label.</p>
+</div>
+
+<h2>Action conditioning and the planning loop</h2>
+
+<p>Prediction alone is passive. The move that makes a world model <em>useful for control</em> is conditioning the rollout on a candidate ego action: "if I follow trajectory \(a\), what does the occupancy around me become?" With that conditional, the model becomes a differentiable driving simulator. You can score a planned trajectory by whether the futures it induces keep the ego voxels free of occupied ones, and even backpropagate a collision or comfort cost through the rollout to refine the plan. OccWorld and its successors show that a single tokenized model can <em>jointly</em> forecast the scene and the ego trajectory, blurring the line between the perception stack and the planner that the rest of the vehicle used to keep strictly separate. The predictive-sensing framing in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a> makes this general: a world model is valuable precisely because it lets an agent <em>imagine</em> the consequences of its actions before committing to one.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: anticipating an occluded pedestrian at a delivery robot's blind corner</h3>
+<p>A sidewalk delivery robot approaches a parked van that hides the crosswalk beyond it. A pure perception stack sees only occupied van voxels and empty road, and plans a normal turn. The team instead ran an occupancy world model conditioned on the robot's intended path. Trained on months of sidewalk logs, the model had learned that occupied space emerging from behind a van at a crosswalk, at roughly walking pace, tends to keep emerging: it rolled the future forward and hallucinated a plausible band of occupancy sweeping into the robot's lane one second before any sensor could confirm a person was there. The planner read those forecast voxels as risk and eased off, and when a pedestrian did step out, the robot was already slowing rather than braking hard. The world model did not <em>detect</em> the pedestrian, because there was nothing yet to detect. It predicted that the <em>space</em> was about to be occupied, which is the only information available before line of sight exists.</p>
+</div>
+
+<p>The rollout below strips the idea to its skeleton: a tokenizer, an autoregressive predictor, and a loop that decodes each predicted frame back into an occupancy volume. It is deliberately schematic, but the control flow is exactly that of OccWorld-style inference.</p>
+
+<pre><code class="language-python">import torch
+
+@torch.no_grad()
+def rollout_occupancy(history_volumes, tokenizer, predictor, decoder,
+                      action_seq, horizon):
+    """Forecast future occupancy volumes autoregressively.
+
+    history_volumes: (H, X, Y, Z) recent occupancy volumes (class ids)
+    action_seq:      (horizon, A) planned ego actions, one per future step
+    returns:         (horizon, X, Y, Z) predicted occupancy volumes
+    """
+    # 1. Compress each observed volume into a grid of discrete codebook tokens.
+    tokens = [tokenizer.encode(v) for v in history_volumes]   # each (h, w)
+    context = torch.stack(tokens, dim=0)                       # (H, h, w)
+
+    futures = []
+    for step in range(horizon):
+        a = action_seq[step]                                  # ego action
+        # 2. Predict next frame's token grid from the token history + action.
+        next_tok = predictor(context, action=a)               # (h, w) code ids
+        # 3. Decode tokens back to a full occupancy volume and record it.
+        vol = decoder(next_tok)                                # (X, Y, Z)
+        futures.append(vol)
+        # 4. Slide the window: the prediction becomes new history.
+        context = torch.cat([context[1:], next_tok[None]], dim=0)
+    return torch.stack(futures, dim=0)
+</code></pre>
+<div class="code-caption">Autoregressive occupancy rollout. The scene is compressed to tokens once (step 1), then the predictor and decoder alternate: each forecast frame is fed back as history, so a per-frame model produces a multi-second future. Action conditioning enters at step 2, which is what turns a passive forecaster into a queryable simulator for planning.</div>
+
+<p>Two properties of that loop matter in deployment. Errors <em>compound</em>: a small mistake at \(t+1\) is fed back and can snowball by \(t+F\), so longer horizons degrade, and calibrated confidence on the forecast (per the methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) matters more than a crisp point prediction. And the sequential decode is the latency bottleneck, which is why linear-time recurrent backbones from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> are attractive for the temporal core.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not build the VQ-VAE tokenizer, the codebook commitment loss, the spatiotemporal transformer, and the nuScenes/Occ3D data plumbing from scratch. The official OccWorld release and the OpenDriveLab occupancy tooling ship the tokenizer, the autoregressive predictor, and the forecasting evaluation as a configured pipeline: standing up a trainable 4D occupancy forecaster drops from well over a thousand lines of tokenizer, codebook, and rollout code to a config plus a checkpoint load. Write the loop above once to understand the mechanism, then let the library own the codebook bookkeeping and the horizon-wise mIoU evaluation.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Autoregressive token rollout is only one recipe, and it compounds error. The current frontier splits three ways. <strong>Diffusion-based generators</strong> such as OccSora (2024) synthesize entire 4D occupancy sequences in a learned latent space rather than stepping one frame at a time, trading autoregressive drift for a heavier sampler. <strong>Camera-only forecasting</strong>, benchmarked by Cam4DOcc (CVPR 2024), pushes to forecast future occupancy from surround-view images alone, removing the lidar crutch. And <strong>occupancy as a pretraining task</strong>: DriveWorld and ViDAR (both CVPR 2024) show that predicting future occupancy or future point clouds is a strong self-supervised objective whose learned features transfer to detection, mapping, and planning. The open problems are honest long-horizon uncertainty, keeping multiple discrete futures alive instead of averaging them, and doing all of it fast enough to run inside a real vehicle's planning budget. These threads converge in the general world-model treatment of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have a static occupancy predictor from <a class="cross-ref" href="section-43.4.html">Section 43.4</a> producing \(200 \times 200 \times 16\) volumes at 2&nbsp;Hz. (a) Estimate the number of categorical variables you would have to predict directly to forecast a 3-second future, and argue quantitatively why a VQ-VAE tokenizer with a codebook of 512 entries and an \(8\times\) spatial downsample makes the prediction problem tractable. (b) Your model's 1-second forecasts are crisp but its 3-second forecasts dissolve into a fog of half-occupied voxels. Name the two distinct causes (one about the rollout, one about multimodality) and propose a concrete change for each. (c) Explain how you would turn this forecaster into a trajectory scorer without training a separate planner, and what the ego action \(a\) must encode for that to work.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>What exactly distinguishes an occupancy world model from the static semantic occupancy predictor of Section 43.4, in terms of inputs, outputs, and supervision?</li>
+<li>Why do occupancy world models tokenize the volume with a VQ-VAE before predicting, instead of regressing the future voxel grid directly? Give both a tractability reason and a quality reason.</li>
+<li>Action conditioning turns a passive forecaster into something a planner can use. What does the model become once you condition the rollout on the ego trajectory, and why is that the point of the whole exercise?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-43.7.html">Section 43.7</a>, we close the chapter by asking how any of these claims are actually measured: the benchmarks and metrics that grade BEV detection, static occupancy, and the 4D forecasts of this section. We will see why voxel mIoU can flatter a model, why ray-based and forecasting-horizon metrics were introduced to catch what it misses, and how leakage-safe splits keep a world model from simply memorizing the future of a route it has already driven.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

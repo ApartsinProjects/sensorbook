@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.4: 3D semantic occupancy prediction (Occ3D, SurroundOcc, TPVFormer). Building Sensory AI." name="description"/>
+<title>Section 43.4: 3D semantic occupancy prediction (Occ3D, SurroundOcc, TPVFormer) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>3D semantic occupancy prediction (Occ3D, SurroundOcc, TPVFormer)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A bounding box tells me a truck is there. Occupancy tells me the ladder sticking out of its bed is about to be there too."</p><cite>A Cautious AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Bird's-eye-view detection, the subject of the previous three sections, flattens the world into a top-down map of labeled boxes. That works beautifully until the world refuses to be a box. A crane arm swinging over a lane, a fallen tree, a mattress on the highway, debris of a category the detector was never trained on: none of these fit a fixed vocabulary of oriented cuboids, yet all of them can stop a car. 3D semantic occupancy prediction replaces "which of my known classes is here" with a more primitive and more honest question asked of every cubic region of space: <em>is this volume occupied, and if so by what?</em> The output is a dense voxel grid, a Minecraft-like reconstruction of the scene where each cell carries a semantic label including a catch-all "general object" class. This section shows how three influential designs, TPVFormer, SurroundOcc, and the Occ3D benchmark, turned that idea from a lidar post-processing trick into a camera-first perception task, and why the geometry of the representation, not the size of the network, is what makes it tractable.</p>
+</div>
+
+<p>This section builds directly on the camera-to-BEV lifting of <a class="cross-ref" href="section-43.2.html">Section 43.2</a> and the multi-sensor BEV grids of <a class="cross-ref" href="section-43.3.html">Section 43.3</a>; you should be comfortable with lift-splat-scatter and with deformable BEV attention before continuing. It also leans on the voxel and point-cloud machinery of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>, since lidar sweeps are what generate the ground-truth voxels here. Our narrow job: derive why a full dense 3D grid is expensive, present the two representational tricks (tri-perspective and coarse-to-fine) that tame that cost, and explain how the Occ3D labels are actually made so you can trust or distrust the numbers a benchmark reports.</p>
+
+<h2>From boxes to voxels: why occupancy is a different problem</h2>
+
+<p>Discretize a region of interest, say 40 meters ahead and behind, 40 meters to each side, and roughly 6 meters of height, into voxels of 0.4 meter. That is a grid of about \(200 \times 200 \times 16\), which is 640,000 cells. A detector predicts perhaps a few dozen boxes; an occupancy model must emit a semantic label for every one of those cells at every frame. The naive storage and compute both scale with the product of the three axes, and a dense 3D convolution over such a grid is the operation that made early occupancy networks too heavy for a car's compute budget. The payoff for spending that budget is <strong>open-set safety</strong>: because the model reasons about occupied volume rather than named instances, an obstacle from an unseen category still registers as occupied, so the planner can avoid a thing it cannot name. This is the property that a box detector structurally cannot offer.</p>
+
+<p>Formally, let \(V \in \{0,1,\dots,K\}^{X \times Y \times Z}\) be the label volume over \(K\) semantic classes plus "empty." The model learns \(p(V \mid \mathcal{I})\) from surround images \(\mathcal{I}\), and training minimizes a voxel-wise loss. Because most of space is air, the class distribution is brutally imbalanced: often more than 90 percent of cells are empty. A plain cross-entropy will happily predict "empty everywhere" and score well, so occupancy models lean on class-balanced weighting and on the Lovász-softmax loss, which directly optimizes the intersection-over-union that the benchmark actually reports.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Occupancy prediction is dense semantic segmentation lifted from 2D pixels into 3D voxels. Every hard lesson from image segmentation carries over: the loss must fight class imbalance, the metric of record is intersection-over-union rather than accuracy, and resolution trades against compute quadratically in 2D but <em>cubically</em> in 3D. That cubic scaling is the single fact that shapes every architecture in this section. The models differ mainly in how they avoid ever materializing the full dense grid.</p>
+</div>
+
+<h2>TPVFormer: three planes instead of one cube</h2>
+
+<p>The bird's-eye-view grid is one projection of 3D space onto the ground plane; it discards height. A full voxel grid keeps height but pays the cubic cost. <strong>TPVFormer</strong> (Huang et al., CVPR 2023) splits the difference with a <em>tri-perspective view</em>: instead of one BEV plane or one dense cube, it maintains three orthogonal feature planes, the top-down \(xy\), the front \(yz\), and the side \(xz\). Any point in space is described by summing the features sampled from its projection onto each of the three planes. This is a rank-decomposition of the volume: three 2D maps of size \(HW + WD + HD\) stand in for a cube of size \(HWD\), turning cubic storage into quadratic. Cross-attention lifts the surround-image features onto each plane using the same deformable-attention lifting you saw in <a class="cross-ref" href="section-43.2.html">Section 43.2</a>, just applied three times with three sets of reference points.</p>
+
+<p>To read the occupancy of an arbitrary voxel at \((x,y,z)\), TPVFormer gathers the feature at \((x,y)\) on the top plane, \((y,z)\) on the front plane, and \((x,z)\) on the side plane, sums them, and passes the result through a small multilayer perceptron that outputs the class. Because the query point is continuous, the representation is resolution-free: you can decode occupancy at any voxel size, or even at raw lidar points, without retraining. That is why TPVFormer, though trained only with sparse lidar-point supervision, can render a dense volume at inference.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the crane that was not a class</h3>
+<p>An automated-driving team ran a box detector and a TPVFormer-style occupancy head side by side on a route past a construction site. A mobile crane had swung its counterweight arm out over the curbside lane at about 3 meters height, well above the hood but well within the truck's swept path. The detector emitted a clean box around the crane's chassis on the ground and nothing at all for the arm, because "crane arm" was not in its 10-class vocabulary and the arm's floating geometry matched no anchor. The occupancy grid, asked only whether each cell was full, marked the entire arm's volume as occupied "general object." The planner's cost map, reading occupied voxels rather than boxes, nudged the trajectory a lane over. The lesson the team wrote into their safety case: detection answers "what," occupancy answers "where is it unsafe to be," and only the second question is closed under the open set of real obstacles.</p>
+</div>
+
+<h2>SurroundOcc: coarse-to-fine dense supervision</h2>
+
+<p>TPVFormer proved cameras could predict occupancy, but sparse lidar-point supervision leaves most voxels unlabeled, so the predicted volume is holey. <strong>SurroundOcc</strong> (Wei et al., ICCV 2023) attacks both ends. On the architecture side it builds a genuine 3D volume but in a <em>coarse-to-fine</em> cascade: 2D image features are lifted into a low-resolution 3D grid, then upsampled and refined through successive 3D deconvolution stages, so the expensive high-resolution convolutions run only on an already-structured volume rather than from scratch. On the supervision side it contributes a pipeline for <em>dense</em> occupancy ground truth: multiple lidar sweeps across a whole clip are aggregated into one dense point cloud, static scene and moving objects are stitched with Poisson surface reconstruction to fill holes, and the result is voxelized into a dense labeled volume. Training against dense targets rather than sparse points is what lets SurroundOcc produce solid, watertight surfaces instead of a cloud of confident dots.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026 the camera-only occupancy leaderboard is anchored by the <strong>Occ3D-nuScenes</strong> and <strong>Occ3D-Waymo</strong> benchmarks (Tian et al., NeurIPS 2023), which pair the SurroundOcc-style dense-labeling recipe with an explicit <em>visibility mask</em> so that voxels the cameras could never see are excluded from the score. Strong recent systems, FB-OCC (the 2023 Occ3D challenge winner), the temporally-fused BEVDet-Occ line, and the sparse-query SparseOcc, all report mean IoU in roughly the high-20s to high-30s range on Occ3D-nuScenes; the numbers look low precisely because dense 3D IoU is a far harsher metric than box detection's average precision. The live frontier is efficiency: sparse and query-based occupancy that skip empty space entirely, and the Gaussian and self-supervised variants that <a class="cross-ref" href="section-43.5.html">Section 43.5</a> takes up next.</p>
+</div>
+
+<h2>How the Occ3D labels are made, and why the mask matters</h2>
+
+<p>A benchmark is only as trustworthy as its ground truth, and dense 3D occupancy ground truth is manufactured, not measured. The Occ3D pipeline accumulates lidar across a sequence into a dense cloud, uses the dataset's 3D box annotations to separate dynamic objects from the static background so moving cars are not smeared into walls, voxelizes the union, and then, decisively, computes a <strong>camera-visibility mask</strong> by ray-casting from each camera through the grid. Voxels that no camera ray could reach, occluded behind a building or below the road surface, are flagged as unobserved and excluded from evaluation. Without that mask a camera model would be penalized for failing to hallucinate the inside of a solid wall, which is not a perception failure but a physics one. Understanding this construction tells you exactly what an Occ3D score does and does not certify: it rewards correct reconstruction of the <em>visible</em> occupied surface, not omniscience.</p>
+
+<p>The snippet below builds a tiny occupancy grid the way the label pipeline does, aggregating points into voxels and marking a coarse visibility mask, so the shape of the supervision target is concrete rather than abstract.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def voxelize(points, labels, bounds, vox=0.4):
+    # points: (N,3) in meters; labels: (N,) semantic class ids
+    lo = np.array(bounds[0]); hi = np.array(bounds[1])
+    dims = np.ceil((hi - lo) / vox).astype(int)          # grid X,Y,Z
+    grid = np.zeros(dims, dtype=np.int8)                 # 0 = empty
+    idx = np.floor((points - lo) / vox).astype(int)
+    keep = np.all((idx >= 0) & (idx < dims), axis=1)
+    idx, lab = idx[keep], labels[keep]
+    grid[idx[:, 0], idx[:, 1], idx[:, 2]] = lab          # last write wins
+    # visibility: a column is observed up to its highest filled voxel
+    observed = np.zeros(dims, dtype=bool)
+    filled_z = np.where(grid != 0, np.arange(dims[2])[None, None, :], -1)
+    top = filled_z.max(axis=2)                           # (X,Y) top surface
+    for z in range(dims[2]):
+        observed[:, :, z] = z <= np.maximum(top, 0)
+    return grid, observed
+
+pts = np.random.uniform([-4, -4, 0], [4, 4, 4], size=(2000, 3))
+lab = np.random.randint(1, 6, size=2000)
+grid, mask = voxelize(pts, lab, bounds=([-4, -4, 0], [4, 4, 4]))
+print("grid", grid.shape, "occupied", int((grid != 0).sum()),
+      "evaluated", int(mask.sum()))
+</code></pre>
+<div class="code-caption">A minimal occupancy-label builder: points are aggregated into a voxel grid and a coarse visibility mask marks which cells count toward the score. The real Occ3D pipeline adds multi-sweep accumulation, dynamic-object stitching, and per-camera ray-casting, but the target shape (a labeled volume plus an evaluation mask) is exactly this.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: MMDetection3D occupancy configs</h3>
+<p>Writing the lift-splat-scatter, the 3D cascade, the class-balanced Lovász loss, and the Occ3D data loader from scratch is well over a thousand lines. The <code>mmdetection3d</code> and <code>OpenOccupancy</code> ecosystems ship SurroundOcc, TPVFormer, and BEVDet-Occ as ready configs: a fifteen-line YAML selects the backbone, the grid bounds, the loss weights, and the Occ3D-nuScenes dataset with its visibility mask already wired in, and one <code>tools/train.py</code> call reproduces a leaderboard entry. You inherit the correct masked-mIoU evaluation for free, which is the part most from-scratch reimplementations get subtly wrong.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the region of interest in the code above and quadruple its side length while keeping voxel size fixed. (a) By what factor does a dense voxel grid grow, and by what factor does a TPVFormer tri-plane representation grow? (b) Occupied cells are typically under 10 percent of the grid; propose one change to the <em>storage</em> (not the loss) that exploits this, and name the inference-time cost you now pay. (c) Explain in two sentences why evaluating unmasked mIoU would make a camera-only model look worse than a lidar-only model even if both reconstructed the visible scene identically.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can an occupancy model avoid an obstacle that a box detector trained on the same classes drives into?</li>
+<li>What does the tri-perspective view of TPVFormer decompose, and how does that change storage cost from cubic to quadratic in the grid resolution?</li>
+<li>The Occ3D visibility mask excludes some voxels from the score. Which voxels, and what unfair penalty does excluding them prevent?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-43.5.html">Section 43.5</a>, we drop the expensive dense supervision entirely. Self-supervised occupancy learns geometry from raw sensor streams via differentiable rendering, and Gaussian occupancy (GaussianOcc) replaces the voxel grid with a cloud of 3D Gaussians, borrowing the splatting machinery of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a> to get continuous, memory-light occupancy without ever building the cube this section fought so hard to shrink.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

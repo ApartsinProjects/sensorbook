@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 47.4: Through-wall and multi-person sensing. Building Sensory AI." name="description"/>
+<title>Section 47.4: Through-wall and multi-person sensing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 47: RF and Wireless Sensing</a></div>
+<h1>Through-wall and multi-person sensing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A wall is opaque to light and merely inconvenient to me. I lose most of my energy crossing it, but the little that returns still carries your outline, your breath, and, if you insist on standing next to a friend, the awkward superposition of both of you at once. My job is to un-add you."</p>
+<cite>An Unobstructed AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the channel-state and pose machinery of the earlier chapter sections: the multipath channel model of <a class="cross-ref" href="section-47.1.html">Section 47.1</a>, the device-free presence idea of <a class="cross-ref" href="section-47.2.html">Section 47.2</a>, and the cross-modal, camera-supervised pose pipeline of <a class="cross-ref" href="section-47.3.html">Section 47.3</a>. The spatial-separation tools we lean on, FMCW range estimation and antenna-array angle-of-arrival, are developed for automotive sensors in <a class="cross-ref" href="../module-44-radar-ai/index.html">Chapter 44</a>; if beat frequency or a virtual array is unfamiliar, read that first. We assume the signal and sampling vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, which is unusually easy to violate when the same room and the same people recur across frames.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why seeing through walls and counting bodies is the hard part</h3>
+<p>Radio frequency sensing has one genuinely uncanny property no camera or lidar can match: at the right frequencies it passes through drywall, furniture, and smoke, so it can perceive people the eye cannot reach. That is the promise of through-wall sensing, and it is why elderly-fall monitors, search-and-rescue radars, and building-scale occupancy systems all reach for RF. But two brutal realities stand between the promise and a working system. First, a wall is a lossy filter: it attenuates the signal on the way in and again on the way out, so the return from a body behind concrete can be forty or more decibels weaker than the wall's own reflection sitting in front of it. Second, the physical world rarely offers you one person at a time, and every person in the field adds their reflection to the same received waveform. The measurement you get is a <em>sum</em>, and pose or vital-sign models trained on a single subject fall apart the moment two people share the room. This section is about the two techniques that make it work anyway: exploiting the geometry (range, angle, Doppler) to spatially un-mix people, and using cross-modal supervision to teach a network what a hidden body looks like.</p>
+</div>
+
+<h2>The physics of penetration: what survives a wall</h2>
+<p><strong>What</strong> happens to a radio wave at a wall is governed by frequency and material. <strong>Why</strong> lower frequencies win: attenuation through a dielectric slab grows with frequency and with the material's loss tangent, so a 2.4 GHz Wi-Fi tone slips through interior drywall with a few decibels of loss, while a 60 GHz millimeter-wave signal is essentially stopped by the same wall. This is the central design tradeoff of through-wall sensing, because the very millimeter-wave bands that give the finest range and angle resolution (see <a class="cross-ref" href="../module-44-radar-ai/index.html">Chapter 44</a>) are the ones walls block, and the sub-6 GHz bands that penetrate give you coarse resolution. <strong>How</strong> practitioners quantify what survives is a one-way link budget. For a target of radar cross-section \(\sigma\) at range \(R\) behind a wall with two-way loss \(L_{\text{wall}}\), the received power follows</p>
+$$ P_r = \frac{P_t\, G_t G_r\, \lambda^2\, \sigma}{(4\pi)^3\, R^4}\, \frac{1}{L_{\text{wall}}}. $$
+<p>The \(R^4\) term already punishes distant targets; the extra \(L_{\text{wall}}\) factor (often 3 to 15 dB one-way for interior walls, far more for reinforced concrete) is what pushes a human return down toward the noise floor. Two consequences follow. The wall's own strong static reflection must be removed, typically by background subtraction across time so that only <em>moving</em> scatterers survive, which is why through-wall systems are so sensitive to motion and breathing and so blind to a person holding perfectly still. And the whole enterprise lives or dies on dynamic range: the receiver must not saturate on the wall while still resolving the whisper behind it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Motion is the through-wall system's flashlight</h3>
+<p>Because the static clutter (wall, furniture, appliances) dwarfs the human return, nearly every through-wall system keys on <em>change</em>. Subtract consecutive frames, or high-pass the signal along slow time, and the immovable scene cancels while a moving limb or a rising chest survives. This is the same logic that lets a device-free presence detector in <a class="cross-ref" href="section-47.2.html">Section 47.2</a> ignore an empty room, pushed to its limit: through a wall you are not imaging a body, you are imaging its <em>motion</em>. The gift is enormous clutter rejection for free. The curse is a genuine failure mode: a stationary person can become invisible, so vital-sign extraction (the sub-millimeter chest motion of breathing) is often the only thread keeping a still subject on the system's map, tying this section back to the vital-sign methods of <a class="cross-ref" href="section-47.3.html">Section 47.3</a>.</p>
+</div>
+
+<h2>Un-mixing multiple people: geometry against superposition</h2>
+<p><strong>What</strong> makes multi-person sensing hard is linear superposition: the antenna sums every reflection, so two people produce one tangled waveform. <strong>Why</strong> you cannot simply run a single-person model twice is that the model never sees the individuals, only their sum, and a pose network trained on one body will happily hallucinate a single averaged skeleton floating between two real people. <strong>How</strong> to separate them is to find a domain where the people occupy different coordinates. Three axes of separation are available, and good systems use all three at once. <em>Range:</em> an FMCW radar maps each scatterer to a beat frequency proportional to its distance, so two people at different depths land in different range bins. <em>Angle:</em> an antenna array estimates angle-of-arrival, so two people at the same range but different bearings separate in the spatial spectrum. <em>Doppler:</em> two people moving at different radial velocities separate in the frequency shift of the return, and even breathing produces a tiny but distinct micro-Doppler signature. The MIT RF-Pose and RF-Pose3D systems combine range and angle into a pair of orthogonal 2D reflection heatmaps (a horizontal and a vertical projection), and later work such as RF-Avatar pushes to reconstructing multiple full-body meshes at once by first localizing each person in the range-angle map and then decoding a body per cluster.</p>
+
+<p>The practical recipe is therefore a two-stage one: <em>localize then decode</em>. Build a range-angle (and, with a 2D array, range-angle-elevation) power map, detect the peaks as candidate people, associate peaks across time into tracks (a data-association problem you have met in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a> and will meet again in tracking), and then run a per-person pose or vital-sign decoder on the local patch around each track. Crucially this converts the intractable "invert a sum of unknown many" problem into "detect K sources, then solve K single-source problems," which is exactly why spatial resolution (and hence a large virtual aperture) matters so much: two people the array cannot resolve in range or angle cannot be un-mixed at all, and the system undercounts.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def range_angle_map(iq, n_range=64, n_angle=64):
+    """iq: (n_chirps, n_ant, n_fast) complex FMCW-MIMO cube.
+    Returns a (n_range, n_angle) power map after slow-time clutter removal."""
+    iq = iq - iq.mean(axis=0, keepdims=True)          # cancel static wall/clutter
+    rng = np.fft.fft(iq, n=n_range, axis=2)            # fast-time FFT -> range
+    rng = rng.mean(axis=0)                             # coherent chirp average -> (n_ant, n_range)
+    ang = np.fft.fftshift(np.fft.fft(rng, n=n_angle, axis=0), axes=0)  # array FFT -> angle
+    return np.abs(ang.T) ** 2                          # (n_range, n_angle) power
+
+def count_people(power, k_max=4, guard=3, rel_db=8.0):
+    """Greedy peak picking: brightest cells, suppressing a neighborhood each time."""
+    p = power.copy()
+    floor = np.median(p)
+    peaks = []
+    for _ in range(k_max):
+        idx = np.unravel_index(np.argmax(p), p.shape)
+        if 10 * np.log10(p[idx] / floor + 1e-9) < rel_db:
+            break                                     # nothing left above threshold
+        peaks.append(idx)
+        r0, a0 = idx                                  # blank a guard region
+        p[max(0, r0 - guard):r0 + guard + 1,
+          max(0, a0 - guard):a0 + guard + 1] = 0.0
+    return peaks
+
+rng_gen = np.random.default_rng(0)
+cube = 0.05 * (rng_gen.standard_normal((32, 8, 128)) + 1j * rng_gen.standard_normal((32, 8, 128)))
+for (rbin, abin, vel) in [(40, 2, 0.9), (70, 5, -0.6)]:      # two moving people
+    t = np.arange(32)[:, None, None]
+    steer = np.exp(1j * 2 * np.pi * abin / 8 * np.arange(8))[None, :, None]
+    fast = np.exp(1j * 2 * np.pi * rbin / 128 * np.arange(128))[None, None, :]
+    cube += (np.exp(1j * 2 * np.pi * vel * t / 32) * steer * fast)
+pmap = range_angle_map(cube)
+print("detected people:", len(count_people(pmap)))
+</code></pre>
+<div class="code-caption">A minimal localize-first pipeline: slow-time subtraction removes the static wall, two FFTs build a range-angle power map, and greedy peak picking with neighborhood suppression counts the resolvable sources. Seeded with two moving targets, it reports two people; collapse their range and angle to the same bins and it undercounts, which is the resolution limit made concrete.</div>
+
+<p>The listing above is the whole two-stage idea in thirty lines: cancel the wall, form a range-angle map, and pick peaks as people. The greedy suppression is a poor person's CLEAN algorithm, and its failure is instructive: two subjects closer than the guard region merge into one detection, so counting accuracy is bounded by aperture, not by the cleverness of the downstream network.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let a signal library own the FFTs and detection</h3>
+<p>The hand-rolled range-angle map and greedy picker above run to roughly forty lines with the clutter removal, windowing, and peak logic you would need in production. A radar DSP stack such as <code>pyradar</code>-style toolkits or the range-Doppler and CFAR primitives shipped with vendor mmWave SDKs (for example TI's <code>mmwave</code> processing chain) collapse the same pipeline, windowed FFTs, MIMO virtual-array formation, 2D CFAR detection, and clustering, into about five configuration calls, and they add the numerically careful windowing and calibration that a from-scratch FFT omits. Reserve the explicit version for teaching or for a custom statistic (like a per-cell breathing score) the stock CFAR does not expose; reach for the library the moment you need calibrated detections on real hardware.</p>
+</div>
+
+<h2>Cross-modal supervision: teaching a network to see the hidden</h2>
+<p><strong>What</strong> the deep-learning breakthrough for through-wall pose actually solved was not the physics but the <em>labels</em>. You cannot hand-annotate a skeleton in an RF heatmap by eye, and you certainly cannot annotate people you cannot see behind a wall. <strong>Why</strong> cross-modal supervision is the elegant escape: during training, place a camera <em>in the same room with a clear line of sight</em>, run an off-the-shelf vision pose estimator to produce skeletons, and use those as ground-truth targets for a network whose input is the synchronized RF heatmaps. This is the teacher-student setup introduced for Wi-Fi pose in <a class="cross-ref" href="section-47.3.html">Section 47.3</a>, and it is the load-bearing trick behind MIT's RF-Pose (2018) and its 3D successor. <strong>How</strong> the through-wall magic emerges: at <em>test</em> time you remove the camera and place the wall back. The network, having learned the RF-to-pose mapping from unobstructed data, generalizes to the occluded case because the RF signal itself barely changed, only attenuated. The camera was never needed at inference; it was a scaffold for supervision, discarded once the network internalized what a body does to radio waves. Multi-person training data is generated the same way, with the vision teacher labeling each person, so the RF student learns to output multiple skeletons and to attribute reflections to the right body.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Clinical: the RF fall monitor that watched a bathroom without a camera</h3>
+<p>An assisted-living operator needed fall detection in the one room a camera can never go: the bathroom. A wall-mounted FMCW sensor outside the door, using the localize-then-decode pipeline above, tracked the single occupant through the closed door by their motion and breathing, flagging the signature of a collapse (a fast downward micro-Doppler burst followed by a body at floor height that then goes ominously still). The team learned this section's two lessons the hard way. First, when a caregiver entered to help, the room briefly held two people, and a single-subject model fused them into one phantom skeleton; the fix was the range-angle localizer that kept the two returns in separate tracks. Second, a resident who fell and lay motionless nearly vanished, because with no gross motion the only surviving signal was the sub-millimeter chest rise of breathing, so the vital-sign channel of <a class="cross-ref" href="section-47.3.html">Section 47.3</a> was not a nicety but the safety-critical thread that kept a still body on the map. The system shipped only after both were fixed, and the privacy story (no imagery ever leaves the room) was, for a bathroom, the entire point.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where through-wall and multi-person RF sensing stand</h3>
+<p>As of 2026 the reference line runs from MIT CSAIL's <strong>RF-Pose</strong> (Zhao et al., CVPR 2018), which first showed camera-supervised 2D skeletons through walls, through <strong>RF-Pose3D</strong> and <strong>RF-Avatar</strong>, which reconstruct multiple 3D bodies and parametric meshes from the range-angle heatmaps, alongside earlier localization systems <strong>WiTrack</strong> and <strong>Vital-Radio</strong> from the same group. On the Wi-Fi side, <strong>Person-in-WiFi</strong> and <strong>DensePose-from-WiFi</strong> extend dense multi-person body sensing to commodity CSI. Three open problems define the frontier: (1) scaling person count, since resolution collapses and association becomes ambiguous beyond a handful of closely spaced people; (2) domain and layout generalization, because a model trained in one apartment's multipath rarely transfers to another, the theme carried into <a class="cross-ref" href="section-47.6.html">Section 47.6</a>; and (3) calibrated uncertainty on occluded predictions, tying back to <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, so a monitor knows when a "no one here" is confident rather than merely a still person lost in the clutter floor.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: find the resolution limit that makes counting fail</h3>
+<p>Take the <code>range_angle_map</code> and <code>count_people</code> code above and place two synthetic people at the same angle bin, then sweep their range separation from far apart down to adjacent bins. Plot detected count against separation and identify the separation at which the two merge into one detection. Repeat the sweep in angle at fixed range. Now degrade the setup: scale the target amplitudes down by 20 dB to mimic a concrete wall and add matching noise, then re-run both sweeps. Write three sentences explaining how wall attenuation and finite aperture jointly set the minimum resolvable spacing, and why a system that undercounts is more dangerous in a fall monitor than one that occasionally over-counts.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why do through-wall systems prefer sub-6 GHz bands over millimeter-wave, and what resolution price do they pay for that choice?</li>
+<li>State the three physical axes along which two people in the same room can be separated, and name the array or waveform property each one requires.</li>
+<li>In camera-supervised through-wall pose, the camera is present during training but absent at test time. Explain precisely what role it plays and why its removal does not break the model.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-47.5.html">Section 47.5</a>, we turn from research prototypes to the standard that is about to make RF sensing a first-class feature of ordinary Wi-Fi hardware: IEEE 802.11bf, its sensing measurement procedure, and what it means when every access point in a building is, by design, also a multi-person radar.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

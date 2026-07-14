@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.7: Using depth FMs inside a sensing stack. Building Sensory AI." name="description"/>
+<title>Section 41.7: Using depth FMs inside a sensing stack | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Using depth FMs inside a sensing stack</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A benchmark rewards the sharpest map. A robot rewards the map that arrives on time, admits when it is guessing, and never tells the planner the wall is a doorway."</p><cite>A Systems-Minded AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous six sections built a monocular depth foundation model into a formidable component: zero-shot, dense, increasingly metric, sensor-promptable. This section is about the wiring around that component. A depth FM is almost never the product; it is one estimator inside a stack that also has odometry, a map, a planner, and often a real range sensor. Dropping it in raises questions no benchmark answers. Where does metric scale come from at run time? What is the latency budget, and does the model fit it after quantization? How do you keep depth stable across a video so a robot does not see the floor breathe? What does the model output when it is wrong, and how does the stack avoid trusting that output? And when should you not use a depth FM at all, because a $30 time-of-flight chip or a lidar already answers the question with a fraction of the risk? Answer these and the depth FM stops being a demo and becomes infrastructure.</p>
+</div>
+
+<p>This section is the integration capstone of the chapter, so it assumes the whole chapter behind it: affine-invariant versus metric prediction from <a class="cross-ref" href="section-41.1.html">Section 41.1</a> and <a class="cross-ref" href="section-41.3.html">Section 41.3</a>, sensor prompting from <a class="cross-ref" href="section-41.5.html">Section 41.5</a>, and the evaluation discipline of <a class="cross-ref" href="section-41.6.html">Section 41.6</a>. It also reaches forward to the consumers of depth: bird's-eye-view and occupancy in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>, spatial mapping in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, and the fusion machinery of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+
+<h2>What role does the depth FM play?</h2>
+
+<p>Decide the job before the model. A depth FM can sit in a stack in three distinct roles, and the right engineering follows from which one you pick. As a <strong>geometry primitive</strong>, it turns each frame into a point cloud that feeds detection, occupancy, or obstacle avoidance; here density and edge accuracy matter most, and scale must be sourced somewhere. As a <strong>prior or initializer</strong>, it seeds a downstream optimizer: dense monocular depth is a superb initialization for multi-view stereo or for the geometry term in a SLAM back end, which then refines it with true triangulation. As a <strong>gap-filler</strong>, it densifies a real but sparse sensor, covering the returns lidar misses on dark or specular surfaces. The role dictates the scale strategy. A primitive that drives a metric planner needs metric depth, so you either run a camera-agnostic metric model or prompt an affine model with a sparse sensor. A prior that will be triangulated later can stay relative, because the downstream optimizer supplies scale from motion. Confusing these is the most common integration mistake: teams demand metric perfection from a model whose output was going to be re-scaled anyway, or ship a relative model into a planner that silently assumed meters.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Scale is a system property, not a model property. A monocular image carries no absolute scale; the meters have to enter from somewhere with a physical reference: a calibrated stereo baseline, a range sensor, wheel odometry, a known camera height above a ground plane, or the intrinsics that a camera-agnostic model uses to reason about metric size. Ask "where do my meters come from?" at design time. If the honest answer is "the network guessed," you have a scale drift bug waiting for a lighting change or a new room to trigger it.</p>
+</div>
+
+<h2>Latency, resolution, and the edge budget</h2>
+
+<p>A depth FM that runs at 2 frames per second on a workstation GPU is a research artifact, not a perception module. Real stacks impose a latency budget, and depth usually shares a compute envelope with detection, tracking, and planning. Three levers bring a large depth transformer into budget. First, <strong>resolution</strong>: inference cost scales with pixel count, and most planners need accurate geometry near obstacles more than crisp far detail, so running at a reduced resolution and upsampling with edge guidance often costs little accuracy where it matters. Second, <strong>backbone choice and distillation</strong>: model families ship small, base, and large variants, and a distilled small student trained from a large teacher recovers most of the accuracy at a fraction of the FLOPs. Third, <strong>quantization and compilation</strong>: converting to INT8 or FP16 and compiling to the target runtime (TensorRT, ONNX Runtime, Core ML, a mobile NPU) is the difference between a demo and an on-device feature, the toolkit of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. Measure end to end: preprocessing and the sparse-alignment fit and the lift to a point cloud all consume the budget, and a model that is fast in isolation can miss the deadline once wrapped.</p>
+
+<p>Video adds a second, subtler cost: <strong>temporal stability</strong>. Run a per-frame image model on a video and the depth flickers, because tiny input changes move the prediction and there is no constraint tying consecutive frames. A planner reading that stream sees phantom motion. Video depth models add temporal attention or a consistency loss so the geometry holds still when the scene does, and a lightweight alternative is to smooth per-frame depth through the pose from your odometry, warping the previous frame's depth into the current view and blending. Either way, temporal consistency is a hard requirement for control, not a nicety.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def depth_fm_stack_step(rgb, sparse_z, sparse_mask, K, prev_depth=None,
+                        flow_warp=None, conf_thresh=0.15):
+    """One frame of a depth-FM perception step: predict, scale, gate, lift.
+
+    rgb        : (H, W, 3) current camera frame
+    sparse_z   : (H, W) metric returns from a range sensor (lidar / ToF)
+    sparse_mask: (H, W) bool, True where the range sensor has a return
+    K          : (3, 3) camera intrinsics, for lifting depth to a point cloud
+    prev_depth : (H, W) previous metric depth, in the current view (pose-warped)
+    """
+    disp = run_depth_fm(rgb)                       # affine-invariant inverse depth
+    a, b = fit_scale_shift(disp, sparse_z, sparse_mask)   # meters from the sensor
+    depth = 1.0 / np.clip(a * disp + b, 1e-6, None)       # dense metric depth
+
+    if prev_depth is not None:                     # temporal smoothing for control
+        depth = 0.7 * depth + 0.3 * prev_depth     # blend warped previous frame
+
+    # Confidence from agreement with the sparse sensor at held-out returns.
+    resid = np.abs(depth[sparse_mask] - sparse_z[sparse_mask]) / sparse_z[sparse_mask]
+    frame_conf = float(np.median(resid))
+    trustworthy = frame_conf &lt; conf_thresh         # gate before the planner sees it
+
+    points = lift_to_pointcloud(depth, K) if trustworthy else None
+    return depth, points, trustworthy, frame_conf
+</code></pre>
+<div class="code-caption">A reference per-frame step wiring a depth FM into a stack: predict affine-invariant depth, source metric scale from a sparse range sensor (the fit of Section 41.5), smooth against the pose-warped previous frame for temporal stability, gate on agreement with held-out returns, and lift to a point cloud only when the frame is trustworthy. The <code>run_depth_fm</code>, <code>fit_scale_shift</code>, and <code>lift_to_pointcloud</code> stubs stand in for the model call, the least-squares alignment, and the intrinsics-based back-projection.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: from checkpoint to point cloud in a few lines</h3>
+<p>The heavy machinery of loading a depth FM, preprocessing, and running inference is a <code>transformers</code> pipeline call: <code>pipeline("depth-estimation", model=...)</code> replaces roughly 80 lines of manual weight loading, normalization, and tiling with two. For the lift to a point cloud, <code>open3d.geometry.PointCloud.create_from_depth_image</code> with your intrinsics turns the back-projection loop (per-pixel unprojection, masking invalid depth, assembling an array) into a single call, about 25 lines to one. What the library does not give you is the scale strategy, the gating, and the temporal smoothing above; those are yours to own because they are where the stack-specific risk lives.</p>
+</div>
+
+<h2>Uncertainty, failure modes, and safety gating</h2>
+
+<p>A depth FM fails in ways that are quiet and geometry-shaped, which makes them dangerous. It hallucinates plausible depth on a blank wall, flattens a reflective floor into an abyss, reads a printed poster of a hallway as a real hallway, and collapses in scenes far from its training distribution. None of these announce themselves; the output looks like a confident, smooth depth map. So a depth FM must never feed a safety-critical planner as ground truth. Wrap it in three guards. First, a <strong>confidence signal</strong>: the cleanest source is disagreement with an independent measurement, the residual against held-out sparse returns in the code above, which is why keeping even a cheap range sensor in the loop pays off twice. Second, <strong>calibrated uncertainty</strong>: rather than trust a raw confidence, calibrate depth intervals so that a stated 90 percent interval contains the true depth 90 percent of the time, the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. Third, a <strong>fallback</strong>: when the gate trips, degrade to the raw range sensor, hold the last trusted map, or slow the system down, rather than acting on a hallucinated hallway. Adversarial framing matters too, because a printed scene or a projected pattern can spoof a monocular model in ways it cannot spoof a time-of-flight sensor, the threat model of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: depth FMs as stack components in 2024 to 2026</h3>
+<p>The current frontier is exactly this integration question. <strong>Depth Anything V2</strong> (Yang et al., 2024) ships small-to-large variants explicitly for the accuracy-versus-latency tradeoff a stack faces, and <strong>Video Depth Anything</strong> (2025) extends the family to temporally consistent long-video depth for streaming use. <strong>UniDepth</strong> (Piccinelli et al., 2024) and <strong>Metric3D v2</strong> (Hu et al., 2024) target the scale-source problem directly by predicting metric depth from a single image plus intrinsics, removing the need for an external scale reference in some deployments. <strong>Prompt Depth Anything</strong> (Lin et al., 2024) closes the loop with a cheap phone lidar prompt for 4K metric depth on device. The open problems are honest per-pixel uncertainty that survives distribution shift, guaranteed temporal consistency under fast motion, and standardized on-robot latency reporting. Verify version numbers and metrics against the current releases before quoting them; this line moves fast.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a warehouse AMR that keeps a lidar honest</h3>
+<p>A robotics team builds an autonomous mobile robot (AMR) for warehouse aisles. It already carries a 2D safety lidar at knee height, certified for stopping distance, but that lidar is blind to overhanging shelf arms, hanging cables, and a pallet's top edge, all of which sit above its scan plane. Adding a 3D lidar blew the cost target. Instead they mounted a single forward camera and ran a distilled depth FM at reduced resolution, INT8, on the robot's existing NPU, inside a 30 millisecond budget shared with detection. The depth FM's job was scoped precisely: it is a geometry primitive for overhead-obstacle detection, not a replacement for the certified safety lidar. Metric scale came from the known camera height above the floor plane plus a handful of 2D lidar returns projected up as a scale prompt. Every frame, the stack cross-checked the depth map against the safety lidar where their fields of view overlapped; when the median disagreement spiked, on a glossy floor or a low-texture white wall, the gate tripped and the robot fell back to conservative speed on the certified lidar alone. The camera caught overhead hazards the lidar never could, and because the depth FM could only slow the robot and never override the certified stop, a depth hallucination degraded throughput but never safety.</p>
+</div>
+
+<h2>When not to reach for a depth FM</h2>
+
+<p>The mark of maturity is knowing when the answer is no. If you need certified metric accuracy for a safety stop, a real range sensor with a physical measurement principle is the right tool, and a monocular estimate is at best a redundant cross-check, developed as a modality in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. If the scene is textureless, transparent, or specular, the monocular prior degrades exactly where a time-of-flight or structured-light sensor still works, though even those struggle on glass. If a fixed, calibrated stereo rig already covers the field of view, its triangulated metric depth is cheaper to trust than a learned prior. And if the platform cannot spare the compute after quantization, a classical stereo or a cheap ToF module beats a depth FM that misses the deadline. The depth FM shines when a camera is already present, when dense geometry is needed on surfaces a sparse sensor misses, when the deployment spans domains no single dataset covered, and when the consumer of depth can tolerate a gated, uncertainty-aware estimate rather than a certified measurement. Treat it as one strong, cheap, general-purpose estimator among several, fused rather than trusted, and the stack gets the best of the foundation-model prior without inheriting its failure modes.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a short indoor video with a phone that exposes its lidar or ToF depth (or any RGB-D clip). Build the per-frame step from the code above end to end: run a zero-shot depth FM, fit scale-and-shift to the sparse depth, and lift to a point cloud. Then measure three things across the clip. (a) Latency: profile each stage and report the end-to-end per-frame time, not just the model call. (b) Temporal stability: compute the frame-to-frame change in depth on a static patch of floor, with and without the pose-warped smoothing term, and report the reduction. (c) Gating: hand-label three frames where the depth is visibly wrong (a reflective or blank surface) and check whether your confidence residual actually trips the gate on those frames. Discuss any frame that looks correct but the gate flagged, and any that looks wrong but slipped through.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Name the three roles a depth FM can play in a stack, and explain why the scale strategy differs between a geometry primitive and a prior for a SLAM back end.</li>
+<li>Why is a per-frame image depth model unsafe to feed directly to a controller, and what two mechanisms make its output usable?</li>
+<li>Give two concrete situations where the correct engineering decision is to not use a monocular depth FM, and say what you would use instead.</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 41</h3>
+<p>run a monocular depth foundation model zero-shot; fuse its output with a sparse depth sensor.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Depth foundation models and video depth</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2406.09414">Yang, L., Kang, B., Huang, Z., Zhao, Z., Xu, X., Feng, J., Zhao, H. (2024). Depth Anything V2. NeurIPS 2024.</a></p>
+<p class="bib-annotation">The workhorse depth FM whose small/base/large variants exist precisely for the accuracy-versus-latency tradeoff a deployed stack must navigate; the natural starting checkpoint for the lab.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2501.12375">Chen, S., Guo, H., Zhu, S., Zhang, F., Huang, Z., Feng, J., Kang, B. (2025). Video Depth Anything: Consistent Depth Estimation for Super-Long Videos. arXiv:2501.12375.</a></p>
+<p class="bib-annotation">Extends the family to temporally consistent streaming depth, addressing the flicker problem that makes per-frame models unsafe for control.</p>
+</div>
+
+<p class="bib-category">Metric scale and sensor prompting</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2403.18913">Piccinelli, L., Yang, Y., Sakaridis, C., Segu, M., Li, S., Van Gool, L., Yu, F. (2024). UniDepth: Universal Monocular Metric Depth Estimation. CVPR 2024.</a></p>
+<p class="bib-annotation">Predicts metric depth from a single image with camera-agnostic reasoning, one clean answer to the "where do my meters come from" question at deployment time.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2404.15506">Hu, M., Yin, W., Zhang, C., Cai, Z., Long, X., Chen, H., Wang, K., Yu, G., Shen, C., Shen, S. (2024). Metric3D v2: A Versatile Monocular Geometric Foundation Model. TPAMI 2024.</a></p>
+<p class="bib-annotation">Zero-shot metric depth and surface normals via a canonical-camera transform, a strong metric primitive when no external scale reference is available.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2412.14015">Lin, H., Peng, S., Chen, J., Peng, S., Zhang, J., Bao, H., Zhou, X. (2024). Prompt Depth Anything. arXiv:2412.14015.</a></p>
+<p class="bib-annotation">Feeds a cheap phone lidar as a prompt for 4K metric depth on device, the sensor-prompted gap-filler role in production form.</p>
+</div>
+
+<p class="bib-category">Diffusion depth and deployment context</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2312.02145">Ke, B., Obukhov, A., Huang, S., Metzger, N., Daudt, R. C., Schindler, K. (2024). Repurposing Diffusion-Based Image Generators for Monocular Depth Estimation (Marigold). CVPR 2024.</a></p>
+<p class="bib-annotation">The diffusion depth prior underlying training-free guided completion; relevant when the stack can trade inference passes for adaptability to any sparse pattern.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2103.13413">Ranftl, R., Bochkovskiy, A., Koltun, V. (2021). Vision Transformers for Dense Prediction (DPT). ICCV 2021.</a></p>
+<p class="bib-annotation">The dense-prediction transformer backbone that most modern depth FMs inherit; understanding its cost model is what makes the resolution and distillation levers concrete.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>, we turn to the real range sensor that has anchored every scale prompt and safety gate in this chapter: lidar. We build the point-cloud representations, sparse-convolution and transformer backbones, and detection and segmentation pipelines that let a machine reason directly in metric 3D, the measurement that a monocular depth FM approximates and a certified stack still depends on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.5: Self-supervised and Gaussian occupancy (GaussianOcc). Building Sensory AI." name="description"/>
+<title>Section 43.5: Self-supervised and Gaussian occupancy (GaussianOcc) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>Self-supervised and Gaussian occupancy (GaussianOcc)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I was asked to label ten million voxels of mostly empty air. I countered with a proposal: let the cameras grade my homework, and let me spend my parameters only where something actually is."</p><cite>A Thrifty AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The dense semantic occupancy of <a class="cross-ref" href="section-43.4.html">Section 43.4</a> is powerful but pays two heavy taxes. The first is a <em>label</em> tax: training Occ3D-style models needs a voxelized ground truth, built by accumulating many lidar sweeps and hand-correcting the result, which is slow, expensive, and impossible where you have no lidar at all. The second is a <em>memory</em> tax: a \(200\times200\times16\) grid spends most of its cells describing empty sky and open road, because the world is mostly air with a thin skin of surfaces. This section attacks each tax with a separate idea, then shows the method that fuses them. Self-supervision removes the label tax by letting differentiable rendering turn the surround cameras into their own supervisor, so occupancy is learned from raw images and their reprojection consistency, no 3D annotation required. Gaussian occupancy removes the memory tax by replacing the dense grid with a sparse set of 3D Gaussian primitives that place capacity on surfaces and leave the empty volume unrepresented. GaussianOcc combines both: a fully self-supervised, Gaussian-based occupancy estimator that is cheaper to train <em>and</em> cheaper to run.</p>
+</div>
+
+<p>This section sits at the confluence of three threads you have already met. It extends the dense occupancy formulation of <a class="cross-ref" href="section-43.4.html">Section 43.4</a>; it borrows its supervision signal from self-supervised depth, the photometric-reprojection trick introduced with monocular depth in <a class="cross-ref" href="../module-41-monocular-depth-foundation-models/index.html">Chapter 41</a> and grounded in the geometry of <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>; and it adopts its representation, 3D Gaussian splatting and differentiable volume rendering, straight from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>. The pretext-task philosophy, learning structure with no human labels, is the same one that powers the contrastive methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. Our narrow job is to connect these into a working occupancy pipeline.</p>
+
+<h2>Where the ground truth actually comes from</h2>
+
+<p>A supervised occupancy model answers "is voxel \((x,y,z)\) occupied, and by what class" because a human-verified voxel grid told it the answer during training. Producing that grid is the bottleneck. The standard recipe registers dozens of lidar sweeps into a common frame, votes per voxel, propagates semantic labels from annotated 3D boxes and segmentation, and then a human fixes the holes, ghosting, and dynamic-object smear. The cost scales with the cube of resolution and with every new city, weather, and sensor rig. Worse, it is circular for the exact deployments we care about: a camera-only vehicle or a low-cost robot has no lidar to build the ground truth from, so it can never be labeled in the first place. Self-supervised occupancy exists to break that circle.</p>
+
+<h2>Self-supervision by differentiable rendering</h2>
+
+<p>The core move is to make occupancy <em>photo-consistent</em> rather than label-consistent. Suppose the network predicts a density field, a scalar \(\sigma(x,y,z)\ge 0\) at every point, plus a color or feature. To supervise it without 3D labels, cast a ray from a known camera pixel, march samples along it, and alpha-composite them exactly as a neural radiance field does. With samples at distances \(t_i\), spacing \(\delta_i\), and densities \(\sigma_i\), the per-sample opacity and accumulated transmittance are</p>
+
+$$ \alpha_i = 1 - e^{-\sigma_i \delta_i}, \qquad T_i = \prod_{j<i}\big(1-\alpha_j\big), $$
+
+<p>and the rendered depth of that pixel is the transmittance-weighted expectation of distance, \(\hat{d} = \sum_i T_i\,\alpha_i\, t_i\). The whole pipe is differentiable, so any disagreement between the rendered image and the <em>real</em> image at a nearby camera or a nearby time flows back as a gradient into \(\sigma\). Two supervision signals do the work: a <strong>spatial</strong> one, render the view of camera A and compare it to what camera B actually saw of the same scene, and a <strong>temporal</strong> one, warp frame \(t\) into frame \(t{+}1\) using the rendered depth and the ego-motion and compare pixels. Where the density field is geometrically wrong, the reprojected colors do not match, and the photometric loss punishes it. This is the surround-view, 3D generalization of the monocular self-supervised depth loss from <a class="cross-ref" href="../module-41-monocular-depth-foundation-models/index.html">Chapter 41</a>. Methods in this family include OccNeRF and SelfOcc (both 2024), which learn occupancy purely from image reprojection, and RenderOcc (2024), which keeps rendering as the supervision path but trains from cheap 2D labels instead of 3D voxels.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Volume rendering is the bridge that lets 2D pixels supervise a 3D field. Because rendering is differentiable, a photometric error measured entirely in image space, "the pixel I predicted does not match the pixel the other camera saw," is backpropagated into an explicit statement about what is occupied in the 3D volume. The occupancy grid is never told the right answer; it is told only that its <em>rendered consequences</em> were wrong, and it must infer geometry that makes all the cameras agree.</p>
+</div>
+
+<pre><code class="language-python">import torch
+
+def render_depth(sigma, t, dt):
+    """Alpha-composite a density field along one batch of rays.
+    sigma: (R, S) nonneg density at S samples on R rays
+    t:     (R, S) sample distances along each ray
+    dt:    (R, S) spacing between samples
+    Returns rendered depth (R,) and per-ray opacity (R,)."""
+    alpha = 1.0 - torch.exp(-sigma * dt)              # (R, S) opacity
+    trans = torch.cumprod(1.0 - alpha + 1e-10, dim=1) # (R, S) transmittance
+    trans = torch.roll(trans, 1, dims=1); trans[:, 0] = 1.0
+    weights = trans * alpha                            # prob. ray terminates here
+    depth = (weights * t).sum(dim=1)                   # expected distance
+    return depth, weights.sum(dim=1)
+
+# Self-supervised signal: reproject one camera into another using the
+# rendered depth, then a photometric loss with NO 3D ground truth.
+def photometric_loss(depth, pix, K_inv, T_src_tgt, img_src, sample):
+    pts_cam  = depth[:, None] * (K_inv @ pix.T).T      # backproject pixels
+    pts_src  = (T_src_tgt[:3, :3] @ pts_cam.T + T_src_tgt[:3, 3:4]).T
+    uv_src   = project(pts_src)                         # into source view
+    warped   = sample(img_src, uv_src)                 # bilinear resample
+    return (warped - target_colors(pix)).abs().mean()  # occupancy learns from this
+</code></pre>
+<div class="code-caption">The rendering core of self-supervised occupancy. <code>render_depth</code> alpha-composites the density field into a depth per ray; <code>photometric_loss</code> reprojects that depth into a neighboring camera and penalizes color disagreement. No voxel label appears anywhere, which is the entire point.</div>
+
+<p>The snippet above is deliberately the whole idea in twenty lines: predict density, render depth, warp, compare. In practice you add an edge-aware smoothness term, mask out dynamic objects that violate the static-scene assumption, and share one density field across all six cameras so their reprojections must be mutually consistent. But the load-bearing mechanism is exactly the two functions shown.</p>
+
+<h2>Gaussian occupancy: primitives instead of a grid</h2>
+
+<p>Self-supervision fixes the labels; it does not fix the wastefulness of a dense grid. Here Gaussian splatting earns its place. Instead of storing a value in every one of the millions of voxels, represent the scene with a <em>sparse set</em> of 3D Gaussians, each carrying a mean \(\mu\) (where it sits), a covariance \(\Sigma\) (its size and orientation), an opacity, and a vector of semantic logits (what class it is). A few thousand to a few tens of thousands of these primitives describe a driving scene, because they cluster on surfaces, a car, a curb, a tree trunk, and simply do not exist in the empty air between them. This is object-centric rather than grid-centric, and it is the representation of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a> applied to perception. GaussianFormer (2024) pioneered this for occupancy: it predicts a set of semantic Gaussians and, when a dense voxel answer is needed, runs a local <em>Gaussian-to-voxel splatting</em> step that queries only the handful of Gaussians near each voxel, reporting a large memory reduction over dense-grid heads at comparable accuracy.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery robot on a crowded sidewalk</h3>
+<p>A sidewalk delivery robot ships with four fisheye cameras and no lidar, and its compute budget is a single embedded GPU shared with planning. A dense \(256\times256\times32\) occupancy grid would not fit in memory alongside the planner, and the team has no way to produce lidar-built voxel labels for the pedestrian-dense scenes it actually operates in. They train a Gaussian occupancy model self-supervised, on nothing but the robot's own recorded video and its wheel-odometry ego-motion. The model allocates Gaussians to the standpipe, the A-frame sign, and the legs of nearby pedestrians, and leaves the open pavement unrepresented, so the whole scene fits in a few thousand primitives. When a scooter leans into the frame, new Gaussians appear on it within a frame or two, and the planner reads occupancy by splatting only the Gaussians inside its short-horizon corridor rather than sweeping a full grid. The robot got a 3D obstacle field it could never have labeled and could not have afforded to store densely.</p>
+</div>
+
+<p>GaussianOcc (2024) is the method that closes the loop by making both ideas hold at once: a <em>fully self-supervised</em> occupancy model whose scene representation is Gaussian. It contributes two pieces that matter for the without-labels setting. First, it uses a Gaussian-splatting projection to handle the cross-view and cross-frame warping that self-supervision needs, avoiding a separately trained pose network that earlier photometric methods leaned on. Second, it renders from a Gaussian-populated voxel space to produce the depth and color images that the photometric loss compares against the real cameras. The result trains end to end from surround video alone and runs markedly faster than dense self-supervised occupancy, because rendering a few thousand Gaussians is cheaper than marching rays through a full volume.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The expensive part of Gaussian occupancy is the tiled, sorted, anti-aliased rasterizer that projects and alpha-composites thousands of anisotropic Gaussians with correct gradients. Do not write it. The <code>gsplat</code> library (and the reference <code>diff-gaussian-rasterization</code> CUDA kernel) exposes forward and backward Gaussian rasterization behind a single autograd-friendly call, turning what would be roughly a thousand lines of hand-tuned CUDA plus its gradient into a few lines of Python. You supply means, covariances, opacities, and colors; the kernel returns a differentiable image you drop straight into the photometric loss above. Reach for the from-scratch renderer only to learn the compositing math, then let the library own the sort-and-blend performance path.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2025 the state of the art is converging on Gaussian occupancy as the efficient successor to dense voxel heads. GaussianFormer-2 (2024) reframes the primitives as a probabilistic mixture and sharpens the Gaussian-to-voxel step; GaussianOcc pushes the fully self-supervised, label-free training regime; and a wave of follow-ups adds temporal Gaussians that persist and flow across frames, connecting occupancy to the world-model prediction of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>. Three problems stay open. Self-supervised photometric loss is blind to <em>uniform, untextured, and dynamic</em> regions where reprojection carries no signal, so a matte wall or a fast-moving truck is under-constrained. Purely self-supervised models learn geometry but not a semantic vocabulary without at least weak labels or a vision-language prior. And metric scale from cameras alone is fragile, which is why radar or a single depth prior (<a class="cross-ref" href="../module-44-radar-ai/index.html">Chapter 44</a>) is often folded back in. Watch the benchmarks in <a class="cross-ref" href="section-43.7.html">Section 43.7</a> to see how close label-free occupancy is coming to its lidar-supervised ceiling.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>(a) A dense occupancy grid is \(200\times200\times16\) with a 18-class logit vector per voxel in float16. Compute its memory, then estimate the memory of a Gaussian model with 25,000 primitives each storing a mean (3), a covariance factor (6), an opacity (1), and 18 class logits, and state the ratio. (b) In the <code>render_depth</code> function, explain why the transmittance uses a shifted cumulative product and why the small \(10^{-10}\) term is present. (c) Your self-supervised model produces sharp geometry on textured buildings but hollow, dented geometry on a blank white truck trailer. Explain in one sentence why the photometric loss fails there, and name one signal you could add to fix it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Self-supervised occupancy never sees a voxel label. What, precisely, plays the role of ground truth during training, and what differentiable operation lets a 2D quantity supervise a 3D field?</li>
+<li>Give the two independent reasons a Gaussian representation is more efficient than a dense grid for a driving scene, one about <em>where</em> capacity is spent and one about <em>rendering</em> cost.</li>
+<li>Name the two contributions GaussianOcc adds specifically to make the label-free setting work, and say which of the two taxes (label or memory) each idea pays down.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-43.6.html">Section 43.6</a>, we let occupancy start to <em>predict</em>. Once a scene is a compact, differentiable 3D field, whether voxels or Gaussians, the natural next question is what it will look like a second from now: occupancy world models roll the representation forward in time, forecasting how the free and occupied volume evolves, a thread we pick up here and develop fully in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

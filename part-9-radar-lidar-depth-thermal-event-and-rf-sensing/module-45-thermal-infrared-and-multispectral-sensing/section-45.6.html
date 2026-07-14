@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.6: Privacy-preserving thermal perception. Building Sensory AI." name="description"/>
+<title>Section 45.6: Privacy-preserving thermal perception | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Thermal, Infrared, and Multispectral Sensing</a></div>
+<h1>Privacy-preserving thermal perception</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They installed me because I cannot see a face. Nobody asked whether I could still recognize the person, and I can."</p><cite>A Discreet AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Thermal cameras are marketed as the privacy-safe alternative to RGB: no color, no texture, no readable face, so surely no privacy problem. That intuition is why thermal now sits in bedrooms, bathrooms, hospital wards, and elder-care homes where a visible-light camera would be unthinkable. It is also dangerously incomplete. A radiometric thermal frame can re-identify a person across days, leak their heart and breathing rate, expose what they just touched or typed, and reveal activities they never consented to sharing. This section separates the perceived privacy of thermal from its actual privacy, builds a concrete threat model, and shows the engineering that turns thermal from accidentally-private into provably-private: resolution budgeting, on-sensor abstraction, and formal mechanisms borrowed from differential privacy and federated learning.</p>
+</div>
+
+<p>This section assumes you can read a thermal frame as calibrated apparent temperature (<a class="cross-ref" href="section-45.1.html">Section 45.1</a>) and that you have seen how much physiology a thermal camera exposes when it images people (<a class="cross-ref" href="section-45.2.html">Section 45.2</a>). It sits deliberately downstream of those: only once you know what thermal <em>can</em> measure can you reason about what it should be prevented from measuring. The formal privacy tooling here (differential privacy, federated aggregation) is developed in depth in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>, and the biometric and regulatory framing in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>; here we specialize both to the thermal modality.</p>
+
+<h2>The privacy paradox of thermal</h2>
+<p>The reason thermal feels private is real but shallow: at long-wave infrared there is no pigment, no printed text, and above roughly 40 &deg;C emissivity flattens fine surface detail, so a stranger glancing at the feed cannot read a face the way they read an RGB still. The reason thermal is not actually private is that it is a <em>physical measurement</em>, and a measurement carries information a photograph does not. Three leakage channels matter in practice. First, <em>re-identification</em>: the spatial pattern of surface temperature over a person's face and body, the so-called thermal signature, is stable enough that models match an individual across sessions with accuracy far above chance, even at low resolution. Second, <em>physiological leakage</em>: nostril periodicity gives breathing rate, superficial-vessel pulsation gives heart rate, and the inner-canthus temperature tracks core temperature, so a thermal stream is a covert vital-sign sensor. Third, <em>interaction residue</em>: skin deposits heat on whatever it touches, so a thermal camera pointed at a keypad, phone, or keyboard can recover a recently entered PIN from the fading warm afterglow of the pressed keys, and even the order of presses from the temperature gradient. None of these require a visible face.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Privacy is a property of the information a signal carries, not of whether the signal looks like a photograph. Thermal removes appearance-based identifiers (face, clothing, skin tone) while adding physics-based ones (thermal signature, vitals, touch residue). Treating "you cannot see a face" as equivalent to "it is anonymous" is the single most common and most expensive mistake in thermal deployment. Design against the information channel, not against the visual impression.</p>
+</div>
+
+<h2>A threat model for thermal perception</h2>
+<p>Engineer privacy the way you engineer safety: name the adversary, the asset, and the channel. The asset is usually one of identity, physiological state, or activity. The adversary might be an eavesdropper on the video link, a curious operator, a downstream analytics vendor, or a future model trained on logged frames for a purpose no one consented to. The channel is the resolution, frame rate, and radiometric precision you actually transmit. The central design lever is that each protected asset has a resolution and precision <em>below</em> which it becomes unrecoverable while the intended task still works. Occupancy counting needs only that a warm blob exists; it survives an \(8 \times 8\) thermopile. Fall detection needs a coarse silhouette trajectory; it survives \(32 \times 24\). Face re-identification needs fine facial thermal texture; it collapses below roughly \(20 \times 20\) pixels on the face. The art is to pick the operating point that keeps the task above its floor and pushes every unwanted inference below its floor. This is a leakage question in the sense of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: a feature you did not intend to expose is still exposed if the bits are in the stream.</p>
+
+<p>The strongest structural defense is to never let the raw frame leave the sensor. If a microbolometer is co-packaged with an edge NPU (the optimization path of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), it can emit only the abstraction the application needs, a count, a fall flag, a breathing rate, and discard the frame in place. What is never recorded cannot be breached, subpoenaed, or repurposed. When frames must be transmitted or stored, degrade them deliberately: downsample, quantize the temperature scale, and add calibrated noise so that the transmitted signal supports the task but not re-identification.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def privacy_reduce(frame_c, out_hw=(24, 32), temp_step=0.5,
+                   dp_sigma=0.3, rng=np.random.default_rng(0)):
+    """Task-preserving, identity-destroying thermal transform.
+    frame_c: HxW apparent temperature (deg C). Returns a coarse, quantized,
+    noised frame that still supports occupancy/fall but not face re-ID."""
+    H, W = frame_c.shape
+    oh, ow = out_hw
+    # 1. Average-pool to a low resolution: kills fine facial thermal texture.
+    fr = frame_c[:oh * (H // oh), :ow * (W // ow)]
+    fr = fr.reshape(oh, H // oh, ow, W // ow).mean(axis=(1, 3))
+    # 2. Quantize the temperature axis: removes sub-degree vessel/vital detail.
+    fr = np.round(fr / temp_step) * temp_step
+    # 3. Add Gaussian noise: bounds the information any single frame leaks.
+    fr = fr + rng.normal(0.0, dp_sigma, size=fr.shape)
+    return fr
+
+hot = np.full((256, 320), 22.0)           # empty room at 22 C
+hot[90:150, 130:190] = 34.0               # one person, face + torso
+coarse = privacy_reduce(hot)
+print(coarse.shape, coarse.max() &gt; 30)    # (24, 32) True  -> still detectable
+</code></pre>
+<div class="code-caption">A three-stage privacy reducer: average-pooling destroys facial thermal texture, temperature quantization removes the sub-degree detail that carries vitals, and per-frame Gaussian noise bounds single-frame leakage. Occupancy and fall cues survive; the face re-identification channel does not.</div>
+
+<p>The <code>privacy_reduce</code> function makes the three levers explicit. Spatial pooling attacks re-identification, temperature quantization attacks the vital-sign channel (sub-degree periodic fluctuation is what respiration and pulse live in), and the noise term is the thermal analogue of the mechanism formalized next. Choosing <code>out_hw</code>, <code>temp_step</code>, and <code>dp_sigma</code> is exactly the threat-model tradeoff: measure task accuracy and re-identification accuracy on a held-out identity split, then pick the smallest degradation that keeps the task above its floor.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: bounded privacy with Opacus</h3>
+<p>Hand-rolling a differentially private training loop, per-sample gradient clipping, calibrated noise, and an accountant that tracks the spent \(\varepsilon\) budget across epochs, is a few hundred lines of subtle, easy-to-get-wrong code. Opacus wraps it around a standard PyTorch loop:</p>
+<pre><code class="language-python">from opacus import PrivacyEngine
+privacy_engine = PrivacyEngine()
+model, optimizer, loader = privacy_engine.make_private_with_epsilon(
+    module=model, optimizer=optimizer, data_loader=loader,
+    epochs=20, target_epsilon=6.0, target_delta=1e-5, max_grad_norm=1.0)
+# train as usual; the engine clips, noises, and accounts for epsilon
+</code></pre>
+<p>Roughly 300 lines of gradient-clipping, noise-calibration, and privacy-accounting logic collapse to about four, and you get a certified \((\varepsilon, \delta)\) guarantee that a thermal model trained on ward footage does not memorize any single patient. You supply the thermal dataset and an identity-disjoint split; the library owns the accounting.</p>
+</div>
+
+<h2>Formal guarantees and where they fit</h2>
+<p>Downsampling and blurring are heuristics; they raise the cost of an attack without bounding it. When you need a guarantee, differential privacy gives one. A randomized mechanism \(M\) is \((\varepsilon, \delta)\)-differentially private if for any two datasets \(D, D'\) differing in one person's data and any output set \(S\),</p>
+$$\Pr[M(D) \in S] \le e^{\varepsilon}\,\Pr[M(D') \in S] + \delta.$$
+<p>Read operationally: the presence or absence of any single individual changes the distribution of outputs by at most a factor \(e^{\varepsilon}\), so no analyst can confidently infer that a specific person was in the training data. For thermal, the two natural places to apply it are at <em>publication</em> (add noise to an aggregate statistic such as a nightly occupancy histogram before it leaves the building) and at <em>training</em> (DP-SGD, so a released model cannot memorize a patient's thermal signature). The complementary tool is federated learning: many homes or wards each train locally on their own thermal frames and share only model updates, which are aggregated centrally. Raw frames never leave the device, and combining federated aggregation with DP noise on the updates yields a system where neither the central server nor a link eavesdropper ever sees an identifiable frame. The full machinery, secure aggregation, the \(\varepsilon\) accountant, the communication-efficiency tricks, is the subject of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: night monitoring in a dementia ward</h3>
+<p>A care provider wants nighttime fall and wandering alerts in a dementia ward where residents cannot meaningfully consent to being filmed and families are rightly wary of cameras. The team chooses thermal specifically to avoid recognizable video, then a privacy audit finds the raw \(640 \times 512\) radiometric feed re-identifies residents at 88 percent accuracy across nights and recovers breathing rate to within two breaths per minute, effectively a covert health monitor no one authorized. They redesign around the threat model: the microbolometer is paired with an on-module NPU that runs fall and wandering detection in place and emits only event flags plus an anonymized \(24 \times 32\) heatmap for a nurse to sanity-check, never the raw frame. Nightly ward-level occupancy statistics are released with DP noise, and the detector itself is trained with DP-SGD on an identity-disjoint split so it cannot memorize an individual. Re-identification on the transmitted stream falls to near chance while fall recall stays at 0.93. The system now satisfies the biometric-data obligations of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> and the responsible-deployment duties of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a> by construction, not by policy promise.</p>
+</div>
+
+<h2>Auditing: prove the privacy you claim</h2>
+<p>Privacy claims must be measured, not asserted, and the honest metric is adversarial: train the strongest re-identification or vital-extraction model you can <em>on the protected output</em> and report its accuracy. If a re-identifier trained on your \(24 \times 32\) noised heatmaps still hits 60 percent on a held-out identity split, your pooling is too gentle regardless of how private the frames look. Always split by identity, never by frame, or the auditor leaks the very signal it is meant to detect, the same leakage-safe discipline as <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Report task accuracy and attack accuracy as a pair across the degradation sweep, and choose the operating point where the task curve is still high and the attack curve has collapsed to chance. That pair, task-utility versus attack-success, is the deliverable that turns "thermal feels private" into "here is the identity-disjoint audit showing it is."</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Build a privacy-utility sweep for <code>privacy_reduce</code>. (1) Take any small thermal face dataset with multiple sessions per person and split it by identity into disjoint train and test identity sets. (2) For a grid of output resolutions from \(8 \times 8\) up to \(64 \times 64\) and temperature steps from 0.1 to 2.0 &deg;C, apply the transform, then train a simple CNN classifier to re-identify the person and, separately, to detect presence. (3) Plot re-identification accuracy and presence-detection accuracy against resolution on the same axes and mark the operating point where presence stays above 0.95 while re-identification drops below the chance line. Report the temperature step at which vital-sign extraction (breathing-band energy) also disappears.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Thermal removes the face but is not automatically anonymous. Name three distinct pieces of information a raw radiometric thermal stream can leak that an RGB photo of the same scene would not.</li>
+<li>Why does temperature quantization specifically attack the physiological-leakage channel, while spatial pooling specifically attacks the re-identification channel?</li>
+<li>You claim your deployed thermal system is privacy-preserving. Describe the identity-disjoint adversarial audit that would either back up or refute that claim, and why splitting by frame instead of by identity would invalidate it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-45.7.html">Section 45.7</a>, we stop treating thermal as a lone modality and fold it into multispectral fusion: combining long-wave infrared with visible, near-infrared, and other bands so that each band covers the others' blind spots, and the fused representation sees material, temperature, and appearance at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

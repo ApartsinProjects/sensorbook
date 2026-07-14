@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.2: Depth Anything v1/v2 and video depth. Building Sensory AI." name="description"/>
+<title>Section 41.2: Depth Anything v1/v2 and video depth | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Depth Anything v1/v2 and video depth</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Give me sixty million photos nobody bothered to label and I will tell you how far away everything is. Ask me for the answer in meters and we should have a longer conversation."</p>
+        <cite>A Self-Taught AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on <a class="cross-ref" href="section-41.1.html">Section 41.1</a>, where the shift from per-dataset depth regression to zero-shot relative depth, and the scale-and-shift-invariant loss that makes it possible, are developed. It assumes the depth geometry and the relative-versus-metric distinction of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and the self-supervised pretraining ideas (DINOv2-style visual encoders) from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. The zero-shot transfer language recurs formally in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Depth Anything is the model that made monocular depth feel solved for everyday use: point any camera at any scene, run one forward pass, and get a clean depth map back, no calibration, no stereo rig, no per-scene tuning. It got there not through a cleverer architecture but through a data engine: a strong teacher network was used to pseudo-label tens of millions of ordinary unlabeled photos, and a student was trained on that flood of automatically annotated data. Version 2 then quietly rebuilt the recipe around synthetic training images and produced markedly sharper, more reliable depth. This section explains how the data engine works, why v2's synthetic-teacher trick matters, what the model's output actually means (relative depth, not meters), and how the same idea was extended to video so that a walk-through clip does not flicker frame to frame.</p>
+    </div>
+
+    <h2>The data engine: how v1 scaled without labels</h2>
+    <p>The bottleneck for monocular depth was never the network; it was ground truth. Metric depth labels come from lidar, structured light, or stereo rigs, all of which are expensive, indoor-biased, sparse, and full of holes. Depth Anything v1 (Yang and colleagues, 2024) sidestepped the bottleneck with self-training at scale. First it trained a strong <em>teacher</em> on the roughly 1.5 million labeled images available across public datasets, using the scale-and-shift-invariant objective from <a class="cross-ref" href="section-41.1.html">Section 41.1</a> so that images from wildly different sensors could be pooled. Then it turned that teacher loose on about 62 million <em>unlabeled</em> internet images, producing a pseudo-label depth map for every one. Finally it trained a <em>student</em> on the combined pile, dominated by the 62 million pseudo-labeled frames. The encoder is a frozen-then-finetuned DINOv2 vision transformer; the decoder is the DPT dense-prediction head. Two design choices made the flood productive rather than merely large: the student was hit with strong perturbations (aggressive color jitter, blur, and CutMix) so it could not simply copy the teacher and instead had to learn robust cues, and an auxiliary feature-alignment loss tied the depth features to DINOv2's frozen semantic features, importing object knowledge that keeps the depth map from bleeding across object boundaries.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The leap in monocular depth came from data coverage, not model capacity. A teacher that is merely good, applied to 62 million diverse unlabeled images, manufactures a training set whose <em>scene variety</em> no hand-labeled depth dataset can match. Diversity of viewpoints, lighting, and object categories is what buys zero-shot generalization; the perturbations and the semantic-feature constraint are what stop the student from just memorizing the teacher's mistakes.</p>
+    </div>
+
+    <h2>Depth Anything V2: let the teacher learn from synthetic data</h2>
+    <p>Version 2 (2024) kept the data-engine skeleton but changed what the teacher learns from, and the change is the whole story. Real labeled depth is noisy: lidar misses thin structures, stereo smears edges, transparent and reflective surfaces are simply wrong. Synthetic renderings, by contrast, carry perfect, pixel-sharp, complete depth (every strand of hair, every mesh edge) but look subtly unreal. V2's recipe: train the teacher <em>only</em> on high-quality synthetic images so it inherits their razor-sharp geometry, scale that teacher up to the largest DINOv2-Giant encoder so it can bridge the synthetic-to-real appearance gap, then use it to pseudo-label a large pool of real unlabeled photos, and finally train the deployable students purely on those real pseudo-labels. The synthetic domain gap, usually a curse, is laundered through the pseudo-labeling step: students never see synthetic pixels, only real ones with clean synthetic-quality depth. The result is depth that is visibly crisper at boundaries and far more robust on hard cases (transparent objects, thin poles, reflections) than v1, while shipping in a family of sizes from a 25-million-parameter Small model, fast enough for a laptop CPU, up to the 1.3-billion-parameter Giant.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026, Depth Anything V2 is the default open-weight backbone for zero-shot relative depth, and its published DINOv2-plus-DPT design is the reference point new work is measured against. The active frontiers are (1) turning its relative output into calibrated metric depth without per-camera tuning, handled by the camera-agnostic models of <a class="cross-ref" href="section-41.3.html">Section 41.3</a>; (2) diffusion-based depth (Marigold, <a class="cross-ref" href="section-41.4.html">Section 41.4</a>) that trades speed for detail; and (3) temporally consistent <em>video</em> depth, covered below, where 2025's Video Depth Anything extended the family to long clips.</p>
+    </div>
+
+    <h2>What the output actually is, and how to use it</h2>
+    <p>A crucial discipline: Depth Anything predicts <em>relative</em> (affine-invariant) depth, not metric depth. The network output is proportional to inverse depth (disparity) up to an unknown global scale \(a\) and shift \(b\); the true metric depth of a pixel relates to the prediction \(\hat{d}\) by</p>
+    \[ \frac{1}{Z} \approx a\,\hat{d} + b, \qquad a, b \text{ unknown per image}. \]
+    <p>This means the map tells you correctly that the chair is nearer than the wall and roughly how much nearer, but it does not tell you either object is two meters away. To recover \(a\) and \(b\) you need at least a little metric anchoring: a couple of known-range points from a lidar return, a stereo baseline, or a known object size. Fit the two constants by least squares against those anchors and the whole relative map snaps to metric. That two-parameter fit is the seam where a depth foundation model plugs into a real sensing stack, and it is exactly the lidar-guided prompting theme of <a class="cross-ref" href="section-41.5.html">Section 41.5</a>. Getting a relative depth map from an image is now a few lines, as Listing 41.2 shows.</p>
+
+    <pre class="language-python"><code class="language-python">from transformers import pipeline
+from PIL import Image
+
+# Zero-shot relative depth: one model handles any scene, no calibration.
+depther = pipeline(task="depth-estimation",
+                   model="depth-anything/Depth-Anything-V2-Small-hf")
+
+image = Image.open("street.jpg")
+out = depther(image)
+depth = out["depth"]            # PIL image; larger value = nearer (inverse depth)
+
+# Relative -> metric needs anchoring. With a few (row, col, Z_true) lidar hits:
+import numpy as np
+d = np.asarray(depth, dtype=np.float32)
+rows, cols, Z_true = anchors[:, 0].astype(int), anchors[:, 1].astype(int), anchors[:, 2]
+A = np.stack([d[rows, cols], np.ones_like(Z_true)], axis=1)
+a, b = np.linalg.lstsq(A, 1.0 / Z_true, rcond=None)[0]   # fit inverse-depth affine
+Z_metric = 1.0 / (a * d + b)                              # metric depth, meters
+</code></pre>
+    <div class="code-caption"><strong>Listing 41.2.</strong> Running Depth Anything V2 (Small) zero-shot, then anchoring its relative output to metric with a least-squares fit of two constants against a handful of known-range points. The forward pass needs no calibration; only the metric conversion does, and it needs just two degrees of freedom.</div>
+
+    <p>Listing 41.2 makes the division of labor explicit: the network solves the hard, ambiguous perception problem (dense ordering of the scene by depth), and a trivial two-parameter fit against any metric anchor handles the part cameras physically cannot infer alone. Keep the two stages separate in your head and the model stops feeling like a magic meter-stick and starts behaving like a well-characterized sensor.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>The from-scratch path, download the checkpoint, rebuild the DINOv2 encoder and DPT head, match the preprocessing (resize to a multiple of 14, normalize, letterbox), run inference, and resize back, is roughly 120 lines of fiddly code where one wrong normalization constant silently degrades the output. The Hugging Face <code>transformers</code> <code>pipeline</code> in Listing 41.2 collapses all of it to three lines and pins the exact preprocessing the weights were trained with, so the only thing you can get wrong is the file path.</p>
+    </div>
+
+    <h2>Video depth: killing the flicker</h2>
+    <p>Run a per-frame depth model on a video and you get a subtler failure than any single frame reveals: <em>temporal flicker</em>. Because each frame is estimated independently, the unknown scale and shift wander from frame to frame, and a static wall breathes in and out by meters while the camera pans. For a still photo this is invisible; for a robot building a map or an AR app anchoring a virtual object, it is fatal, because the geometry it is fusing over time is inconsistent with itself. Video Depth Anything (2025), from the same group, extends V2 to clips by adding a lightweight spatiotemporal head over the frozen image backbone and training with a <em>temporal-gradient</em> consistency loss that penalizes depth changes between consecutive frames that are not explained by actual motion. Critically it does this without a global optimization over the whole clip, so it streams: it processes arbitrarily long videos (thousands of frames) at near-real-time on the smaller sizes, keeping depth stable over time while preserving V2's per-frame sharpness. This temporal-consistency problem, and the gradient-style loss that tames it, is the same shape as the sequence-smoothing ideas in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, applied to a stream of depth maps instead of a stream of scalars.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: AR furniture placement on a phone</h3>
+        <p>A home-furnishing app lets a shopper drop a virtual sofa into their living room through the phone camera. The team first tried per-frame Depth Anything V2 for occlusion (so a real coffee table correctly hides the sofa's front leg). It looked stunning in screenshots and awful in motion: as the user walked around the sofa, the table's estimated depth jittered, so the occlusion boundary shimmered and the sofa's leg flickered in and out from behind it. Switching to Video Depth Anything's streaming, temporally consistent depth removed the shimmer: the table's depth now held steady across frames, the occlusion edge stayed put, and the sofa sat convincingly on the floor. The lesson generalizes to any moving-camera use, robot navigation, drone mapping, wearable AR: for video, temporal consistency is not a polish item, it is the difference between usable and unusable depth. It is also why <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">SLAM and spatial-AI stacks</a> increasingly ingest video depth models rather than per-frame ones.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using Listing 41.2 as a starting point: (a) run Depth Anything V2 Small on three photos of the same room from different distances and confirm that the raw relative maps are <em>not</em> comparable in absolute value across images. (b) Simulate four lidar anchor points per image by reading off known distances, fit \((a, b)\) for each, and check whether a single shared \((a, b)\) works across all three or whether each image genuinely needs its own fit. (c) Explain, in terms of the affine ambiguity, why a video model that keeps \((a, b)\) consistent over time is doing something a per-frame model structurally cannot.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Depth Anything v1 was trained mostly on data it never had human labels for. Where did the labels come from, and what two tricks stopped the student from simply copying the teacher's errors?</p>
+        <p class="quiz-question">2. Depth Anything V2 trains its teacher only on synthetic images yet its deployed students never see a synthetic pixel. How does the pseudo-labeling step turn the synthetic-to-real domain gap from a liability into an advantage?</p>
+        <p class="quiz-question">3. The model outputs relative depth. Write the affine relation to metric depth, say how many anchor points you minimally need to solve for the unknowns, and name one sensor that can supply them.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-41.3.html">Section 41.3</a>, we tackle the constant we kept deferring: true metric depth in meters, straight from a single image, without the per-image affine fit. We look at camera-agnostic models (Metric3D v2, UniDepth) that fold the camera's intrinsics into the network so the output is already scaled, and we see why doing this correctly is harder, and more valuable, than it first appears.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

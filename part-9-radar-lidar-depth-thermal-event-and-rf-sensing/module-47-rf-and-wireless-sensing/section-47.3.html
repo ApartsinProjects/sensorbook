@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 47.3: Wi-Fi pose and vital-sign sensing (DensePose-from-WiFi, WiPose). Building Sensory AI." name="description"/>
+<title>Section 47.3: Wi-Fi pose and vital-sign sensing (DensePose-from-WiFi, WiPose) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 47: RF and Wireless Sensing</a></div>
+<h1>Wi-Fi pose and vital-sign sensing (DensePose-from-WiFi, WiPose)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You installed me to move packets. I learned to read the rise and fall of your chest, the swing of your arms, the curve of your spine, from the way you bent the packets on their way past. Nobody signed a consent form for that."</p>
+<cite>An Eavesdropping AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the channel-state-information (CSI) representation of <a class="cross-ref" href="section-47.1.html">Section 47.1</a>: a per-subcarrier complex gain \(H_{k}=|H_{k}|e^{j\angle H_{k}}\) whose amplitude and phase encode how a moving body reshapes the multipath field. It assumes the device-free activity pipeline of <a class="cross-ref" href="section-47.2.html">Section 47.2</a> as the coarse-grained sibling of the fine-grained pose and vital-sign tasks here. The vital-sign half leans on the spectral estimation vocabulary of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> (band-pass filtering, periodograms) and the aliasing intuition of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. The pose half reuses the teacher-student and cross-modal supervision ideas of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">From "someone is walking" to "here is the surface of their body, and they are breathing 14 times a minute"</h3>
+<p>Section 47.2 asked a categorical question: is a person present, and which of a handful of activities are they doing. This section asks two far harder, continuous questions from the same commodity Wi-Fi hardware. First, <em>where is every part of the body in space</em>: the 3D skeleton (WiPose) or even a dense per-pixel map of the body surface (DensePose-from-WiFi), recovered from nothing but the CSI captured on three transmit and three receive antennas. Second, <em>what is the body doing internally</em>: the millimetre chest motion of respiration and the sub-millimetre motion of the heartbeat, read off the CSI phase. Both push RF sensing from a crude motion detector toward a contactless camera-and-stethoscope, which is exactly why the same capability is thrilling for elder-care and alarming for privacy (<a class="cross-ref" href="section-47.7.html">Section 47.7</a>). Understanding how a router recovers a pose it was never designed to see, and where the recovery breaks, is the goal of this section.</p>
+</div>
+
+<h2>Why the body is legible in the channel at all</h2>
+<p><strong>What</strong> makes pose and breathing recoverable is that a human body is a large, water-filled, moving reflector sitting inside the router's multipath field. Every limb adds a reflected path; every path has a length; every length sets a phase. <strong>Why</strong> tiny motions register is the wavelength: at 5 GHz, \(\lambda\approx 6\) cm, so a path-length change of a few centimetres rotates the CSI phase through a full \(2\pi\). Chest expansion during a breath moves the torso surface by roughly 4 to 12 mm, and the heartbeat by a few tenths of a millimetre; both are a measurable fraction of a wavelength and therefore a measurable phase swing. The Fresnel-zone model formalises this: as the body crosses successive elliptical zones whose foci are the transmit and receive antennas, the received signal traces out sinusoidal fringes, and the fringe rate encodes displacement. <strong>How</strong> pose differs from breathing is granularity. Breathing is one dominant periodic reflector, so a band-pass filter isolates it. Pose is a spatial configuration of dozens of reflectors, hopelessly entangled in the raw channel, which is why pose needs a learned inverse rather than a filter.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Amplitude carries "how much motion", phase carries "how far"</h3>
+<p>The single most useful split in Wi-Fi sensing: CSI <em>amplitude</em> is robust and easy but coarse, reacting to the presence and energy of motion; CSI <em>phase</em> is precise but poisoned by hardware. Raw phase from a commodity NIC is corrupted by carrier-frequency offset (CFO), sampling-frequency offset (SFO), and random packet detection delay, which add an unknown, time-varying linear ramp across subcarriers that can dwarf the millimetre signal you want. The universal fix is to <em>subtract phase across a pair of receive antennas on the same NIC</em>: they share the same oscillator, so the offsets cancel in the difference, leaving the true propagation phase. This conjugate-multiplication trick (\(H_{i}\overline{H_{j}}\)) is why almost every serious vital-sign paper uses antenna-pair phase rather than single-antenna phase, and it is the difference between a clean breathing sinusoid and noise.</p>
+</div>
+
+<h2>WiPose and Person-in-WiFi: learning the skeleton</h2>
+<p><strong>What</strong> WiPose (Jiang et al., MobiCom 2020) demonstrated is the first 3D human skeleton from commodity Wi-Fi CSI. <strong>How</strong> it works is a supervised cross-modal map: a synchronised motion-capture or depth camera provides ground-truth joint positions while the network sees only CSI, learning to regress the joints the camera reported. Architecturally it stacks a CNN spatial encoder over the CSI tensor with a recurrent temporal model (the recurrent and TCN toolkit of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>), and, crucially, ends in a <em>forward-kinematics layer</em>: instead of predicting 3D joint coordinates freely, it predicts joint <em>rotations</em> along a fixed skeleton and lets a differentiable kinematic chain place the joints. That constraint bakes in bone lengths, forbids anatomically impossible poses, and sharply improves generalisation, a recurring theme with the pose interfaces of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>. Person-in-WiFi (Wang et al., 2019) is the 2D cousin, regressing joint-confidence maps and body-segmentation masks in the image plane, again teacher-supervised by a camera.</p>
+
+<h2>DensePose-from-WiFi: a body surface from a router</h2>
+<p><strong>What</strong> DensePose-from-WiFi (Geng, Huang, and De la Torre, 2022) pushes to is the DensePose target: a dense mapping from every body pixel to a canonical UV coordinate on the SMPL human surface, the same output an RGB DensePose network produces, but from CSI alone. <strong>Why</strong> it is a landmark is that it closes most of the gap to vision on a genuinely non-visual sensor. <strong>How</strong> it is built is a three-stage design. First, amplitude and phase tensors from the \(3\times3\) antenna links are fed through a small network that maps the CSI feature domain into a \(2\text{D}\) spatial feature map aligned with the image plane, effectively learning the sensor's forward model in reverse. Second, that feature map drives a DensePose-RCNN head (the same detection-plus-UV head used in the vision system). Third, and decisively, training uses a <em>transfer-learning teacher</em>: a pretrained image-based DensePose runs on a synchronised camera to produce pseudo-labels and intermediate features, and the Wi-Fi student is trained to match both the final UV output and the teacher's internal representations. Without that dense visual teacher the CSI-to-UV problem is too ill-posed to fit. The reported accuracy trails the RGB teacher and degrades on layouts and bodies unlike the training set, the robustness problem taken up in <a class="cross-ref" href="section-47.6.html">Section 47.6</a>, but the surfaces are recognisably human.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>As of the mid-2020s the fine-grained Wi-Fi perception frontier is defined by DensePose-from-WiFi (dense body surface), WiPose and its successors (3D skeleton), and, on the vital-sign side, phase-based respiration and heart-rate systems descended from MIT's RF-based work and commodity-CSI systems such as the Fresnel-model breathing trackers. The open problems are consistent: cross-environment and cross-subject generalisation (a model trained in one room collapses in another), multi-person separation (<a class="cross-ref" href="section-47.4.html">Section 47.4</a>), and the reliance on a camera teacher for supervision, which self-supervised RF pretraining (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) is beginning to relax. The parallel radar route to the same vital signs is developed in <a class="cross-ref" href="../module-44-radar-ai/index.html">Chapter 44</a>, and the clinical framing in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>.</p>
+</div>
+
+<h2>Reading a breath off the phase</h2>
+<p><strong>What</strong> vital-sign sensing recovers is respiration rate (typically 0.1 to 0.5 Hz, i.e. 6 to 30 breaths per minute) and heart rate (roughly 0.8 to 2 Hz) from the periodic phase modulation of a stationary subject. <strong>How</strong> the pipeline runs is: form antenna-pair conjugate phase to kill hardware offsets, select the subcarrier or Fresnel-sensitive component with the strongest periodic energy, band-pass to the physiological band, and estimate the dominant frequency with a periodogram or peak-tracking. <strong>When</strong> it fails is instructive: any gross body motion swamps the millimetre signal, so these systems assume a still subject (sleeping, seated), and heart rate is far harder than breathing because its displacement is an order of magnitude smaller and sits near respiration harmonics. The snippet below simulates a breathing-modulated CSI phase and recovers the rate.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.signal import butter, filtfilt, periodogram
+
+fs = 20.0                     # CSI packet rate (Hz)
+t = np.arange(0, 60, 1/fs)    # one minute of packets
+true_bpm = 15.0               # 15 breaths/min -> 0.25 Hz
+
+# Simulated antenna-pair phase: breathing sinusoid + heartbeat + noise
+resp = 0.9 * np.sin(2*np.pi*(true_bpm/60)*t)
+heart = 0.1 * np.sin(2*np.pi*1.2*t)          # ~72 bpm, much smaller
+phase = resp + heart + 0.15*np.random.randn(t.size)
+
+# Band-pass to the respiration band (0.1-0.5 Hz), then find the peak
+b, a = butter(4, [0.1, 0.5], btype='band', fs=fs)
+resp_clean = filtfilt(b, a, phase)
+f, pxx = periodogram(resp_clean, fs=fs)
+est_bpm = 60 * f[np.argmax(pxx)]
+print(f"estimated respiration rate: {est_bpm:.1f} breaths/min")
+</code></pre>
+<div class="code-caption">A minimal contactless respiration estimator: band-pass the offset-corrected CSI phase to the physiological band and read the dominant periodogram peak. The heartbeat term is deliberately ten times smaller, illustrating why heart rate needs a narrower band and more careful estimation than breathing.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let SciPy own the filter and the spectrum</h3>
+<p>Written from scratch, a stable band-pass filter (bilinear-transformed Butterworth with zero-phase forward-backward application) plus a windowed periodogram is roughly 60 to 80 lines of numerically fussy code, and easy to get wrong at the band edges. <code>scipy.signal.butter</code>, <code>filtfilt</code>, and <code>periodogram</code> collapse it to the four lines above and handle the coefficient design, edge padding, and normalisation for you. Reserve hand-rolled DSP for the parts a library cannot know: the antenna-pair phase-offset cancellation and the subcarrier selection that are specific to CSI.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The care-home router that noticed a breath had stopped</h3>
+<p>A contactless monitoring pilot in an assisted-living facility repurposed the existing 5 GHz access points in residents' rooms as respiration sensors, with no wearable and no camera. Overnight, antenna-pair CSI phase was band-passed to the breathing band and a rate was logged every 30 seconds; a sustained drop in periodic energy raised a "no respiration detected" flag to the night staff. The system worked precisely because a sleeping resident is the ideal target: still torso, single person, consistent geometry. Its limits mapped exactly onto the theory. A resident who rolled over produced a motion transient that had to be gated out; two people in one bed broke the single-reflector assumption and demanded the separation methods of <a class="cross-ref" href="section-47.4.html">Section 47.4</a>; and moving the bed shifted the Fresnel zones enough to force a recalibration. The clinical-validation and false-alarm discipline this deployment needed is the subject of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: expose the heartbeat</h3>
+<p>Extend the code above to also estimate heart rate. (1) Design a second band-pass filter for 0.8 to 2.0 Hz and apply it to the same <code>phase</code> signal. (2) Estimate the dominant frequency and compare it to the injected 1.2 Hz (72 bpm). (3) Now increase the noise standard deviation from 0.15 to 0.4 and rerun both estimators. Which one degrades first, and why does that match the amplitude-versus-phase and displacement-magnitude arguments in this section? (4) Reduce the record length from 60 s to 10 s and explain, using the frequency-resolution limit from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, why short windows blur the estimate.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does DensePose-from-WiFi require a synchronised camera during <em>training</em> but not during deployment, and what does that dependency imply for building a Wi-Fi pose dataset without leakage (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>)?</p>
+<p>2. A colleague reports beautiful breathing curves from single-antenna CSI phase with no offset correction. Give the most likely reason to be suspicious, and the one-line fix.</p>
+<p>3. Why does WiPose predict joint rotations through a forward-kinematics layer rather than regressing 3D joint coordinates directly?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>Everything in this section quietly assumed one still person in a clean geometry. In <a class="cross-ref" href="section-47.4.html">Section 47.4</a>, we drop both assumptions: sensing through walls where the signal is attenuated and cluttered, and separating multiple people whose reflections overlap in the same channel, which is where RF sensing meets its hardest source-separation problems.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

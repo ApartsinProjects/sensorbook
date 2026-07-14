@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 44.4: 4D imaging radar detection and occupancy (RadarOcc, RCBEVDet). Building Sensory AI." name="description"/>
+<title>Section 44.4: 4D imaging radar detection and occupancy (RadarOcc, RCBEVDet) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 44: Radar AI</a></div>
+<h1>4D imaging radar detection and occupancy (RadarOcc, RCBEVDet)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me a fourth axis and suddenly I know not just where and how fast, but how tall. Grant me a few hundred virtual antennas and I will draw you a scene through the fog that lidar refused to enter. It will be blurry. It will be honest. It will still be there at midnight in a blizzard."</p>
+<cite>An Elevated AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section stands on the three radar axes of <a class="cross-ref" href="section-44.1.html">Section 44.1</a> and the range-Doppler tensor built in <a class="cross-ref" href="section-44.3.html">Section 44.3</a>; the "4D" here is those axes plus <em>elevation</em>, unlocked by the MIMO virtual array of <a class="cross-ref" href="section-44.2.html">Section 44.2</a>. The target representations, bird's-eye-view (BEV) grids and voxel occupancy, are exactly the ones defined for camera and lidar in <a class="cross-ref" href="../module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>; read that first if BEV lifting or the occupancy-IoU metric is unfamiliar. Point-cloud voxelization and pillar encoders come from <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. We assume the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, which matters acutely here because radar sequences are highly autocorrelated.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a fourth radar dimension changes the perception game</h3>
+<p>Classic automotive radar is functionally 2.5D: crisp range and Doppler, a coarse azimuth, and essentially <em>no</em> elevation, so it cannot tell an overhead sign from a stopped truck. 4D imaging radar adds a measured elevation angle by stacking antennas vertically as well as horizontally, turning the sensor from a list of flat blips into a genuine 3D (plus velocity) point source that survives fog, rain, dust, and darkness. That single addition lets radar finally play in the two representations that drive modern autonomy: <strong>BEV object detection</strong> (oriented 3D boxes on a top-down grid) and <strong>3D semantic occupancy</strong> (is each voxel of space free or filled, and with what). This section is about how two representative systems get there: <strong>RCBEVDet</strong>, which fuses 4D radar with cameras in BEV for robust detection, and <strong>RadarOcc</strong>, which predicts dense 3D occupancy from radar alone. The through-line is a hard question you will meet in every radar AI project: radar's point cloud is heartbreakingly sparse and noisy, so do you clean it into points, or keep the raw tensor and let the network dig the weak targets out itself?</p>
+</div>
+
+<h2>From virtual array to a four-dimensional data product</h2>
+<p><strong>What</strong> a 4D imaging radar produces, before any AI touches it, is a four-dimensional intensity tensor indexed by range, azimuth, elevation, and Doppler, \(I[r,\theta,\phi,v]\). The extra elevation axis \(\phi\) is the whole story: a 2D MIMO array with transmit and receive elements distributed in <em>both</em> a horizontal and a vertical layout synthesizes a large 2D virtual aperture, and the same spatial-frequency estimation that gave azimuth in <a class="cross-ref" href="section-44.1.html">Section 44.1</a> now also gives elevation. High-end sensors reach hundreds to low thousands of virtual channels, pushing angular resolution toward (though not to) lidar territory. <strong>Why</strong> this is not simply "lidar that sees through weather" is density and noise: even a rich 4D radar returns orders of magnitude fewer confident points per frame than a lidar, and those points sit in a sea of sidelobes, multipath ghosts, and clutter. <strong>How</strong> the community consumes this varies along one crucial axis of choice.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The representation fork: sparse point cloud versus dense 4D tensor</h3>
+<p>Every 4D radar model makes one early, load-bearing decision. <strong>Point-cloud path:</strong> run a CFAR detector (constant false-alarm rate thresholding) on the tensor, keep the peaks as points carrying \((x,y,z)\), Doppler, and radar cross-section (RCS), then reuse the pillar and voxel encoders of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. It is cheap and lidar-compatible, but CFAR <em>throws away</em> every return below threshold, and for radar the weak returns are often the pedestrian, not the noise. <strong>Dense-tensor path:</strong> feed the full \(I[r,\theta,\phi,v]\) tensor to the network and let it learn the thresholding jointly with the task, preserving faint targets at the cost of a much larger, mostly-empty 4D input. RCBEVDet takes the point path (fast, fusion-friendly); RadarOcc takes the tensor path (recall-preserving, occupancy-friendly). Neither is universally right, and knowing <em>why</em> a system chose one tells you its failure modes before you run it.</p>
+</div>
+
+<h2>RCBEVDet: radar-camera detection in bird's-eye view</h2>
+<p><strong>What</strong> RCBEVDet (Lin et al., CVPR 2024) does is fuse a 4D radar point cloud with surround-view cameras into a shared BEV feature map and predict 3D boxes there. <strong>Why</strong> the pairing is natural: cameras give dense semantics and fine azimuth but guess badly at absolute depth and velocity, while radar gives true range and instantaneous radial velocity but sparse, low-resolution structure. In BEV, the two are complementary layers of the same top-down grid, exactly the fusion setting of <a class="cross-ref" href="../module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a> and, more generally, the missing-modality robustness theme of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. <strong>How</strong> RCBEVDet earns its numbers is two design ideas worth remembering. First, a dedicated radar backbone, <em>RadarBEVNet</em>, runs a dual stream: a point-based branch and a transformer branch that share information, plus an RCS-aware scatter that spreads each detection's energy over the BEV cells its cross-section implies rather than a single pixel, respecting radar's inherent spatial smear. Second, a cross-attention fusion module aligns the radar and camera BEV features before summing them, because calibration and ego-motion leave the two grids slightly misregistered and a naive add blurs both. On nuScenes and on the View-of-Delft (VoD) 4D-radar benchmark, this radar-camera design closes much of the gap to lidar while keeping radar's all-weather resilience; RCBEVDet++ extends the fusion further. The payoff shows most in rain and at night, where the camera-only baseline degrades and radar holds the velocity and range channels steady.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The valet garage where camera-only depth collapsed and radar-camera BEV held</h3>
+<p>A robotaxi team benchmarking low-speed automated parking hit a stubborn failure in a dim multi-storey garage: a camera-BEV detector kept placing concrete pillars and parked cars at the wrong depth, because flat low-texture walls and glare from sodium lamps starved the monocular depth cue the lifter relied on. Boxes jittered a meter in range, enough to abort a tight park. Adding a 4D imaging radar and switching to an RCBEVDet-style BEV fusion fixed the depth channel directly: radar's range is a measured beat frequency, not an inferred cue, so pillars locked to within a few centimeters even under glare, and the radial-velocity layer instantly separated a slowly rolling car from a static wall. The camera still supplied what radar could not, the fine azimuth outline and the class label, so the fused boxes were both correctly placed and correctly named. The team's takeaway matched this section's thesis: they did not need radar to be sharp, they needed it to be <em>metric and weatherproof</em>, and to let the camera stay in charge of semantics.</p>
+</div>
+
+<h2>RadarOcc: dense 3D occupancy from radar alone</h2>
+<p><strong>What</strong> RadarOcc (Ling et al., NeurIPS 2024) targets is the harder, denser task of 3D semantic occupancy, labelling every voxel in a volume around the vehicle as free or occupied (and by which class) from 4D radar, without a camera or lidar crutch. <strong>Why</strong> this is ambitious: occupancy is unforgiving of sparsity, because an empty voxel that should be filled is a hole an planner can drive into, and radar's sparse points leave most of the grid unobserved. RadarOcc's answer is to refuse the point-cloud path entirely and keep the <em>raw 4D tensor</em>, so no faint return is discarded before the network can use it. <strong>How</strong> it copes with the tensor's size and its native geometry is the interesting part. Rather than voxelize the sphere into a Cartesian grid up front (which wastes resolution and interpolates away structure), RadarOcc processes the data in its native <em>spherical</em> coordinates, prunes the vast empty regions with a sparsity-aware step, and only then transforms the surviving features into the Cartesian occupancy volume for the final head. Doppler is not collapsed away; the velocity signature helps the network distinguish dynamic occupancy from static. Evaluated on the K-Radar benchmark, RadarOcc shows that radar-only occupancy is feasible and, decisively, that it <em>degrades gracefully in adverse weather</em> where lidar-based occupancy loses returns to rain and snow. That robustness, not raw accuracy, is radar's argument for a seat at the occupancy table.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where 4D radar perception stands, and where it is going</h3>
+<p>As of 2026 the reference points are RCBEVDet and RCBEVDet++ (CVPR 2024) for radar-camera BEV detection, RadarOcc (NeurIPS 2024) for radar-only occupancy, and a fast-growing tensor-native line building on datasets that ship the full 4D cube rather than only CFAR points. The public benchmarks that matter are <strong>K-Radar</strong> (KAIST, 4D tensor with heavy adverse-weather coverage), <strong>View-of-Delft</strong> and <strong>TJ4DRadSet</strong> (4D-radar detection with lidar and camera for supervision), and the earlier RADIal and Astyx sets. Three open problems define the frontier: (1) closing the elevation-resolution gap so radar occupancy stops smearing vertically thin structures; (2) self-supervised and cross-modal distillation that lets a lidar teacher train a radar student, so radar inherits dense labels it can never natively collect; and (3) calibrated uncertainty on radar occupancy, tying back to <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, so a planner knows when a "free" voxel is confidently free versus merely unobserved. Weather-robust fusion that gracefully drops to radar-only is the theme carried into <a class="cross-ref" href="section-44.5.html">Section 44.5</a>.</p>
+</div>
+
+<h2>Building a radar BEV occupancy grid, concretely</h2>
+<p>Before reaching for a full RadarOcc or RCBEVDet model, it helps to feel how a sparse 4D point cloud becomes the BEV/occupancy tensor those networks consume. The code below scatters a set of radar detections, each with a position, a Doppler velocity, and an RCS, into a top-down BEV grid, accumulating occupancy plus per-cell mean velocity and peak RCS. This is the minimal preprocessing that turns radar's handful of points into the image-like input a BEV backbone expects, and it exposes the sparsity problem viscerally: most cells stay empty.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def radar_points_to_bev(points, x_range=(-25, 25), y_range=(0, 50),
+                        cell=0.5):
+    """points: (N,5) array of [x, y, z, doppler, rcs] in meters/(m/s)/dBsm.
+    Returns a (C,H,W) BEV tensor: occupancy, mean Doppler, peak RCS."""
+    W = int((x_range[1] - x_range[0]) / cell)
+    H = int((y_range[1] - y_range[0]) / cell)
+    occ = np.zeros((H, W), np.float32)
+    dop = np.zeros((H, W), np.float32)
+    rcs = np.full((H, W), -1e3, np.float32)      # peak-hold, start very low
+
+    xi = ((points[:, 0] - x_range[0]) / cell).astype(int)
+    yi = ((points[:, 1] - y_range[0]) / cell).astype(int)
+    keep = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+    xi, yi, p = xi[keep], yi[keep], points[keep]
+
+    for u, v, pt in zip(yi, xi, p):              # accumulate per cell
+        occ[u, v] += 1.0
+        dop[u, v] += pt[3]
+        rcs[u, v] = max(rcs[u, v], pt[4])
+    mean_dop = np.divide(dop, occ, out=np.zeros_like(dop), where=occ > 0)
+    rcs[occ == 0] = 0.0
+    return np.stack([np.clip(occ, 0, 1), mean_dop, rcs])  # (3, H, W)
+
+rng = np.random.default_rng(0)
+pts = np.column_stack([rng.uniform(-20, 20, 40), rng.uniform(2, 45, 40),
+                       rng.uniform(-1, 3, 40), rng.uniform(-15, 15, 40),
+                       rng.uniform(-5, 20, 40)])
+bev = radar_points_to_bev(pts)
+occupied = (bev[0] > 0).sum()
+print(f"grid {bev.shape}, occupied cells {occupied} "
+      f"({100*occupied/bev[0].size:.2f}% filled)")
+</code></pre>
+<div class="code-caption">Scattering a 40-point 4D radar frame into a 100&#215;100 BEV grid with occupancy, mean Doppler, and peak-RCS channels. Running it prints roughly 0.3&#37; of cells filled, the sparsity that motivates RadarOcc's decision to keep the raw tensor and RCBEVDet's RCS-aware energy spreading instead of one-pixel scatter.</div>
+
+<p>That printed fill fraction, well under one percent, is the entire design tension of this section in one number. The point-cloud path you just coded is fast but leaves the grid almost empty; a downstream network must hallucinate structure into the holes, which is exactly why RadarOcc keeps the dense tensor and why RCBEVDet leans on the camera to fill semantics. The same voxelization generalizes to 3D by adding a height axis, giving the occupancy volume of <a class="cross-ref" href="../module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let mmdet3d scatter and encode for you</h3>
+<p>The loop above is deliberately explicit for teaching; in practice you would not hand-roll voxelization. The <code>mmdetection3d</code> toolbox provides a <code>PointPillars</code> voxel encoder and BEV scatter that ingest an \((N,5)\) radar point cloud and emit a batched, GPU-resident BEV feature map in about three configuration lines, replacing roughly 40 lines of index arithmetic, boundary handling, and batching, and it handles the multi-frame accumulation and augmentation that a real radar pipeline needs. The RCBEVDet and several 4D-radar detectors ship as mmdet3d configs, so adopting the library is also how you reproduce the published baselines on VoD or K-Radar without reimplementing them. Reserve the from-scratch version for when you need a custom per-cell statistic (like peak-RCS) the stock encoder does not expose.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: measure the cost of CFAR thresholding</h3>
+<p>Extend <code>radar_points_to_bev</code> to accept a per-point SNR and a CFAR-style threshold, then sweep the threshold from permissive to strict. Plot (a) the number of surviving points and (b) the BEV fill fraction against the threshold. Now seed two "pedestrian" points with deliberately low SNR near the grid edge and show at what threshold they vanish. Write two sentences arguing, from your plot, why RadarOcc chose to keep the raw tensor rather than threshold first. Bonus: repeat under a simulated rain model that adds low-SNR clutter, and discuss how a fixed threshold behaves when the weather changes.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>What single physical capability distinguishes a 4D imaging radar from a conventional automotive radar, and which array change provides it?</li>
+<li>RCBEVDet fuses radar with cameras in BEV. State one thing radar contributes that the camera cannot, and one thing the camera contributes that radar cannot.</li>
+<li>RadarOcc keeps the raw 4D tensor instead of a CFAR point cloud. Give the recall-based reason this helps for the occupancy task specifically, and name the cost it pays.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-44.5.html">Section 44.5</a>, we widen the fusion story from radar-plus-camera to the full radar-camera-lidar stack and make weather robustness the explicit design goal: how a perception system degrades gracefully when fog blinds the camera, rain thins the lidar, and radar becomes the sensor still standing.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

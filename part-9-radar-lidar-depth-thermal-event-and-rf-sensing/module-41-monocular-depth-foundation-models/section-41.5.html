@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.5: Sensor-prompted depth (lidar-guided). Building Sensory AI." name="description"/>
+<title>Section 41.5: Sensor-prompted depth (lidar-guided) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Sensor-prompted depth (lidar-guided)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me a thousand guesses about the shape of the room and a dozen true measurements, and I will tell you the room. Give me only the measurements, and I will tell you a dozen dots."</p><cite>A Well-Anchored AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A monocular depth foundation model reads dense structure off a single image: every edge, every occlusion boundary, the smooth fall-off of a floor. What it cannot read reliably is <em>metric scale</em>. The same image is consistent with a dollhouse a foot away and a real house across the street. A sparse depth sensor has the opposite profile: a lidar sweep or a phone time-of-flight chip returns a few hundred to a few thousand points that are metrically true but geometrically threadbare. Sensor-prompted depth marries the two. You keep the network's dense, sharp geometry and let the sensor's sparse measurements fix the numbers, either by a cheap post-hoc alignment or by feeding the sparse depth into the model as a <em>prompt</em> that steers the whole prediction. The result is dense, metric, edge-accurate depth at a fraction of the sensor cost of a dense lidar and a fraction of the failure rate of pure monocular inference. This section shows how the prompting works, from a three-line least-squares fix to network-native conditioning, and when to reach for each.</p>
+</div>
+
+<p>This section assumes you understand affine-invariant depth and why zero-shot monocular models predict geometry up to an unknown scale and shift, developed in <a class="cross-ref" href="section-41.1.html">Section 41.1</a> and sharpened by the metric models of <a class="cross-ref" href="section-41.3.html">Section 41.3</a>. It leans on the least-squares and uncertainty vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and on the lidar measurement model of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>. The sparse lidar itself is treated in depth in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>; here it is the prompt, not the subject.</p>
+
+<h2>Why a few true points go a long way</h2>
+
+<p>Affine-invariant models predict a quantity \(\tilde{d}(u,v)\), usually inverse depth (disparity), that is correct only up to an unknown positive scale \(a\) and shift \(b\). The metric inverse depth at pixel \((u,v)\) is</p>
+
+$$ \frac{1}{z(u,v)} \;=\; a\,\tilde{d}(u,v) + b, \qquad a > 0. $$
+
+<p>Two unknowns. That is the entire gap between a beautiful relative depth map and a usable metric one. If a sensor gives you even a handful of pixels where \(z\) is known, you have more equations than unknowns and can solve for \((a,b)\) directly. This is why sparse guidance is so disproportionately powerful: the network already did the hard, high-dimensional work of recovering per-pixel structure, and the sensor only has to pin down two scalars. The catch is that real monocular predictions are not globally affine to the truth. They bend: the scale that fits the foreground undershoots the far wall, curved surfaces creep, and a single global \((a,b)\) leaves residual metric error exactly where planning cares most. That residual is what network-native prompting exists to remove.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Sparse guidance is not depth completion from scratch. Classical completion (interpolating a dense map from sparse lidar over an RGB image) has to invent structure between the samples. A depth foundation model already supplies the structure; the sparse points only supply the metric calibration. That division of labor is why a modern prompted model beats a from-scratch completion network trained on the same sparse input: the prior it starts from is a web-scale geometry model, not a single dataset.</p>
+</div>
+
+<h2>The cheap fix: global scale-and-shift alignment</h2>
+
+<p>Before reaching for anything learned, fit the two scalars by least squares. Collect the set of pixels \(S\) where the sensor gives metric depth \(z_i\), stack the network's predictions \(\tilde{d}_i\) at those pixels, and solve</p>
+
+$$ (a^\star, b^\star) \;=\; \arg\min_{a,b} \sum_{i \in S} w_i\,\bigl(a\,\tilde{d}_i + b - \tfrac{1}{z_i}\bigr)^2, $$
+
+<p>a two-parameter linear regression that has a closed form and runs in microseconds. The weights \(w_i\) let you down-weight distant or low-confidence returns, where lidar range noise grows. This single step converts any relative-depth foundation model into a metric one for your specific frame, and it is the honest baseline every fancier method must beat.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def align_to_sparse(pred_disp, sparse_z, mask, weights=None):
+    """Fit metric depth = 1 / (a * pred_disp + b) using sparse metric returns.
+
+    pred_disp : (H, W) affine-invariant inverse depth from the foundation model
+    sparse_z  : (H, W) metric depth from lidar/ToF, valid only where mask is True
+    mask      : (H, W) bool, True at pixels with a sensor return
+    """
+    d = pred_disp[mask]                 # network prediction at sensed pixels
+    t = 1.0 / sparse_z[mask]            # target inverse depth (metric)
+    w = np.ones_like(d) if weights is None else weights[mask]
+
+    # Weighted least squares for [a, b]: a * d + b = t
+    A = np.stack([d, np.ones_like(d)], axis=1)
+    W = np.sqrt(w)[:, None]
+    a, b = np.linalg.lstsq(A * W, t * W[:, 0], rcond=None)[0]
+
+    metric_disp = a * pred_disp + b
+    metric_disp = np.clip(metric_disp, 1e-6, None)   # keep depth positive
+    return 1.0 / metric_disp           # dense metric depth map
+</code></pre>
+<div class="code-caption">Closed-form scale-and-shift alignment of an affine-invariant depth map to sparse metric returns. The <code>lstsq</code> call solves the two-parameter regression above; weighting by inverse range variance handles lidar noise that grows with distance. This is the baseline referenced throughout the section: dense metric depth from one foundation-model forward pass plus a microsecond fit.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: alignment in one call</h3>
+<p>You do not need to hand-roll even the regression. <code>numpy.linalg.lstsq</code> reduces the normal-equations bookkeeping (building \(A^\top A\), inverting a 2x2, guarding rank deficiency when all returns are coplanar) to the single line above, turning roughly 30 lines of careful linear algebra into 3. For the robust variant, <code>scipy.optimize.least_squares</code> with a soft-L1 loss adds outlier rejection for lidar multipath in one more argument, versus a hundred-line IRLS loop written by hand.</p>
+</div>
+
+<h2>Prompting the network, not just its output</h2>
+
+<p>Global alignment fixes two numbers but cannot repair the bent-surface residual. To do that, the sparse depth has to enter <em>before</em> the network commits, as a conditioning input that reshapes the prediction. Two design families dominate the current frontier. The first is architectural conditioning: encode the sparse metric depth as an extra input channel or a set of tokens and train the model to honor it, so the decoder produces metric, sensor-consistent depth in a single pass. The second is test-time guided sampling on a diffusion depth model (the Marigold family of <a class="cross-ref" href="section-41.4.html">Section 41.4</a>): at each denoising step you nudge the latent toward agreement with the sparse measurements, so no retraining is needed and the sensor acts as a guidance signal on a frozen model. Architectural prompting is faster at inference and sharper at boundaries; guided diffusion is training-free and adapts to any sparse pattern, at the cost of many forward passes per frame.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: prompted and guided metric depth</h3>
+<p><strong>Prompt Depth Anything</strong> (Lin et al., 2024) feeds a low-cost lidar depth map, such as the sparse time-of-flight sensor in a consumer phone, as a prompt into a Depth Anything backbone and outputs accurate 4K metric depth, treating the raw sensor as a steering signal rather than a fusion target. <strong>Marigold-DC</strong> (Viola et al., 2024) casts depth completion as zero-shot guided diffusion: it steers a frozen Marigold model with sparse depth at test time, with no completion-specific training, and generalizes across sensor patterns it never saw. Both report that starting from a foundation prior plus a sparse prompt beats supervised depth-completion networks trained end to end on the target sensor, the clearest current evidence that the prior does the geometry and the sensor only calibrates it. Verify the exact metric numbers against the current papers before quoting them; this is a fast-moving line.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the room-scan feature on a consumer AR headset</h3>
+<p>A wearables team ships a mixed-reality headset whose job is to place virtual furniture that sits flat on the real floor and tucks correctly behind the real sofa. A dense lidar would blow the power and cost budget, so the device carries a cheap time-of-flight module that returns a coarse, noisy depth grid, roughly a few thousand valid points per frame, with holes on dark and specular surfaces. Pure monocular depth from the RGB camera looked crisp but drifted in scale as the user walked, so placed furniture floated or sank. Pure ToF was metric but too sparse to define the sofa's edge, so occlusion masks were ragged. The team fed the ToF grid as a prompt into a depth foundation model. The network kept the sharp sofa boundary from the image; the sparse ToF locked the metric scale frame to frame; and the guided output gave a dense, edge-accurate, metric depth map at headset frame rate. Furniture stopped floating, occlusion edges snapped to the real sofa, and the bill of materials never grew a real lidar. The team logged both the raw ToF and the prompted output, so evaluation compared the two on held-out frames rather than on the frames used to tune the prompt.</p>
+</div>
+
+<h2>Pitfalls: coverage, calibration, and honest evaluation</h2>
+
+<p>Three failure modes recur. First, <strong>spatial coverage bias</strong>: if every sensor return falls on the near floor, the fitted scale is correct underfoot and wrong on the far wall, because you extrapolated an affine correction outside its support. Spread the prompt across depth ranges when you can. Second, <strong>cross-sensor calibration</strong>: the sparse depth lives in the lidar or ToF frame and must be projected into the camera's pixels using an accurate extrinsic transform; a small rotation error smears the prompt onto the wrong pixels and poisons the fit, which is why the calibration discipline of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a> is load-bearing here. Third, <strong>evaluation leakage</strong>: it is tempting to score a prompted model on the same sparse points you used as the prompt, which measures nothing. Hold out a disjoint set of metric returns for evaluation, or evaluate against a denser reference sensor, in the spirit of the leakage-safe protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. The next section makes this measurement rigorous. When the prompted output feeds a larger multi-sensor estimator, treat it as one more observation with its own uncertainty, the fusion view of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take an RGB-D dataset with dense ground-truth depth (for example an indoor scan). Run a zero-shot affine-invariant depth model to get \(\tilde{d}\). Now simulate a sparse sensor by sampling the ground truth at three densities: 50, 500, and 5000 random pixels. For each density, (a) apply the global scale-and-shift alignment from the code above and measure metric error (absolute relative error) on a <em>disjoint</em> held-out set of pixels, and (b) plot error against sample count. Then repeat with a biased sample that only draws from the nearest third of the scene, and explain the gap between the random and biased curves in terms of extrapolation beyond the prompt's support.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>An affine-invariant model needs how many metric sensor returns, in principle, to become metric under a global fit, and why does adding thousands more still improve real predictions?</li>
+<li>Give one concrete reason network-native prompting can beat post-hoc scale-and-shift alignment on the same sparse input.</li>
+<li>Why is it invalid to evaluate a prompted depth model on the exact sensor points used as the prompt, and what are two valid alternatives?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-41.6.html">Section 41.6</a>, we turn the loose talk of "metric error" and "held-out points" into a disciplined evaluation protocol: the standard depth metrics, how zero-shot transfer is measured across datasets a model never trained on, and the leakage traps that make an impressive benchmark number meaningless.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.1: From per-dataset regression to zero-shot metric depth. Building Sensory AI." name="description"/>
+<title>Section 41.1: From per-dataset regression to zero-shot metric depth | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>From per-dataset regression to zero-shot metric depth</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Ask me how far the wall is and I will happily tell you the shape of the whole room. I just cannot tell you it in meters until you tell me which lens you were wearing when you looked."</p>
+<cite>A Monocular AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the depth fundamentals of <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, especially the fact that a single perspective image discards range along each viewing ray, and on the projection and information-loss view of sensing from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. It assumes the deep-network vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> (encoders, decoders, dense prediction) at a conceptual level, and the leakage-safe evaluation discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, since the whole story here is about a model that must work on data it has never seen. The only mathematics you need is least squares and the pinhole relation \(Z = f\,X / x\). Specific architectures and video extensions are deferred to <a class="cross-ref" href="section-41.2.html">Section 41.2</a> onward; this section builds the conceptual scaffold the rest of the chapter hangs on.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why one photograph should not know depth, yet a foundation model does</h3>
+<p>The physical sensors of <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a> all manufacture a second geometric constraint, a baseline, a projected pattern, a clock, to recover the range that projection threw away. Monocular depth estimation refuses that help. It takes one ordinary RGB image and predicts depth at every pixel, which is formally impossible: infinitely many scenes at different scales project to the identical picture. What makes it work anyway is that a network trained on enough of the world learns a <em>prior</em> over plausible scenes: doors are about two meters tall, faces have a typical size, texture shrinks with distance, the ground recedes toward the horizon. The past decade of this field is one long arc from models that learned that prior for exactly one camera and one room type, and collapsed the instant you moved them, to <strong>foundation models</strong> that estimate usable depth zero-shot on any image from any camera. This section is the map of that arc: what broke, which idea fixed it, and why the last and hardest step is putting a number in meters on the answer.</p>
+</div>
+
+<h2>The scale ambiguity, and three flavors of depth</h2>
+<p><strong>What</strong> makes single-image depth ill-posed is one specific unknown: <em>scale</em>. Shrink an entire scene by a factor and move the camera proportionally closer, and the image does not change one pixel. A network can learn the <em>shape</em> of a scene, which surfaces are nearer than which, from shading, texture gradients, and familiar object sizes, but the absolute size of everything is fundamentally unobservable from pixels alone. <strong>Why</strong> this matters is that it splits the entire field into three distinct output products, and confusing them is the most common error newcomers make.</p>
+<ul>
+<li><strong>Relative (ordinal) depth</strong>: only the ordering is trusted. Pixel A is nearer than pixel B. Useful for occlusion and matting, useless for measurement.</li>
+<li><strong>Affine-invariant depth</strong>: the map is correct up to an unknown global scale and shift, \(Z_{\text{true}} = a\,\hat{Z} + b\) for unknown \(a, b\). This is what most robust monocular models actually output. The scene geometry is right; the meter-stick and the zero point are missing.</li>
+<li><strong>Metric depth</strong>: an absolute value in meters at every pixel, ready to fuse with a lidar point or drive a gripper.</li>
+</ul>
+<p><strong>How</strong> you climb from the first rung to the third is the plot of this section, and each step required a different idea.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Scale is not a nuisance; it is the entire problem</h3>
+<p>Almost every design choice in monocular depth foundation models is a stance on the scale ambiguity. Predicting relative depth sidesteps it. Predicting affine-invariant depth quarantines it into two numbers you resolve later. Predicting metric depth confronts it head-on, and the only honest way to confront it is to feed the network the one piece of physics that fixes absolute size: the camera's focal length. A door subtends a certain number of pixels; only the focal length converts that pixel count into a distance. Keep this in mind and the differences between MiDaS, ZoeDepth, Metric3D, and UniDepth in the coming sections stop looking like a zoo of architectures and start looking like different answers to a single question: where does the model get its scale?</p>
+</div>
+
+<h2>The per-dataset regression era, and why it did not travel</h2>
+<p><strong>What</strong> the field did first, starting with Eigen, Puhrsch, and Fergus in 2014, was treat depth as ordinary supervised regression: take an image-and-depth-map dataset, train a network to map one to the other, evaluate on a held-out split of the <em>same</em> dataset. The datasets were NYU Depth v2 (indoor rooms captured with a Kinect) and KITTI (a car roof-rack lidar on German streets). <strong>Why</strong> a naive per-pixel loss failed even here is the scale ambiguity again: two geometrically identical predictions that differ only by a global scale factor should not be penalized differently, so Eigen introduced a <em>scale-invariant</em> loss in log-depth that ignores the constant offset. That was the first acknowledgement that scale is special.</p>
+<p><strong>How</strong> these models broke was brutal and instructive. A network trained on NYU learned the depth statistics of indoor Kinect scenes: the typical size of rooms, the fact that the far wall is rarely past 8 m, the Kinect's own noise and its habit of failing on shiny surfaces. Point it at a street, a forest, or even a different indoor camera and it produced confident nonsense, because it had memorized one sensor's depth distribution rather than a prior over the physical world. This is textbook distribution shift, the failure mode <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> is built around, and it was baked in by evaluating in-distribution. A model that never leaves its home dataset never reveals that it has learned the dataset instead of the task, which is exactly the leakage trap <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> warns against.</p>
+
+<h2>Dataset mixing and the scale-shift-invariant loss</h2>
+<p><strong>What</strong> unlocked generalization was the realization that the cure for learning one dataset is training on many, and the obstacle was that different datasets speak incompatible units. A laser scanner gives metric meters, a stereo movie gives disparity, a structure-from-motion reconstruction gives depth up to an arbitrary per-scene scale, and a synthetic renderer gives yet another convention. You cannot pool them under a metric loss because their numbers do not agree. <strong>Why</strong> MiDaS (Ranftl and colleagues, 2020) could pool a dozen such sources is that it dropped the demand for metric output entirely and trained on <em>affine-invariant</em> targets using a <em>scale-and-shift-invariant</em> (SSI) loss. Before comparing prediction to ground truth, it solves for the best scale and shift aligning them, then penalizes only what remains. Every dataset contributes its scene shapes; none is required to contribute a consistent meter-stick.</p>
+<p><strong>How</strong> this changed the field is hard to overstate: mixing roughly ten datasets under the SSI loss produced the first model that gave good depth <em>zero-shot</em> on images from cameras and scenes it had never encountered, at the cost of only outputting relative geometry. The evaluation protocol shifted with it. The honest metric became <em>zero-shot cross-dataset transfer</em>: train on a pool, test on entirely held-out datasets, aligning scale and shift per image before scoring. The code below is exactly that alignment step, which is both how SSI training compares predictions and how zero-shot depth is evaluated and consumed.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def align_scale_shift(pred, target, mask=None):
+    """Least-squares fit of Z_true ~= a*pred + b, then report aligned error.
+    pred, target: HxW arrays. Solves the 2-parameter affine alignment MiDaS
+    uses so an affine-invariant prediction can be scored against metric depth."""
+    p = pred.ravel(); t = target.ravel()
+    m = np.isfinite(p) & np.isfinite(t) & (t > 0)
+    if mask is not None:
+        m &= mask.ravel().astype(bool)
+    A = np.stack([p[m], np.ones(m.sum())], axis=1)   # columns: pred, 1
+    (a, b), *_ = np.linalg.lstsq(A, t[m], rcond=None)  # closed-form a, b
+    aligned = a * pred + b
+    err = np.abs(aligned[m.reshape(pred.shape)] - target[m.reshape(pred.shape)])
+    return a, b, float(err.mean())
+
+rng = np.random.default_rng(0)
+gt = rng.uniform(1.0, 10.0, size=(120, 160))         # metric depth, meters
+pred = (1.0 / gt) * 2.5 + 0.1                          # a model that outputs disparity
+a, b, mae = align_scale_shift(1.0 / pred, gt)          # invert, then align
+print(f"recovered scale a={a:.3f}  shift b={b:.3f}  aligned MAE={mae:.3f} m")
+# recovered scale a=0.400  shift b=-0.040  aligned MAE=0.000 m
+</code></pre>
+<div class="code-caption">Code 41.1.1: The two-parameter scale-and-shift alignment at the heart of both SSI training and zero-shot evaluation. Because the synthetic "model" here is a perfect affine function of true depth, least squares recovers the exact scale and shift and drives the aligned error to zero, showing precisely what affine-invariant depth does and does not know: the geometry, but not the meters.</div>
+
+<p>Code 41.1.1 makes the affine-invariant contract literal. The model got the scene exactly right, yet without the recovered \(a\) and \(b\) its raw output is not in meters at all. That residual is the last gap the field had to close.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: zero-shot relative depth in five lines</h3>
+<p>Reproducing an SSI-trained model from scratch, the dataset harmonization, the mixing schedule, the affine-invariant loss, is thousands of lines and weeks of training. Loading a pretrained one is five lines through <code>torch.hub</code>: <code>midas = torch.hub.load("intel-isl/MiDaS", "DPT_Large")</code>, fetch its matching transform, run <code>midas(input_batch)</code>, and you have an affine-invariant depth map for any image. The library owns the encoder, the decoder, and the multi-dataset training; you own two decisions, which model size fits your latency budget and how you resolve scale downstream. Build the alignment of Code 41.1.1 by hand once so you know what the output means, then let the hub carry the network.</p>
+</div>
+
+<h2>Closing the last gap: from relative to zero-shot metric</h2>
+<p><strong>What</strong> the current generation adds is the meter-stick, turning affine-invariant depth into absolute metric depth that transfers across cameras. <strong>Why</strong> this is genuinely hard is the key insight above: absolute scale is only recoverable if the model knows the camera's focal length, yet a foundation model must serve a phone, a webcam, and a machine-vision lens whose focal lengths differ by an order of magnitude. Feed a wide-angle image to a model that silently assumes a narrow lens and every distance is wrong by that ratio. <strong>How</strong> the field solves it is the subject of the next two sections, but the shape of the answer is worth stating now: either warp every image into a single <em>canonical camera</em> so the network only ever sees one effective focal length (the Metric3D approach), or predict the camera intrinsics jointly with depth so the model supplies its own scale (the UniDepth approach), or bolt a metric head onto a strong relative backbone (ZoeDepth). Depth Anything, covered next, pushes the relative-depth branch to its limit with enormous unlabeled pretraining and then fine-tunes metric heads on top.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the frontier sits</h3>
+<p>As of 2025 the leading monocular depth foundation models are <strong>Depth Anything v2</strong> (large-scale pseudo-labeled pretraining for robust relative depth, with metric fine-tunes), <strong>Metric3D v2</strong> (a canonical-camera transformation that makes metric depth transfer across intrinsics), and <strong>UniDepth</strong> (joint dense depth and camera prediction from a single image, so no intrinsics need be supplied). <strong>Marigold</strong> reframes the task as image-conditioned diffusion. The open competition among them is no longer whether zero-shot depth is possible, it clearly is, but which route to metric scale is most robust when the lens is unknown, the scene is out of distribution, and the answer has to carry a calibrated uncertainty. Metric3D v2 and UniDepth are detailed in <a class="cross-ref" href="section-41.3.html">Section 41.3</a>; Marigold in <a class="cross-ref" href="section-41.4.html">Section 41.4</a>.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse AMR that only had one camera</h3>
+<p>A robotics team retrofitting autonomous mobile robots for a distribution center inherited a fleet with a single forward RGB camera and no budget for a depth sensor. A per-dataset model trained on indoor NYU-style scenes gave beautiful depth in the demo room and dangerously wrong depth in the tall-racking aisles it had never seen, braking too late because it read the 12 m aisle as an 8 m room. Swapping to a zero-shot foundation model fixed the shape everywhere, but the affine-invariant output still could not say whether an obstacle was 3 m or 5 m away, and a meter of error is the difference between stopping and colliding. The resolution was a metric model given the robot's known factory-calibrated focal length, which pinned the scale, plus a single sparse time-of-flight beam that anchored the shift against drift. That fusion of a monocular foundation model with one cheap ranging sensor is exactly the pattern <a class="cross-ref" href="section-41.5.html">Section 41.5</a> formalizes, and the broader fusion machinery lives in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+</div>
+
+<p>The through-line, then, is a steady removal of assumptions. Per-dataset regression assumed one camera and one scene type. Dataset mixing under an SSI loss removed the scene-type assumption but conceded metric scale. The metric foundation models remove the scale concession by reintroducing the one piece of physics, the focal length, that scale actually depends on. Each step traded a stronger assumption for a wider operating envelope, and calibrated uncertainty on the result, the subject of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, is what makes the wider envelope safe to act on.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: diagnose a depth model by its failure</h3>
+<p>You are handed three monocular depth models as black boxes and one test image of a hallway with a known 4 m end wall. (1) Model A ranks every surface correctly but its raw output has no consistent unit across images; after per-image scale-and-shift alignment its error is tiny. Which of the three flavors is it, and which training idea most likely produced it? (2) Model B is superb on office images and wildly wrong outdoors. Name the failure mode and the evaluation practice that would have exposed it before deployment, citing the relevant chapter. (3) Model C reads the 4 m wall as 4 m on your 50 mm lens but as 2.6 m when you swap to a 28 mm wide-angle lens without telling it. Explain what quantity the model is implicitly assuming and which two design strategies from this section would fix it. (4) Using the error formula from Code 41.1.1's setup, argue why aligning scale and shift per image before scoring is mandatory for Model A but would <em>hide</em> the real defect in Model C.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why can a network never recover absolute metric depth from image pixels alone, and what single external quantity breaks the tie?</p>
+<p>2. What does the scale-and-shift-invariant loss let you do that a plain metric regression loss forbids, and why was that the key to zero-shot generalization?</p>
+<p>3. A model reports strong numbers when trained and tested on KITTI but collapses on NYU. Is this evidence of a good model or a bad evaluation protocol, and what would you measure instead?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-41.2.html">Section 41.2</a>, we open the most widely deployed of these systems, Depth Anything v1 and v2, and see exactly how large-scale pseudo-labeling on tens of millions of unlabeled images pushes zero-shot relative depth to its current ceiling, then extend the story to temporally consistent <em>video</em> depth, where the scale ambiguity acquires a new twist: keeping the meter-stick steady from frame to frame.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

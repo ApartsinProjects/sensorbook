@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.4: Diffusion-based depth (Marigold). Building Sensory AI." name="description"/>
+<title>Section 41.4: Diffusion-based depth (Marigold) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Diffusion-based depth (Marigold)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every other depth net was trained to answer. This one was trained to imagine, and it turns out that a machine that has imagined a billion scenes already knows roughly how far away things are."</p>
+<cite>A Generative AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the affine-invariant depth framing of <a class="cross-ref" href="section-41.1.html">Section 41.1</a> (a model that predicts depth up to an unknown global scale and shift) and the encoder-decoder regressors of <a class="cross-ref" href="section-41.2.html">Section 41.2</a>, against which diffusion depth is the deliberate contrast. It leans on the projection-throws-away-range intuition of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and on the generative-model and latent-diffusion vocabulary introduced for neural fields in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>. Ensemble variance as an uncertainty estimate connects back to <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. You need to know what a denoising diffusion model does at a high level (iteratively turn noise into a sample); the arithmetic here is deliberately light.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why point a text-to-image model at depth</h3>
+<p>The models in the previous sections are <em>discriminative</em>: an image goes in, one depth map comes out, and the network was trained by regression to match ground truth. Marigold makes a different bet. A modern text-to-image diffusion model such as Stable Diffusion has, in the course of learning to paint photorealistic scenes, absorbed an enormous implicit prior about geometry: how surfaces recede, how occlusion works, how a table leg meets a floor. Marigold recovers that latent knowledge by <em>reformatting depth estimation as conditional image generation</em>. Instead of regressing a number, it <em>samples</em> a depth map from the distribution \(p(\text{depth}\mid\text{image})\). This one shift buys three things that regressors struggle to deliver: razor-sharp object boundaries and thin structures, strong zero-shot generalization from only tens of thousands of <em>synthetic</em> training images, and a free uncertainty signal from the spread of multiple samples. The cost is speed, and most of this section is about that tradeoff and how the field erased it.</p>
+</div>
+
+<h2>The core trick: depth as a latent image</h2>
+<p><strong>What</strong> Marigold (Ke et al., CVPR 2024) does is take a frozen pretrained Stable Diffusion v2 and fine-tune it into a depth estimator with minimal surgery. Stable Diffusion already contains two reusable parts: a variational autoencoder (VAE) that compresses a \(512\times512\) image into a small latent grid, and a denoising U-Net that runs the diffusion process in that latent space. Marigold keeps both. <strong>How</strong> it conditions on the input photograph is the whole idea: encode the RGB image to its latent \(\mathbf{z}^{(x)}\) with the frozen VAE, and at every denoising step concatenate that clean image latent with the current noisy depth latent \(\mathbf{z}^{(d)}_t\) along the channel axis. The U-Net therefore always sees the image it must explain while it denoises the depth. The generative process is the standard reverse diffusion,</p>
+$$\mathbf{z}^{(d)}_{t-1} = f_\theta\!\left(\mathbf{z}^{(d)}_{t},\, \mathbf{z}^{(x)},\, t\right),\qquad t = T, T-1,\dots,1,$$
+<p>started from pure Gaussian noise and run down to a clean depth latent that the VAE decoder turns back into a depth map. <strong>Why</strong> depth can ride through an image VAE at all is a small trick: depth is a single channel, so Marigold replicates it into three channels, normalizes it to the VAE's expected range, and treats it exactly like a grayscale picture. Remarkably, the image VAE reconstructs depth maps faithfully without retraining.</p>
+
+<p><strong>When</strong> this becomes practical is thanks to how little data it needs. The fine-tuning set is roughly seventy-four thousand samples drawn entirely from two <em>synthetic</em> datasets, Hypersim (indoor) and Virtual KITTI 2 (driving), where perfect dense ground-truth depth is free. No real depth sensor, no lidar scans, no messy captured data. Because the pretrained prior already knows what the world looks like, a few days of fine-tuning on synthetic geometry is enough to generalize zero-shot to real photographs the model never saw, echoing the leakage-safe, train-on-synthetic discipline this book keeps returning to.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Generative depth gives you uncertainty for free</h3>
+<p>A regressor emits one depth map and cannot tell you where it is guessing. Because Marigold <em>samples</em>, you can run it several times from different noise seeds and get several plausible depth maps. Aligning them (each is affine-invariant, so fit a per-map scale and shift first) and taking the pixelwise mean gives a cleaner estimate, while the pixelwise standard deviation is a spatial uncertainty map: it lights up on transparent glass, mirrors, sky, and far-away regions, exactly the places where a single viewpoint genuinely underdetermines depth. This test-time ensembling is the same philosophy as the deep-ensemble uncertainty of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, obtained here without training a single extra network. Downstream fusion (Section 41.7) can then downweight high-variance pixels instead of trusting them blindly.</p>
+</div>
+
+<h2>The catch, and how the field killed it</h2>
+<p>The original recipe has an obvious weakness: reverse diffusion is iterative. Getting a good map meant running the U-Net for many denoising steps and, for the uncertainty ensemble, repeating that whole loop ten times. That is seconds per image on a strong GPU, hopeless for a robot or a wearable that needs frames now. Three lines of work collapsed this cost, and they matter because they turn a research curiosity into a deployable sensor.</p>
+<p>First, <strong>consistency distillation</strong>: Marigold-LCM applies latent-consistency distillation so a usable depth map appears in one to four steps instead of dozens, a roughly ten-fold speedup with little quality loss. Second, and more surprising, <strong>end-to-end single-step fine-tuning</strong>: the follow-up work "Fine-Tuning Image-Conditional Diffusion Models is Easier than You Think" (Martin Garcia et al., 2024) traced a subtle inference bug in the original pipeline and showed that once fixed, a <em>single</em> deterministic forward pass matches or beats the multi-step sampler. The diffusion machinery was, in the end, a very good <em>initialization</em> rather than a process you must run to completion. Third, <strong>flow matching</strong>: DepthFM (Gui et al., 2024) trains a straight-line transport from image to depth that likewise needs very few function evaluations. The through-line is that the geometric prior lived in the pretrained weights all along; the many-step stochastic sampler was never the point.</p>
+
+<figure>
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Marigold pipeline: an RGB image is encoded to a latent that conditions a denoising U-Net, which turns noise into a depth latent, decoded to a depth map.">
+<style>
+  .b1 { fill: var(--callout-key-insight-bg, #e8f0fe); stroke: var(--text-color, #333); stroke-width: 1.5; }
+  .b2 { fill: var(--callout-practical-bg, #eafaf1); stroke: var(--text-color, #333); stroke-width: 1.5; }
+  .t  { fill: var(--text-color, #222); font-family: sans-serif; font-size: 12px; text-anchor: middle; }
+  .ts { fill: var(--text-color, #222); font-family: sans-serif; font-size: 10.5px; text-anchor: middle; }
+  .ar { stroke: var(--text-color, #333); stroke-width: 1.6; fill: none; marker-end: url(#a41); }
+</style>
+<defs><marker id="a41" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--text-color,#333)"/></marker></defs>
+<rect class="b1" x="20"  y="95" width="90" height="46" rx="5"/><text class="t" x="65"  y="115">RGB image</text><text class="ts" x="65" y="132">input</text>
+<rect class="b1" x="150" y="95" width="90" height="46" rx="5"/><text class="t" x="195" y="115">frozen VAE</text><text class="ts" x="195" y="132">encoder</text>
+<rect class="b2" x="300" y="80" width="120" height="76" rx="5"/><text class="t" x="360" y="108">denoising</text><text class="t" x="360" y="126">U-Net</text><text class="ts" x="360" y="144">1&#8211;few steps</text>
+<rect class="b1" x="480" y="95" width="90" height="46" rx="5"/><text class="t" x="525" y="115">frozen VAE</text><text class="ts" x="525" y="132">decoder</text>
+<rect class="b2" x="610" y="95" width="90" height="46" rx="5"/><text class="t" x="655" y="115">depth map</text><text class="ts" x="655" y="132">output</text>
+<line class="ar" x1="110" y1="118" x2="150" y2="118"/>
+<line class="ar" x1="240" y1="118" x2="300" y2="118"/>
+<text class="ts" x="270" y="110">image latent (condition)</text>
+<line class="ar" x1="420" y1="118" x2="480" y2="118"/>
+<line class="ar" x1="570" y1="118" x2="610" y2="118"/>
+<text class="t" x="360" y="40" font-weight="bold">Marigold: depth estimation as conditional latent generation</text>
+<text class="ts" x="360" y="60">noise in, depth latent out; the image latent steers every step</text>
+<line class="ar" x1="360" y1="200" x2="360" y2="158"/>
+<text class="ts" x="360" y="215">Gaussian noise seed (resample &#8594; ensemble &amp; uncertainty)</text>
+</svg>
+<figcaption>Marigold reuses a frozen image VAE and denoising U-Net; only the U-Net is fine-tuned to denoise a depth latent conditioned on the input image latent. Reseeding the noise yields an ensemble whose spread is an uncertainty map.</figcaption>
+</figure>
+<p>The pipeline in the figure makes the reuse explicit: the two VAE blocks are lifted unchanged from Stable Diffusion, and only the U-Net learns to speak depth.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Sharp boundaries where a surgeon needs them</h3>
+<p>A minimally invasive surgery research group builds a monocular depth channel for a laparoscopic endoscope, aiming to overlay a pre-operative CT model onto the live view. Discriminative depth models, trained largely on driving and indoor scenes, smear the boundary between a glistening organ and the instrument tip into a soft ramp, and the overlay drifts by millimeters at exactly the edges that matter. Swapping in a Marigold-family model changes the character of the error: the strong generative prior produces crisp, well-localized depth discontinuities along tool and tissue silhouettes, and the wet, specular highlights that wreck stereo matching are hallucinated over plausibly rather than left as holes. The team runs the single-step end-to-end variant to hold a real-time frame rate, and uses the ensemble variance from a slower offline pass to flag frames where reflections make the depth untrustworthy, so the navigation system can suppress the overlay instead of pointing the surgeon at a confident-looking mistake.</p>
+</div>
+
+<h2>Running it, and when to reach for it</h2>
+<p>Because Marigold ships in the Hugging Face <code>diffusers</code> library as a first-class pipeline, using it is short. The snippet below loads the distilled latent-consistency checkpoint, runs it in a handful of steps, and asks for a small ensemble so we also get an uncertainty map.</p>
+
+<pre><code class="language-python">import torch
+import diffusers
+
+# Distilled few-step checkpoint from the ETH Photogrammetry group.
+pipe = diffusers.MarigoldDepthPipeline.from_pretrained(
+    "prs-eth/marigold-depth-lcm-v1-0",
+    variant="fp16", torch_dtype=torch.float16,
+).to("cuda")
+
+image = diffusers.utils.load_image("scene.jpg")
+
+out = pipe(
+    image,
+    num_inference_steps=4,      # LCM: a few steps, not dozens
+    ensemble_size=5,            # resample to estimate uncertainty
+    output_uncertainty=True,
+)
+
+depth = out.prediction          # affine-invariant depth, HxW in [0, 1]
+sigma = out.uncertainty         # per-pixel std across the ensemble
+depth_png = pipe.image_processor.visualize_depth(depth)[0]
+depth_png.save("depth.png")
+</code></pre>
+<div class="code-caption">Zero-shot affine-invariant depth plus a per-pixel uncertainty map in about a dozen lines. The prediction is defined only up to an unknown scale and shift; recovering metric depth needs the anchoring of Section 41.5 or a known reference. The <code>uncertainty</code> field is the ensemble spread discussed in the key-insight callout.</div>
+
+<p>The output is affine-invariant, so it is ideal for tasks that care about relative geometry (matting, relighting, novel-view synthesis, obstacle ordering) and must be anchored before it can report meters. <strong>When</strong> to choose diffusion depth over the regressors of the previous sections comes down to three questions. Do crisp boundaries and thin structures matter more than raw throughput? Do you need calibrated-ish uncertainty without training an ensemble of networks? Is your domain far from any real depth dataset, so a strong pretrained prior beats a supervised regressor? If yes, Marigold-family models are the right tool. If you need metric depth out of the box or the tightest latency on a microcontroller, the metric and distilled feed-forward models of <a class="cross-ref" href="section-41.3.html">Section 41.3</a> remain the safer default.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">State of the art and open threads</h3>
+<p>As of 2026 the strongest results in this family come from the single-step end-to-end fine-tuned Marigold variant and from flow-matching approaches such as DepthFM, both of which match multi-step sampling at a fraction of the cost. The same fine-tune-a-generator recipe now produces surface normals, intrinsic-image decomposition, and, via video diffusion backbones, temporally consistent depth for clips (a thread picked up in Section 41.2). Open questions that matter for sensing: turning the ensemble spread into <em>calibrated</em> uncertainty (Chapter 18), grounding the affine-invariant output to metric scale without a separate model, and shrinking these billion-parameter priors enough for the edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The library does the diffusion plumbing</h3>
+<p>A from-scratch Marigold inference stack means wiring the VAE encode and decode, the U-Net conditioning concatenation, an LCM or DDIM scheduler, the affine alignment across ensemble members, and depth colorization: comfortably 250 to 400 lines of careful PyTorch, plus the checkpoint-loading glue. The <code>diffusers</code> <code>MarigoldDepthPipeline</code> collapses all of it to the roughly twelve lines above, a better than 20x reduction, and it handles fp16 casting, tiling for large images, scheduler selection, and the ensemble statistics for you. You write the two lines that state <em>how many steps</em> and <em>how many samples</em>; the library owns everything between noise and a colorized depth PNG.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: does imagination cost accuracy?</h3>
+<p>Take twenty photographs that include hard cases (a chain-link fence, a potted plant with thin stems, a glass door, a distant skyline). Run three models on each: a Depth Anything v2 regressor (Section 41.2), Marigold with <code>num_inference_steps=1</code>, and Marigold with <code>num_inference_steps=10, ensemble_size=10</code>. Since all three are affine-invariant, align each prediction to the others with a least-squares scale-and-shift fit before comparing. (1) Where does the diffusion model produce visibly sharper boundaries, and where does it hallucinate structure the regressor correctly leaves flat? (2) Plot per-image the Marigold uncertainty map against your subjective difficulty ranking: does the spread track the genuinely ambiguous regions (sky, glass)? (3) Measure wall-clock latency for the three settings and state, for a wearable at 15 frames per second, which one you would actually ship.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Marigold fine-tunes a text-to-image diffusion model on only about seventy-four thousand <em>synthetic</em> RGB-D samples yet generalizes to real photos. Which property of the base model makes such a tiny, synthetic-only training set sufficient?</li>
+<li>A discriminative regressor cannot natively report where it is uncertain, but Marigold can. What is the mechanism, and why does it require no extra trained networks?</li>
+<li>Later work showed a single deterministic forward pass matches multi-step sampling. What does that reveal about where the geometric prior actually lives, and why is it good news for deployment latency?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-41.5.html">Section 41.5</a>, we confront the one thing every model in this chapter so far has refused to give us: absolute scale. We look at sensor-prompted depth, where a handful of sparse lidar or radar returns are fed into the network as a prompt, turning a beautiful but scale-free relative map into metric depth you can actually navigate by.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

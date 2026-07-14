@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.6: Depth uncertainty. Building Sensory AI." name="description"/>
+<title>Section 40.6: Depth uncertainty | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>Depth uncertainty</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I can tell you the wall is three meters away. I cannot tell you it is not four, and at thirty meters I can barely tell you it is a wall."</p>
+        <cite>A Farsighted AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the depth-sensing geometry of <a class="cross-ref" href="section-40.1.html">Section 40.1</a> (stereo, structured light, time-of-flight) and the point-cloud representation of <a class="cross-ref" href="section-40.2.html">Section 40.2</a>. The probability you need, variance, covariance, and first-order error propagation, is developed from scratch in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the calibration language returns in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A depth map that reports a bare number per pixel is lying by omission. Every depth estimate carries an error that is not uniform across the frame: it is small up close and grows without mercy with range, it explodes at object edges, and it collapses entirely on shiny or dark surfaces. A perception stack that treats a point three meters away and a point thirty meters away as equally trustworthy will eventually drive into the thing it could not see. This section makes depth uncertainty a first-class quantity: where it comes from, how to compute it per pixel and per 3D point, and how to hand it downstream so that fusion and planning can weigh each measurement by how much it deserves.</p>
+    </div>
+
+    <h2>Where depth uncertainty comes from</h2>
+    <p>Each depth modality has its own error signature, and knowing the signature is the difference between trusting a reading and being fooled by it. <strong>Stereo</strong> recovers depth by matching a pixel in the left image to its partner in the right, then triangulating; its uncertainty is dominated by how precisely that match can be localized, the disparity error. <strong>Structured light</strong> projects a known pattern and reads its deformation, so it fails on surfaces that swallow or scatter the pattern (black fabric, hair, bright sunlight washing out the projector). <strong>Time-of-flight</strong> measures the round-trip of emitted light and suffers from <em>multipath</em>: light that bounces off a corner before returning inflates the measured range, quietly rounding off sharp concave geometry. Across all three, three failure families recur: <em>range-dependent</em> noise that grows with distance, <em>edge</em> error where a pixel straddles a foreground and background at wildly different depths (the "flying pixels" and "edge fattening" you see as a halo around objects), and <em>invalid</em> regions where the sensor simply returns no answer and marks the pixel as a hole.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Depth error is not a single scalar you can staple to a sensor's datasheet. It is a field that varies pixel by pixel and, above all, with distance. For triangulating sensors the range term dominates everything else, and it grows <em>quadratically</em>: doubling the distance to a target roughly quadruples the depth uncertainty. Any system that budgets a fixed centimeter tolerance regardless of range is budgeting for the wrong sensor.</p>
+    </div>
+
+    <h2>The quadratic law of stereo depth error</h2>
+    <p>The quadratic growth is worth deriving because it governs so much downstream design. A calibrated stereo pair with focal length \(f\) (in pixels) and baseline \(B\) (the spacing between the two cameras) recovers depth \(Z\) from disparity \(d\) (in pixels) by</p>
+    \[ Z = \frac{f B}{d}. \]
+    <p>Depth is inversely proportional to disparity, and that inverse is the whole story. The matcher does not localize disparity perfectly; it has some standard deviation \(\sigma_d\), typically a fraction of a pixel for a good algorithm. Propagating that uncertainty to depth is a one-line application of the first-order rule from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, \(\sigma_Z \approx \lvert dZ/dd \rvert \, \sigma_d\). Differentiating,</p>
+    $$ \sigma_Z \approx \frac{fB}{d^2}\,\sigma_d = \frac{Z^2}{fB}\,\sigma_d. $$
+    <p>There it is: depth uncertainty scales as \(Z^2\). A sub-pixel matcher that is superb at two meters is nearly useless at twenty, because the same \(\sigma_d\) is multiplied by a hundredfold larger factor. The two levers you control are baseline \(B\) (wider cameras see depth more sharply, which is why autonomous trucks mount stereo rigs a meter apart) and matcher precision \(\sigma_d\). Neither lever beats the geometry: past some range every passive stereo rig runs out of resolution, and that range is where you switch to lidar or radar. Listing 40.6 evaluates the law for a realistic rig and prints the depth error at several distances.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+f, B = 700.0, 0.12          # focal length (px), baseline (m)
+sigma_d = 0.2               # sub-pixel disparity std (px)
+
+Z = np.array([2.0, 5.0, 10.0, 20.0, 40.0])   # target ranges (m)
+sigma_Z = (Z**2 / (f * B)) * sigma_d          # propagated depth std (m)
+
+for z, s in zip(Z, sigma_Z):
+    print(f"range {z:5.1f} m  ->  depth std {s*100:6.1f} cm  ({100*s/z:4.1f}% of range)")
+</code></pre>
+    <div class="code-caption"><strong>Listing 40.6.</strong> Propagating a fixed 0.2-pixel disparity uncertainty through \(Z = fB/d\). The printed table shows depth error climbing from under 1 cm at 2 m to roughly 3.8 m at 40 m: the same sensor is centimeter-accurate up close and useless far away, purely because of the \(Z^2\) term.</div>
+
+    <p>Running Listing 40.6 makes the abstraction visceral: the relative error \(\sigma_Z / Z\) itself grows linearly with range, so a stereo rig that is accurate to a fraction of a percent nearby degrades to tens of percent at distance. This is why depth confidence must travel with the depth value, never be assumed constant.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Deriving \(dZ/dd\) by hand is fine for one equation, but real pipelines chain many noisy quantities (calibrated \(f\), \(B\), rectification residuals, disparity), and hand-propagating a covariance through all of them is where sign errors creep in. The <code>uncertainties</code> package tracks the derivatives for you: wrap each input as a value-with-error and every downstream expression carries a correctly propagated standard deviation automatically.</p>
+        <pre class="language-python"><code class="language-python">from uncertainties import ufloat
+f, B = 700.0, 0.12
+d = ufloat(24.0, 0.2)        # disparity: 24 px, +/- 0.2 px
+Z = f * B / d               # -> 3.50+/-0.03 m, error propagated for free
+</code></pre>
+        <div class="code-caption"><strong>Listing 40.6b.</strong> One <code>ufloat</code> per uncertain input replaces roughly a dozen lines of manual partial-derivative bookkeeping; the library computes and combines every gradient, so the depth automatically prints as a value with its propagated one-sigma error.</div>
+    </div>
+
+    <h2>From per-pixel variance to a 3D covariance</h2>
+    <p>A depth pixel does not live alone; it back-projects to a 3D point, and that point has uncertainty in all three axes, not just along the ray. The lateral position of a point at pixel \((u, v)\) is \(X = (u - c_x)\,Z / f\), so lateral error inherits both the pixel-localization error and, again, the depth error. The clean way to carry this forward is a \(3 \times 3\) covariance matrix \(\Sigma\) per point, an ellipsoid of doubt that is stretched long along the viewing ray and thin across it. For a frontal stereo point that ellipsoid is a needle pointing back at the camera: you know <em>where on the image plane</em> the point sits far better than you know <em>how far</em> it is. Preserving that anisotropy matters, because collapsing it to a single radius throws away exactly the structure that fusion exploits. When a lidar return (accurate in range, coarser in angle) meets a stereo point (accurate across the ray, vague along it), a <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Bayesian fuser</a> multiplies the two ellipsoids and lands on a tight estimate neither sensor could produce alone. That is the entire payoff of tracking covariance instead of a scalar.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: automotive stereo and the phantom brake</h3>
+        <p>A driver-assistance stereo camera on a highway watches a stationary truck ahead. At 15 m the depth error is a few centimeters and the system tracks the truck cleanly. As the gap opens to 45 m the very same rig, with the very same 0.2-pixel matcher, now reports depth with a spread of several meters. Frame to frame the estimated range jitters by a car length, and a naive time-to-collision computation reads that jitter as sudden closing speed. Systems that ignored the range-dependent variance became infamous for <em>phantom braking</em>: hard, unprompted stops triggered by depth noise the software treated as signal. The fix is not a better camera; it is feeding the \(Z^2\) uncertainty into the tracker so a wildly uncertain far-range reading updates the estimate gently, and only a confident near-range reading is allowed to slam the brakes.</p>
+    </div>
+
+    <h2>Confidence maps, holes, and learned uncertainty</h2>
+    <p>Modern depth sensors and networks rarely make you derive uncertainty from scratch; they emit it. Commercial depth cameras ship a per-pixel <strong>confidence map</strong> alongside the depth frame, and a hard rule of working with them is to mask out low-confidence and zero (invalid) pixels <em>before</em> any averaging or plane fitting, because a single flying pixel at a depth edge can drag a fitted surface by meters. Learned monocular and stereo networks go further and predict uncertainty directly, and the vocabulary from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> applies cleanly here: <em>aleatoric</em> uncertainty is the irreducible sensor and scene noise (a textureless white wall gives stereo nothing to match, so its depth is genuinely ambiguous), while <em>epistemic</em> uncertainty is the model's own ignorance on inputs unlike its training data. The distinction is practical: aleatoric error you must plan around, epistemic error you can often reduce with more or better-matched training data. The one discipline that ties this section together, whether the number comes from a datasheet, a first-order derivation, or a network head, is that a depth estimate without an accompanying uncertainty is not yet usable for any decision that matters.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the rig in Listing 40.6 (\(f = 700\) px, \(B = 0.12\) m, \(\sigma_d = 0.2\) px). (a) At what range does the depth standard deviation first exceed 10% of the true range? (b) You are allowed to double exactly one of \(B\) or \(f\); which choice pushes that range farther out, and why does the answer follow directly from \(\sigma_Z = Z^2 \sigma_d / (fB)\)? (c) A competing rig halves \(\sigma_d\) to 0.1 px instead. Compare its 40 m depth error to the doubled-baseline design and state which lever bought more accuracy at long range.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does stereo depth uncertainty grow with the square of range while disparity uncertainty stays roughly constant?</p>
+        <p class="quiz-question">2. What does the 3D covariance ellipsoid of a distant frontal stereo point look like, and why is collapsing it to a single radius a mistake before sensor fusion?</p>
+        <p class="quiz-question">3. Distinguish aleatoric from epistemic depth uncertainty with one concrete scene example of each, and say which one more training data can reduce.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-40.7.html">Section 40.7</a>, we put these fundamentals to work: how robots and augmented-reality systems consume depth and its uncertainty to grasp objects, avoid obstacles, and anchor virtual content to the physical world, and why a metric depth map that lies about its own confidence is worse than one that admits what it does not know.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

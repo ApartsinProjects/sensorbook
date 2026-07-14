@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.6: Evaluation and zero-shot transfer. Building Sensory AI." name="description"/>
+<title>Section 41.6: Evaluation and zero-shot transfer | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Monocular Depth Foundation Models</a></div>
+<h1>Evaluation and zero-shot transfer</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Tell me which datasets you never trained on, and I will tell you whether your depth model can see."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>A monocular depth foundation model earns the word "foundation" only if it works on cameras, scenes, and lighting it was never trained on. That claim is not decided by a training loss; it is decided by a measurement protocol. This section is about that protocol: how to align a scale-ambiguous prediction to ground truth, which error metrics actually reward good geometry, how the zero-shot cross-dataset evaluation that made MiDaS and Depth Anything credible is run, and how leakage quietly inflates the numbers. Get the protocol wrong and a mediocre model looks state of the art; get it right and you can trust a depth map before it ever touches a robot or a car.</p>
+</div>
+
+<p>This section assumes you have met the models themselves (<a class="cross-ref" href="section-41.2.html">Section 41.2</a> through <a class="cross-ref" href="section-41.5.html">Section 41.5</a>) and the geometry of depth from <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>. It leans on two running threads of this book: leakage-safe evaluation, treated in general in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, and distribution shift, treated in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. The novelty here is the depth-specific twist: the prediction and the ground truth do not live in the same units.</p>
+
+<h2>Why depth evaluation needs alignment first</h2>
+<p>Most monocular foundation models predict <em>affine-invariant</em> depth or, more precisely, affine-invariant inverse depth (disparity). The network fixes the <em>shape</em> of the scene but leaves an unknown global scale \(s\) and shift \(t\). This is not sloppiness; it is what the data supports. A single image of a room and the same image of a doll house are pixel-identical, so no monocular model can recover absolute metric scale without a prior on the camera or the scene (that is exactly what the metric and camera-aware models of <a class="cross-ref" href="section-41.3.html">Section 41.3</a> add). Evaluation therefore has to remove the degrees of freedom the model was never asked to predict, or every metric collapses to "you guessed the wrong scale."</p>
+
+<p>The standard fix is a least-squares scale-and-shift alignment, computed per image in inverse-depth space. Let \(d_i\) be predicted disparity and \(d^{*}_i = 1/z^{*}_i\) the ground-truth disparity at valid pixels. Solve</p>
+$$ (s, t) = \arg\min_{s,t} \sum_i \big(s\,d_i + t - d^{*}_i\big)^2, $$
+<p>then compare the aligned prediction \(\hat{z}_i = 1/(s\,d_i + t)\) against \(z^{*}_i\). For models that claim metric output you skip the shift and use only a single scale (often the ratio of medians, which is robust to outliers). Aligning in inverse-depth space matters: it weights near geometry, where disparity is large, the way stereo and structure-from-motion errors actually behave.</p>
+
+<h2>The metrics that reward geometry</h2>
+<p>Once aligned, report a small standard panel rather than a single number, because different metrics catch different failures. The workhorses are absolute relative error and the threshold accuracies:</p>
+$$ \text{AbsRel} = \frac{1}{N}\sum_i \frac{|\hat{z}_i - z^{*}_i|}{z^{*}_i}, \qquad \delta_k = \frac{1}{N}\Big|\big\{ i : \max\!\big(\tfrac{\hat{z}_i}{z^{*}_i}, \tfrac{z^{*}_i}{\hat{z}_i}\big) < 1.25^{\,k} \big\}\Big|. $$
+<p>AbsRel is scale-relative, so a 10 cm error at 1 m is penalized like a 1 m error at 10 m, which matches how depth uncertainty grows with range. The \(\delta_1\) accuracy (the fraction of pixels within a 25 percent ratio band) is the headline number for zero-shot leaderboards because it is intuitive and bounded in \([0,1]\). Alongside them, the scale-invariant log error (SILog, from Eigen's early work) penalizes the <em>relative</em> structure of the depth map while ignoring global scale, and boundary or edge-accuracy metrics (F-score on depth discontinuities) expose the blurring that pixel-averaged errors hide. For video depth from <a class="cross-ref" href="section-41.2.html">Section 41.2</a>, add a temporal metric such as optical-flow-based warping error or temporal alignment error, since a per-frame-accurate model can still flicker unusably.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Alignment and metric are a matched pair, and quoting one without the other is meaningless. "AbsRel 0.043" after per-image scale-and-shift alignment and "AbsRel 0.043" after a single global median scale are different claims about a different capability. A number-by-number audit that ignores the alignment protocol will happily compare a per-image-aligned relative model against a truly metric model and declare a false winner. Co-report the alignment, the valid-pixel mask, the depth cap (for example 80 m on driving scenes), and the metric, computed in one pass on one split.</p>
+</div>
+
+<h2>The zero-shot cross-dataset protocol</h2>
+<p>Zero-shot transfer is the property that made these models a paradigm shift, so it needs its own protocol. The recipe, established by MiDaS and inherited by Depth Anything, Metric3D, and Marigold, is: train on a large mixture of datasets, then evaluate on a set of benchmark datasets that are held entirely out of training. The classic held-out suite spans indoor and outdoor, real and synthetic: NYU Depth v2 and ScanNet (indoor RGB-D), KITTI (driving lidar), ETH3D and DIODE (high-precision laser scans), and Sintel (synthetic film). Because none of these appear in training, a strong score is evidence of genuine transfer rather than memorization. This is a stricter bar than the per-dataset regime of <a class="cross-ref" href="section-41.1.html">Section 41.1</a>, where train and test come from the same distribution and a model can overfit the sensor's quirks.</p>
+
+<p>Two disciplines make or break the protocol. First, use each benchmark's own evaluation crop, cap, and mask; NYU uses the Eigen crop, KITTI uses the Garg crop, and comparing across inconsistent crops is a classic silent error. Second, guard against leakage, which for image data is subtle. The same building photographed for two datasets, frames sampled from a shared video source, or a synthetic asset reused across corpora can put near-duplicates on both sides of the train/test line. Perceptual near-duplicate detection over the training mixture and the held-out sets, in the spirit of the leakage-safe pipeline in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, should be a gate, not an afterthought.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: qualifying a depth model for a warehouse AMR</h3>
+<p>A robotics team wants to drop a monocular depth foundation model onto an autonomous mobile robot (AMR) that navigates a warehouse, replacing a costly stereo rig. Their aisles, wrapped pallets, and sodium-vapor lighting appear in no public dataset, which is the point: the model must transfer. They collect a 500-frame validation set with a survey-grade lidar as ground truth, align each prediction with a single median scale (the robot knows its own camera height, so a metric model is preferable), and report AbsRel and \(\delta_1\) capped at 12 m. The uncomfortable finding is that \(\delta_1\) is a healthy 0.94 overall but drops to 0.61 on the thin, specular shrink-wrap that reflective pallets are covered in, precisely the surfaces a robot must not clip. The pixel-averaged number hid a safety-critical failure mode that a per-surface breakdown surfaced. They add a confidence gate and a sparse time-of-flight sensor for those regions rather than trusting the global score.</p>
+</div>
+
+<h2>Running the evaluation yourself</h2>
+<p>The core of the protocol is short. The function below performs least-squares scale-and-shift alignment in disparity space and then computes AbsRel and \(\delta_1\) on the valid, capped pixels, which is exactly what a zero-shot leaderboard entry does per image before averaging.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def align_and_score(pred_disp, gt_depth, mask, max_depth=80.0):
+    """Affine-align predicted disparity to metric depth, then score."""
+    valid = mask & (gt_depth > 1e-3) & (gt_depth < max_depth)
+    gt_disp = 1.0 / gt_depth[valid]
+    d = pred_disp[valid]
+
+    # Least-squares fit of s, t so that s*d + t approximates gt_disp.
+    A = np.stack([d, np.ones_like(d)], axis=1)
+    s, t = np.linalg.lstsq(A, gt_disp, rcond=None)[0]
+
+    pred_depth = 1.0 / np.clip(s * d + t, 1e-6, None)
+    gt = gt_depth[valid]
+
+    abs_rel = np.mean(np.abs(pred_depth - gt) / gt)
+    ratio = np.maximum(pred_depth / gt, gt / pred_depth)
+    delta1 = np.mean(ratio < 1.25)
+    return {"AbsRel": float(abs_rel), "delta1": float(delta1)}
+</code></pre>
+<div class="code-caption">Per-image scale-and-shift alignment followed by the two headline zero-shot metrics. The <code>max_depth</code> cap and the <code>valid</code> mask are part of the protocol, not optional hygiene: change them and the numbers move.</div>
+
+<p>This is fine for understanding the mechanics, but reproducibility demands the exact per-benchmark crops, caps, and masks, which are easy to get subtly wrong by hand.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>Rolling your own loop over six benchmarks, each with its own crop and cap, is roughly 300 to 400 lines and a rich source of off-by-one crop bugs. Evaluation harnesses such as the reference Depth Anything and MiDaS evaluation scripts, and metric libraries like <code>torchmetrics</code> for the depth metrics, collapse a full zero-shot sweep to about 15 lines: you pass a model and a benchmark name, and the harness applies the canonical crop, mask, alignment mode, and metric panel for you. The line you must still write yourself is the leakage check between your training mixture and the held-out sets; no library knows what you trained on.</p>
+</div>
+
+<h2>Calibration, uncertainty, and honest reporting</h2>
+<p>A depth number without an error bar is a liability in any control loop. Foundation models are typically overconfident on out-of-distribution inputs, so pair the accuracy panel with a calibration view: bin pixels by predicted confidence (or, for the diffusion models of <a class="cross-ref" href="section-41.4.html">Section 41.4</a>, by the ensemble variance across samples) and check that stated uncertainty tracks realized error. The conformal-prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> gives distribution-free depth intervals with a coverage guarantee, which is far more useful to a downstream planner than a bare point estimate. Report per-range and per-surface breakdowns as a matter of course, since global averages, as the warehouse story showed, launder the failures that matter most.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take one held-out benchmark (NYU Depth v2 is convenient) and a public monocular depth model. Compute \(\delta_1\) three ways: (a) with per-image scale-and-shift alignment, (b) with a single global median scale only, and (c) with no alignment at all. Explain the ordering of the three numbers, and identify which one a metric-depth model should be judged by and why. Then re-run (a) after artificially injecting five near-duplicate training images into the test set and quantify how much \(\delta_1\) inflates.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why must affine-invariant predictions be aligned before scoring, and why is the alignment done in inverse-depth rather than depth space?</li>
+<li>What does the \(1.25\) in the \(\delta_1\) metric represent, and why is a ratio-band threshold preferable to an absolute-error threshold for depth?</li>
+<li>Name two ways image-level leakage can slip into a zero-shot depth benchmark, and one guard against each.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-41.7.html">Section 41.7</a>, we stop measuring depth foundation models in isolation and wire them into a working sensing stack: feeding aligned, uncertainty-tagged depth into fusion, SLAM, and planning, and deciding when a monocular prior is enough and when it must be anchored by lidar, radar, or a metric camera model.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

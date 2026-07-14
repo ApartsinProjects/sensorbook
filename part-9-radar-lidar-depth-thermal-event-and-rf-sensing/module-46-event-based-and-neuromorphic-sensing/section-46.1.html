@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.1: Event cameras and asynchronous sensing. Building Sensory AI." name="description"/>
+<title>Section 46.1: Event cameras and asynchronous sensing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Event-Based and Neuromorphic Sensing</a></div>
+<h1>Event cameras and asynchronous sensing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A normal camera sends me a postcard every 33 milliseconds whether or not anything happened. An event camera only ever whispers, and only when the world moves. My hardest lesson was that silence is data too."</p>
+<cite>A Sparsely Awake AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section leans on the sampling and timing vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>: an event camera abandons the fixed global clock of Nyquist-rate frame capture in favour of asynchronous, per-pixel <em>level-crossing</em> sampling, so the ideas of sample timing, jitter, and synchronization return here in an unfamiliar guise. It also builds on the forward-model discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: the sensor does not report brightness, it reports the <em>logarithm of a brightness change</em>, and everything downstream is an inference from that. You need comfort with logarithms and thresholds, and the sensor-noise mindset of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. No prior exposure to neuromorphic hardware is assumed; that arrives in <a class="cross-ref" href="section-46.5.html">Section 46.5</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a camera that sees nothing until something changes</h3>
+<p>Every conventional camera in this book, thermal (<a class="cross-ref" href="../module-45-thermal-infrared-and-multispectral-sensing/index.html">Chapter 45</a>) or visible, shares one wasteful habit: it reads out the entire sensor array on a fixed clock, resending millions of pixels that did not change since the last frame. That design caps temporal resolution at the frame rate, blurs fast motion, saturates under bright light, and burns power on redundancy. An <em>event camera</em> (also called a dynamic vision sensor, DVS) throws the global shutter away. Each pixel runs its own analog circuit and fires an <em>event</em> the instant its brightness changes by a set amount, timestamped to the microsecond, independently of every other pixel. The result is a sparse, asynchronous stream instead of a dense frame sequence: microsecond latency, dynamic range beyond 120 dB, no motion blur, and power in the milliwatt range for static scenes. This section explains what an event physically is, the generative model that produces it, and where the modality wins and loses. It is the foundation for the representations (<a class="cross-ref" href="section-46.2.html">Section 46.2</a>), reconstruction networks (<a class="cross-ref" href="section-46.3.html">Section 46.3</a>), and edge deployments (<a class="cross-ref" href="section-46.7.html">Section 46.7</a>) that follow.</p>
+</div>
+
+<h2>What an event is: the pixel-level generative model</h2>
+<p><strong>What</strong> each pixel tracks is not intensity but its logarithm, \(L(x,y,t) = \log I(x,y,t)\). A pixel remembers the log-intensity at which it last fired, \(L(x,y,t_{\text{prev}})\), and emits an event the moment the change crosses a contrast threshold \(C\):</p>
+$$ L(x,y,t) - L(x,y,t_{\text{prev}}) = p\,C, \qquad p \in \{+1,-1\}. $$
+<p>Each event is a four-tuple \(e_k = (x_k, y_k, t_k, p_k)\): pixel coordinates, a microsecond timestamp, and a <em>polarity</em> bit that says whether the log-intensity rose (ON) or fell (OFF). <strong>Why</strong> the logarithm matters is that a fixed \(\Delta L\) corresponds to a fixed <em>fractional</em> change in light, so the pixel responds to <em>contrast</em> rather than absolute brightness. That single choice buys the enormous dynamic range: a threshold on relative change works identically in deep shade and direct sun, whereas a linear sensor with fixed full-well capacity clips. <strong>How</strong> the stream behaves in practice: because \(\log I\) barely moves where nothing happens, a static scene under constant light produces almost no events, while a moving edge produces a thin, fast-moving ribbon of ON and OFF events tracing the brightness gradient. Events are, in effect, a sparse spatiotemporal sampling of the image's temporal derivative along moving edges.</p>
+
+<p>A crucial consequence follows from the model: <strong>an event camera is blind to a perfectly static scene</strong>. With no relative motion between camera and world and no illumination change, \(L\) is constant and no pixel ever crosses its threshold. Information lives entirely in change. This is the mirror image of a frame camera, which reports the static scene faithfully and struggles with fast change. The two sensors are complementary rather than competing, which is exactly why the DAVIS design and the fusion strategies of <a class="cross-ref" href="section-46.6.html">Section 46.6</a> pair an event stream with occasional intensity frames.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Bandwidth follows the scene, not a clock</h3>
+<p>The deepest shift an event camera demands is giving up the idea of a frame rate. There is no rate. A pixel staring at a blank wall costs nothing; a pixel watching a spinning fan blade fires thousands of times a second. The data volume is <em>data-dependent</em>, set by scene dynamics rather than a designer's clock, so a single sensor spans a static corridor and a 10,000-frame-per-second equivalent motion within one recording. This is why the modality's headline latency (single-digit microseconds from photon change to output event) is real rather than marketing: there is no exposure window to wait out and no readout scan to complete, so the sensor never smears fast motion into a blur the way a rolling shutter does. It also means throughput is unpredictable, which is a genuine engineering problem: a sudden flicker or a camera shake can produce a burst of millions of events per second that a downstream buffer must survive.</p>
+</div>
+
+<h2>Why the modality wins: latency, dynamic range, and power</h2>
+<p><strong>What</strong> you gain concentrates in four measurable advantages. <em>Latency:</em> events appear microseconds after the light changes, versus the milliseconds of frame integration plus readout, which matters for closing a control loop on a fast robot or drone (<a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>). <em>Dynamic range:</em> the per-pixel logarithmic front end reaches 120 to 140 dB, roughly a thousand times the usable range of a standard 60 dB sensor, so a car exiting a tunnel into glare stays legible. <em>No motion blur:</em> because there is no exposure window, a fast edge is sampled in time rather than averaged over it. <em>Power and bandwidth:</em> transmitting only changes drops idle power to milliwatts and can cut data volume by one to two orders of magnitude on sparse scenes, the property that makes event vision attractive for the always-on edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+
+<p><strong>When</strong> these advantages actually pay off is the practical question, because none of them is free. They dominate exactly when the scene is <em>high-speed, high-dynamic-range, and sparse</em>: eye tracking, high-frequency vibration monitoring, particle counting, drone obstacle avoidance, automotive perception into low sun. They matter little for a slow, well-lit, information-dense scene, where a cheap frame camera and a mature CNN win on cost and tooling. Recognizing that boundary is the whole art of choosing the sensor, and it is developed fully in <a class="cross-ref" href="section-46.7.html">Section 46.7</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Eye tracking inside an AR headset</h3>
+<p>A mixed-reality headset team needed gaze tracking fast and cheap enough to run all day on a head-worn battery. A conventional 120 Hz eye camera left saccades (the eye's ballistic jumps, up to 700 degrees per second) badly undersampled and blurred, and streaming full frames drained the battery. Switching the eye-facing sensor to a small DVS changed the arithmetic. The pupil edge, being the only thing moving in an otherwise static socket, generated a thin event ribbon that a lightweight tracker followed with sub-millisecond latency, while the near-blank sclera produced almost no data, so average power fell into the tens of milliwatts. The headset could update foveated rendering the instant the eye moved rather than one frame later. The limit surfaced immediately too: when the eye held still to fixate, the pupil stopped emitting events, so the system fused sparse periodic frames to recover absolute pupil position during fixations, the same event-plus-frame pairing that <a class="cross-ref" href="section-46.6.html">Section 46.6</a> formalizes.</p>
+</div>
+
+<h2>Hardware and datasets you will actually meet</h2>
+<p><strong>What</strong> hardware exists is a small, real ecosystem worth naming. iniVation ships the DVS and the DAVIS346 (a hybrid that interleaves events with conventional frames on the same pixel array); Prophesee sells the Metavision GenX and IMX636 sensors (the latter co-developed with Sony) at up to 1280 by 720 resolution; Samsung has published DVS-Gen designs. <strong>How</strong> researchers benchmark against them without owning one is through standard datasets: DSEC (a large driving stereo-event dataset with lidar and GPS ground truth), MVSEC (multi-vehicle stereo events), N-Caltech101 and N-MNIST (frame datasets converted to events by moving the sensor), and the classic Event-Camera Dataset for pose and SLAM. <strong>Why</strong> this matters for you as a model builder is leakage: converted datasets like N-MNIST carry the fixed saccade motion used to generate them, so a network can learn that motion pattern rather than the digit, a confound that leakage-safe splitting (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) exists to catch. Prefer natively recorded data such as DSEC when evaluating real-world generalization.</p>
+
+<p>To make the generative model concrete, the snippet below is a minimal event <em>simulator</em>: it takes two log-intensity images (an earlier and a later moment) and emits the ON and OFF events a DVS would produce, exactly the inverse of what a reconstruction network in <a class="cross-ref" href="section-46.3.html">Section 46.3</a> learns to undo.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def simulate_events(log_img_prev, log_img_now, t_prev, t_now, C=0.2):
+    """Emit DVS events for the log-intensity change between two moments.
+
+    log_img_* : 2-D arrays of log(intensity) at t_prev and t_now.
+    C         : contrast threshold (fractional change is exp(C) - 1).
+    Returns an (N, 4) array of events [x, y, t, polarity], polarity in {+1, -1}.
+    Timestamps are linearly interpolated across the crossings in each pixel.
+    """
+    diff = log_img_now - log_img_prev
+    n_cross = np.floor(np.abs(diff) / C).astype(int)   # threshold crossings per pixel
+    pol = np.sign(diff).astype(int)
+    ys, xs = np.nonzero(n_cross > 0)
+    events = []
+    for y, x in zip(ys, xs):
+        k = n_cross[y, x]
+        # each crossing gets its own timestamp along the [t_prev, t_now] interval
+        for i in range(1, k + 1):
+            frac = (i * C) / abs(diff[y, x])
+            t = t_prev + frac * (t_now - t_prev)
+            events.append((x, y, t, pol[y, x]))
+    events.sort(key=lambda e: e[2])                    # asynchronous stream is time-ordered
+    return np.array(events, dtype=float)
+
+prev = np.log(np.full((4, 4), 10.0))
+now = prev.copy(); now[1, 1:3] = np.log(40.0)          # a bright edge appears
+print(simulate_events(prev, now, t_prev=0.0, t_now=1e-3, C=0.2))
+</code></pre>
+<div class="code-caption">A minimal DVS forward model: a fourfold brightness rise at two pixels (\(\log 40 - \log 10 \approx 1.39\)) crosses the \(C=0.2\) threshold about seven times each, emitting a short burst of ON events with interpolated microsecond timestamps. This is the generative process every event representation and reconstruction method in this chapter must invert.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Loading real event streams in a few lines</h3>
+<p>The simulator above is for intuition; real recordings arrive in vendor formats (Prophesee <code>.raw</code>/<code>.dat</code>, AER, HDF5) with millions of events. Loading, decoding, and slicing them by hand is fifty-plus lines of bit-unpacking per format. The <code>tonic</code> library (or Prophesee's Metavision SDK and iniVation's <code>dv-processing</code>) reads a dataset such as DSEC or N-Caltech101 and yields time-ordered event arrays in three or four lines: <code>tonic.datasets.NCALTECH101(...)</code> then index into it, and the events come back as a structured array with <code>x, y, t, p</code> fields already decoded. The library owns the per-vendor decoders, the coordinate conventions, and the time-window slicing, turning a format-wrangling chore into a one-line import so you can spend your effort on the model instead of the byte layout.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is pushing</h3>
+<p>Current work targets the modality's two weakest points: sensor noise and the lack of absolute intensity. High-resolution sensors (the 1280 by 720 Prophesee IMX636, 2024-era stereo rigs behind DSEC) have made dense event vision practical, but their background-activity and hot-pixel noise still forces careful filtering. On the learning side, the state of the art has moved from hand-built representations to recurrent vision transformers such as RVT and to reconstruction networks like E2VID that regenerate intensity video from events alone, both covered in <a class="cross-ref" href="section-46.3.html">Section 46.3</a>. The open frontier is a genuinely asynchronous, sparse model that consumes events one at a time without ever forming a dense tensor, which is where spiking networks (<a class="cross-ref" href="section-46.4.html">Section 46.4</a>) and neuromorphic silicon (<a class="cross-ref" href="section-46.5.html">Section 46.5</a>) promise the most and deliver the least, so far.</p>
+</div>
+
+<h2>The catches: noise, no absolute intensity, and motion dependence</h2>
+<p><strong>What</strong> tempers the enthusiasm is a set of honest limits. First, <em>no absolute brightness</em>: events encode change, so you cannot read a pixel's grey value from the stream, only its history of contrast crossings; recovering intensity requires integration and is ill-posed. Second, <em>noise</em>: analog pixels produce spurious events. <em>Background activity</em> (random firings that rise in low light) and <em>hot pixels</em> (a few pixels that fire constantly) contaminate the stream, and the effective contrast threshold \(C\) drifts with temperature and illumination, so the same edge yields different event counts across conditions. Third, <em>motion dependence</em>: with no relative motion there is no signal, so a static observer of a static scene is blind, and even useful scenes need a moving camera or moving content. <strong>Why</strong> this reframes the modeling task: the raw stream is not a drop-in replacement for pixels, and this is precisely why the rest of the chapter exists, to convert sparse asynchronous events into representations (<a class="cross-ref" href="section-46.2.html">Section 46.2</a>) that a network can consume without silently learning the sensor's quirks instead of the world's structure.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: the threshold sets the data rate</h3>
+<p>Extend the <code>simulate_events</code> function to take a small video (a stack of log-intensity frames of a bright disk translating across a dark background). Count total events emitted as you sweep the contrast threshold \(C\) from \(0.05\) to \(0.5\), and plot event count versus \(C\). Then double the disk's speed and repeat. Explain in two sentences how \(C\) and scene speed each control the output data rate, and argue why a fixed \(C\) makes the sensor's bandwidth fundamentally unpredictable in the field.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>You point a perfectly still event camera at a static, evenly lit poster. How many events does it produce, and why? What is the minimal change that would wake it up?</li>
+<li>Why does the per-pixel logarithmic response give an event camera its huge dynamic range, where a linear sensor would clip?</li>
+<li>A converted dataset (N-MNIST) gives 99% accuracy in your notebook but the model fails on a real DVS recording of the same digits. Name the most likely leakage source introduced by how such datasets are generated.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-46.2.html">Section 46.2</a>, we confront the practical gap this section opened: a sparse, asynchronous list of \((x,y,t,p)\) tuples is not something a convolutional or transformer backbone can eat directly. We build the bridge, the standard <em>event representations</em>: accumulating events into voxel grids and time surfaces that pack the temporal structure of the stream into dense tensors, trading a little of the sensor's precious asynchrony for compatibility with the deep learning machinery of Part IV.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

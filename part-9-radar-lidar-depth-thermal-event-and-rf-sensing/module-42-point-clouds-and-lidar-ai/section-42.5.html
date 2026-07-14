@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.5: 3D detection, segmentation, and tracking. Building Sensory AI." name="description"/>
+<title>Section 42.5: 3D detection, segmentation, and tracking | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Point Clouds and Lidar AI</a></div>
+<h1>3D detection, segmentation, and tracking</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The backbone hands me a field of features and shrugs. Detection wants a box, segmentation wants a label on every point, tracking wants the same car to keep its name across a hundred frames. Same features, three completely different questions."</p>
+<cite>A Scene-Parsing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section treats the backbone as already built: the sparse-convolution encoders of <a class="cross-ref" href="section-42.3.html">Section 42.3</a> and the point transformers of <a class="cross-ref" href="section-42.4.html">Section 42.4</a> produce the features we attach task heads to, over the representations of <a class="cross-ref" href="section-42.2.html">Section 42.2</a>. Tracking leans on the Kalman filter and data association of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and the confidence scores we threshold connect to the calibration ideas of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Every metric below assumes the sequence-disjoint splitting of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>: frames from one drive must never straddle train and test.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Three questions, one feature field</h3>
+<p>By the end of a lidar backbone you hold a dense feature field, usually flattened to a bird's-eye-view (BEV) grid where each cell summarizes the column of space above it. What you do next is a head, not a new network. <strong>Detection</strong> asks "where are the objects?" and returns a sparse set of oriented 3D boxes. <strong>Segmentation</strong> asks "what is each point?" and returns a label per point, optionally split into instances. <strong>Tracking</strong> asks "which detection now is the thing I saw a moment ago?" and returns a persistent identity across time. These are the three outputs a self-driving stack or a warehouse robot actually consumes. This section builds each head, states the loss that trains it and the metric that grades it, and shows why tracking is almost always bolted on after detection rather than learned end to end.</p>
+</div>
+
+<h2>3D detection: from a feature grid to oriented boxes</h2>
+<p><strong>What</strong> a 3D detector outputs is a set of 7-degree-of-freedom boxes: center \((x, y, z)\), extent \((l, w, h)\), heading yaw \(\theta\), plus a class and confidence. <strong>Why</strong> the extra degrees over 2D detection matter is that planning needs metric position and orientation: heading decides whether a car is cutting in or driving away, and no image-plane box tells you that. <strong>How</strong> the head produces boxes splits in two. <em>Anchor-based</em> heads (SECOND, PointPillars) tile the BEV grid with prior boxes per class and regress a residual from each, which forces one anchor set per class. <em>Center-based</em> heads (CenterPoint) drop anchors: they predict a BEV heatmap whose peaks are object centers, then regress the remaining attributes at each peak. Center-based has become dominant because a rotating object has no orientation ambiguity in a heatmap, and a new class is just another channel.</p>
+<p>Regression uses smooth-L1 on box residuals, classification a focal loss on the heatmap to survive the extreme foreground-background imbalance, and heading is split into a coarse bin plus a residual so the network never regresses across the \(2\pi\) wrap. Because the head emits many overlapping candidates, a <em>rotated non-maximum suppression</em> (NMS) keeps the top-scoring box per cluster using BEV intersection-over-union:</p>
+$$\text{IoU}(A, B) = \frac{\lvert A \cap B\rvert}{\lvert A \cup B\rvert}.$$
+<p><strong>When</strong> you report numbers, the benchmark matters and the two do not agree. KITTI grades car detection at a strict BEV IoU of 0.7 and reports mean average precision (mAP). nuScenes matches by center distance (a 2 m gate) instead of IoU, then folds five true-positive error terms (translation, scale, orientation, velocity, attribute) into one nuScenes Detection Score (NDS). An IoU benchmark punishes loose boxes; a center-distance benchmark forgives a slightly oversized box that still centers correctly.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The empty scene is the hard part</h3>
+<p>An image is dense; a lidar BEV grid is mostly vacuum, with fewer than one percent of cells on a real object. Train a detector with naive cross-entropy and it learns the trivial "everything is background" solution and never fires. This is why modern 3D detectors use focal-style losses that down-weight the swarm of easy empty cells, and why center heatmaps (one hot pixel per object with a Gaussian falloff) work so well: they make the target itself sparse. The same imbalance recurs in segmentation, where "road" points outnumber "pedestrian" points by orders of magnitude. It is a consequence of sensor geometry, not a dataset quirk.</p>
+</div>
+
+<h2>Segmentation: a label on every point</h2>
+<p><strong>What</strong> segmentation produces is a class label for each return in a sweep, in three flavors. <em>Semantic</em> labels each point (road, car, vegetation) but does not separate two adjacent cars. <em>Instance</em> separates objects for countable "thing" classes. <em>Panoptic</em> unifies them: every point gets a semantic label, and every point on a thing also gets an instance id, so "stuff" is labeled semantically while "things" are individuated. <strong>Why</strong> it complements detection is coverage: a box says "a car is here," but a mask says exactly which returns are the drivable surface, which is what a low-speed robot needs.</p>
+<p><strong>How</strong> the head attaches follows the backbone. A cylindrical voxel network (Cylinder3D is canonical) predicts per-voxel logits and scatters them to the points inside. Instances are grouped by predicting a per-point <em>offset</em> toward the object center and clustering the shifted points. Semantic quality is graded by mean IoU (mIoU); panoptic by Panoptic Quality (PQ), a segmentation term times a recognition term:</p>
+$$\text{PQ} = \underbrace{\frac{\sum_{(p,g)\in TP} \text{IoU}(p,g)}{\lvert TP\rvert}}_{\text{segmentation quality}} \times \underbrace{\frac{\lvert TP\rvert}{\lvert TP\rvert + \tfrac{1}{2}\lvert FP\rvert + \tfrac{1}{2}\lvert FN\rvert}}_{\text{recognition quality}}.$$
+<p>PQ punishes sloppy masks and missed or hallucinated instances in one number, which is why SemanticKITTI and nuScenes-panoptic report it. <strong>When</strong> to reach for segmentation over detection: whenever the world is not cleanly boxable (a spilled load, a gravel pile, a construction zone) a per-point mask degrades gracefully where a box would miss or over-cover.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field sits now</h3>
+<p>Detection is led by center-based and query-based heads: CenterPoint is the workhorse baseline, while TransFusion and BEVFusion push the nuScenes leaderboard by pulling camera semantics into the lidar BEV (the camera-to-BEV lifting of <a class="cross-ref" href="../module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>). Lidar panoptic and 4D (space-plus-time) segmentation advance through mask-transformer designs (Mask4D, 4D-StOP) that segment a short stack of sweeps jointly, blurring the line with tracking. On tracking, the lesson of recent years is that a well-tuned Kalman tracker fed strong detections (SimpleTrack, and the velocity-based greedy tracker in CenterPoint) still matches elaborate learned trackers on nuScenes AMOTA, which is why the next subsection treats tracking as association, not a network.</p>
+</div>
+
+<h2>Tracking: giving each detection a persistent name</h2>
+<p><strong>What</strong> a tracker produces is a set of tracks, each a sequence of boxes sharing one identity. <strong>Why</strong> it is solved as <em>tracking-by-detection</em> is leverage: detection quality dominates, so we reuse the strong per-frame detector and spend effort on linking. The classic pipeline (AB3DMOT set the template) has three parts. A constant-velocity Kalman filter <em>predicts</em> where each track should appear. A <em>data-association</em> step matches predicted tracks to new detections by minimizing BEV center distance or negative IoU, solved optimally with the Hungarian algorithm. Matched tracks are <em>updated</em> with the Kalman correction of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, unmatched detections spawn tentative tracks, and long-unseen tracks are retired.</p>
+<p><strong>How</strong> two failure modes are avoided governs the tuning. A <em>gate</em> forbids matches wider than a threshold, so a track never grabs a detection from a different object across a gap. A <em>birth-and-death</em> policy (confirm after \(N\) hits, delete after \(M\) misses) suppresses flicker while surviving brief occlusions. The headline metric, AMOTA, integrates MOTA over recall, and MOTA penalizes false positives, misses, and, distinctively, <em>identity switches</em>: two pedestrians cross and the tracker swaps their names. An id switch is the tracking-specific sin that raw detection metrics cannot see.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+def bev_center_cost(tracks, dets):
+    """L2 distance in the ground plane between predicted tracks and detections."""
+    diff = tracks[:, None, :] - dets[None, :, :]      # (T, D, 2)
+    return np.linalg.norm(diff, axis=2)               # (T, D) cost matrix
+
+def associate(tracks, dets, gate_m=2.0):
+    """Hungarian match, then reject any pairing wider than the gate."""
+    cost = bev_center_cost(tracks, dets)
+    ti, di = linear_sum_assignment(cost)              # optimal min-cost matching
+    matches = [(t, d) for t, d in zip(ti, di) if cost[t, d] <= gate_m]
+    matched_d = {d for _, d in matches}
+    births = [d for d in range(len(dets)) if d not in matched_d]
+    return matches, births
+
+tracks = np.array([[10.0, 3.0], [25.0, -1.0]])        # Kalman-predicted centers
+dets   = np.array([[10.4, 3.1], [24.7, -0.9], [40.0, 5.0]])
+print(associate(tracks, dets))
+# ([(0, 0), (1, 1)], [2])   the 40 m detection is outside every gate -> new track
+</code></pre>
+<div class="code-caption">Code 42.5.1: The heart of a tracking-by-detection step. Two Kalman-predicted tracks are matched to three detections by BEV center distance; the object at 40 m falls outside every track's 2 m gate, so it becomes a birth rather than a forced match. Swapping the cost for negative 3D IoU and wrapping this in the Chapter 9 predict-update loop yields a competitive nuScenes tracker in under 200 lines.</div>
+
+<p>Code 42.5.1 shows why tracking rarely needs a network: the intelligence lives in the motion model and the gate, the classical estimation tools you already met. The Hungarian solver returns the globally cheapest assignment; the gate converts detector confidence into a hard birth-versus-match decision.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Why a robotaxi tracks in BEV, not in the image</h3>
+<p>An urban robotaxi runs a CenterPoint detector on each 20 Hz sweep and feeds the boxes to exactly the tracker of Code 42.5.1, upgraded with per-object velocity from the detection head. At a four-way stop, a cyclist passes behind a parked van for six frames. Because the constant-velocity filter keeps predicting the cyclist's BEV position and the death policy tolerates a few misses, the track survives the gap and reacquires the same id when the cyclist reappears, so the planner never sees a "new" fast object lunge into the intersection. Image-plane tracking fails here, since the van fully occludes the cyclist's pixels, but in BEV the two occupy different ground positions throughout. The fused version that also uses radar velocity belongs to <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: heads and trackers off the shelf</h3>
+<p>Hand-building a center-based detection head (heatmap targets, rotated NMS, per-class regression, the training loop) is well over a thousand lines before it trains. OpenPCDet ships CenterPoint, PointPillars, and voxel backbones as configurable YAML, so a working detector on a public subset is a config edit plus one command; Pointcept does the same for Cylinder3D-style segmentation. AB3DMOT and SimpleTrack wrap the predict-associate-update loop of Code 42.5.1 into a few hundred lines you drive with detections alone. Build the association core once by hand to feel the gate and the id-switch failure, then let these libraries carry the heads. This is the exact tooling the chapter lab uses.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: turn a detector into a tracker and count id switches</h3>
+<p>Take any sequence of per-frame 3D detections (KITTI tracking or a nuScenes scene). (1) Wrap Code 42.5.1 in a constant-velocity Kalman filter from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> so each track predicts before association and updates after. (2) Add a birth policy (confirm after 2 hits) and a death policy (delete after 3 misses). (3) Sweep the gate from 0.5 m to 4 m and plot both false-positive count and id-switch count against it; explain the U-shaped tradeoff. (4) Force two crossing trajectories, confirm a too-loose gate produces an id switch, then show that tightening the gate or adding a velocity term fixes it. State which nuScenes metric each error curve feeds.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A detector scores well on nuScenes NDS but poorly on KITTI mAP at IoU 0.7 for the same class. Give one concrete reason the two can disagree, referencing how each matches predictions to ground truth.</p>
+<p>2. Your semantic segmentation reports 92% mIoU but a mediocre panoptic PQ. Which term of the PQ formula is dragging it down, and what mistake does that imply?</p>
+<p>3. A tracker has almost no false positives and few misses, yet disappointing AMOTA. Which tracking-specific error is the culprit, and why can neither mAP nor mIoU reveal it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-42.6.html">Section 42.6</a>, we confront the cost that haunts every head here: the 3D box, mask, and track labels that train them are brutally expensive to annotate. We turn to self-supervised lidar pretraining (ALSO, LISO), where the network learns useful geometry from raw unlabeled sweeps first, so a detection or segmentation head then needs far fewer human-drawn boxes to reach the accuracy this section taught you to measure.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

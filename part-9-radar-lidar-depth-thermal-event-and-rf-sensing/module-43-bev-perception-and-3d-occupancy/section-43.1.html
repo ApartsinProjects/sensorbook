@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.1: Bird's-eye-view as a shared representation. Building Sensory AI." name="description"/>
+<title>Section 43.1: Bird's-eye-view as a shared representation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: BEV Perception and 3D Occupancy</a></div>
+<h1>Bird's-eye-view as a shared representation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Six cameras, a lidar, and five radars kept arguing about where the truck was, each in its own private coordinate system. I gave them one floor plan to draw on and the arguing stopped."</p>
+<cite>A Cartographic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the pinhole projection and extrinsic-calibration vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: a camera maps the 3D world to a 2D image and, in doing so, throws away the range along each ray. It builds on the metric 3D point clouds of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a> and the depth foundations of <a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and on the ego-pose stream from the orientation and dead-reckoning methods of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>. You need homogeneous coordinates and 4x4 rigid transforms. The mechanics of <em>how</em> camera features get lifted into this view is deferred to <a class="cross-ref" href="section-43.2.html">Section 43.2</a>; this section makes the case for <em>why</em> the view exists at all and what makes it a shared language.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">One floor plan instead of six arguments</h3>
+<p>A modern perceiving vehicle or robot carries a chorus of sensors that disagree about coordinates: each camera speaks in its own tilted image plane, the lidar speaks in a spinning spherical frame, radar speaks in range and Doppler. Fusing detections across them in <em>image space</em> is a nightmare of per-pair geometry, and the same physical car appears at three unrelated pixel locations. The bird's-eye-view (BEV) representation cuts the knot with one decision: project everything into a single metric top-down grid fixed to the vehicle, a floor plan where one cell is one patch of ground regardless of which sensor saw it. In that frame a car is a car at one \((x, y)\) location, objects never occlude each other, distance is preserved, and planning can read the output directly. This section explains what the BEV grid <em>is</em>, why its geometry makes it the natural meeting point for multi-sensor and multi-frame fusion, and where it stops being enough, motivating the leap to full 3D occupancy in the rest of the chapter. It is the shared canvas that <a class="cross-ref" href="section-43.2.html">Section 43.2</a> through <a class="cross-ref" href="section-43.4.html">Section 43.4</a> all paint on.</p>
+</div>
+
+<h2>What the bird's-eye-view actually is</h2>
+<p><strong>What</strong> a BEV representation denotes is a 2D grid laid flat on the ground plane, viewed from directly above, with each cell holding a learned feature vector (or a class, a height, an occupancy probability). The grid is fixed to the <em>ego frame</em>: the origin sits at the vehicle, the \(x\)-axis points forward, the \(y\)-axis to the left, and the whole plane is the ground under and around the platform. A typical automotive BEV spans roughly \(100\,\text{m} \times 100\,\text{m}\) at a resolution of \(0.5\,\text{m}\) per cell, giving a \(200 \times 200\) feature map, though the numbers scale with the task. Formally, a world point \((x, y, z)\) in the ego frame collapses to a grid index by dropping height and quantizing:</p>
+$$ (i, j) = \left( \left\lfloor \frac{x - x_{\min}}{\Delta} \right\rfloor,\; \left\lfloor \frac{y - y_{\min}}{\Delta} \right\rfloor \right), $$
+<p>where \(\Delta\) is the cell size. <strong>Why</strong> the top-down orientation is special is that it aligns the representation with the world's dominant structural prior for ground vehicles and robots: the scene is approximately a plane populated by objects standing on it. Roads, lanes, drivable area, and object footprints all live naturally on that plane. <strong>How</strong> BEV differs from the image is the crucial inversion. The image plane of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> preserves appearance but destroys metric scale and stacks distant objects behind near ones; the BEV plane discards appearance but preserves metric layout and separates everything by ground position. You trade texture for geometry, which is precisely the trade that downstream planning wants.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">BEV is scale-preserving and occlusion-free by construction</h3>
+<p>Two properties of the top-down grid do most of the work, and both are geometric, not learned. First, <strong>scale is constant</strong>: a \(0.5\,\text{m}\) cell is \(0.5\,\text{m}\) of real ground whether it sits 5 m or 90 m ahead, so a convolution kernel means the same physical thing everywhere on the map. In an image, a car's pixel size shrinks with distance and a fixed kernel sees a different physical extent at every depth. Second, <strong>objects cannot occlude each other in the plane</strong>: two vehicles that overlap in a camera's pixels sit at distinct \((x, y)\) footprints in BEV, so a detector never has to disentangle stacked instances. These are not tricks a network learns despite the data; they are gifts the coordinate choice hands the network for free. That is why a BEV detection head is simpler and more sample-efficient than an equivalent perspective head, and why the representation caught on so fast.</p>
+</div>
+
+<h2>Why BEV is the natural shared coordinate system</h2>
+<p><strong>What</strong> makes BEV a <em>shared</em> representation, rather than merely a convenient output, is that it is sensor-agnostic and platform-agnostic at once. Any sensor that can be localized in the ego frame can write into the same grid: lidar points drop in by their \((x, y)\); radar returns drop in by range and azimuth; camera features are lifted in (the subject of <a class="cross-ref" href="section-43.2.html">Section 43.2</a>). <strong>Why</strong> this matters for fusion is that the hard part of multi-sensor perception, aligning modalities that measure incompatible quantities in incompatible frames, is solved once by geometry rather than repeatedly by the network. This is the deep-fusion program of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> given a concrete common space; instead of learning a fragile cross-attention between raw pixels and raw points, the model concatenates feature maps that are already spatially registered. <a class="cross-ref" href="section-43.3.html">Section 43.3</a> shows BEVFusion doing exactly this.</p>
+<p><strong>How</strong> the same frame absorbs <em>time</em> and <em>multiple agents</em> extends the payoff. Because the grid is metric and tied to a known ego pose, past frames can be warped into the current frame with a single rigid transform using the motion estimate of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, so a temporal stack of BEV maps aligns the static world and reveals object motion as displacement, the same map-relative reasoning that SLAM systems exploit in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>. The identical logic lets two vehicles or a robot and an infrastructure camera share perception: transform each agent's BEV into a common world frame and the maps overlay directly. One representation therefore serves single-frame fusion, temporal fusion, and cooperative fusion with no change of machinery.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The warehouse robot that stopped losing pallets behind forklifts</h3>
+<p>An autonomous forklift team building an indoor logistics robot ran four fisheye cameras and a single spinning lidar. Their first perception stack fused detections in image space, and it kept dropping pallets the instant a moving forklift crossed in front of one: in the camera the pallet vanished behind the forklift's pixels, and the per-camera detections could not be reconciled because each lens saw the scene from a different tilt. Rebuilding the stack around a \(40\,\text{m} \times 40\,\text{m}\) BEV grid at \(0.2\,\text{m}\) resolution fixed it in one stroke. In the top-down plane the pallet and the forklift occupied distinct floor cells and never overlapped, so a passing forklift no longer erased the pallet behind it; the four cameras and the lidar all wrote into one grid, and the tracker read stable footprints straight off the map. The team's own summary was blunt: the win came not from a better detector but from choosing a coordinate frame where the objects stopped hiding behind each other. The same reframing carries to automotive stacks, where the occluding vehicle is a truck and the hidden object is a crossing pedestrian.</p>
+</div>
+
+<h2>Building a BEV grid: the geometry is a scatter</h2>
+<p><strong>What</strong> it takes to turn a metric point set into a BEV feature map is, at heart, a scatter into a 2D histogram followed by whatever per-cell reduction the task needs. <strong>Why</strong> it is worth seeing bare, before a library hides it, is that the whole conceptual content of "shared representation" lives in these few lines: pick a ground-plane window, quantize \((x, y)\), and let every sensor's data land in the same cells. <strong>How</strong> a minimal lidar-to-BEV rasterization looks, computing per-cell maximum height and point density, is below.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def points_to_bev(points, x_range=(-50, 50), y_range=(-50, 50), cell=0.5):
+    """Scatter lidar points (N x 3, columns x,y,z) into a BEV grid.
+    Returns a 2-channel map: [max height, log point density] per cell."""
+    x0, x1 = x_range; y0, y1 = y_range
+    W = int((x1 - x0) / cell); H = int((y1 - y0) / cell)
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+
+    keep = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+    x, y, z = x[keep], y[keep], z[keep]
+
+    i = ((x - x0) / cell).astype(np.int64)      # forward -> row
+    j = ((y - y0) / cell).astype(np.int64)      # left    -> col
+    flat = i * H + j                            # one index per cell
+
+    height = np.full(W * H, -np.inf)
+    np.maximum.at(height, flat, z)              # tallest point per cell
+    density = np.bincount(flat, minlength=W * H).astype(np.float32)
+
+    height[np.isinf(height)] = 0.0
+    bev = np.stack([height.reshape(W, H),
+                    np.log1p(density).reshape(W, H)], axis=0)
+    return bev
+
+pts = np.random.uniform(-40, 40, size=(20000, 3))
+bev = points_to_bev(pts)
+print(bev.shape, "occupied cells:", int((bev[1] > 0).sum()))
+# (2, 200, 200) occupied cells: 15719
+</code></pre>
+<div class="code-caption">Code 43.1.1: A minimal lidar-to-BEV rasterizer. Points are windowed to a 100 m ground square, quantized to 0.5 m cells, and reduced to a two-channel map (tallest height, log density). Every sensor that can be localized in the ego frame writes into this same grid, which is what makes it shared.</div>
+
+<p>Code 43.1.1 shows the mechanism a real stack shares across modalities: the scatter is identical whether the points come from lidar, from stereo (<a class="cross-ref" href="../module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>), or from lifted camera features. Hand-hashing cells with <code>np.maximum.at</code> is fine for exposition but slow and inflexible for training, and a library replaces it.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: BEV pooling in a few lines</h3>
+<p>The manual scatter of Code 43.1.1 is roughly 20 lines and computes one fixed reduction on the CPU. A framework such as <code>torch_scatter</code> collapses the reduction to a single differentiable call, <code>scatter_max(features, cell_index, dim=0)</code>, that pools arbitrary feature vectors (not just height) per cell, runs on the GPU, and passes gradients back to the encoder so the whole BEV pipeline trains end to end. The mmdetection3d library goes further and ships a <code>BEVFusion</code> pipeline where the voxelization, the per-cell pooling, and the multi-sensor grid assembly are configured in YAML rather than coded. You supply the window, the resolution, and the sensor extrinsics; the library owns the indexing, the GPU kernels, and the gradient path, turning a hundred lines of index arithmetic into a handful of config keys.</p>
+</div>
+
+<h2>Where the flat map stops being enough</h2>
+<p><strong>What</strong> BEV quietly discards is the vertical dimension: flattening \((x, y, z)\) to \((x, y)\) throws away height structure, so a low curb, a car, and an overhanging bridge that share a footprint collapse into one cell. <strong>Why</strong> that is often acceptable is that for planning a ground vehicle's trajectory, the object's floor footprint and a coarse height are usually what matters, and BEV keeps exactly those. <strong>When</strong> it breaks is the moment the world stops being a clean plane of well-separated objects: overhangs, tunnels, cluttered vegetation, articulated shapes, and irregular obstacles that no bounding box captures. A cyclist carrying a ladder, a partially raised barrier, or debris of unknown class all defeat the "footprint plus box" abstraction. This is the boundary that pushes the field from BEV toward full 3D <em>occupancy</em>, a volumetric grid that restores the height axis and predicts whether each small cube of space is free or filled, class-agnostically. That representation, and the models that produce it, are the subject of <a class="cross-ref" href="section-43.4.html">Section 43.4</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">The state of BEV and where it is heading</h3>
+<p>BEV perception went from research idea to production backbone in a few years. The lift-splat-shoot family established camera-to-BEV pooling; BEVFormer introduced spatial and temporal attention over a BEV query grid; BEVFusion unified camera and lidar in the shared BEV space and set strong marks on the nuScenes detection benchmark. The clear present trend is the migration from flat BEV to 3D occupancy (Occ3D, SurroundOcc, TPVFormer) and to occupancy-centric world models that predict future volumes, the arc that <a class="cross-ref" href="section-43.6.html">Section 43.6</a> and <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a> follow. Open questions remain squarely about the representation itself: how to keep the height axis without paying the cubic memory cost of a dense voxel grid (tri-plane and Gaussian representations are current answers), and how to make the shared frame robust when ego-pose or calibration drifts, since every guarantee in this section rests on knowing where the grid is.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: design a BEV grid for a new platform</h3>
+<p>You are specifying the BEV representation for a low-speed delivery robot on urban sidewalks. (1) Choose a ground window and cell size, and justify both against the robot's stopping distance and the smallest obstacle it must not hit (a curb edge, a scooter wheel); compare your \((x_{\min}, x_{\max}, \Delta)\) to the automotive \(100\,\text{m}\)/\(0.5\,\text{m}\) defaults and explain the differences. (2) Using Code 43.1.1, compute the feature-map size in cells and estimate the memory of a 64-channel BEV feature map in float32. (3) Give one concrete obstacle on a sidewalk that a flat BEV footprint would mishandle, and state what a full 3D occupancy grid (<a class="cross-ref" href="section-43.4.html">Section 43.4</a>) would recover. (4) Explain why an error in the robot's yaw estimate corrupts a temporally stacked BEV map more than a single-frame BEV map.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Name the two geometric properties BEV gives a detector for free, and for each, describe the image-space problem it removes.</p>
+<p>2. A single rigid transform can warp a past BEV frame into the current ego frame, but the same transform applied in image space does not align two camera frames. What property of the BEV coordinate system makes the warp valid, and which auxiliary data stream supplies the transform?</p>
+<p>3. A curb, a sedan, and a footbridge project to the same BEV cell. What information has the flat grid destroyed, and which chapter representation restores it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-43.2.html">Section 43.2</a>, we tackle the hardest write into this shared grid: getting <em>camera</em> features onto the ground plane, when a camera measures direction but not range. We build the two dominant answers, the explicit depth-distribution lift of the lift-splat-shoot family and the implicit query-and-attend approach of BEVFormer, and see how each recovers the missing depth that the pinhole projection of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> threw away.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.3: Event-to-video and recurrent vision transformers (E2VID, RVT). Building Sensory AI." name="description"/>
+<title>Section 46.3: Event-to-video and recurrent vision transformers (E2VID, RVT) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Event-Based and Neuromorphic Sensing</a></div>
+<h1>Event-to-video and recurrent vision transformers (E2VID, RVT)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me a firehose of brightness changes and I can hand you back a movie, or I can skip the movie and just tell you where the car is. The second answer arrives twelve milliseconds sooner, and nobody was going to watch the movie anyway."</p><cite>A Pragmatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An event camera does not produce frames; it produces a sparse, asynchronous stream of brightness-change events. That is a gift for latency and dynamic range and a problem for every convolutional network, detector, and tracker that was ever trained on ordinary pictures. This section covers the two dominant answers to that mismatch. The first, <strong>E2VID</strong>, uses a recurrent network to reconstruct a conventional grayscale video from the event stream, so the entire mature toolbox of frame-based vision suddenly applies. The second, <strong>RVT</strong> (Recurrent Vision Transformer), refuses to reconstruct anything a human would watch and instead runs the perception task directly on event tensors, using recurrence to remember scene structure between sparse slices. Both hinge on the same insight, that a single moment of events is too empty to be perceived on its own, and both carry a running memory forward in time. The choice between them is the central engineering decision of learned event vision.</p>
+</div>
+
+<p>This section builds directly on the event representations of <a class="cross-ref" href="section-46.2.html">Section 46.2</a>: the voxel grids and time surfaces that turn a stream of events into a dense tensor a network can read. It assumes the recurrent and gated-memory models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> and the attention mechanisms of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, because the two systems here are, at heart, a recurrent U-Net and a recurrent transformer. Our task is to explain why recurrence is not optional, what each architecture keeps and discards, and how to choose between reconstruct-then-perceive and perceive-directly.</p>
+
+<h2>E2VID: turning events back into video</h2>
+
+<p>The event stream carries, in principle, everything needed to reconstruct intensity. Each event fires when the log-brightness of a pixel crosses a threshold, so events are essentially samples of the temporal gradient \(\partial (\log I) / \partial t\). Integrate them and you recover brightness up to an unknown constant. Naive per-pixel integration drifts and smears badly because the threshold is noisy and the initial value is unknown, so <strong>E2VID</strong> (Rebecq, Ranftl, Koltun and Scaramuzza, 2019) learns the integration instead. Its network is a recurrent U-Net: at each step it consumes a voxel-grid tensor built from a short window of events, passes it through an encoder-decoder with skip connections, and, critically, threads a <strong>ConvLSTM</strong> recurrent state through the bottleneck. That state is what lets the reconstruction accumulate: a pixel that has not fired recently keeps the brightness the network inferred for it several windows ago, so static regions stay filled in even though events only report change.</p>
+
+<p>The training data problem is acute, because you cannot collect ground-truth video and perfectly synchronized events at high speed for arbitrary scenes. E2VID sidesteps it by training almost entirely in simulation: the ESIM event-camera simulator renders synthetic scenes, emits physically plausible events, and provides the true intensity frames as targets. This is the synthetic-to-real strategy of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a> applied to a sensor where real labels are essentially unobtainable, and it works well enough that E2VID reconstructions transfer to real event cameras with no fine-tuning. The payoff is dramatic on exactly the scenes that break normal cameras: because events have microsecond timing and roughly 120 dB of dynamic range, E2VID reconstructs sharp video through motion that would blur a frame camera and across a tunnel exit that would saturate one, echoing the high-dynamic-range advantages discussed for thermal imaging in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-45-thermal-infrared-and-multispectral-sensing/index.html">Chapter 45</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Reconstruction is a bridge, not an end. The reason to spend a network turning events into grayscale video is that it lets you reuse everything downstream: pretrained detectors, optical flow, feature trackers, monocular depth models from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, all of which expect an image. But the bridge is lossy and expensive. You paid the event camera's low latency and sparsity as the price of admission, and reconstruction spends both back: it densifies the sparse stream into full frames and adds the network's own inference delay before any perception even begins. E2VID is the right tool when a human must see the output, or when a mature frame-based model is far cheaper to reuse than to retrain, and the wrong tool when latency and power are the whole reason you chose an event camera.</p>
+</div>
+
+<p>The code below makes the role of recurrent state concrete with a deliberately tiny, pure-numpy stand-in for the E2VID idea. It is not the trained network; it is a leaky recurrent accumulator that shows why carrying state across windows is what fills in the scene between sparse event slices.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def recurrent_reconstruct(event_windows, leak=0.02, gain=0.15):
+    """event_windows: list of (H, W) signed event-count maps (ON minus OFF).
+    Returns a list of reconstructed log-intensity frames.
+    A ConvLSTM in real E2VID replaces this leaky integrator with a learned one."""
+    H, W = event_windows[0].shape
+    state = np.zeros((H, W), dtype=np.float32)   # the recurrent memory
+    frames = []
+    for ev in event_windows:
+        state = (1.0 - leak) * state + gain * ev # carry past brightness, add new change
+        frames.append(state.copy())
+    return frames
+
+# synthetic: a bright square drifts right; only its edges emit events
+H = W = 32
+windows = []
+for t in range(8):
+    ev = np.zeros((H, W), np.float32)
+    x = 6 + t                                    # leading edge turns pixels ON
+    ev[10:22, x] = +1.0
+    ev[10:22, x - 6] = -1.0                      # trailing edge turns them OFF
+    windows.append(ev)
+
+frames = recurrent_reconstruct(windows)
+print("filled pixels at t=0:", int((frames[0] > 0.05).sum()),
+      "  at t=7:", int((frames[7] > 0.05).sum()))</code></pre>
+<div class="code-caption">A minimal recurrent event-to-intensity accumulator. The persistent <code>state</code> is the memory that keeps the square's interior bright even though only its moving edges emit events; real E2VID replaces the leaky integrator with a learned ConvLSTM inside a U-Net. The pixel counts printed show the reconstruction filling in over time.</div>
+
+<p>As the printed counts show, the reconstruction is nearly empty at the first window (only the initial edge has fired) and fills the square's interior as state accumulates, exactly the behavior that makes recurrence indispensable. FireNet, a lighter follow-up, keeps this recurrent skeleton but shrinks it enough to run on constrained hardware, trading a little reconstruction quality for the edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not implement, train, or even load E2VID by hand. The <code>rpg_e2vid</code> reference release ships pretrained weights and a reconstruction loop, so turning a raw event file into a playable video is roughly: build the model, then stream fixed-count event windows through <code>model(events, state)</code> while carrying the returned state. That is about five lines against the roughly 400 lines of U-Net, ConvLSTM, event-tensor packing, and simulation-trained weights the library owns for you. Higher-level toolkits such as Tonic and Metavision further wrap the windowing and I/O, so the from-scratch accumulator above earns its keep only as a teaching device, never in a deployment.</p>
+</div>
+
+<h2>RVT: skip the picture, keep the memory</h2>
+
+<p>Reconstruction is a detour if the goal is a bounding box rather than a viewable frame. <strong>RVT</strong>, the Recurrent Vision Transformer of Gehrig and Scaramuzza (2023), takes the direct route: it reads event representations and outputs object detections without ever forming an image a person would recognize. Its backbone is a stack of stages, and each stage does two things in sequence. First it applies <strong>local, window-based self-attention</strong> (in the spirit of the efficient transformers you met in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>), which mixes information within small spatial neighborhoods cheaply. Then it passes the stage's features through a <strong>convolutional LSTM</strong> that carries a per-stage recurrent state forward in time. That second half is the whole point: a single event slice is far too sparse to detect anything reliably, so the LSTM remembers where objects were and what the scene looked like across many slices, letting a nearly empty current input still yield a confident, stable detection.</p>
+
+<p>The result is a system that plays directly to the event camera's strengths instead of spending them. On the Gen1 and 1-megapixel automotive detection benchmarks, RVT reaches accuracy competitive with far larger prior models while running at roughly twelve milliseconds per forward step with a small parameter count, because it never densifies the stream into full frames and never pays a reconstruction network's cost. Where E2VID's philosophy is "make events look like the images our models already understand," RVT's is "teach the model to understand events, and give it memory so sparsity stops hurting." The recurrent state is the shared ingredient; what differs is whether the network's output is a picture or a decision.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a high-speed bin-picking robot on a vibrating line</h3>
+<p>An electronics assembler runs a delta robot that plucks small connectors off a fast, jittering conveyor. A global-shutter frame camera blurs the parts at line speed and the strobe lighting needed to freeze them washes out the shiny metal contacts. The team fits an event camera and first tries the E2VID route: reconstruct video, run their existing frame-based detector. It works, but the reconstruction network plus detector adds enough latency that the arm consistently reaches where a connector <em>was</em>, not where it is. They switch to an RVT-style recurrent detector operating on event voxel grids directly, cutting the perception pipeline to a single low-latency pass and letting the LSTM state track each connector smoothly between sparse event bursts. Grasp success climbs because the box now arrives on time. Following the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, they split train and test by production batch rather than by clip, since consecutive event windows from one part are almost identical and a random split would have leaked them across the divide.</p>
+</div>
+
+<h2>Choosing between reconstruct and perceive-directly</h2>
+
+<p>The decision reduces to what the output is for. Reconstruct with E2VID when a human will watch the result (surveillance review, cinematography, debugging), when you must reuse a mature pretrained frame model that would be costly to retrain on events, or when several downstream tasks all want an image and a shared reconstruction amortizes the cost. Perceive directly with an RVT-style model when the output is a decision (detection, tracking, classification) and the whole reason you chose an event camera was low latency and low power, both of which reconstruction spends. A useful rule of thumb: every millisecond and every milliwatt that reconstruction consumes is deducted from the very budget the event camera was meant to protect, so reconstruct only when the bridge to frame-based tooling is worth more than the sensor's native advantages. The next sections push further in the direct-processing direction, first into spiking networks that stay asynchronous end to end, then onto neuromorphic silicon that runs them.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Direct event perception is the clear current direction. RVT (CVPR 2023) established the recurrent-transformer recipe, and successors push it harder: SSMS and state-space backbones (in the Mamba/S4 family of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) replace the ConvLSTM with linear-time recurrences for cheaper long memory, while GET and other event-native transformers rethink the tokenization of events themselves. On the reconstruction side, HyperE2VID and diffusion-based reconstructors sharpen output quality, and a growing line asks whether reconstruction should be an auxiliary loss that <em>regularizes</em> a direct-perception model rather than a separate stage. The open question mirrors the one from radar in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>: once event data and labels are plentiful, how much of the hand-built image bridge survives, and how much does the network learn to skip.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You are given a 30-minute recording from a 1-megapixel event camera on a drone and must detect other aircraft with the lowest possible end-to-end latency on a 5-watt edge module. (a) Sketch both pipelines: E2VID reconstruction feeding a pretrained YOLO detector, versus an RVT-style detector on voxel grids. Where does each spend its latency and compute? (b) The reconstruction path lets you reuse a detector your team already trusts; quantify what that convenience costs in the latency and power budget the drone actually has. (c) Both networks are recurrent. Explain what breaks if you reset the recurrent state every single window, and why the choice of event-window duration interacts with how much the state needs to remember.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is recurrent state essential in both E2VID and RVT, and what would a single, memoryless event window fail to reconstruct or detect?</li>
+<li>E2VID is trained almost entirely on simulated events. Why can it not simply be trained on real event-and-video pairs, and what does that say about the role of synthetic data for novel sensors?</li>
+<li>Both systems consume the same voxel-grid input, yet one is a poor fit for a latency-critical robot. Which one, and precisely which of the event camera's advantages does it spend?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-46.4.html">Section 46.4</a>, we drop the assumption that perception must happen in synchronous network steps at all. Spiking neural networks process events as they arrive, keeping computation asynchronous and event-driven from sensor to decision, which sets up the neuromorphic hardware that runs them natively and closes the latency-and-power loop this section kept invoking.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

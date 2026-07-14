@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.3: Calibration and coordinate frames. Building Sensory AI." name="description"/>
+<title>Section 40.3: Calibration and coordinate frames | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>Calibration and coordinate frames</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every one of my sensors is certain it sits at the center of the universe. My job is to talk them out of it before they collide."</p>
+<cite>A Diplomatic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you can read a depth map and a point cloud as produced in <a class="cross-ref" href="section-40.2.html">Section 40.2</a>, and that you have met the projective measurement model of a camera in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Rotation and rigid-body motion are developed in depth alongside inertial estimation in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>; here we need only matrix multiplication and the idea that a rotation is an orthonormal \(3\times 3\) matrix. Linear algebra as in Appendix A is enough.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A depth sensor tells you where things are, but "where" is meaningless until you say <em>where relative to what</em>. A stereo rig reports points in its own optical frame, a lidar in its spinning-head frame, the wheels in a body frame, the map in a fixed world frame. None of these agree by default, and a system that fuses them without first nailing down the transforms between them is not fusing data, it is averaging fiction. Calibration is the unglamorous discipline that makes every sensor speak the same spatial language. Get it right and a lidar point, a camera pixel, and a robot gripper all land on the same physical millimeter. Get it wrong by half a degree and your obstacle appears a lane over at fifty meters.</p>
+</div>
+
+<h2>Frames, poses, and the rigid-transform chain</h2>
+<p>A <strong>coordinate frame</strong> is an origin plus three orthonormal axes attached to a physical thing: the camera's optical center, the lidar's rotation axis, the vehicle's rear axle, a surveyed point on the factory floor. A 3D point has different numeric coordinates in each frame even though it is one point in the world. The <em>what</em> of calibration is finding, for every pair of frames you care about, the rigid transform that converts coordinates from one to the other; the <em>why</em> is that perception, planning, and control each live in a different frame and must exchange geometry constantly.</p>
+<p>A rigid transform from frame \(B\) to frame \(A\) is a rotation \(R \in SO(3)\) and a translation \(t \in \mathbb{R}^3\), packed into a \(4\times 4\) homogeneous matrix so that composition becomes matrix multiplication:</p>
+$$ {}^{A}T_{B} = \begin{bmatrix} R & t \\ 0\;0\;0 & 1 \end{bmatrix}, \qquad {}^{A}p = {}^{A}T_{B}\, {}^{B}p . $$
+<p>The leading superscript names the frame the coordinates are expressed in. This bookkeeping is not pedantry: the single most common calibration bug is applying a transform backwards, and \({}^{A}T_{B}\) versus its inverse \({}^{B}T_{A} = {}^{A}T_{B}^{-1}\) differ by exactly that mistake. Transforms compose along a chain, \({}^{A}T_{C} = {}^{A}T_{B}\,{}^{B}T_{C}\), which is what lets you move a lidar point through the sensor mount, into the body frame, and out into the world in one product. Because \(R\) is orthonormal, its inverse is its transpose, and the inverse transform is \(R^\top\) with translation \(-R^\top t\), never a naive negation.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Calibration splits cleanly into two questions that are solved by different means. <strong>Intrinsics</strong> describe what happens <em>inside</em> one sensor: how a 3D ray becomes a pixel or a range. <strong>Extrinsics</strong> describe the rigid pose <em>between</em> sensors, or between a sensor and a body. Intrinsics are a property of the device and change only with temperature and age; extrinsics change every time someone bumps the mount. Diagnose them separately, because a reprojection error can come from either and blaming the wrong one wastes days.</p>
+</div>
+
+<h2>Intrinsic calibration: turning pixels into rays</h2>
+<p>For a depth camera derived from a pinhole model, the intrinsics are the focal lengths \(f_x, f_y\) and principal point \((c_x, c_y)\) that map a 3D point in the camera frame to a pixel, plus lens-distortion coefficients that bend straight lines. The forward projection of a point \((X, Y, Z)\) is</p>
+$$ u = f_x \frac{X}{Z} + c_x, \qquad v = f_y \frac{Y}{Z} + c_y . $$
+<p>Inverting it is what makes depth 3D: given a pixel \((u,v)\) and its measured depth \(Z\), you recover \(X = (u - c_x)\,Z / f_x\) and \(Y = (v - c_y)\,Z / f_y\). This back-projection is the bridge between the depth map and the point cloud of <a class="cross-ref" href="section-40.2.html">Section 40.2</a>, and every point cloud is only as accurate as the intrinsics behind it. A principal point wrong by five pixels or a focal length off by one percent shears the whole cloud, so a plane looks slightly bowled and registration in <a class="cross-ref" href="section-40.4.html">Section 40.4</a> never quite converges. Radial distortion, if left uncorrected, curves what should be straight walls, an error that grows toward the image edges precisely where wide-baseline stereo is already weakest.</p>
+<p>Intrinsics are estimated by showing the sensor a known target, classically a checkerboard, from many poses and minimizing the reprojection error between detected corners and their projected model positions. The <em>when</em>: do this once per device at build time, then re-check whenever thermal cycling or a lens knock is suspected, because a depth camera's baseline can drift with a few degrees of temperature change.</p>
+
+<h2>Extrinsic calibration: putting every sensor in one frame</h2>
+<p>Extrinsic calibration finds \({}^{A}T_{B}\) between two sensors so their observations of the same scene overlap. The three cases you will meet constantly are camera-to-camera (the stereo baseline of <a class="cross-ref" href="section-40.1.html">Section 40.1</a>), camera-to-depth (aligning a color image to a depth map so each pixel gets both), and camera-to-lidar or lidar-to-IMU for a full robot stack. Each is solved by observing shared structure: mutual views of a board for cameras, a board whose plane is visible to both camera and lidar for the cross-modal case, and a motion sequence for camera-to-IMU, where the classic hand-eye formulation \(AX = XB\) recovers the unknown mounting pose \(X\) from the two sensors' relative motions \(A\) and \(B\).</p>
+<p>The code below composes an extrinsic and does the color-to-depth alignment that a wearable or an RGB-D camera performs on every frame: back-project depth pixels to 3D, move them into the color camera's frame, and project them into the color image so each depth sample inherits a pixel of color.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def align_depth_to_color(depth, K_d, K_c, T_c_d):
+    """Map each depth pixel into the color camera's image.
+    depth: HxW depth in meters (depth-camera frame)
+    K_d, K_c: 3x3 intrinsics for depth and color cameras
+    T_c_d: 4x4 rigid transform, depth frame -> color frame
+    """
+    H, W = depth.shape
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth.reshape(-1)
+    valid = z > 0
+    # back-project depth pixels to 3D rays in the depth frame
+    x = (u.reshape(-1) - K_d[0, 2]) * z / K_d[0, 0]
+    y = (v.reshape(-1) - K_d[1, 2]) * z / K_d[1, 1]
+    pts_d = np.stack([x, y, z, np.ones_like(z)], axis=0)   # 4xN homogeneous
+    pts_c = T_c_d @ pts_d                                    # into color frame
+    # project into the color image
+    proj = K_c @ pts_c[:3]
+    uu = proj[0] / proj[2]
+    vv = proj[1] / proj[2]
+    return uu[valid], vv[valid], pts_c[2, valid]            # color pixels + their depth
+</code></pre>
+<div class="code-caption">Color-to-depth registration in one pass: the extrinsic <code>T_c_d</code> carries every back-projected depth sample into the color camera's frame before the intrinsic <code>K_c</code> reprojects it, so a wrong extrinsic and a wrong intrinsic produce visibly different misalignments (a rigid shift versus a shear).</div>
+
+<p>Notice the single line <code>pts_c = T_c_d @ pts_d</code> is where extrinsic error enters and the two <code>K</code> matrices are where intrinsic error enters, which is exactly why the key insight above insists you separate them. The output pixels <code>(uu, vv)</code> tell you where each depth sample lands in color; a systematic constant offset means the extrinsic translation is off, while a fan-shaped spread that grows with depth means the rotation is off.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let OpenCV and Open3D own the estimation</h3>
+<p>Writing a distortion-aware checkerboard detector, a Levenberg-Marquardt reprojection minimizer, and a hand-eye solver from scratch is several hundred lines and a week of edge cases. In practice you call the library: <code>cv2.calibrateCamera</code> returns intrinsics and distortion from a stack of board images, <code>cv2.stereoCalibrate</code> returns the stereo extrinsic, and <code>cv2.calibrateHandEye</code> solves \(AX = XB\), each in a handful of lines. Open3D's <code>PinholeCameraIntrinsic</code> plus <code>create_from_depth_image</code> collapses the entire back-projection above to two calls. You supply correspondences and coordinate conventions; the library owns the optimizer, the Jacobians, and the numerical stability. Roughly 300 lines become 15, and the 15 are correct.</p>
+</div>
+
+<h2>The transform tree, time, and staying honest</h2>
+<p>A real platform has more than two frames, so the transforms are organized as a tree with the world at the root and each sensor a leaf, exactly the <code>tf</code> tree that middleware like ROS maintains. Any frame-to-frame query is answered by walking the tree and multiplying transforms along the path. Some edges are static (a bolted-down camera relative to the chassis) and some are dynamic (the chassis relative to the world, updated by odometry or SLAM). Keeping this tree consistent is a running concern, not a one-time setup, and it links tightly to the localization and mapping of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+<p>Two failure modes dominate. The first is <strong>temporal</strong>: transforming a lidar point captured at time \(t\) using a body pose from time \(t + \delta\) smears the cloud whenever the platform moves, so calibration is inseparable from the timestamp synchronization of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. At highway speed a 20 ms sync error is a 30 cm position error. The second is <strong>drift</strong>: mounts flex, thermal expansion shifts baselines, and vibration slowly rotates a bracket, so extrinsics that were perfect at the factory decay in the field. Mature systems therefore monitor calibration continuously, watching reprojection residuals or plane-fit consistency, and either recalibrate online or raise a health flag.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Automotive: the half-degree that moved a pedestrian</h3>
+<p>An autonomous shuttle team fused a roof lidar with a windshield camera to label objects with both range and class. In validation the fused boxes drifted: a pedestrian correctly seen by both sensors at 10 m agreed to within a pixel, but at 45 m the lidar box and the camera box separated by more than a body width, enough to assign the person to the wrong lane. Intrinsics checked out, so the team looked at the lidar-to-camera extrinsic and found the rotation was off by about \(0.4^\circ\), well inside what a coarse target-based calibration tolerates. That angular error projects to a lateral offset that grows linearly with range: negligible up close, dangerous far away. The fix was a target-free extrinsic refinement that maximized edge alignment between the projected lidar depth and the image gradients across a driving log, pulling the residual under \(0.05^\circ\). The lesson is structural: a tolerance that is invisible near the sensor becomes the dominant error at the ranges where you most need to trust it.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: forward, inverse, and the sign that bites</h3>
+<p>You are given <code>T_c_d</code>, the depth-to-color extrinsic, as a \(4\times 4\) matrix, and asked to render the color image into the depth camera's frame instead. (1) Write the transform you must apply and express it in terms of the rotation \(R\) and translation \(t\) of <code>T_c_d</code>, without calling a matrix-inverse routine. (2) A colleague implements the inverse as \([R^\top \mid -t]\). Give the specific geometric error this produces and the pixel-space symptom you would see. (3) Extend <code>align_depth_to_color</code> so that samples projecting outside the color image bounds or landing behind the camera (\(Z \le 0\)) are dropped, and explain why the behind-camera check is not optional.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does an error in the principal point \((c_x, c_y)\) distort a back-projected point cloud differently from an error in the focal length \(f_x\)? Describe the shape of each distortion.</li>
+<li>A fused lidar-camera box is perfectly aligned at 8 m but separates at 40 m. Is the more likely culprit the extrinsic rotation or the extrinsic translation, and why does range amplify one but not the other?</li>
+<li>Your point cloud smears only when the robot is turning, never when it drives straight or stands still. Is this a spatial-calibration bug or a timing bug, and what single measurement would confirm it?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-40.4.html">Section 40.4</a>, we take the clouds that calibration has placed in a common frame and clean them: removing outliers, downsampling for speed, estimating normals, and registering overlapping scans with ICP so that many partial views become one coherent model. Calibration puts sensors into approximate agreement; registration is how you refine that agreement point by point.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

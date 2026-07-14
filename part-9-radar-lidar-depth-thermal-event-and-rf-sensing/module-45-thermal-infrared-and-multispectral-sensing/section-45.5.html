@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.5: Visible-to-thermal translation. Building Sensory AI." name="description"/>
+<title>Section 45.5: Visible-to-thermal translation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Thermal, Infrared, and Multispectral Sensing</a></div>
+<h1>Visible-to-thermal translation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You want me to guess how hot a wall is from a photograph of its paint color. I will give you a beautiful, confident, and occasionally correct answer."</p>
+        <cite>A Radiometrically Humble AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the radiometry of <a class="cross-ref" href="section-45.1.html">Section 45.1</a>: that a thermal camera measures emitted long-wave radiation set by temperature and emissivity, not reflected visible light. It is the pixel-synthesis counterpart to the detector-level domain adaptation of <a class="cross-ref" href="section-45.4.html">Section 45.4</a>, so read that first to keep the two ideas distinct. It leans on generative adversarial and diffusion image models from deep learning generally, and connects to the synthetic-data discipline of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a> and the leakage-safe evaluation rules of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Thermal training data is scarce, expensive, and hard to label; RGB data is everywhere and comes pre-annotated by the million. Visible-to-thermal translation tries to close that gap by learning a function that turns an ordinary color image into a plausible thermal one, so a pedestrian detector or a segmentation model can be trained (or pre-trained) on synthetic infrared frames it would otherwise never see. The catch is physical: a color photograph does not contain the temperature of the scene, so the mapping is fundamentally under-constrained and the network is filling in radiometry from correlations, not measurement. This section explains why the problem is ill-posed, how paired and unpaired image-translation models (pix2pix, CycleGAN, InfraGAN, and modern diffusion translators) attack it anyway, how to inject the structural priors that keep the output honest, and, most importantly, how to use synthetic thermal without fooling your own benchmark.</p>
+    </div>
+
+    <h2>Why the mapping is ill-posed, and what that means</h2>
+    <p>Start from the physics, because it dictates everything downstream. A visible pixel encodes reflected illumination: surface albedo times incident light, integrated over the visible band. A thermal pixel encodes emitted radiance, governed by the Stefan-Boltzmann relation and the surface emissivity \(\varepsilon\),</p>
+    \[ L_{\text{thermal}} \propto \varepsilon\, \sigma\, T^{4}, \]
+    <p>where \(T\) is the absolute surface temperature. Nothing in the RGB image measures \(T\) or \(\varepsilon\). Two objects that look identical in color (a sun-baked black car hood at 60 C and a black plastic bin at 25 C) can differ by tens of degrees in thermal, and two objects that look nothing alike in color (bare skin and a warm coffee cup) can read nearly the same. So the map from visible to thermal is many-to-many: the same RGB input is consistent with a whole distribution of thermal outputs depending on time of day, weather, recent heating, and material. A translation network cannot recover the true thermal image; the best it can do is learn the <em>conditional expectation</em> of thermal appearance given visible cues that correlate with temperature (material class, whether a region is likely a warm body, sky versus ground, sunlit versus shaded). This is why translated thermal looks convincing for common classes it saw often in training and hallucinates confidently on anything rare or thermally surprising.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Visible-to-thermal translation is not sensor simulation; it is educated guessing over a distribution. Because RGB carries no radiometric information, the network learns \(\mathbb{E}[\text{thermal} \mid \text{visible}]\), a smoothed, class-typical infrared appearance, not the actual heat pattern. Treat every synthetic thermal frame as a plausible sample, never as a measurement, and design your use of it (augmentation, pre-training) so that being wrong on the rare cases costs you little.</p>
+    </div>
+
+    <h2>Paired and unpaired translation: pix2pix, CycleGAN, InfraGAN</h2>
+    <p>Two data regimes drive two families of method. When you have <em>pixel-aligned</em> RGB-thermal pairs (a co-boresighted rig producing registered frames, as in the KAIST Multispectral Pedestrian and FLIR ADAS datasets), you can train a conditional GAN in the pix2pix style (Isola and colleagues, 2017): a U-Net generator maps RGB to thermal, a PatchGAN discriminator judges local realism, and an \(L_1\) reconstruction term anchors the output to the registered ground-truth thermal so the generator cannot drift. InfraGAN (Ozkanoglu and Ozer, 2022) is the specialization that matters here: it augments the pix2pix objective with a structural-similarity (SSIM) loss and a pixel-level discriminator, because thermal images are dominated by smooth temperature gradients and sharp object silhouettes rather than fine texture, and plain \(L_1\) plus a texture discriminator tends to wash those silhouettes out.</p>
+    <p>Perfect pixel alignment is expensive and often impossible (parallax between the two cameras, different resolutions, occlusion), so the unpaired regime is the common one. CycleGAN (Zhu and colleagues, 2017) trains two generators, \(G: \text{RGB} \to \text{thermal}\) and \(F: \text{thermal} \to \text{RGB}\), with a cycle-consistency constraint that going both ways returns you to the start,</p>
+    \[ \mathcal{L}_{\text{cyc}} = \big\| F(G(x)) - x \big\|_1 + \big\| G(F(y)) - y \big\|_1, \]
+    <p>so the two mappings must be near-inverses and the network cannot collapse every scene to one generic thermal image. The unpaired freedom is also the danger: with no registered target, cycle-consistency alone lets the generator invent geometry (adding, removing, or relocating warm blobs) as long as the reverse map undoes it. That is exactly the kind of content hallucination that ruins a downstream detector, and it is why unpaired translators for perception almost always add a structural anchor.</p>
+
+    <h2>Injecting structure: edges, semantics, and diffusion</h2>
+    <p>The fix for hallucination is to force the output to keep the input's scene layout. The cheapest and most effective prior is an <em>edge</em> constraint: extract edges from the RGB input (a Canny or learned edge map) and penalize the generator when the translated thermal's edges disagree, since object boundaries survive the modality change even when brightness inverts. Semantic priors go further: condition the generator on a segmentation map so that "this region is a person" propagates a warm-body appearance and "this region is sky" propagates a cold, flat one, aligning the synthesis with material class rather than raw color. As of 2026 the strongest results come from replacing the GAN generator with a conditional <em>diffusion</em> model, which produces sharper, more diverse thermal samples and is markedly more stable to train than adversarial translators; ControlNet-style edge or depth conditioning is the standard way to hold scene structure fixed while the diffusion model paints in the infrared appearance. The tradeoff is inference cost: a GAN translates in a single forward pass, while a diffusion translator needs tens of denoising steps, which matters when you are generating millions of augmentation frames.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current direction (2025 to 2026) is physics-guided and diffusion-based translation that conditions on more than color: monocular depth, surface-normal, and material or semantic maps are fed alongside the RGB so the generator has a proxy for the variables (geometry, exposure to sun, material class) that actually drive temperature. Coupling a translator to a physics-based thermal renderer (the digital-twin idea of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>), so the learned model refines physically simulated thermal rather than inventing it from scratch, is the most promising route to translations that are radiometrically defensible and not merely photogenic.</p>
+    </div>
+
+    <p>A practical GAN translation is a few lines once weights exist, as Listing 45.5 shows. The generator is a small residual network; the point of the snippet is the preprocessing and the honest single-channel output, not the architecture.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, numpy as np
+from PIL import Image
+
+# Load a pretrained RGB->thermal generator (e.g. a CycleGAN/InfraGAN G_A2B checkpoint).
+gen = torch.hub.load("your-org/rgb2thermal", "generator", pretrained=True).eval()
+
+def rgb_to_thermal(path):
+    img = Image.open(path).convert("RGB").resize((256, 256))
+    x = torch.from_numpy(np.asarray(img, np.float32) / 127.5 - 1.0)   # scale to [-1, 1]
+    x = x.permute(2, 0, 1).unsqueeze(0)                               # NCHW
+    with torch.no_grad():
+        y = gen(x)[0, 0]                                              # 1-channel thermal
+    y = (y.clamp(-1, 1) + 1.0) * 0.5                                  # back to [0, 1]
+    return y.numpy()                                                  # relative, NOT Celsius
+
+therm = rgb_to_thermal("street_day.jpg")
+# WARNING: therm is a plausible appearance map, not a temperature field.
+# Do not read Celsius off it; use only for augmentation / pre-training.
+</code></pre>
+    <div class="code-caption"><strong>Listing 45.5.</strong> A single-pass RGB-to-thermal GAN translation. The normalization to \([-1, 1]\) and the single-channel output are what the weights expect; the comment is the load-bearing part, since the array carries no calibrated temperature and must never be treated as one.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Writing a CycleGAN from scratch (two generators, two PatchGAN discriminators, cycle plus identity plus adversarial losses, the image-buffer trick, and the training loop) is roughly 400 to 500 lines that are easy to get subtly wrong. The reference <code>pytorch-CycleGAN-and-pix2pix</code> repository trains an unpaired RGB-to-thermal model from a config and a data folder in well under 20 lines of your own code, and ships pix2pix, CycleGAN, and the standard evaluation hooks so you can swap paired for unpaired by changing one flag.</p>
+    </div>
+
+    <h2>Using synthetic thermal without fooling yourself</h2>
+    <p>The reason to translate is almost always data augmentation: pre-train or expand a thermal model with cheap synthetic frames, then fine-tune or validate on a small pool of real thermal. Done carelessly, this quietly inflates your numbers. The failure mode is a leakage-and-distribution trap. If you translate RGB frames that share a scene, a time, or a rig with your real thermal test set, the synthetic and real images are correlated, and a detector that memorizes translation artifacts scores well on the test set for the wrong reason. The discipline mirrors the leakage-safe rules of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>: keep the real thermal test set drawn from scenes, sensors, and days that never fed the translator, and never let a synthetic frame derived from a test scene into training. Evaluate the translation itself on two axes: distributional realism (Frechet Inception Distance between real and synthetic thermal) and, more decisively, <em>task transfer</em>, the accuracy of a detector trained on synthetic and tested on held-out <em>real</em> thermal. A model can post a flattering FID and still transfer poorly, so the task metric is the one that counts. Translation is a bridge for the missing-modality problem of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>, not a replacement for a real thermal camera.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: bootstrapping a night-time pedestrian detector</h3>
+        <p>An automotive supplier needed a thermal pedestrian detector for a night-driving ADAS but had only a few thousand labeled thermal frames, against millions of labeled daytime RGB frames from its existing camera fleet. The team trained an InfraGAN-style translator on the KAIST paired set, translated a large slice of its RGB fleet to synthetic thermal (inheriting the RGB bounding-box labels for free), and pre-trained the detector on that synthetic pile before fine-tuning on the small real-thermal set. Two guardrails made it work rather than backfire. First, they split by <em>city and night</em>, so no scene used to generate synthetic frames appeared in the real thermal validation set, killing the leakage. Second, they audited failure cases and found the translator systematically under-heated pedestrians in the first minutes after stepping out of a warm car, exactly the many-to-many ambiguity from the physics, so they down-weighted synthetic frames for the hardest thermal-contrast cases and leaned on real data there. The synthetic pre-training lifted real-thermal average precision by a wide margin over training on the small real set alone, while the leakage-safe split kept the reported gain honest.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a paired RGB-thermal set (KAIST or FLIR ADAS). (a) Train a pix2pix translator and an unpaired CycleGAN on the same data and compare their outputs on a scene with a strong thermal surprise (a warm car hood on a cold day); explain which one hallucinates and why cycle-consistency alone does not prevent it. (b) Add an edge-consistency loss to the CycleGAN and measure whether object silhouettes in the output align better with the input. (c) Train a small pedestrian detector three ways (real only, synthetic only, synthetic pre-train then real fine-tune), always testing on held-out real thermal, and report both FID and detection AP. Which metric better predicts the ranking you actually care about?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In one sentence, why is visible-to-thermal translation fundamentally ill-posed, and what quantity does the network actually learn instead of the true thermal image?</p>
+        <p class="quiz-question">2. You have no pixel-aligned RGB-thermal pairs. Which method family applies, what constraint replaces the reconstruction loss, and what failure does that constraint fail to prevent on its own?</p>
+        <p class="quiz-question">3. A translator posts a low FID but a detector trained on its output transfers poorly to real thermal. Give one likely leakage cause and one reason FID can look good while task transfer is bad.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-45.6.html">Section 45.6</a>, we turn the lens around: thermal's very ability to see people in the dark and read body heat makes it a privacy hazard, and we look at privacy-preserving thermal perception, from on-sensor blurring and low-resolution capture to models that detect presence and posture without ever reconstructing an identifiable image.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

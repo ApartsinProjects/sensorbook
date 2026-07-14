@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.5: 3D representations (voxels, points, meshes, SDFs). Building Sensory AI." name="description"/>
+<title>Section 40.5: 3D representations (voxels, points, meshes, SDFs) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>3D representations (voxels, points, meshes, SDFs)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The world does not come with a data structure attached. I have to choose one, and every choice throws away something I might later miss."</p><cite>A Reluctant AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A depth sensor hands you a raw measurement, but a perception system needs a <em>representation</em>: a data structure that says where matter is, where empty space is, and what belongs to what. The same scanned chair can live as a grid of occupied cubes, a bag of surface points, a triangle mesh, or a scalar field whose zero-crossing is the surface. None of these is universally correct. Each trades off memory, resolution, ease of neural processing, and how naturally it answers the query you actually have (Is this cell free? What is the surface normal here? Do these two objects collide?). This section maps the four workhorse 3D representations, when each wins, and how to convert between them, so that in later chapters you can choose the substrate a detector, an occupancy network, or a SLAM back-end is built on rather than inheriting it by accident.</p>
+</div>
+
+<p>This section assumes you can already produce a point cloud from a depth map and place it in a metric coordinate frame, both covered in <a class="cross-ref" href="index.html">Sections 40.2 and 40.3</a>. It also leans on the probability vocabulary of occupancy and log-odds from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. No prior graphics background is required; we build each representation from its query.</p>
+
+<h2>Points: the raw sample, kept sparse</h2>
+
+<p>A point cloud is simply a set \(P = \{\mathbf{x}_i \in \mathbb{R}^3\}\), optionally carrying color, intensity, or a normal per point. It is what almost every depth sensor emits natively, so it is the representation with zero conversion loss: nothing has been quantized, smoothed, or interpolated. That fidelity is its strength. Its weaknesses follow from what it lacks. A point cloud has <em>no connectivity</em> (you cannot ask "what is adjacent to this point" without building a spatial index), <em>no notion of free space</em> (the gaps between points are ambiguous: unseen, occluded, or genuinely empty?), and <em>no fixed size</em>, which is awkward for tensor-shaped neural networks.</p>
+
+<p>Points shine when the surface is thin relative to the scene and you want to defer any commitment about topology. Lidar perception stacks (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>) operate directly on points precisely because voxelizing a 100 m lidar sweep at centimeter resolution would be almost entirely empty. Memory scales with <em>surface area sampled</em>, not scene volume, which is the decisive advantage outdoors.</p>
+
+<h2>Voxels: the volumetric grid</h2>
+
+<p>A voxel grid partitions space into a regular 3D lattice of cells of edge length \(v\), and stores a value per cell: a binary occupancy flag, an occupancy probability, a semantic label, or a learned feature vector. The appeal is that voxels turn 3D into an image-like tensor, so the entire machinery of convolution, pooling, and 3D U-Nets transfers directly. Free space is represented explicitly and for free: an empty cell is a stored zero, which is exactly what a robot's motion planner or an AR occlusion test wants to query.</p>
+
+<p>The cost is cubic. Memory and compute scale as \((L/v)^3\) for a scene of extent \(L\), so halving the voxel size multiplies storage eightfold. A dense \(10\,\text{m}\) room at \(1\,\text{cm}\) resolution is \(10^9\) cells, most of them empty. Two fixes dominate practice. <strong>Sparse voxels</strong> store only non-empty cells in a hash map, which is how sparse-convolution backbones stay tractable. <strong>Octrees</strong> refine resolution adaptively, subdividing only where surface detail lives, so a flat wall costs one large node while a textured object costs many small ones.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The four representations are not four kinds of data, they are four answers to <em>which query is cheap</em>. Points make "give me the observed surface" free but "is this location empty" expensive. Voxels invert that exactly. Meshes make "render this view" and "what is the surface area" cheap. SDFs make "how far to the nearest surface, and in which direction" a single lookup. Choose the representation whose cheap query is your hot path, and convert lazily for the rest.</p>
+</div>
+
+<h2>Meshes: surfaces with connectivity</h2>
+
+<p>A triangle mesh is a set of vertices plus a set of faces that connect them, so it encodes the surface <em>and its topology</em> explicitly. This is the representation graphics pipelines, physics engines, and CAD tools expect, because connectivity is what lets you compute a consistent surface normal, integrate area, ray-trace efficiently, or test watertightness. A mesh is compact for large smooth regions: a planar floor is two triangles regardless of physical size, whereas the same floor costs thousands of voxels or points.</p>
+
+<p>Meshes are less convenient as a neural substrate. Their irregular, variable connectivity does not tensorize cleanly, and topology changes (a hole opening, two objects merging) are awkward to represent as a smooth deformation, which complicates learning. In a sensing stack meshes usually appear as an <em>output</em> product: you reconstruct one for visualization, collision geometry, or export, rather than running inference on it directly. Recovering a mesh from points or a volume is the job of reconstruction algorithms such as Poisson surface reconstruction or the classic Marching Cubes, which extracts a triangle surface from a scalar field, the field we turn to next.</p>
+
+<h2>SDFs: the implicit surface as a field</h2>
+
+<p>A signed distance function assigns to every point \(\mathbf{x}\) the distance to the nearest surface, signed negative inside the object and positive outside:</p>
+
+$$ f(\mathbf{x}) = s \cdot \min_{\mathbf{p}\,\in\,\partial\Omega} \lVert \mathbf{x} - \mathbf{p} \rVert, \qquad s = \begin{cases} -1 & \mathbf{x}\ \text{inside} \\ +1 & \mathbf{x}\ \text{outside} \end{cases} $$
+
+<p>The surface is the level set where \(f(\mathbf{x}) = 0\). This implicit view has three properties that make it the backbone of modern 3D reconstruction. First, the surface is defined everywhere at arbitrary resolution: you sample the field as finely as you like without pre-committing to a grid. Second, the gradient \(\nabla f\) is the outward surface normal at the zero-crossing, so geometry and orientation come from the same object. Third, distances compose, which makes collision and nearest-obstacle queries trivial.</p>
+
+<p>In practice an SDF is stored two ways. A <strong>truncated SDF (TSDF)</strong> keeps distance values in a voxel grid but only near the surface (truncated beyond a band), and is what depth-fusion systems like KinectFusion integrate frame by frame: it averages many noisy depth maps into one clean field and is the standard bridge from a stream of depth images to a mesh. A <strong>neural SDF</strong> represents \(f\) as the weights of a small network, trading memory for a learned, continuous, differentiable field; this is the door into neural fields and their Gaussian-splatting cousins in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the warehouse pick-cell scanner</h3>
+<p>An industrial bin-picking cell mounts a structured-light depth camera above a tote of jumbled parts. The vendor's first pipeline ran detection on the raw point cloud and struggled: overlapping parts left the grasp planner unsure which gaps were reachable free space versus occluded shadow. The rebuild fused every frame into a <strong>TSDF</strong> at 2 mm resolution. Now empty space is explicit, so the planner reads reachability directly; the fused field cancels the sensor's per-frame speckle noise; and a single Marching Cubes pass exports a watertight <strong>mesh</strong> for the collision checker. The same scan lives as points (for the detector), a TSDF (for free-space and denoising), and a mesh (for collision) at once, each feeding the stage whose cheap query it matches. Cycle-time dropped because the grasp planner stopped guessing about occlusion.</p>
+</div>
+
+<p>The workhorse conversion in that story, TSDF volume to triangle mesh, is a few lines with a modern geometry library, and getting it right by hand (correct triangle winding, watertight seams, per-vertex normals) is exactly the kind of detail a library has already solved.</p>
+
+<pre><code class="language-python">import numpy as np
+import open3d as o3d
+
+# A stream of RGB-D frames fused into a Truncated SDF volume,
+# then extracted as a mesh. Voxel size sets resolution; the
+# truncation band (sdf_trunc) sets how far from the surface
+# distances are stored.
+volume = o3d.pipelines.integration.ScalableTSDFVolume(
+    voxel_length=2.0 / 1000.0,   # 2 mm voxels
+    sdf_trunc=8.0 / 1000.0,      # 8 mm truncation band
+    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+)
+
+for color, depth, cam_intrinsic, cam_pose in rgbd_stream:      # your calibrated frames
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        color, depth, depth_scale=1000.0, convert_rgb_to_intensity=False)
+    volume.integrate(rgbd, cam_intrinsic, np.linalg.inv(cam_pose))
+
+mesh = volume.extract_triangle_mesh()   # Marching Cubes on the zero level set
+mesh.compute_vertex_normals()           # normals from the SDF gradient
+o3d.io.write_triangle_mesh("part.ply", mesh)
+</code></pre>
+<div class="code-caption">Fusing calibrated depth frames into a TSDF and extracting a watertight mesh with Open3D. The <code>integrate</code> call performs the running distance-weighted average that denoises the stream; <code>extract_triangle_mesh</code> runs Marching Cubes on the zero level set. The camera poses come from the calibration and registration of Sections 40.3 and 40.4.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: TSDF fusion and meshing</h3>
+<p>A from-scratch TSDF integrator plus a correct Marching Cubes surface extractor (voxel hashing, per-voxel distance-weighted updates, the 256-case triangle table, consistent winding, seam-free vertex interpolation) is comfortably 500 to 700 lines and a rich source of edge-case bugs. The Open3D calls above are roughly 15 lines and the library owns the numerics, the case table, and the memory-scalable voxel hashing. Reach for the from-scratch version only when you are teaching the algorithm or need a custom fusion rule.</p>
+</div>
+
+<h2>Choosing, and converting</h2>
+
+<p>Read the choice off your dominant query. Need to run a detector over a wide outdoor sweep? Stay on <strong>points</strong> so memory tracks surface, not volume. Need explicit free space for planning or occupancy learning, on an image-like tensor? Use <strong>voxels</strong>, sparse or octree once resolution bites. Need to render, simulate collisions, measure area, or export to CAD? Produce a <strong>mesh</strong>. Need a continuous, denoised, differentiable surface with cheap distance and normal queries, or you are fusing many noisy frames? Use an <strong>SDF/TSDF</strong>. Conversions are routine and mostly one-directional in loss: points to voxels (bin and count), TSDF to mesh (Marching Cubes), mesh to points (surface sampling), points to SDF (unsigned distance, then sign via ray-casting or learned occupancy). Every conversion discards something, so convert as late as possible and keep the representation your accuracy-critical stage needs closest to the raw sensor.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a single frame from an RGB-D dataset (or a synthetic depth render) and materialize it four ways: (1) a raw point cloud, (2) an occupancy voxel grid at 1 cm and at 4 cm, (3) a TSDF, and (4) a mesh via Marching Cubes on the TSDF. Record the on-disk size and vertex/cell count of each. Then answer, empirically, for each of these queries which representation returns it fastest: "is the point (0.3, 0.1, 1.2) m in free space?", "what is the surface normal at the nearest surface point?", "what is the total visible surface area?" Explain each result in terms of the representation's structure.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>A colleague voxelizes a 120 m lidar sweep at 3 cm resolution into a dense grid and runs out of memory. Which two representation changes fix this without lowering resolution, and why does each help?</li>
+<li>Why does a TSDF built from 50 noisy depth frames produce a cleaner surface than any single frame, and what role does the truncation band play?</li>
+<li>You need per-point surface normals. Explain how you would obtain them from (a) a point cloud, (b) a mesh, and (c) an SDF, and say which is most direct.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-40.6.html">Section 40.6</a>, we stop treating these geometries as exact and confront depth uncertainty head-on: where the error in a depth measurement comes from, how it grows with range and baseline, and how to carry a per-point or per-voxel confidence through the representations we just built so that downstream fusion and planning know how much to trust each surface.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.2: Depth maps and point clouds. Building Sensory AI." name="description"/>
+<title>Section 40.2: Depth maps and point clouds | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>Depth maps and point clouds</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A depth map is a photograph that remembers how far away everything was. A point cloud is the same scene after it stopped caring where the camera stood."</p><cite>A Reprojecting AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every depth sensor you met in <a class="cross-ref" href="section-40.1.html">Section 40.1</a>, whether stereo, structured light, or time-of-flight, ultimately hands you one of two data structures: a <strong>depth map</strong> (a 2D image where each pixel stores a distance) or a <strong>point cloud</strong> (an unordered set of 3D coordinates). These are not competing formats; they are two views of the same measurement, and the conversion between them is one short matrix operation. Getting that operation exactly right, and knowing which representation to reach for when, is the foundation every downstream 3D model in this Part stands on. Misread a depth encoding by a factor of a thousand, or apply the wrong intrinsics, and a robot's grasp planner will confidently reach for a wall.</p>
+</div>
+
+<p>This section assumes you are comfortable with the pinhole camera model and camera intrinsics from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. We treat calibration and the full menagerie of coordinate frames as given here and defer their rigorous treatment to <a class="cross-ref" href="section-40.3.html">Section 40.3</a>. Our job in this section is narrow and load-bearing: define both representations precisely, derive the map that connects them, and catalog the encoding traps that silently corrupt real pipelines.</p>
+
+<h2>The depth map: a 2.5D image</h2>
+
+<p>A depth map \(D\) is a single-channel image the same size as the intensity image it accompanies. The value \(D(u,v)\) at pixel column \(u\), row \(v\) is a distance in physical units. Two conventions coexist and are routinely confused. <strong>Z-depth</strong> stores the perpendicular distance from the camera plane along the optical axis, the \(Z\) coordinate of the surface point. <strong>Range</strong> (or radial depth) stores the Euclidean distance from the camera center to the surface point along the ray. They differ by the ray's obliquity: a point at the image edge has larger range than Z for the same physical surface. Most RGB-D cameras and depth-estimation networks emit Z-depth; lidar and some time-of-flight sensors report range. Assuming the wrong one skews your reconstruction outward toward the frame edges.</p>
+
+<p>We call a depth map "2.5D" because it captures the visible front surface of the scene from one viewpoint and nothing behind it. It is a function over the image grid, so it inherits every convenience of images: it is dense, it aligns pixel-for-pixel with color for easy fusion, and it feeds straight into a 2D convolutional network. Those properties are exactly why monocular depth foundation models in <a class="cross-ref" href="../module-41-monocular-depth-foundation-models/index.html">Chapter 41</a> predict depth maps rather than point clouds: the output stays on a regular grid a CNN or transformer can regress.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A depth map is tied to the camera; a point cloud is tied to the world. The moment you unproject, you trade the grid structure (neighbor relationships, dense coverage, cheap 2D convolution) for viewpoint independence (metric geometry you can rotate, merge across frames, and register). Almost every 3D pipeline decision reduces to when to pay that trade, and in which direction.</p>
+</div>
+
+<h2>The point cloud: geometry without a grid</h2>
+
+<p>A point cloud \(P = \{\mathbf{p}_i\}\) is a set of 3D points \(\mathbf{p}_i = (x_i, y_i, z_i)\), optionally carrying per-point attributes: RGB color, surface normal, lidar return intensity, semantic label, or timestamp. The set has no intrinsic ordering and no fixed size; two frames of the same scene may hold wildly different point counts. This is the format that lidar produces natively and the format the detection and segmentation backbones of <a class="cross-ref" href="../module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a> consume.</p>
+
+<p>A useful distinction is <strong>organized</strong> versus <strong>unorganized</strong> clouds. An organized cloud, produced by unprojecting a depth map, retains the \(H \times W\) image layout: point \((u,v)\) sits at a known array index, so pixel neighborhoods map to spatial neighborhoods for free and normal estimation is cheap. An unorganized cloud, typical of a spinning lidar merged across beams, is a flat list with no such structure; finding a point's neighbors requires a spatial index such as a k-d tree. Preserving organization when you have it saves enormous downstream cost, a theme we develop in <a class="cross-ref" href="section-40.4.html">Section 40.4</a>.</p>
+
+<h2>Unprojection: from pixels to points</h2>
+
+<p>The bridge is the pinhole model. Given intrinsics with focal lengths \(f_x, f_y\) and principal point \((c_x, c_y)\), a pixel \((u,v)\) with Z-depth \(d = D(u,v)\) unprojects to the camera-frame point</p>
+
+$$ x = \frac{(u - c_x)\, d}{f_x}, \qquad y = \frac{(v - c_y)\, d}{f_y}, \qquad z = d. $$
+
+<p>Run this over every valid pixel and you have an organized point cloud in the camera frame. The inverse, projecting a point back to a pixel, divides by \(z\) and is how you would render a cloud into a new view. Two subtleties bite here. First, invalid measurements (out of range, low confidence, or occluded) are usually stored as \(0\) or NaN; unproject those blindly and you get a spurious wall of points at the origin. Second, if your depth is <em>range</em> rather than Z-depth, you must first convert: \(z = d / \sqrt{1 + ((u-c_x)/f_x)^2 + ((v-c_y)/f_y)^2}\) before applying the formulas above.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def depth_to_points(depth_m, fx, fy, cx, cy, min_d=0.2, max_d=8.0):
+    """Unproject a Z-depth map (meters) to an organized camera-frame cloud."""
+    H, W = depth_m.shape
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth_m
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    pts = np.stack([x, y, z], axis=-1)          # (H, W, 3), stays organized
+    valid = (z > min_d) & (z < max_d) & np.isfinite(z)
+    return pts, valid                            # mask, do not delete, to keep the grid
+
+# 16-bit PNG depth is almost always millimeters: convert before use.
+raw = np.random.randint(0, 4000, (480, 640), dtype=np.uint16)  # stand-in frame
+depth_m = raw.astype(np.float32) / 1000.0                      # mm -> m
+pts, valid = depth_to_points(depth_m, fx=525., fy=525., cx=319.5, cy=239.5)
+print(pts.shape, "valid points:", int(valid.sum()))</code></pre>
+<div class="code-caption">Unprojecting a depth map to an organized point cloud with vectorized NumPy. The valid mask is returned rather than applied so the \(H \times W\) grid survives; note the explicit millimeter-to-meter scaling that trips up most first pipelines.</div>
+
+<p>The code above makes the unprojection concrete and, more importantly, exposes the two failure points in one place: the unit scale on the raw PNG and the validity mask. Both are invisible in the math and unforgiving in practice.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Open3D collapses the whole unproject-and-clean routine into one call: <code>o3d.geometry.PointCloud.create_from_depth_image(depth, intrinsic, depth_scale=1000.0, depth_trunc=8.0)</code> reads the millimeter scale, truncates out-of-range values, and returns a ready cloud. That replaces roughly 15 lines of masking and meshgrid bookkeeping with one, and it handles the RGB-D variant (<code>create_from_rgbd_image</code>) that also carries color onto each point. Reach for the hand-written version only when you need the organized grid preserved, which Open3D discards.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a warehouse pick-and-place cell</h3>
+<p>A robotics integrator deploys an Intel RealSense D435 above a conveyor to grasp parcels. The camera streams 16-bit depth in millimeters. The first build read the raw values as meters, so every box appeared 1000 times too far away and the grasp planner returned empty. Fixing the <code>depth_scale</code> put the boxes back at 0.8 m. The team then noticed the parcel edges bristled with phantom points: pixels near depth discontinuities where the stereo matcher was uncertain returned near-zero depth and unprojected to a cluster at the camera origin. Masking out \(D &lt; 0.2\) m and low-confidence pixels cleaned the cloud, and grasp success climbed from erratic to reliable. Two one-line fixes, both in the encoding rather than the algorithm, separated a broken cell from a working one.</p>
+</div>
+
+<h2>Choosing a representation</h2>
+
+<p>Prefer the depth map when the task lives on the image grid: learned depth regression, dense fusion with color, or any 2D-convolutional stage. Prefer the point cloud when geometry is the point: merging views across a moving camera, registering scans, fitting planes and objects, or feeding a 3D detection backbone. Many systems keep both and convert lazily. A SLAM front end (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>) may track on depth maps for speed while accumulating a global point cloud map for loop closure. The uncertainty attached to each depth value, which you will learn to propagate in <a class="cross-ref" href="section-40.6.html">Section 40.6</a>, follows the measurement through the unprojection and should travel with the points.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a depth map with focal length \(f_x = f_y = 525\) px and principal point at the image center of a 640&times;480 frame. (a) A pixel at the far top-left corner reads a Z-depth of 3.0 m. Compute its full \((x, y, z)\) camera-frame coordinate and its <em>range</em> to the camera center. By what percentage does range exceed Z-depth here? (b) Now suppose the sensor had actually reported that 3.0 m as range, not Z-depth. Recompute \(z\). (c) Explain in one sentence why the discrepancy is largest at the corners and zero at the principal point.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>What is the practical difference between an organized and an unorganized point cloud, and which one does unprojecting a depth map give you?</li>
+<li>You unproject a depth map and find a dense blob of points sitting exactly at the camera origin. What are the two most likely encoding causes?</li>
+<li>Why do monocular depth networks output depth maps rather than point clouds, given that the downstream consumer often wants 3D points?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-40.3.html">Section 40.3</a>, we make the coordinate frames we glossed over here fully explicit: how intrinsics are calibrated, how extrinsics relate the depth sensor to the color camera, the IMU, and the robot base, and how a clean chain of transforms turns a camera-frame cloud into a world-frame map you can trust.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.4: Point-cloud preprocessing and registration. Building Sensory AI." name="description"/>
+<title>Section 40.4: Point-cloud preprocessing and registration | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>Point-cloud preprocessing and registration</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Two scans of the same room, and neither one agrees on where the wall is. My first job is to make them shake hands."</p>
+<cite>A Diplomatic AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>A single depth sensor never sees the whole scene, and the raw cloud it does return is a mess: millions of points at wildly uneven density, speckled with outliers, floating in whatever frame the sensor happened to occupy. Every downstream task in this part of the book, from lidar object detection to SLAM, assumes it is handed a clean cloud already living in one consistent coordinate frame. This section is the bridge that builds that assumption. We cover the preprocessing that turns a raw scan into usable geometry, then the registration machinery that stitches many partial scans into one aligned model. Get this stage wrong and no amount of clever perception downstream can recover; get it right and the rest of 3D perception becomes tractable.</p>
+</div>
+
+<p>This section builds directly on the point-cloud data structure from <a class="cross-ref" href="section-40.2.html">Section 40.2</a> and the coordinate frames and extrinsics from <a class="cross-ref" href="section-40.3.html">Section 40.3</a>. We assume you can read a rigid transform \(T = \begin{bmatrix} R &amp; t \\ 0 &amp; 1 \end{bmatrix}\) with rotation \(R \in SO(3)\) and translation \(t \in \mathbb{R}^3\), and that you are comfortable with nearest-neighbor search and least squares. The sampling and non-uniform-density intuitions trace back to <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>; the noise models we lean on here are the spatial cousins of the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>.</p>
+
+<h2>From raw scan to usable geometry</h2>
+<p>A raw point cloud has three problems that preprocessing exists to fix. First, <strong>density is non-uniform</strong>: a lidar returns dense points near the sensor and sparse points far away, because angular resolution is fixed but arc length grows with range. A structured-light or time-of-flight camera gives dense foreground and ragged edges. Feeding this directly to a geometric algorithm biases it toward wherever points happen to pile up. The fix is <em>voxel downsampling</em>: overlay a 3D grid of cubes with side \(v\), and replace all points in each occupied cube with their centroid. This equalizes density, caps the point count, and is the single most impactful preprocessing step because it makes every later operation both faster and less biased.</p>
+<p>Second, real clouds contain <strong>outliers</strong>: stray returns from sensor noise, multipath, dust, or the mixed-pixel artifact where a beam straddles a depth discontinuity and reports a phantom point in empty space. Two cheap filters handle most of them. <em>Statistical outlier removal</em> computes, for each point, the mean distance to its \(k\) nearest neighbors, then discards points whose mean distance exceeds the global mean by more than a chosen number of standard deviations. <em>Radius outlier removal</em> simply deletes points with fewer than a threshold of neighbors inside a fixed radius. Statistical removal adapts to local density; radius removal is faster and more predictable.</p>
+<p>Third, many algorithms need <strong>surface normals</strong> that a bare point list does not carry. The standard estimate fits a local plane to each point's neighborhood by taking the eigenvector of the neighborhood covariance matrix with the smallest eigenvalue; that direction is the surface normal, and the small eigenvalue itself tells you how planar the patch is. Normals are not optional decoration: the best registration cost we will meet below depends on them, and so do the meshing and SDF representations of <a class="cross-ref" href="section-40.5.html">Section 40.5</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Downsample first, then everything else is affordable</h3>
+<p>Registration cost is dominated by nearest-neighbor queries, which scale with point count. Voxel downsampling a 2-million-point scan to 40,000 points shrinks every subsequent step by roughly \(50\times\) while barely moving the recovered transform, because rigid alignment is a global fit that does not need every point. The discipline is: choose a voxel size matched to the geometry you care about (a few centimeters for rooms, tens of centimeters for driving scenes), downsample once, and run the pipeline on the small cloud. Keep the full-resolution cloud around only to apply the final transform.</p>
+</div>
+
+<h2>The registration problem</h2>
+<p>Registration is the task of finding the rigid transform that aligns a <em>source</em> cloud \(P = \{p_i\}\) onto a <em>target</em> cloud \(Q = \{q_j\}\) so that overlapping geometry coincides. If we knew which source point corresponds to which target point, this would be closed-form. We almost never do, which is why the workhorse algorithm, <strong>Iterative Closest Point (ICP)</strong>, alternates two steps until convergence: assign each source point to its nearest target point as a provisional correspondence, then solve for the transform that minimizes the total squared distance under those correspondences, apply it, and repeat. The point-to-point objective is</p>
+$$E(R, t) = \sum_{i} \bigl\lVert R\,p_i + t - q_{\,c(i)} \bigr\rVert^2,$$
+<p>where \(c(i)\) indexes the current nearest target point. Each transform sub-problem has an exact solution via the singular value decomposition of the cross-covariance between the centered clouds, so ICP is fast per iteration. A better-behaved variant, <strong>point-to-plane ICP</strong>, replaces the plain distance with the distance measured along the target surface normal \(n_{c(i)}\):</p>
+$$E(R, t) = \sum_{i} \Bigl( \bigl( R\,p_i + t - q_{\,c(i)} \bigr) \cdot n_{\,c(i)} \Bigr)^2.$$
+<p>This lets surfaces slide tangentially against each other instead of being pinned point-for-point, which is exactly what you want when two scans sample the same wall at different spots. Point-to-plane converges in far fewer iterations on the planar, man-made surfaces that dominate indoor and driving scenes, and it is why we bothered estimating normals.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse robot closing the map</h3>
+<p>An autonomous forklift in a distribution center carries a spinning lidar. As it drives an aisle it captures one scan every 100 ms, each a partial slice of racking, floor, and pallets. Consecutive scans overlap heavily but each sits in the pose the robot occupied at capture time. The onboard stack voxel-downsamples each scan to 5 cm, removes the ground plane and statistical outliers, estimates normals, then runs point-to-plane ICP between the new scan and the accumulated local map, seeded by the wheel-odometry guess. The recovered transform both places the new points correctly and corrects the drifting odometry estimate. This scan-to-map ICP loop is the geometric heart of the lidar SLAM systems in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, and the odometry prior it leans on comes straight from the dead-reckoning of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>.</p>
+</div>
+
+<h2>Getting into the basin: global registration</h2>
+<p>ICP has one dangerous property: it is a <em>local</em> optimizer. Its nearest-neighbor correspondences are only trustworthy when the two clouds already start close together, so if the initial misalignment is large, ICP happily converges to a confident, completely wrong pose. When you have no good initial guess (loop closure between scans taken minutes apart, aligning a fresh scan to a prior map, matching a part to a CAD reference), you first need <strong>global registration</strong> to land inside ICP's convergence basin.</p>
+<p>The standard recipe is feature-based. Compute a local shape descriptor at each point, commonly the <em>Fast Point Feature Histogram (FPFH)</em>, which encodes the distribution of relative normal orientations in a point's neighborhood into a pose-invariant vector. Match descriptors between the two clouds to propose putative correspondences, then use <em>RANSAC</em> to find a rigid transform supported by a large consistent subset while rejecting the many wrong matches. The result is coarse but globally correct, and it becomes the seed for a final ICP refinement. This <strong>coarse-to-fine</strong> pipeline, global feature registration followed by local ICP polish, is the default for any registration where the starting displacement is unknown. The FPFH descriptor and the learned successors that now beat it recur in the point-cloud deep learning of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>.</p>
+
+<pre><code class="language-python">import open3d as o3d
+
+src = o3d.io.read_point_cloud("scan_a.ply")
+tgt = o3d.io.read_point_cloud("scan_b.ply")
+
+# Preprocess: voxel downsample, remove outliers, estimate normals.
+voxel = 0.05  # 5 cm, matched to indoor geometry
+src_d = src.voxel_down_sample(voxel)
+tgt_d = tgt.voxel_down_sample(voxel)
+src_d, _ = src_d.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+for pc in (src_d, tgt_d):
+    pc.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 2, max_nn=30))
+
+# Point-to-plane ICP, seeded by an odometry guess T_init.
+result = o3d.pipelines.registration.registration_icp(
+    src_d, tgt_d, max_correspondence_distance=voxel * 1.5, init=T_init,
+    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane())
+
+print(result.transformation)  # 4x4 rigid transform aligning src -> tgt
+print(result.fitness, result.inlier_rmse)  # overlap fraction, residual error
+</code></pre>
+<div class="code-caption">Open3D preprocessing and point-to-plane ICP: voxel downsample, statistical outlier removal, and normal estimation feed a single ICP call. The returned <code>fitness</code> and <code>inlier_rmse</code> are the quality metrics discussed below; <code>T_init</code> is the odometry or global-registration seed that keeps ICP inside its convergence basin.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Open3D collapses the pipeline to a dozen lines</h3>
+<p>A from-scratch registration stack, a KD-tree for nearest neighbors, a voxel-grid hasher, the SVD transform solver, the ICP iteration loop, FPFH descriptors, and a RANSAC estimator, is several hundred lines and a week of debugging correspondence bookkeeping. Open3D exposes each stage as one call, so the working pipeline above is roughly 12 lines instead of 300-plus, and its C++ core runs the nearest-neighbor queries far faster than hand-rolled Python. Reach for the library for production; implement one ICP iteration by hand once, so you understand what the black box converges to and why it sometimes does not.</p>
+</div>
+
+<h2>Judging an alignment</h2>
+<p>A transform that ICP returns without complaint can still be wrong, so you never trust registration without checking two numbers. <strong>Fitness</strong> is the fraction of source points that found a target neighbor within the correspondence distance: it measures how much of the cloud actually overlaps and aligned. <strong>Inlier RMSE</strong> is the root-mean-square residual over those matched pairs: it measures how tightly the overlap fits. A good registration has high fitness and low RMSE. High fitness with high RMSE means a loose, sloppy fit; low fitness means the clouds barely overlap and the pose is probably a local-minimum artifact you must discard. The classic failure mode is a symmetric or feature-poor scene, a long bare corridor, a flat field, where many poses fit almost equally well and ICP slides along the ambiguous axis. The defense is the same in every domain: seed with a good prior, verify with fitness and RMSE, and where the geometry is genuinely ambiguous, fuse in another sensor rather than trusting geometry alone, which is precisely the probabilistic fusion argument of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take two overlapping scans of the same scene. (a) Run point-to-plane ICP directly from the identity transform and record fitness and inlier RMSE. (b) Now apply a 90-degree rotation to the source before running ICP from identity again. Explain why the result collapses even though the scenes are identical, then fix it by inserting an FPFH plus RANSAC global-registration step before ICP. (c) Sweep the voxel size across 2 cm, 5 cm, and 20 cm and plot recovered-pose error against runtime. Where is the knee, and why does too-coarse downsampling eventually corrupt the alignment?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ul>
+<li>Why does point-to-plane ICP usually converge in fewer iterations than point-to-point ICP on indoor scenes, and what preprocessing step does it require that point-to-point does not?</li>
+<li>ICP returns a transform with fitness 0.18 and low inlier RMSE. Is the alignment trustworthy? What single number told you, and what does it imply about the scans?</li>
+<li>You must align a fresh scan to a map built an hour ago, with no odometry prior. Why will bare ICP likely fail, and what do you run first?</li>
+</ul>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-40.5.html">Section 40.5</a>, we take the clean, registered clouds this section produced and ask how to <em>represent</em> them: as voxel grids, raw point sets, triangle meshes, or signed distance functions. Each representation trades memory, resolution, and the ease of the operations you most want to run, and the choice quietly shapes every 3D model you will build in the rest of Part IX.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.7: Applications in robotics and AR. Building Sensory AI." name="description"/>
+<title>Section 40.7: Applications in robotics and AR | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Radar, Lidar, Depth, Thermal, Event, and RF Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Depth and 3D Sensing Fundamentals</a></div>
+<h1>Applications in robotics and AR</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Everyone celebrates the depth map. Nobody thanks the depth map for the collision that never happened."</p><cite>An Underappreciated AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous six sections built the depth toolkit: how sensors measure range, how a depth map becomes a metric point cloud, how frames are calibrated and clouds are registered, which 3D representation to store, and how uncertain every number really is. This section is where that toolkit earns its keep. Two domains dominate the demand for real-time 3D: <em>robots</em>, which must not hit things, must know where they are, and must pick things up; and <em>augmented reality</em>, which must place virtual content so convincingly into a live scene that a rendered mug sits behind your real coffee cup and gets occluded by your hand. Both reduce to the same three geometric questions asked hundreds of times per second: where is free space, where is the surface, and where am I relative to both. We trace how depth flows into a navigation costmap, into a grasp, and into an AR occlusion test, and we confront the latency and uncertainty budgets that separate a demo from a shipping product.</p>
+</div>
+
+<p>This section assumes you can turn a depth image into a point cloud in a metric frame (<a class="cross-ref" href="index.html">Sections 40.2 and 40.3</a>), choose a representation such as an occupancy voxel grid (<a class="cross-ref" href="index.html">Section 40.5</a>), and reason about per-pixel depth error (<a class="cross-ref" href="index.html">Section 40.6</a>). The pose-tracking that ties frames together over time is the subject of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, and we lean on it here rather than rebuild it. No robotics background is assumed; each application is developed from its geometric query.</p>
+
+<h2>Robot navigation: from depth to free space</h2>
+
+<p>A mobile robot's first job is to not collide. The classical machinery for this is the <strong>costmap</strong>: a 2D or 3D grid where each cell holds a traversal cost derived from occupancy. Depth is the primary input. Each frame, the robot projects its depth image into 3D, drops points that fall outside a height band (the floor below the wheels, the ceiling above the sensor), and marks the remaining points as obstacles in the grid. Crucially it also marks the space <em>along each ray, in front of the hit</em> as free: a depth measurement is not just evidence of a surface at range \(z\), it is evidence of emptiness everywhere between the sensor and \(z\). This ray-casting step is what lets a robot clear a costmap cell after a person walks away, and it is why a raw obstacle-only map drifts into paralysis.</p>
+
+<p>Occupancy is fused over time in log-odds, exactly the recursive Bayesian update introduced in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. A cell seen occupied many times becomes confidently solid; a transient flicker from sensor noise decays away. The depth uncertainty of Section 40.6 sets the update weights directly: a stereo camera's error grows as \(z^2\), so a hit at 8 m should nudge the map far less than a hit at 1 m. Ignore that and a robot brakes for phantom walls at the edge of its range. The code block below builds a minimal top-down occupancy grid from a single depth frame, the operation a navigation stack runs every cycle.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def depth_to_occupancy(depth, fx, fy, cx, cy, cell=0.05, grid_m=6.0,
+                       floor=0.05, ceil=1.8):
+    """Project a metric depth image into a top-down occupancy grid.
+    depth: HxW array of metric depth (meters), 0 = invalid.
+    Returns an NxN uint8 grid: 1 = obstacle, 0 = unknown/free."""
+    H, W = depth.shape
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth.ravel()
+    valid = z &gt; 0
+    # Back-project pixels to camera-frame 3D points (Section 40.2).
+    x = (us.ravel() - cx) * z / fx
+    y = (vs.ravel() - cy) * z / fy
+    x, y, z = x[valid], y[valid], z[valid]
+    # Keep only points within the robot's collision height band.
+    band = (y &gt; -ceil) &amp; (y &lt; -floor)   # y points down in camera frame
+    x, z = x[band], z[band]
+    # Rasterize the ground-plane (x, z) footprint into grid cells.
+    n = int(grid_m / cell)
+    gx = ((x + grid_m / 2) / cell).astype(int)
+    gz = (z / cell).astype(int)
+    keep = (gx &gt;= 0) &amp; (gx &lt; n) &amp; (gz &gt;= 0) &amp; (gz &lt; n)
+    grid = np.zeros((n, n), np.uint8)
+    grid[gz[keep], gx[keep]] = 1
+    return grid
+
+# Synthetic frame: a wall at 2 m fills the lower half of the image.
+depth = np.zeros((120, 160), np.float32)
+depth[60:, :] = 2.0
+occ = depth_to_occupancy(depth, fx=120, fy=120, cx=80, cy=60)
+print("occupied cells:", int(occ.sum()))
+</code></pre>
+<div class="code-caption">A single-frame depth-to-occupancy projection: back-project pixels to 3D, filter to the robot's height band, and rasterize the ground footprint into a grid. A production stack adds ray-cast free-space clearing and log-odds fusion across frames; this shows the geometric core that every navigation costmap runs each cycle.</div>
+
+<p>The height-band filter in that function is not a detail, it is the whole trick that turns a wall of points into a floor plan a planner can use. Points near the ground are the floor and must be ignored; points at wheel or torso height are what will actually stop the robot.</p>
+
+<h2>Manipulation: grasping from a point cloud</h2>
+
+<p>Where navigation asks "where is free space", manipulation asks "where is the surface, precisely". A robot arm picking parts from a bin needs the object's local geometry to millimeter accuracy so it can place a gripper on a graspable patch. The modern pipeline segments the target's point cloud, estimates surface normals (recall that a normal is only meaningful with the connectivity or neighborhood structure discussed in <a class="cross-ref" href="index.html">Section 40.5</a>), and either fits a known CAD model by registration (Section 40.4) or runs a learned grasp network that proposes 6-DoF gripper poses directly on raw points. This is where a robot's exteroceptive depth stream meets the proprioceptive and tactile senses of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>: vision plans the grasp, touch confirms it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Robotics and AR are the same geometry problem viewed from opposite sides. A robot uses depth to decide <em>where it may move matter</em> (free space, graspable surface, self-localization). AR uses depth to decide <em>where it may draw matter</em> (occlusion, placement, anchoring). Both need the identical three primitives: a free-space model, a surface model, and a pose. Build those three well and a navigation stack and an AR engine share most of a codebase.</p>
+</div>
+
+<h2>Augmented reality: occlusion, placement, and anchoring</h2>
+
+<p>An AR system's credibility rests on depth. Three jobs depend on it. <strong>Placement</strong> needs plane detection: the system finds horizontal and vertical surfaces so a virtual object rests on the real table instead of floating. <strong>Occlusion</strong> needs a per-pixel depth of the real scene: before drawing a virtual pixel, the renderer compares the virtual fragment's depth against the sensed real depth, and if the real surface is nearer, the virtual pixel is discarded. This single test is what makes a rendered character walk convincingly behind a real sofa. <strong>Anchoring</strong> needs pose: the virtual content must stay locked to its world position as the user moves, which is the tracking half of SLAM again.</p>
+
+<p>Modern phone AR frameworks (Apple's ARKit, Google's ARCore) fuse a sparse visual-inertial pose with a depth stream, from a dedicated time-of-flight sensor on high-end devices or from monocular depth estimation elsewhere, to produce both a coarse scene mesh and a per-frame environment depth map. The monocular route connects directly to <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-41-monocular-depth-foundation-models/index.html">Chapter 41</a>, where a single camera yields dense depth with no active emitter at all, and to the neural scene reconstructions of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an AR tape measure that respects your walls</h3>
+<p>Consider a home-improvement app that lets a user measure a room by tapping corners on the phone screen. Each tap is a 2D pixel; the app must turn it into a 3D world point. It ray-casts the tap through the camera model into the fused environment depth, reads the metric range at that pixel, and back-projects to a world coordinate anchored by ARKit's pose. Two measured corners give a Euclidean distance. The failure modes are pure Section 40.6 material: on a dark or glossy wall the time-of-flight return is weak and depth is noisy, so the app snaps the tap to the nearest detected plane instead of trusting a single pixel, and it refuses to report a measurement when the plane fit residual is large. The product lesson is that the depth number is never used naked; it is always regularized by a surface prior and gated by its own uncertainty.</p>
+</div>
+
+<h2>The shared constraint: real time on a power budget</h2>
+
+<p>What unites both domains is a brutal latency budget. A robot avoiding a walking person and an AR headset stabilizing an anchor both need the perceive-to-act loop closed in tens of milliseconds; a 200 ms lag turns a smooth overlay into visible swim and turns obstacle avoidance into a collision. This forces the whole pipeline (projection, fusion, planning, rendering) onto an embedded processor with a fixed power envelope, the territory of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. It is why costmaps are 2D when 2D suffices, why voxel grids are truncated to a few meters around the agent, and why depth is often downsampled before fusion. The engineering art is spending the millisecond and milliwatt budget on the geometry that actually changes the next action.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The hand-rolled projection above is instructive but partial: a real navigation map needs ray-cast free-space clearing and probabilistic fusion. <a href="https://octomap.github.io/">OctoMap</a> provides exactly this as a mature octree occupancy library. Inserting a full cloud with automatic ray-casting and log-odds update is two calls, <code>tree.insertPointCloud(cloud, origin)</code> then a probability query, replacing roughly 150 lines of grid ray-tracing, hit/miss bookkeeping, and octree memory management. You supply the registered cloud and sensor origin; the library handles adaptive resolution, unknown-versus-free distinction, and serialization. For the point-cloud front end (voxel downsampling, normal estimation, plane and cluster segmentation) Open3D collapses each into a single call, which is the subject of this chapter's lab.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend <code>depth_to_occupancy</code> to also mark free space. For each valid pixel, before setting the obstacle cell, walk the grid cells along the ray from the sensor origin \((n/2, 0)\) to the hit cell and set them to a distinct "free" value (say 2) where they are still unknown. Then feed two consecutive frames in which a simulated obstacle moves one meter sideways, and confirm that the cells it vacated flip from occupied back toward free. Which decays faster with a naive overwrite versus a log-odds update, and why does that matter for a robot deciding whether a doorway is now passable?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does a robot mark space <em>in front of</em> a depth hit as free, and what goes wrong if it only ever marks obstacles?</p>
+<p>2. In AR occlusion, exactly which two depth values are compared per pixel, and what is drawn when the real one is smaller?</p>
+<p>3. A stereo camera's depth error grows with \(z^2\). Give one concrete way this should change how a distant measurement updates a navigation costmap versus a near one.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 40</h3>
+<p>load, register, downsample, and segment point clouds with Open3D.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Robot mapping and navigation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1007/s10514-012-9321-0">Hornung, A., Wurm, K. M., Bennewitz, M., Stachniss, C., &amp; Burgard, W. (2013). OctoMap: An Efficient Probabilistic 3D Mapping Framework Based on Octrees. Autonomous Robots.</a></p>
+<p class="bib-annotation">The reference octree occupancy-mapping system: probabilistic, ray-cast, memory-efficient, and the practical default behind the library shortcut in this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1109/MRA.2010.936956">Marder-Eppstein, E., Berger, E., Foote, T., Gerkey, B., &amp; Konolige, K. (2010). The Office Marathon: Robust Navigation in an Indoor Office Environment. ICRA.</a></p>
+<p class="bib-annotation">Introduces the layered costmap navigation stack that turns depth and laser scans into traversal costs; the conceptual basis for the occupancy-grid pipeline here.</p>
+</div>
+
+<p class="bib-category">Grasping and manipulation from depth</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1703.09312">Mahler, J., et al. (2017). Dex-Net 2.0: Deep Learning to Plan Robust Grasps with Synthetic Point Clouds and Analytic Grasp Metrics. RSS.</a></p>
+<p class="bib-annotation">A landmark showing that grasps can be learned directly on depth-derived point clouds with synthetic supervision, closing the depth-to-manipulation loop.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1905.10520">ten Pas, A., Gualtieri, M., Saenko, K., &amp; Platt, R. (2017). Grasp Pose Detection in Point Clouds. IJRR.</a></p>
+<p class="bib-annotation">Detects 6-DoF grasp candidates on raw, unsegmented clouds, illustrating the surface-precision query that manipulation places on depth.</p>
+</div>
+
+<p class="bib-category">Augmented reality and dense reconstruction</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1109/ISMAR.2011.6092378">Newcombe, R. A., et al. (2011). KinectFusion: Real-Time Dense Surface Mapping and Tracking. ISMAR.</a></p>
+<p class="bib-annotation">The system that made real-time depth-camera reconstruction practical, seeding modern AR occlusion and scene meshing via truncated signed-distance volumes.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://developer.apple.com/documentation/arkit">Apple (2023). ARKit Developer Documentation: Scene Depth and Plane Detection.</a></p>
+<p class="bib-annotation">The production reference for how a shipping AR platform fuses visual-inertial pose with depth for placement, occlusion, and anchoring.</p>
+</div>
+
+<p class="bib-category">Point-cloud tooling</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1801.09847">Zhou, Q.-Y., Park, J., &amp; Koltun, V. (2018). Open3D: A Modern Library for 3D Data Processing.</a></p>
+<p class="bib-annotation">The library behind Lab 40: one-call voxel downsampling, normal estimation, registration, and segmentation for the depth pipelines in this chapter.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1109/ICRA.2011.5980567">Rusu, R. B., &amp; Cousins, S. (2011). 3D is Here: Point Cloud Library (PCL). ICRA.</a></p>
+<p class="bib-annotation">The foundational open-source point-cloud toolkit whose filtering, segmentation, and registration modules underpin most robotics depth stacks.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-41-monocular-depth-foundation-models/index.html">Chapter 41</a>, we drop the active emitter entirely and ask a single ordinary camera for dense metric depth. Foundation models like Depth Anything and Metric3D now deliver zero-shot depth good enough to feed the very costmaps, grasps, and occlusion tests you just built, turning any phone or webcam into a 3D sensor.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
