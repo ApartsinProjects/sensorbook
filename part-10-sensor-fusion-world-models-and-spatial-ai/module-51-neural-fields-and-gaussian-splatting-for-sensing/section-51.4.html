@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.4: Joint lidar-camera splatting (SplatAD). Building Sensory AI." name="description"/>
+<title>Section 51.4: Joint lidar-camera splatting (SplatAD) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Joint lidar-camera splatting (SplatAD)</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"Build the world once. Then let each sensor look at it the way its own optics demand."</p>
+        <cite>A Frugal AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the Gaussian primitive and its tile-based rasterizer from <a class="cross-ref" href="section-51.2.html">Section 51.2</a>, and on the sensor re-simulation goals set out in <a class="cross-ref" href="section-51.3.html">Section 51.3</a>. You should know how a lidar sensor forms a range image (spherical projection, beam pattern, intensity, ray dropping) from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a> and <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and understand rolling-shutter timing and cross-sensor synchronization from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. The physical optics that make a camera and a lidar disagree geometrically come from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The previous section rendered a lidar view and a camera view from a reconstructed scene as two separate exercises. That is wasteful and, worse, inconsistent: a photometric reconstruction and a geometric reconstruction of the same street can drift apart, so the fake camera image and the fake point cloud stop agreeing about where the parked truck is. <strong>Joint lidar-camera splatting</strong> fixes this by reconstructing a single set of 3D Gaussians and attaching two render heads to it, one that rasterizes to a pinhole image and one that rasterizes to a lidar range image. SplatAD, the driving-focused method this section is named for, was the first to do both inside one real-time Gaussian pipeline while also modeling the two effects that wreck naive re-simulation on a moving car: rolling shutter and lidar ray dropping. The payoff is a digital replica of a drive whose synthetic camera and synthetic lidar are, by construction, describing the same world.</p>
+    </div>
+
+    <h2>Why one scene, two heads</h2>
+    <p>The <em>what</em> is a shared explicit representation: a cloud of anisotropic 3D Gaussians, each with a mean, covariance, opacity, and appearance features, exactly the primitive of <a class="cross-ref" href="section-51.2.html">Section 51.2</a>, optimized so that <em>both</em> sensors reproduce their real measurements. The <em>why</em> is consistency and cost. A camera constrains a Gaussian's color and its silhouette but is nearly blind to absolute depth; a lidar constrains that same Gaussian's range to centimeters but says little about color. Optimizing them jointly lets each sensor supply what it measures well and correct what the other measures poorly. A camera-only splat can float geometry anywhere along a ray and still look photometrically perfect; the lidar term nails it in place. The result is one geometry that is simultaneously photorealistic and metrically correct, which is precisely what a re-simulation pipeline (<a class="cross-ref" href="section-51.3.html">Section 51.3</a>) needs to be trustworthy.</p>
+    <p>The <em>how</em> is that the two heads share the scene but not the projection. The camera head is standard perspective splatting. The lidar head cannot be: a spinning lidar does not image through a pinhole, it sweeps a set of laser beams across azimuth and reports range per return. So the lidar head projects each Gaussian into <strong>spherical coordinates</strong>, azimuth and elevation, and rasterizes onto the sensor's beam grid, compositing not color but expected range, intensity, and a probability that the ray returns at all. The <em>when</em> to reach for this over single-sensor splatting is any application that will consume both modalities downstream: autonomous-driving stacks, robot perception that fuses lidar and vision, or any augmentation set feeding a multimodal detector like those in <a class="cross-ref" href="../module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The two sensors are not two datasets to fit; they are two <em>orthogonal constraints on the same unknowns</em>. Think of each Gaussian's position as having a large uncertainty along the camera ray (depth) and a large uncertainty across the lidar beam (angle and appearance). Joint optimization multiplies these likelihoods, and the product is sharp where either factor is sharp. This is the same complementary-observation logic as classical multi-sensor estimation in <a class="cross-ref" href="../module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>, but now the shared latent state is an entire scene rather than a pose vector.</p>
+    </div>
+
+    <h2>Rolling shutter and the moving-platform problem</h2>
+    <p>On a car at 15 m/s, the assumption that a frame is captured at one instant is simply false, and pretending otherwise bakes a ghost into the reconstruction. A rolling-shutter camera reads pixel rows sequentially over the exposure, so the bottom of the image is sampled milliseconds after the top. A spinning lidar is even more extreme: a full sweep takes about 100 ms, and every point in it is stamped at a different time as the beam rotates and the vehicle moves beneath it. If you splat the whole sweep from a single pose, straight lane markings bend and poles lean.</p>
+    <p>The fix is to make time a first-class coordinate of rendering. Each output element, a camera row or a lidar beam column, carries its own timestamp \(t\), and the sensor pose used to project the Gaussians is the interpolated ego pose at that exact \(t\). Concretely, if the ego trajectory is \(T(t) \in SE(3)\), the render for a pixel or beam fired at time \(t\) uses \(T(t)\), not the frame's nominal timestamp. Dynamic actors get the same treatment: each moving object has its own rigid trajectory, so a Gaussian belonging to a passing cyclist is placed at that actor's pose at \(t\) before projection. SplatAD folds this per-element timing into the rasterizer itself so that both sensors are unrolled correctly and remain mutually consistent, which is exactly why the joint formulation matters here, the timing model is shared rather than reinvented per sensor.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: replaying a near-miss for an AV stack</h3>
+        <p>An autonomous-driving team has one logged sequence where a pedestrian steps out from behind a van and the emergency-braking system triggers correctly. They want a hundred variations to stress-test the planner. They reconstruct the 20-second log with joint splatting: cameras plus a 32-beam lidar, actors tracked as separate rigid Gaussians. Because the reconstruction is metrically anchored by lidar and photometric from cameras, they can now shift the van 1.5 m left, delay the pedestrian by 200 ms, and re-render <em>both</em> the eight camera streams and the lidar sweep of the edited scene. Crucially the rolling-shutter and beam-timing model means the re-rendered lidar of the moved van has physically plausible point spacing and self-occlusion, so the perception model under test cannot tell it apart from a real log by cheap statistics. A camera-only rig would have produced pretty images that the lidar-based detector ignores; the joint rig produces a coherent multimodal replay.</p>
+    </div>
+
+    <h2>Rendering the lidar head: range, intensity, and ray drop</h2>
+    <p>A lidar return is not one number. For each beam SplatAD predicts three things by alpha-compositing the Gaussians that fall on that beam, sorted front to back just as in camera splatting: the expected <strong>range</strong> (depth to first solid return), the <strong>intensity</strong> of the return (a learned per-Gaussian feature, since reflectivity depends on material and angle, see <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>), and a <strong>ray-drop probability</strong>. That last term is what separates a convincing synthetic sweep from an obviously fake one: real lidars fail to get a return on dark, wet, specular, or grazing-angle surfaces, and the pattern of missing points is a strong tell. Rather than hand-code it, the model learns a per-ray dropout that a small network refines from the composited features, so the synthetic sweep has the same holes a real one would.</p>
+    <p>Training minimizes a sum of per-sensor losses on the raw measurements: a photometric loss on the camera image, an L1 (or L2) loss on lidar range, a loss on intensity, and a binary loss on ray drop, all evaluated against the recorded sensor data. Because everything is differentiable through the shared Gaussians, a range error at one beam nudges the same Gaussian that a color error at an overlapping pixel nudges. On the leakage-safe discipline running through this book, held-out timestamps or held-out camera rigs must define the evaluation split; scoring re-rendered frames at poses the optimizer already fit is measuring memorization, not synthesis, a point <a class="cross-ref" href="section-51.7.html">Section 51.7</a> makes into a full validation protocol.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+
+def project_to_lidar_beams(mu_world, ego_pose_at_t):
+    """Project Gaussian centers into a spinning-lidar's spherical frame.
+    mu_world:        (N,3) Gaussian means in world coordinates
+    ego_pose_at_t:   (N,4,4) the ego pose sampled at EACH point's own
+                     firing time (rolling shutter / sweep timing)."""
+    # Bring each point into the sensor frame using ITS timestamp's pose.
+    ones = torch.ones(mu_world.shape[0], 1)
+    homog = torch.cat([mu_world, ones], dim=1).unsqueeze(-1)      # (N,4,1)
+    p_sensor = torch.matmul(torch.inverse(ego_pose_at_t), homog)  # (N,4,1)
+    x, y, z = p_sensor[:, 0, 0], p_sensor[:, 1, 0], p_sensor[:, 2, 0]
+
+    rng       = torch.sqrt(x*x + y*y + z*z)          # depth = lidar "pixel value"
+    azimuth   = torch.atan2(y, x)                    # horizontal beam angle
+    elevation = torch.asin(z / (rng + 1e-9))         # selects the beam row
+    return azimuth, elevation, rng                   # rasterize onto beam grid
+</code></pre>
+    <div class="code-caption">The lidar head replaces the camera's pinhole projection with a spherical one, and, unlike a camera frame, applies a per-point pose so the sweep is unrolled in time. Azimuth and elevation index the beam grid; range is the value composited along each beam. Intensity and ray-drop heads (omitted for brevity) composite additional per-Gaussian features the same way.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Writing a differentiable spherical rasterizer with correct rolling-shutter timing, actor unrolling, and ray-drop compositing from scratch is roughly 2,000 to 3,000 lines of CUDA and Python before it trains at all. The reference SplatAD implementation and driving frameworks built on <code>nerfstudio</code>-style splatting expose this as a configured sensor model: point it at a nuScenes, PandaSet, or Argoverse2 log with camera plus lidar calibration and it fits the joint scene in tens of lines of config. The library owns the spherical projection, the per-element timestamps, the intensity and ray-drop heads, and the tiled backward pass; you supply data and losses. That is a 50-to-1 code reduction over a hand-rolled rasterizer, and it inherits the numerically tested gradients.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>SplatAD (Hess et al., CVPR 2025) is the current reference for real-time joint camera-lidar Gaussian splatting on driving data, reporting large speedups over NeRF-based re-simulators such as NeuRAD (Hess et al., CVPR 2024) and UniSim while improving both novel-view image quality and lidar range accuracy on nuScenes, PandaSet, and Argoverse2. Open problems remain: fast-spinning lidar with severe motion still challenges the timing model, learned ray drop does not yet capture weather-dependent physics (rain, fog, spray) faithfully, and specular and transparent surfaces confuse the shared geometry. The tight coupling with Gaussian-splatting SLAM, where the same joint scene is built online, is the subject of <a class="cross-ref" href="../module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+    </div>
+
+    <h2>What joint splatting buys, and what it costs</h2>
+    <p>The concrete gains are three. First, <strong>metric-photometric agreement</strong>: the synthetic camera and lidar cannot contradict each other because they read one geometry, which is the whole reason multimodal detectors trained on the output do not collapse. Second, <strong>speed</strong>: splatting rasterizes rather than ray-marches a network, so both sensors render at interactive-to-real-time rates where NeRF-based joint re-simulation ran seconds per frame, the difference between augmenting a dataset overnight and over a month. Third, <strong>editability</strong>: because actors are separate Gaussian sets with their own trajectories, you can move, add, or remove them and re-render both sensors coherently, which is the machinery <a class="cross-ref" href="section-51.5.html">Section 51.5</a> uses to manufacture rare events.</p>
+    <p>The costs are real and worth naming. Joint fitting needs accurate cross-sensor calibration and ego poses; a few centimeters of lidar-to-camera miscalibration puts the two loss terms in disagreement and smears the geometry. The scene is still a reconstruction of one drive, not a general world model, so extrapolating far from the recorded trajectory degrades. And appearance is baked at capture time, relighting to a different sun angle or weather is not free. These are exactly the seams that <a class="cross-ref" href="section-51.7.html">Section 51.7</a> teaches you to probe before trusting synthetic-from-real data in an evaluation loop.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a reconstructed sequence and render the lidar head twice: once using a single frame-nominal pose for the whole sweep, and once using per-point timestamped poses as in the code above. Overlay both synthetic sweeps on the real recorded sweep for a segment containing a straight guardrail while the ego vehicle turns. Measure the mean range error against the real points for each. Quantify how much the rolling-shutter (per-point timing) model reduces the error, and explain geometrically why the error grows with ego angular velocity.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why does adding a lidar loss to camera-only Gaussian splatting sharpen geometry that looks already perfect in the rendered image?</li>
+            <li>The camera head uses perspective projection and the lidar head uses spherical projection, yet they optimize the <em>same</em> Gaussians. What quantity must the two heads agree on for the joint scene to be well-defined?</li>
+            <li>What real-world lidar behavior does the learned ray-drop head reproduce, and why would a synthetic sweep without it be easy for a detector to distinguish from a real one?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-51.5.html">Section 51.5</a>, we put the editability of this joint scene to work: by relocating actors, inserting new agents, and perturbing trajectories, we generate synthetic examples of the rare and dangerous events that real logs almost never contain, and we ask what makes such synthetic data safe to train and evaluate on.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

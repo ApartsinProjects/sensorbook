@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.1: Neural radiance fields and signed distance fields. Building Sensory AI." name="description"/>
+<title>Section 51.1: Neural radiance fields and signed distance fields | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Neural radiance fields and signed distance fields</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"A scene is not a pile of points. It is a function of space you have not yet bothered to learn."</p>
+        <cite>A Continuous AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the camera and depth geometry of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>: pinhole projection, rays, and how a pixel maps to a line through space. It uses the measurement-model view of a sensor from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and the plain multilayer-perceptron and backpropagation machinery of Appendix B and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. Point clouds and surface extraction are the subject of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. The Gaussian-splatting alternative that replaces the networks here with explicit primitives is the work of the next section, not this one.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every representation of the physical world so far in this book has been discrete: a grid of pixels, a set of points, a voxel occupancy volume. A <strong>neural field</strong> throws the grid away and stores the scene as a <em>function</em>. You hand a small neural network a 3D coordinate and it returns what is there: a color and a density, or a signed distance to the nearest surface. The scene lives entirely in the weights of the network, queryable at any point at any resolution, with no fixed sampling. Two members of this family dominate sensing. A <strong>neural radiance field</strong> (NeRF) learns the volumetric appearance of a scene from posed images and lets you render it from viewpoints no camera ever occupied. A <strong>signed distance field</strong> (SDF) learns the geometry as the zero level set of a distance function, giving a clean, watertight surface. Both are trained by a single trick: make the field reproduce the sensor measurements you actually have, and the physically correct scene falls out as the only field that could have produced them.</p>
+    </div>
+
+    <h2>The radiance field and its rendering integral</h2>
+    <p>A NeRF is a function \(F_\theta:(\mathbf{x}, \mathbf{d}) \mapsto (\mathbf{c}, \sigma)\). It takes a 3D position \(\mathbf{x}\in\mathbb{R}^3\) and a unit viewing direction \(\mathbf{d}\), and returns an emitted RGB color \(\mathbf{c}\) and a volume density \(\sigma \ge 0\). Density depends only on position (geometry does not change with where you look), while color depends on both, so that a wet road or a glossy panel can look different from different angles. The <em>what</em> is deliberately minimal: \(F_\theta\) is a small MLP, often eight layers wide, with no convolutions and no explicit 3D data structure.</p>
+    <p>The <em>why</em> it can be trained from ordinary photographs is the rendering model. To predict the color of one pixel, you cast the camera ray \(\mathbf{r}(t)=\mathbf{o}+t\mathbf{d}\) into the scene, sample points along it, and composite their colors weighted by how much light reaches the camera from each. This is the volume rendering integral:</p>
+    <p>$$C(\mathbf{r}) = \int_{t_n}^{t_f} T(t)\,\sigma(\mathbf{r}(t))\,\mathbf{c}(\mathbf{r}(t),\mathbf{d})\,dt,\qquad T(t)=\exp\!\left(-\int_{t_n}^{t}\sigma(\mathbf{r}(s))\,ds\right).$$</p>
+    <p>The transmittance \(T(t)\) is the probability a ray travels from the camera to \(t\) without being absorbed; \(\sigma\) governs how fast that probability decays. A point contributes to the pixel only if it is dense <em>and</em> nothing dense sits in front of it. The <em>how</em> of training is then pure supervision by re-projection: render the predicted pixel color \(\hat C(\mathbf{r})\), compare it to the true captured pixel \(C_\text{gt}(\mathbf{r})\), and descend the photometric loss \(\mathcal{L}=\sum_{\mathbf{r}} \lVert \hat C(\mathbf{r}) - C_\text{gt}(\mathbf{r})\rVert^2\). No 3D labels are needed; the geometry emerges because reproducing many overlapping views is only possible if \(\sigma\) concentrates on the true surfaces. The <em>when</em>: NeRF shines when you have dozens of well-posed images of a mostly static scene and want photorealistic novel views, and it struggles when poses are unknown, the scene moves, or you have only a handful of frames.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A raw MLP on \((x,y,z)\) cannot learn sharp edges: fully connected networks are biased toward low frequencies and blur the scene into mush. The fix that made NeRF work is <strong>positional encoding</strong>, mapping each coordinate through a bank of sinusoids \(\gamma(x)=[\sin(2^0\pi x),\cos(2^0\pi x),\dots,\sin(2^{L-1}\pi x),\cos(2^{L-1}\pi x)]\) before the MLP sees it. Lifting the input into this high-frequency space lets the same tiny network represent fine texture and crisp silhouettes. The lesson generalizes far beyond graphics: when a coordinate network looks blurry, the input encoding, not the network depth, is almost always the thing to fix.</p>
+    </div>
+
+    <h2>Signed distance fields: geometry as a level set</h2>
+    <p>Density is a soft, fog-like quantity: it is superb for rendering but it never tells you exactly <em>where</em> the surface is, only where light tends to stop. When the deliverable is geometry, a lidar-quality mesh, a collision surface for a robot, a metric measurement, an SDF is the better field. An SDF is a function \(s_\theta:\mathbb{R}^3\to\mathbb{R}\) returning the signed distance to the nearest surface: negative inside the object, positive outside, and exactly zero <em>on</em> it. The surface is the implicit set \(\{\mathbf{x}: s_\theta(\mathbf{x})=0\}\). The <em>why</em> to prefer this: a true distance function has a defined normal everywhere (\(\mathbf{n}=\nabla s_\theta\)), extracts a watertight mesh by marching cubes on the zero crossing, and supports exact ray-surface intersection by sphere tracing, stepping along a ray in increments of the current distance value, which cannot overshoot the surface.</p>
+    <p>For \(s_\theta\) to be a genuine distance rather than an arbitrary field with the right sign, it must satisfy the <strong>eikonal equation</strong> \(\lVert\nabla s_\theta(\mathbf{x})\rVert=1\) almost everywhere: moving one meter through space should change the distance-to-surface by one meter. This is imposed during training as a soft penalty, the eikonal loss \(\mathcal{L}_\text{eik}=\mathbb{E}_\mathbf{x}\big(\lVert\nabla s_\theta(\mathbf{x})\rVert-1\big)^2\), evaluated on random points using the network's own autodiff gradient. The <em>how</em> of supervision depends on your sensor. A lidar or depth camera gives near-direct supervision: points on the beam return are zero-distance surface samples, and free space between sensor and return is known to be empty (positive distance). RGB-only supervision is subtler; methods such as NeuS and VolSDF convert the SDF into a density profile so that the same volume rendering integral above can train geometry and appearance jointly, marrying NeRF's easy photometric supervision to the SDF's clean surface.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+def positional_encoding(x, L=6):                 # x: (..., 3) coordinates
+    freqs = 2.0 ** torch.arange(L) * torch.pi    # [pi, 2pi, 4pi, ...]
+    xb = x[..., None] * freqs                     # (..., 3, L)
+    enc = torch.cat([xb.sin(), xb.cos()], dim=-1) # (..., 3, 2L)
+    return torch.cat([x, enc.flatten(-2)], dim=-1)
+
+class TinyField(nn.Module):                       # (x,y,z) -> (rgb, density)
+    def __init__(self, L=6, w=128):
+        super().__init__()
+        d_in = 3 + 3 * 2 * L
+        self.net = nn.Sequential(nn.Linear(d_in, w), nn.ReLU(),
+                                 nn.Linear(w, w), nn.ReLU(),
+                                 nn.Linear(w, 4))        # 3 color + 1 density
+    def forward(self, x):
+        h = self.net(positional_encoding(x))
+        return torch.sigmoid(h[..., :3]), torch.relu(h[..., 3])
+
+def render_ray(field, o, d, tn=2.0, tf=6.0, N=64):
+    t = torch.linspace(tn, tf, N)                 # sample points along the ray
+    pts = o + t[:, None] * d                      # (N, 3)
+    rgb, sigma = field(pts)                        # (N,3), (N,)
+    delta = (t[1:] - t[:-1])                       # segment lengths
+    delta = torch.cat([delta, delta[-1:]])
+    alpha = 1.0 - torch.exp(-sigma * delta)        # opacity per segment
+    T = torch.cumprod(torch.cat([torch.ones(1), 1 - alpha[:-1]]), 0)  # transmittance
+    w = T * alpha                                  # compositing weights
+    return (w[:, None] * rgb).sum(0)               # rendered pixel color</code></pre>
+    <div class="code-caption"><strong>Listing 51.1.</strong> The complete forward path of a neural radiance field in one screen: a positionally encoded coordinate MLP and the discretized volume rendering integral. <code>render_ray</code> samples <code>N</code> points, turns density into per-segment opacity <code>alpha</code>, accumulates transmittance <code>T</code> as the running product of what light survives, and composites color by the weights <code>w</code>. Training minimizes the squared error between this rendered color and the captured pixel; the geometry is never supervised directly.</div>
+    <p>Listing 51.1 makes the central seam visible: the network is trivial, and every bit of physics lives in the rendering step that turns field values along a ray into one pixel. Swap the color-plus-density head for a distance head and reuse the same ray machinery and you have moved from a radiance field to a rendered SDF.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: mapping a substation for an inspection robot</h3>
+        <p>A utility sends a quadruped through an electrical substation once a month to check for corrosion, oil leaks, and loose hardware. On each visit the robot's calibrated stereo camera and a low-cost lidar capture a few hundred posed frames. The team fits a signed distance field to the lidar returns and a joint radiance-plus-SDF field to the images, producing both a millimeter-clean surface and a photorealistic appearance model of the whole yard. Because the field is continuous, an inspector can later query a novel viewpoint, say, a close-up of a bushing that no single frame captured head-on, and the reconstruction fills it in. More usefully, differencing this month's SDF against last month's flags a two-millimeter bulge on a transformer fin as a signed-distance change long before it is visible to a human. The metric surface comes from the SDF's eikonal-constrained geometry; the ability to re-render an arbitrary view for the maintenance report comes from the radiance side. Neither a bare point cloud nor a bare photo set would have supported both queries.</p>
+    </div>
+
+    <h2>From slow MLPs to real hash grids</h2>
+    <p>The original NeRF paid for its elegance with time: a single scene took a day on a GPU because every one of millions of ray samples ran a full MLP forward and backward pass. The decisive engineering shift, Instant-NGP (Muller et al., 2022), keeps the field idea but moves most of the capacity out of the MLP and into a <strong>multiresolution hash grid</strong> of trainable feature vectors. A query point looks up and interpolates feature vectors from several grid resolutions, concatenates them, and passes the result through a tiny two-layer MLP. The <em>why</em> this is faster: the grid does the memorizing, so the network can be small, and the lookups are cheap; training drops from hours to seconds. The <em>how</em> it stays compact: fine levels index a fixed-size table through a hash, accepting rare collisions in exchange for bounded memory. This is the representation most production neural-field and splatting systems build on, and it is why neural fields moved from a research curiosity to something you can fit on a robot's logged drive over lunch. The same acceleration underlies the near-real-time reconstruction pressures taken up later in this chapter and the mapping backbones of <a class="cross-ref" href="index.html">Chapter 51</a>'s neighbor, <a class="cross-ref" href="../module-52-slam-and-spatial-ai/index.html">Chapter 52</a> on SLAM.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Listing 51.1 is a teaching toy. A production neural field needs hash-grid encodings, hierarchical ray sampling, pose refinement, appearance embeddings, and a mesh exporter, easily two thousand lines of careful CUDA-aware code. <code>nerfstudio</code> collapses the whole pipeline to a command:</p>
+        <pre class="language-python"><code class="language-python"># reconstruct a scene from a folder of images, then export a mesh
+# (shell, one line each)
+# ns-process-data images --data ./substation_frames --output-dir ./proc
+# ns-train nerfacto --data ./proc
+# ns-export poisson --load-config outputs/.../config.yml --output-dir ./mesh</code></pre>
+        <div class="code-caption"><strong>Listing 51.2.</strong> An entire NeRF workflow, structure-from-motion pose estimation, hash-grid training, and mesh export, in three <code>nerfstudio</code> commands, replacing roughly 2,000 lines of custom rendering, sampling, and CUDA glue. The library owns positional and hash encoding, ray sampling, and the training loop; what stays yours is the capture protocol, the choice between a radiance and an SDF model (<code>nerfacto</code> versus <code>neus-facto</code>), and validating that the reconstruction is faithful enough for your sensing task.</div>
+        <p>As Listing 51.2 shows, the library owns the rendering mathematics; you own the sensing judgment, whether the exported surface is metrically trustworthy for the task that consumes it.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The field is moving fast on both quality and geometry. Mip-NeRF 360 and Zip-NeRF push anti-aliased, unbounded outdoor scenes; Neuralangelo (Li et al., 2023) combines hash-grid encodings with numerical-gradient eikonal regularization to recover surface detail rivaling laser scanners from images alone. On the sensing side, SDF and radiance fields are increasingly supervised directly by lidar and depth (for example urban-scale reconstructions fusing camera and lidar), which is exactly the sensor re-simulation thread this chapter develops next. The largest disruption, though, came from outside the neural-field family: 3D Gaussian splatting replaces the queried MLP with millions of explicit, differentiable Gaussians and rasterizes them, matching NeRF quality while rendering in real time. That is the subject of the next section, and much of the current frontier is about porting NeRF's hard-won lessons, anti-aliasing, SDF regularization, sensor supervision, onto that faster substrate.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 51.1 into a distance-rendering SDF. Replace the color-plus-density head with a single signed-distance output, then (a) implement sphere tracing: march a ray from the camera in steps equal to the current \(|s_\theta|\) until it falls below a small \(\epsilon\), and return the hit point. (b) Add an eikonal penalty by taking the autodiff gradient of \(s_\theta\) with respect to a batch of random points and pushing its norm toward one. (c) Reason about failure: if you drop the eikonal term entirely, the network can still fit zero at the surface. What goes wrong with the recovered normals and the mesh, and why is the constraint doing more than cosmetic work?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In the volume rendering integral, what does the transmittance \(T(t)\) represent, and why does a dense point behind another dense point contribute almost nothing to the pixel?</p>
+        <p class="quiz-question">2. Why does raw \((x,y,z)\) input make a coordinate MLP blurry, and what specifically does positional encoding change about the problem?</p>
+        <p class="quiz-question">3. You need a watertight, metrically accurate surface for a robot's collision checker. Would you fit a density-based radiance field or a signed distance field, and what does the eikonal constraint guarantee that a raw sign-correct field does not?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-51.2.html">Section 51.2</a>, we trade the queried network for an explicit, rasterizable representation: 3D Gaussian splatting, which scatters the scene across millions of differentiable Gaussians that render in real time, keeping the photometric supervision of NeRF while dropping the per-sample MLP cost that made these fields slow.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

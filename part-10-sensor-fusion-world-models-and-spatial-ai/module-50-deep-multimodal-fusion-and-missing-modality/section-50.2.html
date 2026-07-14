@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.2: Cross-attention and transformer fusion. Building Sensory AI." name="description"/>
+<title>Section 50.2: Cross-attention and transformer fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Cross-attention and transformer fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Concatenation asks two sensors to agree by sitting next to each other. Attention lets them argue, and pays more attention to whoever is making sense."</p><cite>A Diplomatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>In <a class="cross-ref" href="section-50.1.html">Section 50.1</a> each modality got its own encoder, so radar, camera, and inertial streams each arrive as a sequence of tokens in their own private embedding space. The obvious next step, stacking those tokens and passing them through one classifier, is exactly what you should not do first. It forces the network to fuse before it understands, gives every modality equal say regardless of quality, and collapses the moment one sensor drops out. Cross-attention fuses differently: it lets one modality <em>query</em> another, aligning information across streams that are unsynchronized, of different lengths, and of different reliability. This section builds cross-attention from the scalar dot product up, shows why it is the right primitive for heterogeneous sensor fusion, and connects it to the transformer fusion architectures that now dominate automotive perception and multimodal foundation models.</p>
+</div>
+
+<p>This is an advanced, research-frontier section. It assumes you are comfortable with the scaled dot-product attention introduced for single-stream sensor data in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, with the encoder outputs of <a class="cross-ref" href="section-50.1.html">Section 50.1</a>, and with the probabilistic view of fusion from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>. If attention notation is unfamiliar, read Chapter 15 first; everything here is a two-stream generalization of that single-stream machinery.</p>
+
+<h2>From self-attention to cross-attention</h2>
+
+<p>Self-attention lets a token attend to other tokens in the <em>same</em> sequence. Cross-attention keeps the identical arithmetic but draws the queries from one sequence and the keys and values from another. Let modality \(A\) produce a token matrix \(X_A \in \mathbb{R}^{n \times d}\) and modality \(B\) produce \(X_B \in \mathbb{R}^{m \times d}\), where \(n\) and \(m\) need not match: a camera frame might yield 256 patch tokens while a radar sweep yields 40 detection tokens. We project queries from \(A\) and keys and values from \(B\):</p>
+
+$$Q = X_A W_Q,\quad K = X_B W_K,\quad V = X_B W_V,\qquad \text{CrossAttn}(A \leftarrow B) = \operatorname{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V.$$
+
+<p>The attention matrix is now \(n \times m\): every token of \(A\) forms a soft, learned alignment over the tokens of \(B\). This is the single most important property for sensor fusion. You do not need the two streams to be sampled at the same rate, on the same grid, or even time-aligned to the millisecond, because the softmax discovers the correspondence. A camera patch showing a pedestrian can learn to pull from exactly the radar bin carrying that object's range and Doppler, ignoring the other 39 bins. Contrast this with the hard extrinsic calibration and resampling that classical fusion (Chapter 48) demands before concatenation is even meaningful.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: attention is soft, differentiable data association</h3>
+<p>Classical fusion solves data association explicitly: which radar return corresponds to which camera detection, resolved by nearest-neighbor gating or the Hungarian algorithm. Cross-attention replaces that hard combinatorial step with a soft, learned, end-to-end-differentiable assignment. The \(n \times m\) attention weights <em>are</em> the association matrix, and they are trained by the downstream loss rather than hand-tuned. This is why transformer fusion tolerates miscalibration and asynchrony that would break a Kalman-style tracker: the alignment is a learned quantity, not a geometric assumption.</p>
+</div>
+
+<h2>Fusion topologies: how to wire the streams</h2>
+
+<p>Cross-attention is a primitive; a fusion architecture is a choice of how to arrange it. Four topologies cover almost everything you will build.</p>
+
+<p><strong>Bottleneck fusion.</strong> Each modality runs its own transformer stack, and they exchange information only through a small set of shared latent tokens (typically 4 to 16). Every modality writes into and reads from these fusion tokens by cross-attention, but modalities never attend to each other's full token sets. The bottleneck forces the model to compress cross-modal information, which regularizes fusion and, critically, keeps cost linear in the number of modalities rather than quadratic. This is the design behind MBT (Multimodal Bottleneck Transformer, Nagrani et al., 2021) and it is the right default when you have three or more streams.</p>
+
+<p><strong>One-directional query fusion.</strong> A designated modality issues queries into the others. In automotive BEV perception, learnable spatial queries anchored to a bird's-eye grid attend into image and radar features to gather whatever supports each grid cell. This is the pattern of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>'s BEV transformers, where the query grid is the output geometry and the sensors are the value store.</p>
+
+<p><strong>Co-attention (bidirectional).</strong> Two streams alternately query each other, \(A \leftarrow B\) then \(B \leftarrow A\), refining both. Symmetric and expressive, but the \(O(nm)\) cost per layer per direction makes it viable only for two modalities with modest token counts.</p>
+
+<p><strong>Early token-mixing.</strong> Concatenate all tokens and run plain self-attention over the union, distinguishing modalities by a learned modality-type embedding added to each token. Self-attention then subsumes both within-modality and cross-modality attention. Simple and strong when token counts are small, but cost is quadratic in the <em>total</em> token count, so it scales poorly.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: forward-collision warning on a delivery robot</h3>
+<p>A sidewalk delivery robot fuses a fisheye camera (fast, semantically rich, blind in glare and fog) with a low-cost 60 GHz radar (robust to weather, poor at classification). The team first tried concatenating a global camera embedding with a global radar embedding into an MLP. It worked in clear weather and failed at dusk: the fused vector was dominated by the camera, and when sun glare washed out the image the radar's clean range-rate on an approaching cyclist was drowned out.</p>
+<p>Switching to bottleneck cross-attention, with 8 fusion tokens querying both streams, fixed it. On glare frames the camera tokens carried low-confidence, near-uniform keys, so the softmax naturally shifted weight onto the radar tokens carrying a sharp closing-velocity signal. Braking latency on the glare subset dropped and false-negative cyclist detections fell by more than half, with no change to either encoder. The fusion layer learned <em>when</em> to trust each sensor, which is precisely what the concatenation MLP could not represent.</p>
+</div>
+
+<h2>Making attention reliability-aware</h2>
+
+<p>The delivery-robot story hints at the deepest reason cross-attention beats concatenation for sensors: the softmax is a built-in, input-dependent gate. When a modality's keys are uninformative (a saturated camera, a radar drowning in multipath), the alignment scores flatten and that modality contributes a near-average, low-salience value. You can make this explicit rather than hoping it emerges. Two levers matter in practice.</p>
+
+<p>First, <strong>attention masking for dropout and asynchrony</strong>. If modality \(B\) is missing on a given frame, set its key logits to \(-\infty\) so the softmax assigns it zero weight and the query falls back to whatever remains. This single mechanism, exercised during training by randomly masking modalities, is the backbone of the graceful-degradation strategy developed in <a class="cross-ref" href="section-50.4.html">Section 50.4</a>. Second, <strong>reliability biases</strong>. Add a per-token scalar \(b_j\) derived from a signal-quality estimate to the pre-softmax logits, nudging attention toward high-quality tokens. This connects fusion to the calibration and uncertainty machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: a well-calibrated per-sensor confidence becomes a direct, principled input to the attention weights.</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def cross_attend(x_q, x_kv, Wq, Wk, Wv, kv_mask=None, kv_bias=None):
+    # x_q: (n, d) queries from modality A; x_kv: (m, d) keys/values from B
+    Q, K, V = x_q @ Wq, x_kv @ Wk, x_kv @ Wv
+    d_k = Q.shape[-1]
+    logits = (Q @ K.transpose(-1, -2)) / d_k**0.5      # (n, m) alignment
+    if kv_bias is not None:                            # per-token reliability (m,)
+        logits = logits + kv_bias.unsqueeze(0)
+    if kv_mask is not None:                            # True = present, False = dropped
+        logits = logits.masked_fill(~kv_mask.unsqueeze(0), float("-inf"))
+    attn = F.softmax(logits, dim=-1)                   # rows sum to 1 over present tokens
+    return attn @ V, attn                              # fused (n, d), weights (n, m)
+
+cam = torch.randn(256, 64)      # camera patch tokens
+radar = torch.randn(40, 64)     # radar detection tokens
+Wq, Wk, Wv = (torch.randn(64, 64) for _ in range(3))
+present = torch.ones(40, dtype=torch.bool); present[10:] = False   # radar partly dropped
+quality = torch.randn(40) * 0.5                                     # per-bin SNR bias
+fused, weights = cross_attend(cam, radar, Wq, Wk, Wv, present, quality)
+print(fused.shape, weights.sum(-1)[:3])   # (256, 64), each query's weights sum to 1</code></pre>
+<div class="code-caption">A minimal reliability-aware cross-attention block: camera tokens query radar tokens, with a boolean presence mask (for missing-modality fallback) and a per-token quality bias folded into the pre-softmax logits. The returned <code>weights</code> matrix is the soft association that Section 50.6 inspects for interpretability.</div>
+
+<p>The code above is deliberately bare so the mechanism is visible: the mask and bias enter as two extra lines on the logits, and everything downstream is unchanged. In a real stack you would wrap this in multi-head attention, residual connections, and a feed-forward block, exactly as in a transformer encoder layer.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: multi-head cross-attention in one call</h3>
+<p>Hand-rolling multi-head projections, head splitting, dropout, and the residual or norm wrapper is roughly 40 to 60 lines. PyTorch's <code>torch.nn.MultiheadAttention</code> collapses the whole attention core to a single call: pass camera tokens as <code>query</code> and radar tokens as <code>key</code>/<code>value</code>, plus <code>key_padding_mask</code> for missing-modality dropout, and it returns fused outputs and the averaged attention weights. That is about 3 lines instead of 50, and it ships fused CUDA kernels and <code>scaled_dot_product_attention</code> (Flash-Attention) underneath, so it is both shorter and faster than a from-scratch version. Reach for the built-in once you understand the four lines of logit arithmetic above; write the loop by hand only to learn or to add a bias term the API does not expose.</p>
+</div>
+
+<h2>Cost, tokenization, and what actually scales</h2>
+
+<p>Cross-attention costs \(O(nm)\) time and memory for the \(n \times m\) score matrix. On a delivery robot with 256 camera tokens and 40 radar tokens this is trivial; on a multi-camera vehicle with thousands of tokens per view it is the dominant cost. Three moves keep it tractable, and all trace back to controlling token counts rather than optimizing the softmax. Pool or downsample each encoder's output before fusion so the token grids are coarse where fine detail is not needed. Use bottleneck tokens so fusion cost is \(O((n+m)\,k)\) with a small \(k\) instead of \(O(nm)\). And prefer one-directional query fusion, where a fixed set of output queries (the BEV grid, a set of object slots) bounds one side of the product regardless of how many raw sensor tokens exist. Linear-time sequence models (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) are beginning to replace the attention core inside each modality's encoder, but the cross-modal alignment step is still where attention earns its keep, because that is where soft data association happens.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: where transformer fusion stands now</h3>
+<p>Query-based transformer fusion is the production standard for camera-lidar-radar perception. DETR-style object queries (Carion et al., 2020) generalized to 3D in DETR3D and to fused sensors in BEVFormer (Li et al., 2022) and its successors, where deformable cross-attention lets spatial queries sample sparsely from multi-view features at learned locations, cutting the \(O(nm)\) cost to near-linear. On the foundation-model side, the perceiver-style bottleneck (Jaegle et al., Perceiver IO, 2021) and Flamingo-style gated cross-attention (Alayrac et al., 2022) show the same primitive fusing arbitrary modality counts into a fixed latent, the design that underlies the multimodal sensor-language models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. The open frontier is efficient cross-attention that stays robust under sensor dropout and adversarial spoofing, the theme that carries into Sections 50.4 and 50.6.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the <code>cross_attend</code> function above and build a two-stream toy: 8 camera tokens carrying a class signal, 4 radar tokens carrying a range signal, and a fixed set of 3 bottleneck tokens that query both. (a) Implement the bottleneck as two cross-attention calls (bottleneck queries camera, then bottleneck queries radar) and confirm the fusion cost scales as \(O((n+m)k)\), not \(O(nm)\). (b) Zero out (mask) the radar stream on half your training batches and verify from the returned attention weights that the bottleneck tokens redistribute weight onto camera when radar is absent. (c) Add a per-token quality bias that is high for radar when a synthetic "fog" flag is set and confirm attention shifts toward radar on foggy frames. Report how fusion accuracy on foggy frames changes with and without the bias.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why can cross-attention fuse two sensor streams of different lengths and sampling rates without resampling them to a common grid first, when concatenation cannot?</li>
+<li>You have five sensor modalities. Which fusion topology keeps per-layer cost from growing quadratically in the number of modalities, and what is the mechanism?</li>
+<li>A modality drops out at inference. What single change to the pre-softmax logits makes the fused output fall back gracefully onto the surviving sensors, and why does exercising it during training matter?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-50.3.html">Section 50.3</a>, we make the reliability gating explicit and discrete. Cross-attention lets a modality be softly ignored; gated fusion and mixture-of-experts route each input to specialized sub-networks and learn hard, sparse decisions about which experts (and which sensors) fire, trading the smoothness of attention for capacity and efficiency. We will see when a gate beats an attention weight, and how to keep the gating stable under the same sensor dropout this section learned to survive.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

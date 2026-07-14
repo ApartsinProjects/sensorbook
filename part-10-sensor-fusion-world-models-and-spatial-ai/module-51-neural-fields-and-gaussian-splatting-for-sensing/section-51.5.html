@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.5: Synthetic data generation for rare events. Building Sensory AI." name="description"/>
+<title>Section 51.5: Synthetic data generation for rare events | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Synthetic data generation for rare events</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"The accident you never recorded is still the one your model will be judged by."</p>
+        <cite>A Long-Tailed AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section stands on the sensor re-simulation of <a class="cross-ref" href="section-51.3.html">Section 51.3</a> and the joint lidar-camera splatting of <a class="cross-ref" href="section-51.4.html">Section 51.4</a>: those give you a reconstructed scene you can render new sensor views from. It assumes the class-imbalance and long-tail vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, the importance-sampling notion from the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the 3D perception targets (boxes, occupancy) of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a> that this synthetic data will train. Whether the generated data is trustworthy is deferred to <a class="cross-ref" href="section-51.7.html">Section 51.7</a>; here we assume the pipeline renders faithfully and ask how to aim it at the tail.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A perception model fails on the events it never saw enough of: the child darting from behind a parked van, the overturned truck blocking two lanes, the cyclist running a red at dusk. These events are safety-critical and vanishingly rare, so no amount of fleet mileage collects them in useful numbers. <strong>Synthetic data generation for rare events</strong> flips the economics. Instead of waiting for the tail to arrive, you reconstruct a <em>real</em> scene once with the splatting machinery of this chapter, then <em>edit</em> it: insert a pedestrian on a novel trajectory, swap daylight for rain, reroute a truck into your path, and re-render fully labeled lidar and camera streams for each variation. One captured drive becomes a controllable generator of the exact hazards your logs are missing. The reconstruction gives photometric and geometric realism the classical simulator lacks; the editing gives the rarity the real world withholds.</p>
+    </div>
+
+    <h2>Why the tail is a data problem, not a model problem</h2>
+    <p>Start with the <em>what</em>. Empirical risk minimization averages loss over whatever distribution your data came from. If a hazard class occurs with probability \(p_{\text{rare}}\), then in a dataset of \(N\) frames it contributes on the order of \(N p_{\text{rare}}\) examples, and its gradient signal is drowned by the common case. The <em>why</em> is arithmetic: at \(p_{\text{rare}} = 10^{-6}\) per frame, a fleet logging a billion frames a year sees roughly a thousand instances, scattered across hundreds of visually distinct sub-types, with no guarantee any given sub-type appears at all. You cannot label your way out; the events are not in the logs. This is the same distribution-shift failure mode studied in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, except here you have a lever to move the training distribution deliberately.</p>
+    <p>The <em>how</em> is to treat generation as importance sampling over a hazard space. Let \(z\) parameterize a scenario (actor positions, velocities, weather, ego trajectory). The risk you actually care about up-weights dangerous regions by a task-relevance weight \(w(z)\):</p>
+    <p>$$\mathcal{R} = \mathbb{E}_{z \sim p_{\text{world}}}\big[w(z)\,\ell(z)\big] = \mathbb{E}_{z \sim q(z)}\Big[\tfrac{p_{\text{world}}(z)}{q(z)}\,w(z)\,\ell(z)\Big].$$</p>
+    <p>You choose a proposal \(q(z)\) that oversamples the tail, generate synthetic frames from it, and correct with the ratio \(p_{\text{world}}/q\) so the model learns the rare loss without being told the tail is common. The <em>when</em> is any safety case where the cost of a miss dwarfs its frequency: autonomous driving, industrial safety interlocks, collision-avoidance robotics. When the operating distribution is stationary and the tail is benign, plain collection is cheaper and you should not reach for this.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Reconstruction-based generation is powerful precisely because it factorizes a scenario into <em>background</em> and <em>foreground</em>. The static scene, its road geometry, lighting, occluders, is captured once from a real drive and is guaranteed physically consistent because it <em>happened</em>. Only the rare element, the actor and its trajectory, is synthesized. This is why splatting beats a fully synthetic engine for the tail: you are not asking a graphics artist to model a plausible intersection, you are inserting one anomalous agent into a real one. The domain gap you must defend is confined to the inserted object and its shadow, not the entire world, which shrinks the validation burden of <a class="cross-ref" href="section-51.7.html">Section 51.7</a> to a tractable surface.</p>
+    </div>
+
+    <h2>Four editing operators on a reconstructed scene</h2>
+    <p>Rare-event synthesis reduces to a small algebra of edits applied to the Gaussian scene of <a class="cross-ref" href="section-51.4.html">Section 51.4</a>. <strong>Actor insertion</strong> composites an asset (itself a splatted or meshed object) at a chosen pose, with the renderer resolving occlusion against the scene depth and casting a matching shadow; this manufactures jaywalkers, debris, and stalled vehicles. <strong>Trajectory perturbation</strong> re-times or re-routes an existing dynamic actor to produce the near-miss the original drive avoided: the same truck, made to cut in. <strong>Condition transfer</strong> re-renders the fixed geometry under new lighting, fog, or rain, exploiting that the scene's structure is decoupled from its appearance. <strong>Ego re-simulation</strong> renders novel viewpoints along a counterfactual ego path, exercising the sensor rig from angles the real drive never took, which is the direct payoff of the free-viewpoint property from <a class="cross-ref" href="section-51.3.html">Section 51.3</a>.</p>
+    <p>Because you place the actor, you know its 3D box, class, and instance mask exactly; the labels are generated, not annotated, and they are perfect by construction for the lidar and camera targets of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. The engineering risk is physical plausibility: an inserted pedestrian floating above the road, a shadow with the wrong azimuth, or a trajectory that clips a wall teaches the model artifacts instead of hazards. Snapping actors to the reconstructed ground plane and to a drivable-area map, and validating each shadow against the scene's estimated light direction, are the guardrails that keep the tail realistic rather than merely present.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def sample_cutin_scenarios(n, ego_speed=14.0, rng=np.random.default_rng(0)):
+    """Propose rare 'cut-in' actor trajectories oversampling the dangerous tail,
+    and return importance weights that correct back to the fleet distribution."""
+    # q(z): proposal deliberately biased toward short, aggressive cut-ins
+    gap = rng.uniform(3.0, 25.0, n)           # longitudinal gap at cut-in (m)
+    lat_speed = rng.uniform(0.5, 3.5, n)      # lateral closing speed (m/s)
+    ttc = gap / np.maximum(ego_speed - rng.uniform(-2, 4, n), 1e-3)  # time-to-collision
+
+    # fleet-observed density p_world: cut-ins are almost always gentle and distant
+    p_world = np.exp(-0.5 * ((lat_speed - 0.8) / 0.4) ** 2) * np.exp(-gap / 30.0)
+    q = np.ones(n)                             # near-uniform proposal over the box
+    weight = p_world / (q + 1e-9)              # importance-sampling correction
+
+    rare = ttc < 1.5                           # the safety-critical sub-population
+    return dict(gap=gap, lat_speed=lat_speed, ttc=ttc, weight=weight, rare=rare)
+
+s = sample_cutin_scenarios(10_000)
+print(f"rare (TTC&lt;1.5s) fraction under proposal: {s['rare'].mean():.3f}")
+print(f"effective rare fraction after reweighting: "
+      f"{s['weight'][s['rare']].sum() / s['weight'].sum():.5f}")</code></pre>
+    <div class="code-caption"><strong>Listing 51.5.</strong> Scenario proposal for actor insertion, separated from rendering. The proposal \(q\) oversamples aggressive short-gap cut-ins so the reconstructed scene can be edited into many near-misses, while <code>weight</code> = \(p_{\text{world}}/q\) records how improbable each is under the fleet distribution, so training can down-weight them back to their true rarity. The printed gap between the two fractions (roughly 0.15 versus 0.0002 here) is exactly the tail amplification you are buying.</div>
+    <p>As Listing 51.5 shows, generation splits cleanly into a cheap scenario sampler and an expensive renderer. You iterate on the sampler, the part that decides <em>which</em> rare events to make, without ever touching the splatting pipeline that turns each accepted \(z\) into labeled sensor frames.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: manufacturing the pedestrian an AV never met</h3>
+        <p>An autonomous-driving team finds their emergency-braking stack under-reacts to pedestrians emerging from between parked vehicles, a scenario present in exactly four logged clips across two million kilometers. Rather than wait for more, they reconstruct twelve real urban blocks with joint lidar-camera splatting (<a class="cross-ref" href="section-51.4.html">Section 51.4</a>), then run the actor-insertion operator: a library of pedestrian assets is placed emerging from behind each parked-car occluder, on trajectories sampled by the cut-in proposal above but retargeted to walking speeds, snapped to the reconstructed sidewalk-to-road boundary. Each insertion yields synchronized lidar sweeps and camera frames with pixel-exact masks and 3D boxes. Twelve drives become forty thousand labeled emergence events spanning occluder geometry, approach angle, and lighting. Trained with the importance weights so the tail does not distort the common case, the braking model's time-to-react on a held-out set of <em>real</em> emergence clips improves measurably, and, per the discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>, the synthetic set is used only for training, never as the safety-case evidence itself.</p>
+    </div>
+
+    <h2>Keeping the generator from teaching its own artifacts</h2>
+    <p>The failure that quietly ruins rare-event synthesis is <em>leakage of the generator</em>. If the same reconstructed blocks appear in both training and evaluation, or if the model learns the tell-tale rendering signature of inserted actors (a subtly different noise floor, a too-clean silhouette) rather than the hazard itself, your metrics inflate while real-world behavior does not move. The defenses are concrete. Split by <em>source scene</em>, not by frame, so no reconstruction straddles train and test, extending the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> from recordings to reconstructions. Mix synthetic and real at a controlled ratio and monitor whether a discriminator can separate them; if it can trivially, the model can too. And always reserve a <em>real</em> rare-event test set, however small, as the only ground truth that counts, because a synthetic-only evaluation measures the renderer, not the world. Section 51.7 makes this validation rigorous; the point here is that the generator's convenience is also its trap.</p>
+    <p>A second, subtler risk is <em>coverage collapse</em>: an over-tuned proposal \(q\) that piles thousands of near-identical worst-cases teaches the model one narrow hazard and calls the tail solved. Rarity is not enough; the synthetic tail must be <em>diverse</em> across the axes that matter (approach geometry, actor appearance, occluder layout, sensor conditions). Stratifying the proposal over those axes, rather than sampling one scalar severity, is what turns amplification into genuine generalization.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not hand-code occlusion-aware compositing, shadow casting, and label export for inserted actors. Driving-scene reconstruction toolkits, <code>DriveStudio</code> and the ecosystem around <code>Street-Gaussians</code> and NVIDIA's <code>NeuRAD</code>, expose a scene as decomposed static-plus-dynamic Gaussians with an actor API, so an insertion plus a re-render is a short call:</p>
+        <pre class="language-python"><code class="language-python">from drivestudio import Scene, Actor          # reconstructed splat scene + asset API
+scene = Scene.load("urban_block_07")           # static background from a real drive
+scene.insert(Actor("pedestrian_03"),           # library asset
+             traj=cutin_traj, snap_to="ground") # occlusion + shadow handled by renderer
+lidar, cam, boxes = scene.render(sensor_rig)   # labeled synthetic frames, 3D boxes free</code></pre>
+        <div class="code-caption"><strong>Listing 51.6.</strong> Actor insertion and labeled re-render in four lines. The toolkit owns roughly 800 lines of depth-tested compositing, light-direction-consistent shadow synthesis, and per-sensor label projection that you would otherwise maintain by hand; you own the trajectory, the asset choice, and the scenario proposal that decides what to generate.</div>
+        <p>As Listing 51.6 shows, the library collapses the rendering plumbing to a call, leaving you the one irreducible judgment it cannot make: which rare events are worth generating, and whether they are physically plausible.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The state of the art is closed-loop, controllable driving-scene reconstruction that generates the tail rather than replays the log. NVIDIA's <em>NeuRAD</em> (Tonderski et al., 2024) reconstructs multi-sensor driving scenes with editable actors for exactly this re-simulation; <em>UniSim</em> (Yang et al., 2023) built a neural closed-loop simulator that inserts and re-routes agents; and <em>Street Gaussians</em> (Yan et al., 2024) decomposes dynamic urban scenes into separable static and per-object Gaussians that can be moved, removed, or duplicated. In parallel, diffusion-based generators such as <em>DriveDreamer</em> and <em>Panacea</em> synthesize controllable multi-view driving video conditioned on layouts, and the open question of the moment is <em>hybrid</em> generation: reconstruction for geometric fidelity fused with diffusion priors for the appearance of never-seen actors and conditions. This connects directly to the digital-twin and physics-informed synthetic-data program of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You reconstruct one intersection and generate 50,000 cut-in scenarios by sampling only the closing speed, holding actor appearance and approach angle fixed. Offline metrics on your synthetic test split reach near-perfect recall, yet on a small real cut-in set recall barely improves. (a) Name the two distinct pathologies from this section that jointly explain this, and identify which one a source-scene-level split would have caught. (b) The proposal in Listing 51.5 makes 15% of scenarios rare (TTC &lt; 1.5s) but reweighting drops their effective mass to 0.02%. Explain what each number means and why training uses the second, not the first. (c) Propose one change to the proposal that attacks coverage collapse directly.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does reconstruction-based generation confine the domain gap to the inserted actor, and why does that shrink the validation burden compared with a fully synthetic engine?</p>
+        <p class="quiz-question">2. Write the role of the importance weight \(p_{\text{world}}/q\): what would go wrong in training if you oversampled the tail with the proposal but omitted the weight?</p>
+        <p class="quiz-question">3. Name the four editing operators and give one rare event each is best suited to manufacture.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-51.6.html">Section 51.6</a>, we confront the cost side of all this rendering: reconstructing and re-simulating a scene fast enough to matter, on the real-time and memory budgets that separate an offline data factory from a system that can reconstruct on the move.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

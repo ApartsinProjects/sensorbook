@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 49.3: Occupancy grids. Building Sensory AI." name="description"/>
+<title>Section 49.3: Occupancy grids | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 49: Probabilistic and Bayesian Fusion</a></div>
+<h1>Occupancy grids</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A point cloud tells me where I have been looking. A grid tells me where I am still allowed to be ignorant."</p>
+<cite>A Cartographic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the recursive Bayes filter and the log-likelihood bookkeeping of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and on prior, likelihood, and odds from the uncertainty primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. It assumes you have a range or depth sensor that returns a distance along a bearing, as produced by the depth and lidar hardware of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a> and <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>. The redundancy-and-independence framing from <a class="cross-ref" href="../module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> underlies the per-cell fusion here. Robot pose is assumed known for now; jointly estimating pose and map is SLAM, deferred to <a class="cross-ref" href="../module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A Kalman filter fuses several sensors into an estimate of a <em>vector</em>: a position, a velocity, an orientation. But navigation needs something larger, an estimate of the whole surrounding <em>space</em>: which square metres are wall and which are open floor a robot may drive through. The occupancy grid answers this by chopping the world into cells and running one tiny Bayesian binary filter per cell, each fusing every range reading that ever passed through it into a single number, the probability that the cell is solid. It is the workhorse map of mobile robotics precisely because it is so blunt: it makes no assumption about object shape, it fuses lidar, sonar, and depth cameras in the same coordinate frame, and it degrades gracefully into "I do not know" for space no beam has visited.</p>
+</div>
+
+<h2>From a beam to a field of maybes</h2>
+<p>A single lidar return is a point: distance \(r\) along bearing \(\theta\). Stacked into a cloud, thousands of such points sketch surfaces, but a raw cloud answers the wrong question for navigation. A planner does not ask "where are the reflecting surfaces"; it asks "is <em>this</em> square metre safe to occupy," and that question includes the empty space between the sensor and the surface, space the cloud never represents at all. The occupancy grid reframes the map as a function over space rather than a set of points. Tile the plane into cells \(m_i\) of, say, 5&nbsp;cm, and let each cell carry a binary state: occupied (\(m_i = 1\)) or free (\(m_i = 0\)). The map is the posterior \(p(m_i \mid z_{1:t}, x_{1:t})\) for every cell, given all measurements \(z\) and known poses \(x\).</p>
+<p>The move that makes this tractable is a strong and deliberately wrong assumption: cell independence. The full posterior over an entire map factorizes into a product over cells,</p>
+\[ p(m \mid z_{1:t}, x_{1:t}) = \prod_i p(m_i \mid z_{1:t}, x_{1:t}). \]
+<p>The <em>why</em> is arithmetic survival. A modest \(1000 \times 1000\) grid has \(10^6\) cells; the joint distribution over their binary states has \(2^{10^6}\) configurations, which no machine will ever tabulate. Factoring lets us store one number per cell and update each independently. The cost is that structure is thrown away: the grid cannot know that a cell is probably wall <em>because its neighbours are wall</em>. That is a real limitation, revisited by the learned occupancy models at the end of this section, but for classical mapping the independence assumption is what turns an impossible inference into a for-loop over cells.</p>
+
+<h2>The log-odds trick</h2>
+<p>Each cell is now its own two-state Bayes filter, updated recursively as new beams arrive, exactly the recursion of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> shrunk to a single binary variable. Applying Bayes' rule directly means multiplying probabilities, normalizing, and watching values crawl toward 0 or 1 where floating-point underflow lurks. The standard fix is to track not the probability but its <strong>log-odds</strong>,</p>
+\[ \ell_i = \log \frac{p(m_i = 1)}{p(m_i = 0)} = \log \frac{p(m_i)}{1 - p(m_i)}. \]
+<p>The <em>why</em> is that in log-odds space, Bayesian updating becomes addition. Fusing a new observation reduces to</p>
+\[ \ell_{i,t} = \ell_{i,t-1} + \underbrace{\log\frac{p(m_i \mid z_t)}{1 - p(m_i \mid z_t)}}_{\text{inverse sensor model}} - \ell_{i,0}, \]
+<p>where \(\ell_{i,0}\) is the prior log-odds (zero for an uninformative \(p = 0.5\) prior). Every beam that says "free" subtracts a fixed increment; every beam that says "occupied" adds one. There is no normalization, no underflow, and recovering a probability at the end is a single logistic squash \(p = 1/(1 + e^{-\ell})\). Unknown space sits at \(\ell = 0\), which reads as exactly \(p = 0.5\): the map reports its own ignorance plainly rather than defaulting to "empty."</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Log-odds turns fusion into a running sum, and that is more than a numerical convenience: it makes the grid a natural evidence accumulator. Corroborating readings pile up additively, so a wall seen by fifty beams reaches high confidence while a cell grazed once stays tentative, mirroring the inverse-variance stacking of <a class="cross-ref" href="../module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>. Clamping \(\ell\) to a band such as \([-5, +5]\) is what keeps the map alive: without a ceiling, a cell seen a thousand times as wall would need a thousand contrary readings to change its mind, and a table moved into the room would stay a ghost forever. The clamp trades a little static confidence for the ability to forget.</p>
+</div>
+
+<h2>Building the map: the inverse sensor model and ray casting</h2>
+<p>The one piece of physics the update needs is the <strong>inverse sensor model</strong>: given a range reading, which cells does it call free and which occupied? Note the direction. Chapter 2's forward model predicts a measurement from the world; here we invert it, inferring cell states from the measurement. For a range beam the answer is geometric and cheap. The beam travels in a straight line from the sensor to the point it struck. Every cell the ray passes <em>through</em> before the endpoint must have been empty, or the beam would have stopped sooner, so each receives the free increment \(\ell_{\text{free}} < 0\). The cell at the <em>endpoint</em> reflected the beam, so it receives the occupied increment \(\ell_{\text{occ}} > 0\). Cells beyond the endpoint, and cells the beam never entered, are left untouched at their prior.</p>
+<p>Finding the cells a ray crosses is the classic Bresenham line-traversal from computer graphics, run once per beam. Listing 49.3 assembles the whole pipeline: ray-cast each beam, apply the two-valued inverse sensor model in log-odds, clamp, and squash back to probability.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+L_FREE, L_OCC = -0.4, 0.85      # log-odds evidence per beam observation
+L_MIN,  L_MAX = -5.0, 5.0        # clamp keeps the map able to change its mind
+grid = np.zeros((60, 60))        # log-odds; 0 means p=0.5, i.e. unknown
+
+def bresenham(x0, y0, x1, y1):
+    """Integer cells a ray passes through, sensor -> endpoint."""
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    err, cells = dx - dy, []
+    while True:
+        cells.append((x0, y0))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy: err -= dy; x0 += sx
+        if e2 <  dx: err += dx; y0 += sy
+    return cells
+
+def integrate_beam(grid, sx, sy, hx, hy):
+    ray = bresenham(sx, sy, hx, hy)
+    for cx, cy in ray[:-1]:                      # cells before the hit: free
+        grid[cy, cx] = np.clip(grid[cy, cx] + L_FREE, L_MIN, L_MAX)
+    ex, ey = ray[-1]                              # endpoint cell: occupied
+    grid[ey, ex] = np.clip(grid[ey, ex] + L_OCC, L_MIN, L_MAX)
+
+# sensor at (5, 30); three beams strike a wall in column 45
+for hy in (28, 30, 32):
+    integrate_beam(grid, 5, 30, 45, hy)
+
+prob = 1 / (1 + np.exp(-grid))                    # log-odds -> occupancy prob
+print(f"free cell   p(occ)={prob[30, 20]:.2f}")   # ~0.40, leaning empty
+print(f"wall cell   p(occ)={prob[30, 45]:.2f}")   # ~0.70, leaning solid
+print(f"never seen  p(occ)={prob[ 5,  5]:.2f}")   # 0.50, still unknown</code></pre>
+<div class="code-caption"><strong>Listing 49.3.</strong> A complete log-odds occupancy grid update. Bresenham traversal returns the cells each beam crosses; interior cells get the free increment and the endpoint gets the occupied increment. The three printed cells show the three states the map can hold: leaning free (0.40), leaning occupied (0.70), and genuinely unknown (0.50). Note that unknown is a first-class value, not a disguised zero.</div>
+
+<p>As Listing 49.3 shows, the asymmetry between <code>L_FREE</code> and <code>L_OCC</code> encodes a real sensor fact: a single beam is stronger evidence of a surface at its endpoint than of emptiness at any one interior cell, because the endpoint is where energy actually returned. Repeated observations then do the fusion. Sweep a lidar across a corridor and the walls climb toward \(p \approx 1\) while the driveable lane settles near \(p \approx 0\), each cell integrating the votes of every ray that ever touched it.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a warehouse floor robot</h3>
+<p>An autonomous mobile robot ferrying totes across a fulfilment centre runs a 2D occupancy grid at 5&nbsp;cm resolution as its live obstacle map. A 2D lidar spins at 10&nbsp;Hz; every scan of roughly 1000 beams is ray-cast into the grid, walls and racking rising to near-certain occupied, the aisle staying open. The planner reads the grid directly, treating any cell above a threshold as untraversable and, crucially, treating <em>unknown</em> cells conservatively so the robot slows before rounding a blind shelf-end. The clamp on log-odds is what lets a pallet dropped mid-aisle appear within a second or two of scans, and lets the aisle reopen once the pallet is cleared. The same grid also fuses a downward depth camera that flags a spill on the floor as occupied even though the lidar plane sails clean over it: two modalities, different physics, one shared map, exactly the complementarity of <a class="cross-ref" href="../module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Listing 49.3 is honest but 2D and dense; a real robot maps three dimensions, where a fixed grid at 5&nbsp;cm over a warehouse is tens of gigabytes of mostly-empty voxels. <strong>OctoMap</strong> stores the same log-odds occupancy in an octree that merges uniform regions and prunes free space, giving multi-resolution 3D maps in megabytes. A from-scratch 3D grid with ray casting, clamping, memory management, and serialization is several hundred lines; OctoMap reduces integrating a full scan to a handful:</p>
+<pre class="language-python"><code class="language-python">import octomap, numpy as np
+tree = octomap.OcTree(0.05)                       # 5 cm leaf resolution
+tree.insertPointCloud(points_xyz, origin=sensor_xyz)   # ray-casts every point
+tree.updateInnerOccupancy()
+p = tree.search([1.2, 0.3, 0.8]).getOccupancy()   # query a voxel's p(occupied)</code></pre>
+<div class="code-caption"><strong>Listing 49.4.</strong> OctoMap folds ray casting, the log-odds inverse sensor model, clamping, and octree compression behind <code>insertPointCloud</code>, cutting a multi-hundred-line 3D mapper to a few calls. It handles the memory scaling that defeats a dense voxel grid; the modelling choices (resolution, clamp thresholds) remain yours.</div>
+<p>The library removes the plumbing, not the judgement. Choosing the leaf size, the free and occupied increments, and how to treat unknown space in the planner is still the engineering that makes or breaks the map.</p>
+</div>
+
+<h2>Where the grid stops: dynamics, scaling, and learned occupancy</h2>
+<p>Two assumptions bound the classical grid. The first is the <strong>static-world assumption</strong>: the derivation treats each cell's true state as fixed, so a moving person smears into a trail of half-occupied cells rather than a tracked object. Clamping mitigates this by letting stale evidence decay, but genuine moving obstacles belong to the tracking machinery of <a class="cross-ref" href="section-49.4.html">Section 49.4</a>, not the map. The second is <strong>scaling</strong>: a dense grid costs \(O(n^2)\) cells in 2D and \(O(n^3)\) in 3D, which is why production 3D mapping uses octrees, as above, and why coarse resolutions are chosen where fine detail is not needed.</p>
+<p>The independence assumption is the deepest limit, and it is exactly what modern learned methods attack. Rather than treat cells as isolated binary filters, networks predict a dense occupancy volume from sensor input while exploiting spatial structure, so an unobserved cell wedged between walls is inferred occupied from context a per-cell grid could never use. This is the throughline to <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>, where bird's-eye-view and 3D occupancy prediction supersede the hand-built grid with a data-driven one.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The occupancy grid is being reborn as a learned representation. Autonomous-driving stacks now train networks to predict a semantic 3D occupancy volume around the vehicle, each voxel carrying both an occupancy probability and a class, evaluated on benchmarks such as <strong>Occ3D</strong> (built on nuScenes and Waymo) and driven by architectures like TPVFormer and SurroundOcc. These models keep the grid's core promise, a dense query of "is this space full," while discarding its cell-independence blindness by learning spatial and semantic priors end to end. The classical log-odds grid remains the interpretable, sensor-agnostic baseline against which these learned occupancy fields are measured, and still runs onboard where compute and verifiability matter more than semantic richness.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend Listing 49.3 with a second sensor pass that ray-casts beams from a <em>different</em> sensor origin toward the same wall, then add a moving obstacle: integrate a cluster of "occupied" cells at one location, then, several updates later, integrate free readings through that same location as the obstacle departs. Plot \(p(\text{occ})\) for one affected cell over time. How many free readings does it take to overcome the clamp and reopen the cell? Now halve <code>L_MAX</code> and repeat. Explain the trade-off you have just tuned between map stability and responsiveness to change.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why does representing each cell in log-odds turn the Bayesian update into an addition, and what two practical failures does that avoid compared with multiplying probabilities directly?</p>
+<p class="quiz-question">2. A cell has never been touched by any beam. What is its log-odds value and its occupancy probability, and why is it important that a path planner treat this differently from a cell known to be free?</p>
+<p class="quiz-question">3. The cell-independence assumption is provably false (walls are contiguous), yet the grid is enormously useful. What does independence buy you, what does it cost, and how do the learned occupancy models of Chapter 43 recover the lost structure?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-49.4.html">Section 49.4</a>, we confront the world the static grid smears: moving objects. When several targets weave through clutter and each scan returns a jumble of detections, the core question becomes which measurement belongs to which track. We take up data association, from the joint probabilistic approach (JPDA) to multiple-hypothesis tracking (MHT), and turn a field of blips into a set of confidently followed objects.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

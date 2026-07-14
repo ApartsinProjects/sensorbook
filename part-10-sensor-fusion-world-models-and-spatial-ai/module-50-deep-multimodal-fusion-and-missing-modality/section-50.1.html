@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.1: Modality-specific encoders. Building Sensory AI." name="description"/>
+<title>Section 50.1: Modality-specific encoders | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Modality-specific encoders</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"You would not read a barcode and a sonnet with the same eye. Do not ask one network to."</p>
+        <cite>A Specialized AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can build the per-signal backbones it composes: 1D convolutions and temporal models from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and the tokenize-then-attend pattern from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. It uses the sampling-rate and synchronization vocabulary from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and it sits directly on the early/mid/late fusion taxonomy of <a class="cross-ref" href="../module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>. Deep learning basics (backprop, normalization layers) are collected in Appendix B. How these encoder outputs are then combined is the work of the rest of this chapter, not this section.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Before any deep fusion mechanism can mix modalities, each modality has to be turned into something mixable. A raw camera frame is a \(3\times H\times W\) grid; a lidar sweep is an unordered set of \(N\times 3\) points; an inertial burst is a \(6\times T\) time series at 200 Hz; a temperature log is one number a minute. These live in incompatible spaces with incompatible statistics, sampling rates, and geometry. A <strong>modality-specific encoder</strong> is the network that maps one such stream into a common latent representation, a fixed-width set of embedding vectors, so that fusion downstream sees only vectors of the same size and meaning. Get this stage right and fusion becomes a clean linear-algebra problem; get it wrong and no cross-attention or gating in later sections can rescue it.</p>
+    </div>
+
+    <h2>One encoder per modality, and why not one for all</h2>
+    <p>The design rule is blunt: give every modality its own encoder, tuned to that modality's structure, and make them all agree on only one thing, the width \(d\) of the vectors they emit. The <em>what</em> is a set of functions \(f_m: \mathcal{X}_m \to \mathbb{R}^{n_m \times d}\), one per modality \(m\), each turning its native input into \(n_m\) tokens of dimension \(d\). The <em>why</em> is inductive bias. A convolution assumes translation-equivariant local structure, which is true of images and spectrograms and false of a bag of lidar points. A permutation-invariant set encoder is right for that point cloud and wrong for a time series, where order is the signal. Forcing one architecture across modalities means every modality but one is being processed under an assumption it violates.</p>
+    <p>The <em>how</em> is to reuse the right backbone from earlier parts of the book. Images and depth maps go through a CNN or vision transformer; point clouds and lidar sweeps through a set or voxel network of the kind built in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>; inertial, audio, and biosignal streams through the 1D convolutional or transformer encoders of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>; a handful of scalar tags through a small MLP. The <em>when</em> to break the rule is worth stating precisely: <strong>share</strong> an encoder only when the streams are genuinely the same modality, three identical accelerometers on one body, a stereo pair of the same camera, where a shared \(f_m\) both saves parameters and enforces a consistent representation. Distinct physics means distinct encoders.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The encoder's job is not just to compress; it is to <em>relocate</em>. Two modalities that describe the same event, a spoken word and the lip motion that produced it, start in spaces where their vectors are uncomparable. A good pair of encoders places both near each other in \(\mathbb{R}^d\), so that a simple dot product or a shared attention layer can relate them. This is why the projection to a common width is not a formality: it is the coordinate system fusion will reason in. The encoders decide what "close" means before fusion ever measures it.</p>
+    </div>
+
+    <h2>Making heterogeneous streams commensurable</h2>
+    <p>Three concrete mismatches have to be resolved inside the encoders, or they leak into fusion as bugs. The first is <strong>dimensionality</strong>: each encoder ends in a projection to the shared width \(d\), typically a linear layer on a pooled or per-token feature, so a 2048-channel CNN feature and a 128-channel IMU feature both leave as \(d\)-vectors. The second is <strong>token count</strong>. An encoder can emit one summary vector per modality (\(n_m = 1\), cheap, discards structure) or a sequence of tokens (\(n_m > 1\), preserves where and when, which the cross-attention of <a class="cross-ref" href="section-50.2.html">Section 50.2</a> needs). The choice is an accuracy-versus-cost knob you set here.</p>
+    <p>The third and most treacherous is <strong>rate and phase</strong>. Modalities arrive at wildly different sampling rates and with real time offsets, exactly the synchronization problem of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Two disciplines keep this honest. Encode each stream over a shared <em>time window</em> rather than a shared <em>sample count</em>, so a 200 Hz IMU and a 30 Hz camera covering the same second stay aligned in meaning even though their token counts differ. And normalize per modality: an accelerometer in \(\text{m/s}^2\), a pixel in \([0,1]\), and a temperature in kelvin cannot share one normalization statistic, so each encoder owns its own input scaling. On the leakage-safe discipline of Part I, these normalization statistics are fit on training data only; a normalizer fit across the whole set silently leaks test-time distribution into every modality at once.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+D = 256   # shared embedding width every modality must emit
+
+class IMUEncoder(nn.Module):        # 6-axis inertial, (B, 6, T) at high rate
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(6, 64, 7, stride=2, padding=3), nn.GELU(),
+            nn.Conv1d(64, 128, 5, stride=2, padding=2), nn.GELU(),
+            nn.AdaptiveAvgPool1d(1))          # one summary token
+        self.proj = nn.Linear(128, D)
+    def forward(self, x):
+        return self.proj(self.net(x).squeeze(-1)).unsqueeze(1)   # (B, 1, D)
+
+class ImageEncoder(nn.Module):      # camera frame, (B, 3, H, W)
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(),
+            nn.AdaptiveAvgPool2d(2))          # a 2x2 grid = 4 tokens
+        self.proj = nn.Linear(64, D)
+    def forward(self, x):
+        f = self.net(x).flatten(2).transpose(1, 2)   # (B, 4, 64)
+        return self.proj(f)                           # (B, 4, D)
+
+imu  = IMUEncoder()(torch.randn(8, 6, 200))     # (8, 1, 256)
+cam  = ImageEncoder()(torch.randn(8, 3, 64, 64))# (8, 4, 256)
+tokens = torch.cat([imu, cam], dim=1)           # (8, 5, 256) ready for fusion
+print(imu.shape, cam.shape, tokens.shape)</code></pre>
+    <div class="code-caption"><strong>Listing 50.1.</strong> Two modality-specific encoders that disagree on everything except output width. The IMU path is a 1D convnet emitting a single token; the image path is a 2D convnet emitting a small token grid. Both project to <code>D=256</code>, so their outputs concatenate into one <code>(B, 5, 256)</code> tensor that any fusion block in this chapter can consume. Note the different <code>forward</code> shapes: the shared contract is only the last dimension.</div>
+    <p>As Listing 50.1 shows, the interface between "sensing" and "fusion" is exactly this shape agreement. Everything specific to a sensor, its geometry, its rate, its physics, is spent inside its own encoder; everything after the concatenation is modality-blind. That clean seam is what lets you swap a better image backbone in without touching the fusion head.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a fall-detection smartwatch</h3>
+        <p>A wrist wearable fuses three streams to distinguish a genuine fall from a dropped watch or vigorous handwashing. A 100 Hz six-axis IMU carries the impact and posture change; a green-LED PPG at 25 Hz carries the pulse spike of a startle response; a low-rate barometer carries the roughly one-meter altitude drop of a body hitting the floor. Each gets its own encoder: a dilated 1D convnet for the IMU burst, a short temporal encoder for the PPG segment (built on the cardiovascular models of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>), and a two-layer MLP for the barometer window. They emit one 128-dim token each into a shared space. Because the encoders normalize independently, the barometer's slow millibar drift never has to share a scale with the IMU's \(\pm 16g\) spikes. The payoff surfaces in the next sections: when the PPG channel is lost to a loose strap, the fusion head still has two clean tokens to reason over, precisely because each modality was encoded on its own terms rather than crammed into a shared front end that assumed all three were present.</p>
+    </div>
+
+    <h2>Pretrained backbones and where to freeze</h2>
+    <p>Encoders rarely start from scratch. The single biggest lever on multimodal accuracy is initializing each \(f_m\) from a strong single-modality model, an ImageNet or CLIP vision backbone, an audio encoder, a self-supervised inertial model from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, then training only a thin projection plus the fusion layers on top. The <em>why</em> is data economy: paired multimodal data is scarce and expensive, while unimodal pretraining data is abundant, so you want most of each encoder's competence to come from cheap single-modality learning. The <em>when</em> to freeze versus fine-tune is a small decision tree: freeze the backbone and train only the projection when paired data is tiny or the modality is well covered by its pretrained model; unfreeze the top blocks when your sensor's domain (a wrist accelerometer, a thermal camera) drifts far from the backbone's training distribution. Either way you keep the projection head trainable, because that is the layer that rotates each modality into the shared space fusion expects.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-building and pretraining a competitive vision backbone is thousands of lines and days of compute you do not need to spend. A pretrained encoder plus a projection is two lines with <code>timm</code>:</p>
+        <pre class="language-python"><code class="language-python">import timm, torch.nn as nn
+backbone = timm.create_model("vit_small_patch16_224", pretrained=True, num_classes=0)
+img_encoder = nn.Sequential(backbone, nn.Linear(backbone.num_features, 256))  # -> (B, 256)</code></pre>
+        <div class="code-caption"><strong>Listing 50.2.</strong> A production-grade image encoder in two lines: <code>timm</code> supplies the pretrained ViT and its weights, and a single linear layer projects to the shared width. This replaces roughly 300 lines of model definition plus a multi-day pretraining run with one call; <code>timm</code> and <code>transformers</code> expose hundreds of such backbones for image, audio, and text under the same interface. What the library will not decide for you is the shared width and which blocks to freeze.</div>
+        <p>As Listing 50.2 shows, the library owns the encoder; you own the interface it plugs into. The judgment about token count, freezing, and per-modality normalization stays with the architect.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The strict one-encoder-per-modality rule is being softened at the frontier. Perceiver IO (Jaegle et al., 2021) feeds raw bytes from many modalities into a single attention stack with a shared latent array, and ImageBind (Girdhar et al., 2023) trains six modalities, image, text, audio, depth, thermal, and IMU, into one embedding space by binding each to images, so that modalities never seen together still land nearby. Meta-Transformer (Zhang et al., 2023) pushes further, sharing a single frozen transformer across twelve modalities with only lightweight per-modality tokenizers in front. The trend is thinning the modality-specific part down to a small tokenizer and letting a shared backbone do the heavy lifting, which is exactly the sensor-language direction of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. For most sensor stacks today, though, separate encoders with a shared width remain the reliable default.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the three-stream smartwatch from the In-Practice box. Sketch the tensor shape at the output of each encoder if you choose (a) one summary token per modality versus (b) one token per 0.2 s window over a 2 s clip. For each design, state the total token count entering fusion and one consequence: memory cost, and whether a later cross-attention layer could localize <em>when</em> in the window the fall occurred. Then decide which barometer normalization statistics you would compute and on which split, and explain what leaks if you compute them on the full dataset.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is a permutation-invariant set encoder correct for a lidar sweep but wrong for an IMU stream, and what does each assume about its input?</p>
+        <p class="quiz-question">2. Two encoders emit features of width 2048 and 128. What single layer makes them fusable, and what property of the shared space does it establish?</p>
+        <p class="quiz-question">3. You have abundant unimodal pretraining data but only a few thousand paired examples. Which parts of each encoder do you freeze, which do you train, and why?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-50.2.html">Section 50.2</a>, we take the aligned token sequences these encoders produce and let the modalities actually talk to each other, using cross-attention and transformer fusion to route information between streams rather than merely concatenating them, so that the camera tokens can be sharpened by the radar tokens and back again.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.4: Message passing for fault localization. Building Sensory AI." name="description"/>
+<title>Section 54.4: Message passing for fault localization | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Graph Neural Networks for Sensor Networks</a></div>
+<h1>Message passing for fault localization</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"An alarm tells me the network is sick. Message passing tells me which sensor is coughing and which ones just caught the draft."</p>
+<cite>A Diagnostically Inclined AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the graph representation of <a class="cross-ref" href="section-54.1.html">Section 54.1</a> (nodes, edges, the adjacency matrix \(\mathbf{A}\)) and the spatiotemporal predictors of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>, whose one-step-ahead forecasts we turn into residuals here. It assumes the residual and change-detection thinking of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, the condition-monitoring context of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>, and the message-passing intuition that a variable's estimate should be refined by its neighbors, first met in the factor graphs of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. The neural building blocks (a learnable linear layer, a nonlinearity) come from the Deep Learning Refresher in Appendix B.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A network-wide anomaly detector answers one bit of a much richer question. It says "something is wrong" when a bearing overheats, a pipe cracks, or a phasor unit drifts. What an operator actually needs is the next word: <em>where</em>. Fault localization is the task of pointing at the specific node (or the small set of nodes) that is the source, and distinguishing it from the many neighbors that merely inherited the disturbance through the physics of the system. This is exactly where a graph model earns its keep. Because a fault propagates along edges (heat down a shaft, pressure down a main, congestion down a road), the pattern of who-deviates-and-by-how-much is a graph signal, and the mechanism that reads graph signals is message passing. This section shows how one round of message passing aggregates each node's own residual with its neighbors', and how stacking a few rounds lets a model separate the culprit from the collateral.</p>
+</div>
+
+<h2>From "something is wrong" to "here is the source"</h2>
+<p>The <em>what</em>: fault localization outputs a per-node score, ideally a probability that node \(i\) is the origin of the current anomaly, rather than a single global flag. The <em>why</em> it is hard, and why classical per-sensor thresholds fail, is <strong>fault propagation</strong>. Consider a chilled-water loop: a fouled heat exchanger raises the temperature it reports, but within minutes the downstream pump, the return-line thermometer, and the setpoint controller all read abnormally too. A detector that flags every sensor exceeding its own band lights up half the plant and localizes nothing. The origin and the collateral look identical in the marginal statistics; they differ only in the <em>relational</em> pattern. The origin deviates first and most, and its deviation is <em>unexplained</em> by its neighbors, whereas a collateral node's deviation is exactly what its upstream neighbor predicts. Message passing is the tool that makes "explained by neighbors" computable.</p>
+<p>The standard recipe has two stages. First, a model of normal behavior (the spatiotemporal GNN of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>, trained on healthy data only, leakage-safe per <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) produces a one-step prediction \(\hat{x}_i(t)\) for every node. The <strong>residual</strong> \(r_i(t) = x_i(t) - \hat{x}_i(t)\) is large exactly where reality departs from the learned normal. Second, a message-passing localizer takes the residual graph (residuals as node features on the same topology) and scores each node for being the source. Splitting the problem this way keeps the normal model reusable and lets the localizer specialize in the relational question.</p>
+
+<h2>The message-passing mechanism</h2>
+<p>The <em>how</em> is one equation applied in rounds. A message-passing layer updates every node's hidden vector \(\mathbf{h}_i\) by gathering transformed messages from its graph neighbors \(\mathcal{N}(i)\), pooling them with a permutation-invariant aggregator, and combining the pool with the node's own state:</p>
+\[ \mathbf{h}_i^{(\ell+1)} = \phi\!\left( \mathbf{h}_i^{(\ell)},\; \bigoplus_{j \in \mathcal{N}(i)} \psi\!\left(\mathbf{h}_i^{(\ell)}, \mathbf{h}_j^{(\ell)}, e_{ij}\right) \right). \]
+<p>Here \(\psi\) is a learnable <em>message</em> function (often a small MLP on the concatenation of the two endpoints and the edge feature \(e_{ij}\)), \(\bigoplus\) is the <em>aggregator</em> (sum, mean, or max, chosen so the result does not depend on neighbor ordering), and \(\phi\) is the <em>update</em> function. Initialize \(\mathbf{h}_i^{(0)} = r_i\) with the node's residual and this becomes a diffusion of anomaly evidence along physical edges. The design choices matter for localization specifically. <strong>Sum</strong> aggregation preserves degree information, so a node whose many neighbors all deviate accumulates a large signal, useful for spotting a hub-level fault. <strong>Max</strong> aggregation is directional-evidence friendly: it forwards the single strongest upstream deviation, which helps trace a fault back along a flow path. And because \(\psi\) sees both endpoints, the model can learn the crucial asymmetry: a message from an already-abnormal upstream neighbor should <em>lower</em> a node's own source-score (its deviation is explained), while an anomaly with no abnormal upstream cause should <em>raise</em> it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: receptive field is a diagnostic dial, not just a depth hyperparameter</h3>
+<p>Stacking \(L\) message-passing layers gives every node an \(L\)-hop receptive field: after \(L\) rounds, node \(i\)'s representation depends on all nodes within \(L\) edges. For localization this has a physical reading. Set \(L\) roughly to the number of hops a fault can travel within your prediction horizon. Too shallow, and the localizer cannot see far enough to tell "I deviated because my upstream did" from "I deviated on my own," so it over-blames collateral nodes. Too deep, and <em>over-smoothing</em> sets in: repeated averaging washes every node's representation toward the graph mean, and the sharp source-versus-collateral contrast you need for localization dissolves. A localizer with two or three layers usually beats a ten-layer one on this task, which is the opposite of the "deeper is better" reflex from vision. The right depth is the fault's physical reach, not the network's capacity.</p>
+</div>
+
+<h2>Scoring the source, and reading the propagation</h2>
+<p>After \(L\) rounds, a shared readout head maps each node's final vector to a source-score \(s_i = \sigma(\mathbf{w}^\top \mathbf{h}_i^{(L)})\). Two supervision regimes are common. When labeled fault injections exist (a valve you can command shut, a documented historical failure with a known root node), train the localizer <em>supervised</em> with a per-node binary target and a class-weighted loss, since sources are rare relative to healthy and collateral nodes. When labels are scarce, run <em>unsupervised</em>: rank nodes by a message-passing-refined anomaly score, for example the residual reconstruction error after the network has had a chance to explain each node from its neighbors, so that only genuinely unexplained deviations keep a high score. Either way the output is a ranked shortlist, and the graph gives you the propagation story for free: follow the edges of high-score nodes backward along the flow direction and the path terminates at the origin. That directed trace is what connects this section to the root-cause and interpretability tooling of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, and to the edge-attribution methods of <a class="cross-ref" href="section-54.7.html">Section 54.7</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: locating a leak on a district water main</h3>
+<p>A water utility instruments a district network with pressure sensors at 90 junctions, wired into a graph whose edges are the pipes (directed downstream, weighted by inverse pipe length). A GNN forecaster trained on a leak-free month predicts each junction's next-hour pressure. One afternoon a pipe cracks near junction 41. The raw residuals are messy: junction 41 drops sharply, but so do junctions 39, 44, and 52 downstream, and a naive threshold flags all four plus three noisy sensors elsewhere. The two-layer message-passing localizer resolves it. Junction 41's abnormal pressure has <em>no</em> abnormal upstream neighbor to explain it, so its source-score stays high; junctions 44 and 52 each receive a strong message from an already-abnormal upstream node, and the learned update discounts their scores as explained-by-propagation. The localizer returns junction 41 as the top-ranked source with 44 and 52 as its downstream cone. The repair crew is dispatched to one junction, not seven, and the false alarms elsewhere in the district, which lacked any propagating structure, are suppressed because no coherent path supports them.</p>
+</div>
+
+<p>The code below implements the core loop in plain NumPy so the mechanism is visible: build a small directed graph, plant a fault at one node, propagate residuals, and score. We reference it to show that "message passing" is, at bottom, sparse matrix multiplies interleaved with a nonlinear update.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Directed line graph: 0 -> 1 -> 2 -> 3 -> 4 (flow downstream)
+N = 5
+A = np.zeros((N, N))
+for i in range(N - 1):
+    A[i + 1, i] = 1.0          # node i sends a message to its downstream node i+1
+
+# Residuals: a fault originates at node 1 and propagates, decaying, downstream.
+r = np.array([0.0, 1.0, 0.7, 0.5, 0.3])
+
+def message_pass(h, A, W_self, W_msg):
+    agg = A @ h                       # sum of upstream neighbor states (max-aggregation variant omitted)
+    # Source-evidence update: own residual minus what an abnormal upstream explains.
+    return np.tanh(h @ W_self - agg @ W_msg)
+
+np.random.seed(0)
+W_self = np.array([[1.6]])            # amplify a node's own unexplained deviation
+W_msg  = np.array([[1.1]])            # subtract deviation already explained upstream
+h = r.reshape(-1, 1)
+for _ in range(2):                    # two hops: physical reach of the fault
+    h = message_pass(h, A, W_self, W_msg)
+
+source_score = h.ravel()
+print("source scores:", np.round(source_score, 3))
+print("localized origin -> node", int(np.argmax(source_score)))
+</code></pre>
+<div class="code-caption">A minimal two-hop message-passing localizer in NumPy. Node 1 carries a deviation with no abnormal upstream cause, so the self-versus-neighbor update keeps its score highest; downstream nodes 2 to 4 are discounted as explained-by-propagation, and the argmax returns the true origin.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut: PyTorch Geometric's MessagePassing base class</h3>
+<p>The hand-rolled loop above hides the parts that get painful at scale: sparse neighbor gathering, per-edge message functions, batched multi-relation graphs, and gradient flow through the aggregator. PyTorch Geometric's <code>MessagePassing</code> base class reduces a custom layer to overriding <code>message()</code> and <code>update()</code>; its <code>propagate()</code> call handles the scatter-gather, edge indexing, and choice of aggregator (<code>aggr="sum" | "mean" | "max"</code>) for you. A localizer that would take roughly 120 lines of careful sparse-tensor bookkeeping in raw PyTorch collapses to about 15 lines, and it runs on the real METR-LA or a utility's SCADA graph without you touching an index. Reach for the from-scratch version only to build the intuition, or when a target device forbids the dependency (the TinyML constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>).</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: graph anomaly localization at grid scale</h3>
+<p>Current work pushes message-passing localization in three directions. <strong>GDN</strong> (Graph Deviation Network, Deng and Hooi, AAAI 2021) learns the sensor graph and localizes multivariate anomalies by per-node deviation from an attention-based neighbor forecast, and remains a strong baseline on the SWaT and WADI water-treatment testbeds. <strong>FuSAGNet</strong> and related fused reconstruction-plus-forecast localizers tighten the source-versus-collateral separation. On power systems, spatiotemporal GNN localizers now diagnose line faults from PMU streams within cycles. The open problems are honest uncertainty on the localization (which node with what confidence, tying back to the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) and localization under a shifting graph, where the topology itself changes as breakers trip or valves close mid-fault.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the NumPy example and branch the graph: make node 2 feed two downstream children, 3 and 4, and plant the fault at node 2 instead. (a) Run two hops and confirm the origin is still top-ranked. (b) Now increase to five hops and observe over-smoothing: report how many nodes end up within 10% of the maximum score, and explain why deeper hurts localization here. (c) Switch the aggregator from sum (\(\mathbf{A} \mathbf{h}\)) to max by replacing the matrix product with a per-node maximum over incoming neighbors, and describe one fault topology where max localizes better than sum.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does a per-sensor threshold detector "light up half the plant" during a propagating fault, and what relational quantity does message passing add that a marginal threshold cannot?</li>
+<li>Explain the trade-off in choosing the number of message-passing layers \(L\) for localization, and why the best \(L\) is often much smaller than for a deep vision network.</li>
+<li>In the two-stage recipe, why is the normal-behavior model trained on healthy data only, and what would go wrong if fault windows leaked into its training set?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-54.5.html">Section 54.5</a>, we confront the practical wall that a real grid, a national road network, or a utility with hundreds of thousands of nodes puts in front of message passing: full-graph training no longer fits in memory. We cover neighbor sampling, graph partitioning, and the linear-time tricks that let the mechanism you just built run on networks far too large to load at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

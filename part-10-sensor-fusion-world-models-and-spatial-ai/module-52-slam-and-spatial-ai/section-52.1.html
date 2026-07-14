@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.1: Visual-inertial odometry. Building Sensory AI." name="description"/>
+<title>Section 52.1: Visual-inertial odometry | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Visual-inertial odometry</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The camera tells me where I am but not how fast; the gyro tells me how fast but forgets where. I let them argue sixty times a second."</p>
+<cite>A Self-Localizing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the IMU error model (bias, random walk, scale factor) and strapdown integration from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, and orientation-on-a-manifold plus dead-reckoning drift from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>. The estimator machinery is developed earlier: the EKF update in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and the sliding-window factor-graph smoothing in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. Hardware time alignment between the camera and IMU clocks comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Visual-inertial odometry (VIO) is the estimation problem that sits underneath almost every modern spatial AI system: recover the six-degree-of-freedom pose of a moving device from a camera and an inertial measurement unit (IMU), incrementally, without a prebuilt map and without loop closure. It is <em>odometry</em>, not full SLAM, because it never revisits or corrects the past globally; it only integrates forward. What makes it work is that the two sensors fail in exactly complementary ways. The IMU is fast, metric, and gravity-aware but drifts within seconds; the camera is slow, scale-blind, and fragile under blur but carries no accumulated error. Fuse them tightly and you get a pose stream that is smooth at 200 Hz, metrically scaled, gravity-aligned, and robust to the moments when either sensor alone would be lost. Sections 52.2 onward add the map and the loop closures; this section builds the front end they all stand on.</p>
+</div>
+
+<h2>Why camera and IMU are the canonical pairing</h2>
+<p>The <em>what</em> is a division of labor. An IMU reports specific force and angular rate at hundreds of hertz; integrating it (Chapter 24) gives orientation, velocity, and position, but the double integration of accelerometer bias makes position error grow cubically in time, so raw inertial dead reckoning is useless beyond a few seconds. A camera, by contrast, measures the <em>bearing</em> to scene points with essentially zero temporal drift, yet a single monocular camera cannot recover metric scale (a small nearby scene and a large distant one project identically) and it stalls under motion blur, low texture, or darkness. The <em>why</em> of pairing them is that each covers the other's blind spot: the camera anchors the IMU's drift, and the IMU supplies the metric scale, the gravity direction, and the high-rate motion that carries the estimate across the visual dropouts. This is the complementarity dividend of <a class="cross-ref" href="../module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> in its most-deployed form.</p>
+<p>Three properties fall out of adding inertial data that pure visual odometry cannot deliver, and they are the reason VIO, not visual-only odometry, ships in phones, headsets, and drones. First, <strong>metric scale</strong>: the accelerometer feels real acceleration in \(\text{m/s}^2\), which fixes the scale ambiguity of a monocular rig. Second, <strong>gravity alignment</strong>: at rest the accelerometer reads the gravity vector, pinning roll and pitch to an absolute reference so they never drift. Third, <strong>robustness through gaps</strong>: when the camera is blinded for 100 ms by a light or a fast turn, inertial integration coasts through with bounded error.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: four of the fifteen degrees of freedom are unobservable, and that is fine</h3>
+<p>A VIO state carries pose, velocity, and IMU biases. Careful observability analysis shows that four directions can never be recovered from camera-plus-IMU data alone: the three components of global position and the rotation about gravity (global yaw). Intuitively, no measurement can tell you where the world's origin is or which way is north, only how you have moved relative to where you started. Roll and pitch, in contrast, <em>are</em> observable because gravity is visible in the accelerometer. Good VIO systems do not fight this; they fix a gauge (anchor the first pose and yaw) and report everything relative to it. Filters that accidentally treat these four directions as observable gain spurious information and become inconsistent, the classic failure that <em>observability-constrained</em> and <em>first-estimates-Jacobian</em> designs were built to prevent.</p>
+</div>
+
+<h2>Tight coupling and IMU preintegration</h2>
+<p>The <em>how</em> divides on one decision: loose versus tight coupling. A <strong>loosely coupled</strong> system runs visual odometry and inertial integration as separate black boxes and fuses their pose outputs with a Kalman filter. It is simple and modular but throws away information, because the camera's real evidence is individual feature bearings, not a finished pose. A <strong>tightly coupled</strong> system puts the raw feature reprojection residuals and the raw inertial residuals into one joint estimator over the full state. Tight coupling is uniformly more accurate and is the standard in every competitive system; the cost is a larger, nonlinear optimization that must run in real time.</p>
+<p>The obstacle to tight coupling used to be the mismatch of rates: the camera produces a keyframe every 30 ms while the IMU produces a sample every 5 ms, so between two frames sit dozens of inertial readings. Re-integrating them from scratch each time the linearization point moves would be ruinous. <strong>IMU preintegration</strong>, introduced by Forster and colleagues, solves this by integrating the inertial measurements between two keyframes into a single relative-motion factor expressed on the \(SO(3)\) manifold, with an analytic correction for how that factor shifts when the bias estimate changes. The preintegrated measurement between keyframes \(i\) and \(j\) constrains the change in rotation, velocity, and position,</p>
+\[ \Delta \mathbf{R}_{ij},\quad \Delta \mathbf{v}_{ij} = \mathbf{R}_i^\top(\mathbf{v}_j - \mathbf{v}_i - \mathbf{g}\,\Delta t_{ij}),\quad \Delta \mathbf{p}_{ij} = \mathbf{R}_i^\top\!\left(\mathbf{p}_j - \mathbf{p}_i - \mathbf{v}_i \Delta t_{ij} - \tfrac{1}{2}\mathbf{g}\,\Delta t_{ij}^2\right), \]
+<p>so the many raw samples collapse into one factor whose covariance is propagated once. This single idea is what let tightly coupled VIO become a real-time factor graph (the smoothing of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>) rather than a research curiosity.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an AR headset holding a virtual object still</h3>
+<p>Consider a mixed-reality headset that must pin a virtual lamp to a real desk while the wearer walks around it. The rendering pipeline needs a fresh head pose every display refresh, roughly every 5 ms, or the lamp visibly swims and the wearer feels nauseated. The camera runs at 30 Hz, far too slow, and it briefly whites out every time the wearer turns toward the window. VIO is what makes the illusion hold: the IMU delivers the 200 Hz pose that the renderer consumes, preintegrated inertial factors carry the estimate through the window glare, and each incoming camera keyframe silently corrects the drift before it accumulates into visible jitter. When the same headset is switched to camera-only tracking for a demo, the lamp scale is wrong and it slides during fast head turns; the difference is entirely the inertial channel. The identical estimator, retuned, is what stabilizes a delivery drone's downward camera during a gust that blurs three consecutive frames.</p>
+</div>
+
+<h2>Two estimator families: filtering and fixed-lag smoothing</h2>
+<p>Given tightly coupled residuals, two architectures dominate. The <strong>filtering</strong> family, exemplified by the Multi-State Constraint Kalman Filter (MSCKF), keeps a sliding window of recent camera poses in the EKF state and marginalizes each feature after using it to constrain those poses, which keeps computation linear in the number of features and bounded per step. The <strong>optimization</strong> family, exemplified by OKVIS, VINS-Mono, and VINS-Fusion, keeps an explicit sliding-window factor graph of recent keyframes and landmarks and runs a few Gauss-Newton iterations per keyframe, marginalizing old states into a prior to bound the window. Optimization re-linearizes and so is generally more accurate; filtering is lighter and more predictable on a tight compute budget. The choice is a genuine engineering tradeoff, not a settled winner, and both appear in shipping products.</p>
+<p>One step precedes either estimator and quietly decides success: <strong>initialization</strong>. Before the filter or optimizer can run, the system must estimate the initial velocity, the gravity direction in the camera frame, the metric scale, and the initial gyroscope and accelerometer biases, typically by aligning a short visual-only structure-from-motion trajectory with the preintegrated inertial factors. Poor initialization (starting perfectly still, so the accelerometer sees only gravity and scale is unobservable) is the most common reason a VIO system diverges in the first two seconds. Practical systems demand a small excitation, a gentle wiggle, before they declare a valid pose.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def preintegrate(gyro, accel, dt, bg, ba):
+    """Minimal IMU preintegration between two keyframes (bias-corrected)."""
+    dR = np.eye(3)                       # delta rotation  (SO(3))
+    dv = np.zeros(3)                     # delta velocity  (body frame at i)
+    dp = np.zeros(3)                     # delta position  (body frame at i)
+    for w, a in zip(gyro, accel):
+        w = w - bg; a = a - ba           # remove estimated biases
+        theta = w * dt                   # small-angle rotation increment
+        ang = np.linalg.norm(theta)
+        K = _skew(theta / ang) if ang > 1e-9 else np.zeros((3, 3))
+        dRi = np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * K @ K  # Rodrigues
+        dp = dp + dv * dt + 0.5 * dR @ a * dt**2
+        dv = dv + dR @ a * dt
+        dR = dR @ dRi
+    return dR, dv, dp                    # one factor, ready for the graph
+
+def _skew(v):
+    return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+</code></pre>
+<div class="code-caption"><strong>Listing 52.1.</strong> The core of IMU preintegration: dozens of raw samples between two keyframes are collapsed into a single relative-motion measurement \((\Delta\mathbf{R}, \Delta\mathbf{v}, \Delta\mathbf{p})\). A production implementation (OpenVINS, GTSAM) also propagates the \(9\times 9\) covariance and the Jacobians of the deltas with respect to the biases <code>bg, ba</code>, so the factor can be re-corrected without re-integration when the bias estimate updates. Note gravity is not added here; it enters at the graph level in the residual shown above.</div>
+<p>Listing 52.1 shows why preintegration is the load-bearing idea: the inner loop runs once per IMU sample, but the estimator that consumes it only sees one compact factor per keyframe, decoupling the fast inertial clock from the slow optimization clock.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: do not hand-roll the filter</h3>
+<p>The Listing above is the pedagogical kernel, not a system. A correct, consistent, real-time VIO stack (calibrated camera-IMU extrinsics, online time-offset estimation, robust feature tracking, marginalization, observability constraints, zero-velocity updates) is several thousand lines. Reach for <strong>OpenVINS</strong> (a filtering MSCKF reference) or <strong>VINS-Fusion</strong> (an optimization-based graph): each turns a from-scratch effort of roughly 4,000 to 6,000 lines into a config file plus a ROS topic subscription, well under 100 lines of glue. The library owns the parts that are easy to get subtly, catastrophically wrong: the manifold Jacobians, the covariance propagation, and the first-estimates-Jacobian bookkeeping that keeps the filter consistent.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: learned and event-based VIO</h3>
+<p>Classical VIO assumes sharp, well-exposed frames and hand-designed features. Two frontiers push past that. <strong>Learned VIO</strong> replaces pieces of the pipeline with networks: TLIO and RONIN learn inertial displacement priors that stabilize the estimate during long visual dropouts, while DROID-SLAM (Section 52.2) and its VIO variants make the entire front end differentiable dense flow. <strong>Event-camera VIO</strong>, building on the neuromorphic sensors of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>, replaces the frame camera with a sensor that reports microsecond brightness changes, so tracking survives the high-speed motion and high-dynamic-range lighting that blur a conventional camera into uselessness. The open problem across both is uncertainty calibration: a learned displacement prior that is confidently wrong is far more dangerous to a tightly coupled filter than an honest classical residual.</p>
+</div>
+
+<h2>When VIO is the right tool, and when it is not</h2>
+<p>The <em>when</em> is bounded by physics. VIO is the right choice for a device that moves through a texture-rich, adequately lit environment and needs a smooth, metric, self-contained pose without external infrastructure: phones, AR/VR headsets, indoor drones, warehouse robots. It is the wrong choice, alone, when the environment is dark, textureless (a blank corridor), or dominated by moving objects that violate the static-scene assumption, and when absolute global position is required, since VIO's global position and yaw are unobservable and drift without bound over long trajectories. The standard fixes are exactly the subjects ahead: add loop closure and a map to become full SLAM (Sections 52.2 onward), or fuse an absolute reference such as GNSS from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a> to pin down the unobservable directions. VIO is the drift-bounded local engine; the rest of this chapter is about anchoring it to a persistent world.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public visual-inertial dataset (EuRoC MAV or TUM-VI) and run VINS-Fusion or OpenVINS on one sequence. (1) Report absolute trajectory error against ground truth. (2) Now corrupt the data two ways: drop every camera frame for a 0.5 s window, and separately add a constant 0.05 \(\text{m/s}^2\) accelerometer bias the estimator is told is zero. Explain which failure the inertial channel coasts through and which one poisons the metric scale, and connect each to the observability discussion above. (3) Re-run with the camera-IMU time offset deliberately mis-set by 20 ms and describe how the trajectory degrades; relate it to the synchronization requirements of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why can a monocular camera not recover metric scale on its own, and precisely which inertial quantity supplies it? 2. Explain the difference between loose and tight coupling and give the one-sentence reason tight coupling is more accurate. 3. Preintegration exists to solve a rate mismatch: state the two rates involved and what would go wrong if you re-integrated the IMU from scratch on every keyframe instead.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-52.2.html">Section 52.2</a>, we promote this drift-bounded front end into full simultaneous localization and mapping: ORB-SLAM3 adds a persistent feature map and loop closure that corrects the global position and yaw VIO leaves unobservable, and DROID-SLAM replaces hand-designed features with a differentiable dense front end. The preintegrated inertial factor built here carries straight into both.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

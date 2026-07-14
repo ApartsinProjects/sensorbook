@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 48.4: Fusion under missing modalities. Building Sensory AI." name="description"/>
+<title>Section 48.4: Fusion under missing modalities | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 48: Foundations of Sensor Fusion</a></div>
+<h1>Fusion under missing modalities</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I was trained on five senses and shipped with three. The other two are a rumor I tell myself at inference time."</p><cite>A Resigned AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>A fusion model that only works when every sensor is present is a demo, not a product. In the field, modalities vanish constantly: a camera saturates in glare, a GPS receiver loses lock inside a parking garage, a wearable's optical sensor detaches from the skin, a lidar return drops out in fog. The question is not <em>whether</em> an input will go missing but <em>how gracefully</em> your system copes when it does. This section builds the foundational vocabulary and the core, non-deep techniques for fusion that degrades gracefully instead of crashing. We treat missingness as a first-class design constraint, not an edge case to patch later.</p>
+</div>
+
+<p>This section assumes you understand the fusion stages from <a class="cross-ref" href="section-48.2.html">Section 48.2</a> (early, middle, late) and the complementary-vs-redundant distinction from <a class="cross-ref" href="section-48.1.html">Section 48.1</a>. The probability notation for marginalization draws on the primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The deep, learned approaches to this problem (cross-attention with modality tokens, gated mixtures of experts, contrastive pretraining that survives dropout) are the subject of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>; here we stay at the level every fused system needs regardless of architecture.</p>
+
+<h2>Why modalities go missing, and why the reason matters</h2>
+
+<p>Before choosing a coping strategy, classify the failure. Borrowing the missing-data taxonomy from statistics and adapting it to sensing gives three regimes with sharply different consequences.</p>
+
+<ul>
+<li><strong>Missing completely at random (MCAR).</strong> A packet drops, a bus arbitration collision loses a frame, a sensor reboots. The absence carries no information about the scene. Simple imputation is safe here.</li>
+<li><strong>Missing at random (MAR).</strong> The absence correlates with <em>other observed</em> signals but not with the hidden truth given those signals. Example: a wearable's photoplethysmography (PPG) drops out during high accelerometer energy (vigorous motion), and you still have the accelerometer. You can predict and compensate.</li>
+<li><strong>Missing not at random (MNAR).</strong> The absence correlates with the very thing you want to infer. A radar that stops returning because the target is now occluded, or a glucose sensor that fails <em>because</em> of the extreme physiology you care about. This is the dangerous case: a naive imputer will hallucinate normality precisely when the world is abnormal.</li>
+</ul>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Missingness is itself a signal. The <em>indicator</em> of whether a modality is present often carries information about the state you are estimating. Feed the availability mask into the model as an explicit input, never silently paper over a gap with a zero. A zero and "no measurement" mean different things, and a model that cannot tell them apart will confidently average one into the other.</p>
+</div>
+
+<h2>Four core strategies, from crude to principled</h2>
+
+<p>Given a set of modalities \(\{x_1, \dots, x_M\}\) and an availability mask \(m \in \{0,1\}^M\), there are four load-bearing ways to produce an output when some \(m_i = 0\).</p>
+
+<p><strong>1. Drop and re-weight (late fusion).</strong> When each modality has its own head producing a prediction or a score, simply omit the absent branches and renormalize the combination. If you fuse per-modality posteriors, dropping a term and renormalizing over the survivors is exactly marginalization under an independence assumption. This is why <em>late fusion degrades most gracefully under missingness</em>: the architecture never assumed a fixed-width concatenated vector. The cost is that late fusion cannot exploit fine cross-modal interactions (see the tradeoff in <a class="cross-ref" href="section-48.2.html">Section 48.2</a>).</p>
+
+<p><strong>2. Masked / default imputation.</strong> Replace the missing input with a learned or statistical default (the training-set mean, a zero after mean-centering, or a per-context prior) and pass the mask alongside so the model knows the value is synthetic. Cheap and effective for MCAR. Actively harmful for MNAR, because the default asserts "typical" exactly when reality is atypical.</p>
+
+<p><strong>3. Cross-modal reconstruction.</strong> Learn to predict the missing modality from the present ones, then fuse the reconstruction. This works when modalities are <em>redundant</em>: an inertial stream can stand in for a dropped visual-odometry frame over short gaps (the dead-reckoning idea from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>). It fails for <em>complementary</em> modalities that carry non-overlapping information, since there is nothing to reconstruct from.</p>
+
+<p><strong>4. Marginalization (probabilistic fusion).</strong> In a Bayesian estimator you integrate the absent measurement out of the posterior rather than inventing a value:</p>
+
+$$p(z \mid x_{\text{obs}}) = \int p(z \mid x_{\text{obs}}, x_{\text{miss}})\, p(x_{\text{miss}} \mid x_{\text{obs}})\, dx_{\text{miss}}.$$
+
+<p>A Kalman-family filter does this almost for free: when a sensor is unavailable at time \(t\), you run the prediction step and skip that measurement update, and the covariance simply grows to reflect the increased uncertainty. This is the cleanest answer and the reason state-estimation fusion (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>) handles dropouts so naturally. The uncertainty growth is honest: the system knows it knows less.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: the parking-garage handoff</h3>
+<p>A delivery robot fuses GNSS, wheel odometry, and a downward camera for localization. Rolling into a concrete garage, GNSS drops from a clean fix to nothing within two seconds (an MNAR-adjacent case: the loss correlates with being indoors, which correlates with the very pose you need). A brittle system built on a fixed nine-dimensional fused vector would feed stale or zeroed GNSS into the estimator and drift the robot into a wall. The deployed system instead runs an error-state Kalman filter that marginalizes the absent GNSS: it keeps propagating pose from odometry and camera, and its position covariance visibly inflates on the operator dashboard. When GNSS reacquires at the exit, the filter snaps back and the covariance collapses. Nothing crashed; the system simply reported wider error bars while blind, which is the correct behavior.</p>
+</div>
+
+<h2>Training so the model expects gaps</h2>
+
+<p>A model only degrades gracefully at inference if it saw degradation during training. The workhorse technique is <strong>modality dropout</strong>: during training, randomly zero out entire modalities (with their masks set) so the network learns to produce sensible outputs from any subset. This is the multimodal analogue of ordinary dropout and it is what makes late-fusion and attention-fusion models robust rather than merely functional. Crucially, sample the dropout pattern to match your <em>deployment</em> missingness distribution: if the camera fails ten times more often than the IMU, weight the dropout accordingly, or the model will over-invest in a modality that is rarely the one missing.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def modality_dropout(batch, drop_probs, rng):
+    """Randomly null out whole modalities and return an availability mask.
+    batch: dict name -> array of shape (B, ...); drop_probs: dict name -> p."""
+    B = next(iter(batch.values())).shape[0]
+    out, mask = {}, {}
+    for name, x in batch.items():
+        keep = rng.random(B) &gt;= drop_probs[name]          # 1 = present
+        # never drop every modality for a given sample:
+        m = keep.astype(np.float32)
+        out[name] = x * m.reshape(B, *([1] * (x.ndim - 1)))  # zero the absent ones
+        mask[name] = m
+    present = np.stack(list(mask.values()), axis=1).sum(1)
+    for i in np.where(present == 0)[0]:                     # rescue all-missing rows
+        name = rng.choice(list(batch.keys()))
+        mask[name][i] = 1.0
+        out[name][i] = batch[name][i]
+    return out, mask                                       # feed BOTH to the model
+
+rng = np.random.default_rng(0)
+data = {"imu": np.ones((4, 6)), "ppg": np.ones((4, 1)), "cam": np.ones((4, 128))}
+x, m = modality_dropout(data, {"imu": 0.1, "ppg": 0.4, "cam": 0.3}, rng)
+</code></pre>
+<div class="code-caption">Modality dropout with an availability mask. The rescue loop guarantees at least one present modality per sample, and both the masked inputs and the mask are returned so the model can distinguish "measured zero" from "absent". Deployment-matched <code>drop_probs</code> tune robustness toward the sensors that actually fail most.</div>
+
+<p>The <code>modality_dropout</code> function above is deliberately framework-agnostic and about fifteen lines. In a real training loop it slots in as a batch transform, and you pair it with a loss that is only computed over present targets. Notice the two habits it enforces: the mask travels with the data, and no sample is ever left with zero modalities (which would produce a meaningless gradient).</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>You rarely hand-roll the reconstruction path. TorchMultimodal and the <code>MultiBench</code> benchmark ship missing-modality utilities, and for tabular-style sensor features <code>sklearn.impute.IterativeImputer</code> plus a <code>MissingIndicator</code> gives you MAR-aware imputation with the availability mask in about three lines instead of the fifty a hand-written conditional imputer needs. The library handles the mask bookkeeping, the fit/transform split (so you avoid leaking test statistics, per <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), and the round-trip of indicator columns. You still own the deployment-matched dropout distribution, which no library can guess for you.</p>
+</div>
+
+<h2>Evaluating degradation, not just the happy path</h2>
+
+<p>A single accuracy number on fully-observed data hides the failure you actually ship. Report a <strong>degradation curve</strong>: performance as a function of which modalities are present, ideally one row per realistic missingness pattern rather than a single "all sensors" cell. Two systems with identical full-input accuracy can differ enormously when the camera drops, and the leakage-safe protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> apply here too: the missingness in your test set must mirror deployment, and you must not tune the dropout schedule on the test split. Section 48.6 develops the full evaluation methodology for fused systems; the point to carry forward is that <em>missingness is an axis of your evaluation, not a footnote</em>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a three-modality activity-recognition dataset (accelerometer, gyroscope, PPG). (a) Train a late-fusion classifier with modality dropout probabilities \((0.1, 0.1, 0.4)\) and a second one with no dropout. (b) Build the full \(2^3 - 1 = 7\) degradation table (every non-empty subset present) for both. (c) For the PPG-absent row, explain which missingness regime (MCAR/MAR/MNAR) best describes real PPG dropout during exercise, and argue whether mean-imputation or drop-and-reweight is safer given that regime.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is a zero-filled missing input dangerous, and what single extra input fixes most of the danger?</li>
+<li>Which fusion stage (early, middle, or late) degrades most naturally under missing modalities, and why?</li>
+<li>Give one concrete MNAR example from sensing and explain why cross-modal imputation is the wrong tool for it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-48.5.html">Section 48.5</a>, we turn the crude "drop and renormalize" step into something principled: confidence-weighted combination, where each modality contributes in proportion to how much it should be trusted at this instant. That is exactly the machinery a fused system needs when a modality is not fully absent but merely degraded, noisy, or low-confidence.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

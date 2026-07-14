@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.7: Deployment tradeoffs. Building Sensory AI." name="description"/>
+<title>Section 50.7: Deployment tradeoffs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Deployment tradeoffs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A fusion model that needs three synchronized sensors and a datacenter is not a perception system. It is a demo with good lighting."</p><cite>A Deployment-Scarred AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous six sections taught you how to build a fusion model that is accurate: modality encoders, cross-attention, gated mixtures, missing-modality training, contrastive pretraining, and interpretability. This section asks the harder question that decides whether any of that reaches a real product. A fusion architecture is not just a hypothesis about how modalities combine; it is a bill of materials. Every extra sensor is silicon, wiring harness, calibration jig, bandwidth, watts, and a new failure mode in the field. Every cross-attention layer is latency you pay on every frame. Choosing a fusion design at deployment time means trading accuracy against latency, energy, unit cost, and the operational cost of keeping many sensors synchronized and alive across a fleet. Get this wrong and you ship a model that wins the benchmark and loses the product.</p>
+</div>
+
+<p>This section assumes you are comfortable with the fusion building blocks from Sections 50.1 through 50.4 and with the missing-modality machinery in particular. It leans on edge optimization ideas (quantization, pruning, distillation) developed in <a href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, on the streaming and latency-budget framing of <a href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, and on the fleet-operations perspective of <a href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>. If synchronization jitter is unfamiliar, revisit <a href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> before reading the calibration discussion below.</p>
+
+<h2>The four axes: accuracy, latency, energy, and unit cost</h2>
+
+<p>A deployment decision is a point in a four-dimensional tradeoff space. <em>Accuracy</em> is what the benchmark measures. <em>Latency</em> is the wall-clock time from sensor sample to decision, which matters because a perception result that arrives after the actuator has committed is worthless. <em>Energy</em> per inference sets battery life on a wearable and thermal headroom on a robot. <em>Unit cost</em> is the amortized dollar price of the sensors and compute multiplied across every device you will ever ship. These axes conflict: the cheapest way to raise accuracy is usually to add a modality or a fusion layer, and both cost latency, energy, and dollars.</p>
+
+<p>The reason fusion is expensive is structural. If modality \(m\) produces a token sequence of length \(L_m\), a full cross-attention fusion over the concatenation costs on the order of</p>
+
+$$ C_\text{fuse} \;\propto\; \Big(\sum_{m} L_m\Big)^{2} \, d, $$
+
+<p>where \(d\) is the model width. Adding a fourth sensor does not add a quarter to the cost; because of the quadratic term it can nearly double it. This single fact explains most of the architectural moves in real systems: late fusion (combine per-modality decisions, so cost grows linearly), token pruning before fusion, and restricting attention to a small learned set of fusion queries so the quadratic term is \(k \cdot \sum_m L_m\) with \(k\) fixed rather than \((\sum_m L_m)^2\). The design question is never "which fuses best" in isolation; it is "which fuses best per millisecond and per milliwatt on my target chip."</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Where you fuse is primarily an economic decision, not an accuracy decision. Early (feature-level) fusion tends to win accuracy because it lets modalities correct each other before any information is discarded, but it forces all sensors to be present, synchronized, and streamed to one compute node at full bandwidth. Late (decision-level) fusion sacrifices some accuracy but lets each modality run on its own cheap processor, tolerate the loss of a sensor gracefully, and scale linearly. Mid fusion with a fixed set of learned queries is the usual production compromise: most of the cross-modal accuracy at a bounded, predictable cost.</p>
+</div>
+
+<h2>Sensor cost is the dominant term, not FLOPs</h2>
+
+<p>Engineers instinctively optimize the neural network because that is the part they wrote. In shipped sensor products the network is rarely the expensive part. A lidar can cost more than the entire compute board; a medical-grade sensor carries a regulatory burden that dwarfs any GPU bill; a second camera adds a lens, an ISP channel, a calibration step on the assembly line, and a cleaning obligation for the life of the product. The right mental model is a cost-normalized accuracy: for each candidate sensor set \(S\), estimate</p>
+
+$$ U(S) \;=\; \text{Accuracy}(S) \;-\; \lambda \, \text{Cost}(S), $$
+
+<p>where \(\text{Cost}(S)\) folds in unit price, energy, bandwidth, and the operational tax of keeping that sensor calibrated and clean, and \(\lambda\) encodes how much a point of accuracy is worth in your domain. The missing-modality robustness you built in Section 50.4 is what makes this optimization actionable: if the model degrades gracefully when a sensor is absent, you can ship a cheaper sensor set to the low tier and reserve the full set for the premium tier, training one model for both. Without graceful degradation, every sensor is load-bearing and every tier needs its own model.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: two trims of one delivery robot</h3>
+<p>A sidewalk delivery robot ships in two trims. The premium trim carries stereo cameras, a solid-state lidar, and radar; the value trim drops the lidar to hit a lower price. The team trains a single mid-fusion model with modality dropout so that the lidar branch can be masked at inference. On the premium trim, all branches run and the robot handles glass doors and low-contrast curbs. On the value trim, the lidar query tokens are simply never populated; the model falls back to stereo plus radar and loses about four points of curb-detection recall, which the product team accepts for that price point. Crucially, the fleet runs one model binary and one training pipeline. The lidar is not merely compute the robot skips; it is the single most expensive line on the bill of materials, so removing it changes the unit economics far more than any pruning of the network ever could. This is the deployment payoff of the graceful-degradation training from Section 50.4.</p>
+</div>
+
+<h2>Dynamic fusion: pay for modalities only when they help</h2>
+
+<p>Static architectures pay the full fusion cost on every frame even when one cheap modality already settles the decision. Dynamic (input-adaptive) fusion breaks that. A lightweight gating policy, related to the mixture-of-experts routing in Section 50.3, decides per input whether an expensive branch is worth running. On a clear, well-lit frame the camera branch alone may be confident, so the lidar encoder and the fusion layers are skipped and both latency and energy drop. On a foggy or ambiguous frame the policy wakes the expensive branch. The expected cost becomes \(\mathbb{E}[C] = \sum_m p_m \, C_m\), where \(p_m\) is how often branch \(m\) actually fires, and in benign conditions the \(p_m\) for costly branches are small.</p>
+
+<p>The tradeoff is a governance one: a data-dependent compute path has data-dependent latency, which functional-safety reviewers dislike because they must certify the worst case, not the average. The engineering answer is a hard latency budget with a guaranteed cheap fallback path, so the branch either returns in time or is preempted and the system uses the fast-modality result. That safety-case framing is developed in <a href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class BudgetedFusion(nn.Module):
+    """Skip the expensive branch when the cheap branch is already confident."""
+    def __init__(self, cheap_enc, costly_enc, fuse, head, tau=0.85):
+        super().__init__()
+        self.cheap_enc, self.costly_enc = cheap_enc, costly_enc
+        self.fuse, self.head, self.tau = fuse, head, tau
+
+    def forward(self, x_cheap, x_costly):
+        z_cheap = self.cheap_enc(x_cheap)              # always runs
+        logits  = self.head(z_cheap)
+        conf    = logits.softmax(-1).max(-1).values     # per-sample confidence
+        run_costly = conf &lt; self.tau                    # only the unsure samples
+        used = 0
+        if run_costly.any():                            # gate the costly path
+            z2 = self.costly_enc(x_costly[run_costly])
+            fused = self.fuse(z_cheap[run_costly], z2)
+            logits[run_costly] = self.head(fused)
+            used = int(run_costly.sum())
+        return logits, used                             # 'used' = costly calls made
+</code></pre>
+<div class="code-caption">A confidence gate that runs the costly encoder only for samples the cheap branch is unsure about. The returned <code>used</code> count is the deployment metric that matters: it turns directly into average energy and latency. In a batch of mostly easy frames, <code>used</code> stays low and the expensive branch idles.</div>
+
+<p>The snippet above is deliberately minimal so the mechanism is visible: confidence below <code>tau</code> is the only thing that spends the lidar-scale compute. In production you would replace the confidence heuristic with a learned, calibrated router and enforce a hard timeout, but the accounting stays the same.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>You do not hand-roll the compression that makes a fusion model fit an edge budget. Exporting a trained multimodal model to a quantized, fused-operator engine is a few lines: with the Hugging Face <code>optimum</code> plus ONNX Runtime path, an <code>ORTQuantizer.from_pretrained(...).quantize(...)</code> call replaces roughly 150 to 250 lines of manual calibration, per-channel scale estimation, and operator fusion, and it handles INT8 calibration, weight packing, and graph fusion for you. Pair it with the pruning and distillation recipes in <a href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>; typical result is 2 to 4x lower latency and energy at a small accuracy cost you measure with the leakage-safe protocol below.</p>
+</div>
+
+<h2>The operational tax: synchronization, calibration, and fleet drift</h2>
+
+<p>The costs above are per-frame. The costs that actually sink deployments are per-fleet and per-year. A fusion model trained on well-synchronized data implicitly assumes the sensors stay aligned in time and space. In the field they do not. Clocks drift, so a 20 ms timestamp skew between camera and IMU smears a moving object across frames and quietly poisons cross-attention; this is exactly the timing problem from <a href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Extrinsic calibration decays as a robot vibrates or a car flexes in the heat, so the projection that lined lidar points onto image pixels at the factory is wrong six months later. Different production batches of the "same" sensor have different noise floors and spectral responses. Early fusion is the most sensitive to all of this because it binds the modalities before any per-modality sanity check can catch the drift; late fusion is the most forgiving.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>The current direction is fusion that self-monitors and self-heals so the operational tax shrinks. Robust cross-modal architectures such as BEVFusion (Liu et al., 2023) fuse camera and lidar in a shared bird's-eye-view space that tolerates modest calibration error, and follow-on work adds online calibration-consistency checks that flag a drifting extrinsic before it corrupts the output. In parallel, sensor and time-series foundation models (Chapters 19 and 20) are pushing toward encoders that transfer across sensor batches with little recalibration, and multimodal sensor-language models such as those in <a href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a> are being explored as a single deployable backbone that a fleet can update centrally rather than per-device. The open problem is certifying that a self-healing fusion stack stays within its safety envelope while it adapts.</p>
+</div>
+
+<p>Two practices keep the operational tax bounded. First, monitor per-modality health at inference and route around a modality whose statistics have drifted out of distribution, using the same graceful-degradation path you trained for missing data; the distribution-shift detection in <a href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> supplies the trigger. Second, evaluate deployment tradeoffs on a leakage-safe split (Chapter 5): if the same drive, subject, or device leaks across train and test, your latency-versus-accuracy curve is fiction and you will overspend on a sensor that only looked useful because the test set was contaminated.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take your trained Lab 50 fusion model and profile it. For each sensor subset (all sensors, minus lidar, minus camera, camera only), measure three numbers on your target device or a CPU proxy: accuracy, median latency, and peak memory. Plot accuracy against latency as a Pareto frontier and mark which subsets are dominated. Then pick a plausible \(\lambda\) for a battery-powered wearable and a separate \(\lambda\) for an automotive box, and show that the two \(\lambda\) values select different points on the same frontier. Write one paragraph on which sensor you would drop for each product and why.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Adding a fourth sensor to a full cross-attention fusion increases compute by roughly what factor, and why is it not just a 33% increase?</li>
+<li>Why does missing-modality training (Section 50.4) directly enable a cheaper product tier without a second model?</li>
+<li>Give one reason a functional-safety reviewer objects to dynamic (input-adaptive) fusion, and the standard engineering answer.</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 50</h3>
+<p>Train a cross-attention/MoE fusion model; measure degradation with each sensor removed.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Efficient and robust multimodal fusion</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2205.13542">Liu, Z., Tang, H., Amini, A., et al. (2023). BEVFusion: Multi-Task Multi-Sensor Fusion with Unified Bird's-Eye View Representation. ICRA.</a></p>
+<p class="bib-annotation">The reference design for camera-lidar fusion in a shared BEV space; its efficiency and calibration tolerance make it a canonical deployment-grade fusion architecture.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2107.14795">Jaegle, A., Borgeaud, S., Alayrac, J.-B., et al. (2022). Perceiver IO: A General Architecture for Structured Inputs and Outputs. ICLR.</a></p>
+<p class="bib-annotation">Introduces a fixed set of latent queries that bounds fusion cost to linear in input size, the core trick behind predictable-latency multimodal deployment.</p>
+</div>
+
+<p class="bib-category">Adaptive and conditional computation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1701.06538">Shazeer, N., Mirhoseini, A., Maziarz, K., et al. (2017). Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer. ICLR.</a></p>
+<p class="bib-annotation">The sparse-gating result that grounds dynamic fusion: route each input only to the experts it needs, so expected compute falls below worst-case.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1709.01686">Teerapittayanon, S., McDanel, B., Kung, H.T. (2017). BranchyNet: Fast Inference via Early Exiting from Deep Neural Networks. ICPR.</a></p>
+<p class="bib-annotation">Early-exit inference: stop computing once a cheap branch is confident, the mechanism behind the budgeted-fusion gate in this section.</p>
+</div>
+
+<p class="bib-category">Edge deployment and model compression</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1712.05877">Jacob, B., Kligys, S., Chen, B., et al. (2018). Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference. CVPR.</a></p>
+<p class="bib-annotation">The INT8 quantization recipe that lets a fusion model fit an edge energy budget; the basis for the one-line library export in this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1503.02531">Hinton, G., Vinyals, O., Dean, J. (2015). Distilling the Knowledge in a Neural Network. NeurIPS Deep Learning Workshop.</a></p>
+<p class="bib-annotation">Knowledge distillation: compress a large multi-sensor teacher into a small student that meets latency and memory targets on device.</p>
+</div>
+
+<p class="bib-category">Missing modalities and graceful degradation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2203.05587">Ma, M., Ren, J., Zhao, L., et al. (2022). Are Multimodal Transformers Robust to Missing Modality? CVPR.</a></p>
+<p class="bib-annotation">Quantifies how much accuracy a fusion transformer loses when a modality disappears, the empirical grounding for tiered-sensor product decisions.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>, we move from fusing sensors into a decision to fusing them into a reconstructed world. Neural fields and Gaussian splatting build an explicit 3D representation from multi-sensor streams, which lets you re-simulate a lidar or camera view, generate synthetic data for the rare events your deployment tradeoffs left underdefined, and reason about a scene rather than a single frame.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

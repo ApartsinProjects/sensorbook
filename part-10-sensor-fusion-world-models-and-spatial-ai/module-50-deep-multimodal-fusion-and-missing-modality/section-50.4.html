@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.4: Missing-modality training and graceful degradation. Building Sensory AI." name="description"/>
+<title>Section 50.4: Missing-modality training and graceful degradation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Missing-modality training and graceful degradation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They trained me on five senses and deployed me with three. On my first day the fog rolled in and took a fourth, and no one had told me what to do with the silence."</p>
+<cite>A Suddenly Deaf AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the fusion architectures of <a class="cross-ref" href="section-50.1.html">Section 50.1</a> through <a class="cross-ref" href="section-50.3.html">Section 50.3</a>: modality-specific encoders, cross-attention, and gated fusion. You should be comfortable with the attention mask notion from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and with the calibration language of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, because a model that loses a sensor must also correct its confidence. The probabilistic view of combining sensors from <a class="cross-ref" href="../module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a> is the classical counterpart to what we do here with learned weights.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Real sensor suites are not the tidy, always-complete tensors your training loader hands you. A lidar ices over, a camera blinds into the sun, a wearable's photoplethysmography channel saturates during a workout, a radio link drops a packet. A fusion model trained to always expect every modality treats an absent one as an emergency, and its accuracy can collapse well below what a single-sensor model would have delivered. Missing-modality training turns that failure into a design parameter: you deliberately hide inputs during training so the network learns to stand on whatever subset survives, and you measure degradation as a curve you own rather than a cliff you discover in the field.</p>
+</div>
+
+<h2>Why fusion models shatter when a sensor drops out</h2>
+<p><strong>What</strong> goes wrong is specific and mechanical. A fusion head learns a joint decision boundary over the concatenated or attended features of all modalities. Suppose training always presents camera features \(z_c\), radar features \(z_r\), and lidar features \(z_l\). The head learns weights tuned to the <em>statistics of all three arriving together</em>, including their correlations. At inference the lidar fails and you must supply something in place of \(z_l\). The tempting default, feeding a zero vector, is a trap: zero is not "absent," it is a specific, confident input that almost never occurred in training, so the head extrapolates into a region it has never seen. The network does not know the lidar is missing; it reads a vivid, wrong measurement and fuses it with full confidence.</p>
+<p><strong>Why</strong> this matters more for deep fusion than for the classical Bayesian fusion of <a class="cross-ref" href="../module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a> is that a Kalman-style filter has an explicit measurement model: drop a measurement and you simply skip its update step, and the posterior widens in a principled way. A learned fusion head has no such factorization by default. Its reliance on cross-modal correlation, the very thing that makes joint fusion powerful, is exactly what makes it brittle when the correlation partner vanishes. Empirically, a naive tri-modal model fed a zeroed modality often scores below a model trained on the two survivors alone. You paid for a third sensor and got a liability.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Robustness to a missing modality is not a property you can bolt on after training by patching the input. It has to be present in the loss. If the network never saw the incomplete input distribution it will face, no amount of clever masking at inference recovers the accuracy, because the decision boundary was never shaped for that region. Train on the subsets you will deploy on.</p>
+</div>
+
+<h2>Modality dropout: train on the subsets you will face</h2>
+<p><strong>What</strong> modality dropout does is stochastically remove entire modalities during training, the structured analogue of the neuron-level dropout you know from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. On each forward pass you sample a subset \(S \subseteq \{c, r, l\}\) of present modalities from some distribution \(p(S)\), mask the rest, and compute the loss only from what remains. Formally, instead of minimizing the full-modality risk, you minimize its expectation over the dropout distribution,</p>
+$$ \mathcal{L} = \mathbb{E}_{(x,y)}\,\mathbb{E}_{S \sim p(S)}\big[\ell\big(f_\theta(x_S),\, y\big)\big], $$
+<p>where \(x_S\) keeps only the modalities in \(S\). <strong>Why</strong> this works: the single set of shared parameters \(\theta\) is now optimized to make a good decision under every subset that \(p(S)\) gives weight to, so the fusion head learns to reweight itself toward whatever evidence is present. The network effectively becomes an ensemble of \(2^M - 1\) sub-models sharing one backbone, one for each non-empty subset of \(M\) modalities.</p>
+<p><strong>How</strong> you choose \(p(S)\) is the design lever, and it should mirror your deployment failure model, not a uniform coin flip. If lidar fails in fog once a week but the camera is essentially always up, weight \(p(S)\) toward "lidar-dropped" configurations proportionally to how much you care about performing well in them. A common, robust default is a per-modality Bernoulli drop with rate \(p_{\text{drop}}\) around \(0.15\) to \(0.3\), plus a guard that forbids the empty set (you must keep at least one modality, or the loss is undefined). <strong>When</strong> to raise the rate: when your safety case in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> demands strong single-sensor fallback. When to lower it: when modalities are genuinely reliable and you would rather spend capacity on peak accuracy.</p>
+
+<pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+class ModalityDropout(nn.Module):
+    """Randomly drop whole modalities during training; never drop them all."""
+    def __init__(self, drop_rate=0.25):
+        super().__init__()
+        self.drop_rate = drop_rate
+
+    def forward(self, feats, learned_absent):
+        # feats: (M, B, D) stacked modality features; learned_absent: (M, D)
+        if not self.training:
+            return feats, torch.ones(feats.shape[:2], device=feats.device)
+        M, B, D = feats.shape
+        keep = (torch.rand(M, B, device=feats.device) > self.drop_rate)
+        # guarantee at least one surviving modality per sample
+        empty = keep.sum(dim=0) == 0
+        keep[torch.randint(M, (empty.sum(),)), empty.nonzero(as_tuple=True)[0]] = True
+        mask = keep.float().unsqueeze(-1)                      # (M, B, 1)
+        # replace a dropped modality with its LEARNED "absent" token, not zero
+        feats = feats * mask + learned_absent.unsqueeze(1) * (1 - mask)
+        return feats, keep.float()
+</code></pre>
+<div class="code-caption"><strong>Listing 50.4.</strong> A modality-dropout layer for stacked encoder outputs. Two details carry the section: the empty-set guard keeps every sample supervised by at least one modality, and dropped slots are filled with a per-modality <em>learned</em> absent embedding rather than a zero vector, so "missing" is a token the network is trained to recognize instead of a spurious confident reading. The returned <code>keep</code> mask is reused downstream as an attention key-padding mask.</div>
+
+<p>Listing 50.4 shows the mechanism, and the returned <code>keep</code> mask is the bridge to the next idea: how the architecture should <em>consume</em> an absent modality once dropout has hidden it.</p>
+
+<h2>Mechanics of a missing input: mask, do not impute a zero</h2>
+<p>There are three honest ways to represent an absent modality, and the wrong one silently poisons the fusion. <strong>Zero-imputation</strong>, already condemned above, injects a fake measurement. <strong>Learned absent embeddings</strong> replace the missing features with a trainable vector, the same trick BERT uses for its mask token; the network learns what "I have no lidar right now" should look like in feature space, and because dropout showed it that token constantly, it responds by leaning on the survivors. <strong>Attention masking</strong> is cleaner still for transformer fusion (<a class="cross-ref" href="section-50.2.html">Section 50.2</a>): you never fabricate a feature at all, you simply exclude the missing modality's tokens from the attention key set, so downstream queries attend only over present evidence. The softmax renormalizes over what remains, which is precisely the graceful behavior you want.</p>
+<p>Prefer attention masking when your fusion is token-based, because it is exact: an absent modality contributes literally nothing rather than a learned approximation of nothing. Prefer learned absent embeddings when your fusion concatenates fixed-width feature vectors and a mask would break the tensor shape. Reserve zero-imputation for the case where a channel within a modality is missing and zero is a physically meaningful "no signal," which is rare. In all cases, pass the presence mask forward so the confidence head can widen its uncertainty when evidence is thin, closing the loop with the calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Hand-writing masked attention means building an additive \(-\infty\) bias tensor, broadcasting it across heads, and being careful that the softmax never sees an all-masked row (which produces <code>NaN</code>). That is roughly 15 to 20 lines of index-sensitive code you will get subtly wrong at least once. PyTorch's attention takes a boolean <code>key_padding_mask</code> directly, so dropping a modality is one flip of your presence mask:</p>
+<pre class="language-python"><code class="language-python">import torch.nn as nn
+attn = nn.MultiheadAttention(embed_dim=256, num_heads=8, batch_first=True)
+# key_padding_mask: True where a modality token is ABSENT and must be ignored
+fused, _ = attn(query, kv_tokens, kv_tokens, key_padding_mask=~keep_bool)</code></pre>
+<div class="code-caption"><strong>Listing 50.4b.</strong> One <code>key_padding_mask</code> argument replaces a hand-built additive attention bias and its <code>NaN</code>-guarding, collapsing about 15 lines into a single call. The library handles the renormalization; keep at least one token unmasked per sample and it will not produce a degenerate softmax.</div>
+</div>
+
+<h2>Graceful degradation as a measurable contract</h2>
+<p><strong>Graceful degradation</strong> means the accuracy-versus-available-sensors relationship is a gentle slope, ideally monotone: removing a modality never helps, and each loss costs a bounded, predictable amount. This is a contract you can and should measure, not a hope. Build a <em>degradation table</em>: for every subset of modalities you evaluate the leakage-safe test performance (the held-out discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> applies here without exception), and you check two things. First, monotonicity: does any full subset underperform one of its own sub-subsets? If so, a modality is actively harmful when present, a red flag that fusion has learned a spurious dependence. Second, floor: is the worst single-sensor row still above your safety threshold? That row is your true fallback capability.</p>
+<p>A second technique sharpens the floor: <strong>cross-modal knowledge distillation</strong>. Train a full-modality teacher, then distill it into students that see only reduced subsets, matching the teacher's soft predictions. The student inherits some of the teacher's cross-modal reasoning even though it can no longer observe the missing sensor, because the teacher's outputs encode structure the student learns to reproduce from correlated survivors. This is how a camera-only fallback can perform better than a camera-only model trained from scratch: it was taught by a model that also saw lidar.</p>
+
+<div class="callout practical-example">
+<h4>Automotive: the fog that took the lidar</h4>
+<p>A robotaxi perception stack fuses camera, radar, and lidar into a bird's-eye-view occupancy grid (the representation of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>). In validation the team built a degradation table and found the tri-modal model scored 0.71 mean average precision with everything present but crashed to 0.38 when lidar was zero-imputed, worse than the 0.54 of a camera-plus-radar model trained alone. They retrained with modality dropout at a 0.2 per-sensor rate, learned absent embeddings, and a distillation loss from the full-sensor teacher. The new degradation table read 0.72 full, 0.63 without lidar, 0.58 without radar, 0.49 with camera only, every row monotone and every row above the 0.45 minimum the safety case required. When real fog arrived on the road and lidar returns collapsed, the stack shed 9 points of precision and kept driving, instead of hallucinating an empty road. The 0.63 fog-mode number was now a documented specification, not a surprise.</p>
+</div>
+
+<div class="callout research-frontier">
+<h4>Research Frontier</h4>
+<p>Beyond dropout and distillation, current work makes missing-modality robustness architectural. "SMIL: Multimodal Learning with Severely Missing Modality" (Ma et al., AAAI 2021) uses Bayesian meta-learning to reconstruct missing-modality features from a learned prior even when a modality is absent for most of training, not just at test time. "Multi-modal Learning with Missing Modality via Shared-Specific Feature Modelling" (ShaSpec, Wang et al., CVPR 2023) splits each encoder into a shared subspace and a modality-specific subspace, so the shared component keeps carrying signal when a specific stream disappears. The frontier direction is unifying these with the contrastive alignment of <a class="cross-ref" href="section-50.5.html">Section 50.5</a>: if all modalities are pretrained into one shared embedding space, a missing modality leaves a hole the others already partly fill, and reconstruction becomes nearest-neighbor retrieval rather than fabrication.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a three-modality classifier you have trained (or the Chapter 50 lab model). Build its full degradation table across all seven non-empty subsets, evaluated on a leakage-safe test split. Then retrain the identical architecture with modality dropout at rate 0.25 and learned absent embeddings, and rebuild the table. Report both tables side by side and answer: (1) did any subset in the original table violate monotonicity, and did dropout fix it? (2) By how much did the worst single-sensor row improve? (3) Did full-modality accuracy drop, and if so, is the trade worth it for your deployment's failure model?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why does feeding a zero vector for a missing modality often perform worse than a model that never had that modality at all?</p>
+<p class="quiz-question">2. In the risk \(\mathcal{L} = \mathbb{E}_{S \sim p(S)}[\ell(f_\theta(x_S), y)]\), what real-world quantity should the distribution \(p(S)\) be chosen to match, and why not just use a uniform distribution over subsets?</p>
+<p class="quiz-question">3. A degradation table shows the camera-plus-radar row scoring higher than the camera-plus-radar-plus-lidar row. What does this non-monotonicity tell you, and what would you investigate first?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-50.5.html">Section 50.5</a>, we pursue the frontier hint above: contrastive multimodal pretraining that maps every sensor into one shared embedding space. Once modalities live in a common geometry, a missing one is no longer a void to be masked but a gap the aligned survivors can help fill, and the same alignment powers zero-shot transfer across sensor types.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

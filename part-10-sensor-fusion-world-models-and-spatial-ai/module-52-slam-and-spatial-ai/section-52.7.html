@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.7: Evaluation and benchmarks. Building Sensory AI." name="description"/>
+<title>Section 52.7: Evaluation and benchmarks | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Evaluation and benchmarks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A trajectory that looks perfect is one you forgot to align to ground truth."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every previous section of this chapter promised a system that estimates where it is and rebuilds the world around it. This section is where those promises are cashed out or exposed. A SLAM paper that reports a single accuracy number is hiding at least three decisions: how the estimated trajectory was aligned to ground truth, which error statistic was reported, and how many times the (usually nondeterministic) system was run. Getting evaluation wrong is not a rounding issue; it is the difference between a headset that holds a virtual object still and one that makes users nauseated, and between a warehouse robot that docks reliably and one that drifts into a shelf. This section gives you the metrics, the datasets, and the leakage-safe protocol that let you compare a classical, a neural, and a Gaussian-splatting SLAM system on equal terms, and read a leaderboard without being fooled by it.</p>
+</div>
+
+<h2>Trajectory accuracy: ATE, RPE, and the alignment you must not skip</h2>
+<p>The first question any SLAM evaluation answers is <em>how close is the estimated path to the truth</em>, and there are two construct-distinct ways to ask it. <strong>Absolute Trajectory Error (ATE)</strong> measures global consistency: it takes the whole estimated trajectory, rigidly aligns it to the ground-truth trajectory, and reports the root-mean-square of the per-pose position differences. <strong>Relative Pose Error (RPE)</strong> measures local drift: it compares the estimated and true motion over fixed time or distance intervals \(\Delta\), so a system that tracks smoothly but slowly accumulates yaw error scores well on RPE and badly on ATE. You report both because they answer different questions. ATE tells the AR designer whether the lamp stays pinned to the desk; RPE (often stated as drift in percent of distance travelled, the KITTI convention) tells the robotics engineer how fast error grows per metre.</p>
+<p>The alignment step is where most published comparisons quietly break. A stereo or lidar system produces a metric trajectory and should be aligned with a rigid \(SE(3)\) transform (rotation and translation only). A monocular system has an unobservable scale, exactly the metric-scale gap discussed for dead reckoning in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, so it must be aligned with a similarity transform \(Sim(3)\) that also fits one global scale factor. The closed-form solution is Umeyama alignment. Given estimated positions \(\{\mathbf{p}_i\}\) and truth \(\{\mathbf{q}_i\}\), ATE is</p>
+\[ \mathrm{ATE} = \min_{s,\mathbf{R},\mathbf{t}}\ \sqrt{\tfrac{1}{N}\sum_{i=1}^{N}\big\lVert \mathbf{q}_i - (s\,\mathbf{R}\,\mathbf{p}_i + \mathbf{t})\big\rVert^2}, \]
+<p>where you solve for \(s=1\) in the metric case and for a free \(s\) in the monocular case. Aligning a monocular result with a rigid transform makes it look ten times worse than it is; aligning a stereo result with a free scale silently hides real scale drift. The single most common leaderboard error is a scale mismatch between the two.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def umeyama_ate(P, Q, fix_scale=False):
+    """ATE with SE(3) (fix_scale=True) or Sim(3) (monocular) alignment.
+    P: estimated Nx3 positions, Q: ground-truth Nx3 positions (time-matched)."""
+    muP, muQ = P.mean(0), Q.mean(0)
+    Pc, Qc = P - muP, Q - muQ
+    Sigma = (Qc.T @ Pc) / len(P)
+    U, D, Vt = np.linalg.svd(Sigma)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) &lt; 0:   # reflection guard
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    s = 1.0 if fix_scale else np.trace(np.diag(D) @ S) / (Pc**2).sum() * len(P)
+    t = muQ - s * R @ muP
+    err = Q - (s * (P @ R.T) + t)                    # per-pose residuals
+    return np.sqrt((err**2).sum(1).mean()), s        # ATE (RMSE), fitted scale
+</code></pre>
+<div class="code-caption"><strong>Listing 52.7.</strong> Umeyama trajectory alignment and ATE in a dozen lines. The <code>fix_scale</code> flag is the load-bearing switch: leave it <code>False</code> for a monocular system (report the fitted <code>s</code> so scale drift is visible), set it <code>True</code> for stereo, RGB-D, or lidar systems whose output is already metric. The reflection guard on the SVD is what stops a degenerate near-planar trajectory from being "aligned" by a mirror flip.</div>
+
+<p>Listing 52.7 makes the alignment explicit so the choice cannot hide in a library call. In practice you run it after time-synchronizing the two trajectories, because estimate and ground truth arrive on different clocks (the synchronization problem of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>); a 20 ms timestamp offset during fast motion inflates ATE more than most algorithmic differences you are trying to measure.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A trajectory error number is meaningless without its alignment. Three quantities must always travel together: the metric (ATE or RPE), the alignment group (\(SE(3)\) or \(Sim(3)\)), and the aggregation (RMSE, median, or max). Changing any one of them can move the reported error by a factor of two or more without touching the SLAM system at all. When you cannot reproduce a paper's number, suspect the alignment before you suspect the algorithm.</p>
+</div>
+
+<h2>Map and rendering quality: geometry versus appearance</h2>
+<p>Trajectory error says nothing about the map, and the neural and Gaussian-splatting systems of Sections 52.3 through 52.5 exist precisely to produce a good map. Map quality splits into two construct-distinct families. <strong>Geometric reconstruction</strong> is scored against a ground-truth mesh or depth: <em>accuracy</em> (mean distance from each reconstructed point to the nearest true surface), <em>completeness</em> (the reverse distance, penalizing holes), depth L1 error, and the combined <em>F-score</em> at a distance threshold, which is the geometric analogue of precision and recall. A system can be accurate but incomplete (sharp where it commits, full of holes elsewhere) or complete but inaccurate (dense but smeared), so you report both halves, never just one.</p>
+<p><strong>Appearance / novel-view quality</strong> matters for the radiance-field and splatting systems built on the representations of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>, where the map is judged by how it looks from held-out camera poses. The standard triple is <em>PSNR</em> (pixel fidelity, easily gamed by blur), <em>SSIM</em> (structural similarity), and <em>LPIPS</em> (a learned perceptual distance that correlates far better with human judgement). Report all three: a splatting map can win PSNR by over-smoothing while losing LPIPS, which is the metric a human actually notices. The critical protocol point is that novel views must be genuinely held out from the mapping stream, or you are measuring memorization, not reconstruction, the exact leakage failure mode formalized in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: qualifying a warehouse AMR before it ships</h3>
+<p>An autonomous mobile robot team is choosing between a classical lidar-inertial stack and a Gaussian-splatting SLAM system for a 200-metre warehouse loop. On the vendor's demo video both look flawless. The team runs a proper qualification instead. They record ten passes of the loop with a survey-grade total station providing ground truth, then compute \(SE(3)\)-aligned ATE and per-metre RPE for every pass. The classical stack posts a median ATE of 8 cm but a worst-case pass of 41 cm when a forklift crosses the aisle and violates the static-scene assumption; the splatting system posts 6 cm median but degrades to 90 cm under the same dynamic event because its photometric loss latched onto the moving forklift. Neither number was visible in the demo. The team ships the classical stack with a dynamic-object mask, and files the splatting system's failure as a robustness gap, not a headline accuracy win. The evaluation, not the demo, made the decision.</p>
+</div>
+
+<h2>Datasets, benchmarks, and what each one actually tests</h2>
+<p>No single dataset stresses everything, so competent evaluation reports a suite. <strong>EuRoC MAV</strong> and <strong>TUM-VI</strong> are the visual-inertial standards, with Vicon or motion-capture ground truth and controlled indoor motion; they test drone- and headset-style dynamics. <strong>KITTI odometry</strong> is the outdoor driving benchmark, long metric trajectories where per-distance drift dominates. <strong>TUM RGB-D</strong> and <strong>ICL-NUIM</strong> are the classic indoor RGB-D sets, ICL-NUIM notable for a synthetic ground-truth mesh that makes reconstruction accuracy and completeness computable exactly. <strong>Replica</strong> and <strong>ScanNet</strong> drive most neural and splatting SLAM evaluation because they pair posed RGB-D with dense mesh and semantics. <strong>TartanAir</strong> adds hard photometric and dynamic conditions, and the <strong>Newer College</strong> and <strong>Hilti SLAM Challenge</strong> sets push lidar-inertial-camera fusion in construction sites where GNSS is unavailable. Choose datasets whose motion profile and sensor suite match your deployment; an ATE that is excellent on smooth EuRoC flights tells a car nothing.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: evaluating the systems that blur mapping and rendering</h3>
+<p>The current SOTA systems (MonoGS, SplaTAM, Photo-SLAM, and the lidar-fused Gaussian-LIC of Section 52.5) break the old evaluation split, because a single Gaussian map is simultaneously a geometry estimate and a renderer. The community has not converged on a fair joint protocol: reporting only PSNR rewards a system that renders beautifully while its geometry is metrically wrong, and reporting only ATE ignores the reconstruction those systems exist to produce. Emerging practice reports a four-tuple (ATE, depth-L1, LPIPS, and runtime FPS) co-computed on one sequence, plus explicit run-to-run variance, since these optimizers are seeded stochastically. A further open problem is <em>uncertainty-aware evaluation</em>: a map that knows where it is unsure (the calibration theme of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) should be scored better than an equally-accurate but overconfident one, yet standard ATE ignores the covariance entirely.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: do not re-implement the metric harness</h3>
+<p>Listing 52.7 is the pedagogical kernel, not the tool you ship an evaluation with. A correct harness also handles timestamp association with interpolation, \(SE(3)\)-versus-\(Sim(3)\) selection, RPE over configurable intervals, per-axis breakdowns, and publication-ready plots. The <strong>evo</strong> package (<code>evo_ape</code>, <code>evo_rpe</code>, <code>evo_traj</code>) does all of it from the command line on TUM, KITTI, EuRoC, and ROS bag formats, turning a roughly 500-line from-scratch harness into three CLI calls. For reconstruction, the <strong>TartanAir</strong> and <strong>Replica</strong> evaluation scripts provide the mesh accuracy, completeness, and F-score computations so you do not re-derive point-to-mesh distances yourself. Let the library own the association and alignment bookkeeping that is easy to get subtly, and unfairly, wrong.</p>
+</div>
+
+<h2>Protocol: making a comparison you can defend</h2>
+<p>A defensible SLAM comparison rests on four rules. First, <strong>hold the input identical</strong>: same sequences, same sensor calibration, same start-up excitation, or you are comparing datasets, not systems. Second, <strong>report variance</strong>: neural and splatting SLAM are nondeterministic, so a single run is an anecdote; report median and spread over at least five seeds, because a system with a great mean and catastrophic tail is unshippable. Third, <strong>measure the cost, not just the accuracy</strong>: real-time factor (does it keep up with the sensor stream?), peak memory, and end-to-end latency belong in the same table as ATE, since a system that needs 4x real time is disqualified for a live headset regardless of its error. Fourth, <strong>test the failure modes on purpose</strong>: inject camera dropout, dynamic objects, and low texture, and report degradation, not just the clean number, because the clean number is the one condition a deployed system rarely enjoys. These four rules are the SLAM-specific instance of the general leakage-safe evaluation discipline that runs as a thread through this whole book.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take one EuRoC MAV sequence and run a monocular and a stereo configuration of the same SLAM system. (1) Compute ATE for both with <code>evo_ape</code>, deliberately once with \(SE(3)\) and once with \(Sim(3)\) alignment, and explain why the monocular number changes drastically while the stereo number barely moves. (2) Report the fitted scale <code>s</code> for the monocular \(Sim(3)\) case and state what a value far from 1.0 reveals about scale drift. (3) Run the stochastic system five times with different seeds and report median and interquartile range of ATE; write one sentence on why a paper reporting a single run should be distrusted.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. State the construct difference between ATE and RPE and give one deployment where each is the metric that matters. 2. Why must a monocular trajectory be aligned with \(Sim(3)\) rather than \(SE(3)\), and what does the fitted scale factor tell you? 3. A splatting SLAM system reports a higher PSNR but a worse LPIPS than a competitor; which one better predicts human-perceived quality, and what protocol mistake could make the PSNR advantage meaningless?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 52</h3>
+<p>run a visual-inertial or Gaussian-splatting SLAM system and evaluate trajectory/map quality.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Metrics and evaluation tooling</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.cvlibs.net/publications/Geiger2012CVPR.pdf">Geiger, Lenz, and Urtasun (2012). Are We Ready for Autonomous Driving? The KITTI Vision Benchmark Suite. CVPR.</a></p><p class="bib-annotation">Defines the per-distance drift convention (percent of trajectory length) that remains the standard for outdoor odometry evaluation.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1690643">Umeyama (1991). Least-Squares Estimation of Transformation Parameters Between Two Point Patterns. IEEE TPAMI.</a></p><p class="bib-annotation">The closed-form similarity alignment underlying every ATE computation; the reason monocular and metric trajectories must be aligned differently.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://github.com/MichaelGrupp/evo">Grupp (2017). evo: Python Package for the Evaluation of Odometry and SLAM. Software.</a></p><p class="bib-annotation">The de facto command-line harness for ATE and RPE across TUM, KITTI, and EuRoC formats; the Right-Tool replacement for a hand-rolled metric.</p></div>
+
+<p class="bib-category">Benchmark datasets</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://journals.sagepub.com/doi/10.1177/0278364915620033">Burri et al. (2016). The EuRoC Micro Aerial Vehicle Datasets. International Journal of Robotics Research.</a></p><p class="bib-annotation">The visual-inertial benchmark with motion-capture ground truth used to qualify drone and headset trackers.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://cvg.cit.tum.de/data/datasets/rgbd-dataset">Sturm et al. (2012). A Benchmark for the Evaluation of RGB-D SLAM Systems. IROS.</a></p><p class="bib-annotation">The TUM RGB-D dataset and its ATE/RPE evaluation scripts that standardized indoor SLAM comparison.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1906.03289">Wang et al. (2020). TartanAir: A Dataset to Push the Limits of Visual SLAM. IROS.</a></p><p class="bib-annotation">Hard photometric, weather, and dynamic conditions plus dense ground truth; stresses the robustness cases clean benchmarks omit.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1906.05797">Straub et al. (2019). The Replica Dataset: A Digital Replica of Indoor Spaces. arXiv.</a></p><p class="bib-annotation">High-fidelity posed RGB-D with dense meshes; the reconstruction and novel-view benchmark for most neural and splatting SLAM systems.</p></div>
+
+<p class="bib-category">Systems that reframe evaluation</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2312.02126">Matsuki, Murai, Kelly, and Davison (2024). Gaussian Splatting SLAM (MonoGS). CVPR.</a></p><p class="bib-annotation">A monocular splatting SLAM system whose evaluation reports ATE, depth, and rendering jointly, illustrating the four-tuple protocol.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2004.01294">Campos et al. (2021). ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial, and Multimap SLAM. IEEE Transactions on Robotics.</a></p><p class="bib-annotation">The classical baseline every new SLAM system is measured against; its evaluation tables set the reporting norms for the field.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>, we move from mapping the world as it is to modelling how it will change: world models that predict future sensor observations and let an agent plan in a learned latent space. Evaluation shifts with the goal, from trajectory error against a static ground truth to physical-plausibility and prediction benchmarks, and the leakage-safe discipline built here carries directly into judging whether a model has learned dynamics or merely memorized a rollout.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

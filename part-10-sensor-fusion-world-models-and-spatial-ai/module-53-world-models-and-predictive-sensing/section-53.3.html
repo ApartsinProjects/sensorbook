@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 53.3: Joint-embedding predictive architectures (I-JEPA, V-JEPA 2). Building Sensory AI." name="description"/>
+<title>Section 53.3: Joint-embedding predictive architectures (I-JEPA, V-JEPA 2) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 53: World Models and Predictive Sensing</a></div>
+<h1>Joint-embedding predictive architectures (I-JEPA, V-JEPA 2)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I gave up trying to repaint every leaf the wind would move. I only predict that the branch will still be a branch."</p>
+<cite>An Abstemious AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the self-supervised and contrastive pretraining machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, especially the collapse problem and the trick of an exponential-moving-average target network. The backbone is the vision transformer and patch tokenization of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. It contrasts throughout with the reconstruction-based, pixel-space world models of <a class="cross-ref" href="section-53.2.html">Section 53.2</a>, so read that first if the phrase "recurrent latent state" is unfamiliar.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A joint-embedding predictive architecture (JEPA) is a world model that makes its predictions in <em>representation space</em> rather than in <em>signal space</em>. The recurrent world models of the previous section, and every generative model of the next one, learn by reconstructing pixels or samples: given part of the world, predict the missing part in full detail. JEPA refuses that. It encodes the observed context and the masked target through the same network, and trains a predictor to map the context embedding to the <em>embedding</em> of the target, never to its raw pixels. The payoff is that the model is not forced to model the parts of the sensor stream that are inherently unpredictable (the exact texture of foliage, the precise speckle of a lidar return, the microsecond jitter of a noisy accelerometer). It spends capacity only on structure that a downstream perception or control task can actually use. Yann LeCun's group has pushed this from I-JEPA on still images to V-JEPA 2 on internet-scale video and, critically for this Part, to action-conditioned prediction that plans robot motions in latent space.</p>
+</div>
+
+<h2>Why predict in latent space at all</h2>
+<p>The <em>what</em> is a change of target. A generative predictor minimizes a loss in observation space, \(\lVert x_{\text{target}} - \hat{x} \rVert\); a JEPA minimizes a loss in embedding space, \(\lVert s_{\theta}(x_{\text{target}}) - g(s_{\theta}(x_{\text{context}})) \rVert\), where \(s_\theta\) is a shared encoder and \(g\) is a predictor conditioned on where the target sits. The <em>why</em> is the signal-to-noise structure of real sensor data. Most of the bits in a camera frame or a raw waveform are high-frequency detail that no model can predict from context and that no perception task needs; a pixel reconstruction loss forces the network to burn representational capacity chasing that irreducible noise, which is why masked-autoencoder features often need heavy fine-tuning to become linearly useful. By moving the target into a learned embedding, JEPA lets the encoder <em>discard</em> unpredictable detail before the loss is computed. The prediction problem becomes "will there be an edge here, roughly this oriented" instead of "what are the exact 768 sub-pixel values," and the resulting features are strong off-the-shelf, without labels.</p>
+<p>This is the same energy-based, non-generative philosophy as the contrastive methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, but with a decisive difference. Contrastive learning needs carefully mined negative pairs and hand-built augmentations to avoid collapse; JEPA needs neither. It is a <em>predictive</em> rather than <em>invariance</em> objective: it does not ask two views to be identical, it asks one view to predict another's representation given their spatial or temporal relationship, which preserves information about position and motion that invariance objectives throw away.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: asymmetry is what stops collapse without negatives</h3>
+<p>A predictor that maps context to target embedding has a trivial cheat: make the encoder output a constant, so every prediction is perfect and every embedding is identical. JEPA blocks this the same way BYOL and DINO do, through architectural asymmetry rather than negative samples. The <strong>target encoder</strong> is not trained by gradient descent; its weights are an exponential moving average (EMA) of the <strong>context encoder</strong>, and gradients are stopped from flowing into it. The context encoder must therefore chase a slowly moving, non-degenerate target it cannot directly control, and a collapsed constant is no longer a fixed point of the dynamics. The predictor is deliberately narrow so it cannot memorize the target. No contrastive negatives, no clustering, no reconstruction: the EMA plus stop-gradient plus a bottlenecked predictor is the entire anti-collapse mechanism.</p>
+</div>
+
+<h2>I-JEPA: masked prediction on a single image</h2>
+<p>The <em>how</em> is cleanest in the image case. I-JEPA (Assran and colleagues, 2023) tokenizes an image into patches with a vision transformer, then samples one <em>context</em> block and several <em>target</em> blocks of patches. The context encoder sees only the context patches. The target encoder (the EMA copy) encodes the full image and the target patch embeddings are read off from it. A predictor, given the context embedding plus positional tokens marking <em>where</em> each target block lives, must produce the target encoder's embeddings for those blocks. The design choices that matter are non-obvious and were found empirically: the target blocks should be reasonably large (semantic, not a single patch), the context should be spatially distributed rather than a tight crop, and masking should be informed so the task is neither trivial nor impossible. Because everything happens on embeddings, there is no pixel decoder at all; I-JEPA trains a ViT-Huge to strong linear-probe accuracy far faster than pixel-reconstruction masked autoencoders, precisely because it never pays the decoder tax.</p>
+
+<pre class="language-python"><code class="language-python">import torch, torch.nn.functional as F, copy
+
+def jepa_step(ctx_encoder, tgt_encoder, predictor, imgs, ctx_mask, tgt_mask,
+              opt, ema=0.996):
+    # target embeddings: full image through the EMA encoder, no gradient
+    with torch.no_grad():
+        z_tgt = tgt_encoder(imgs)                    # (B, N_patches, D)
+        z_tgt = z_tgt[tgt_mask].detach()             # keep only target patches
+
+    z_ctx = ctx_encoder(imgs, keep=ctx_mask)         # context patches only
+    z_hat = predictor(z_ctx, target_pos=tgt_mask)    # predict IN embedding space
+    loss  = F.smooth_l1_loss(z_hat, z_tgt)           # no pixels, no negatives
+
+    opt.zero_grad(); loss.backward(); opt.step()
+
+    # EMA update of the target encoder (stop-gradient side)
+    for p_t, p_c in zip(tgt_encoder.parameters(), ctx_encoder.parameters()):
+        p_t.data.mul_(ema).add_(p_c.data, alpha=1 - ema)
+    return loss.item()
+</code></pre>
+<div class="code-caption"><strong>Listing 53.3.</strong> One I-JEPA training step. The three ingredients that prevent collapse are all visible: the target encoder runs under <code>torch.no_grad()</code> with <code>.detach()</code> (stop-gradient), its weights follow the context encoder only through the EMA loop at the bottom, and the loss compares embeddings, never pixels. Swap the image tokenizer for a spatiotemporal one and this identical skeleton becomes V-JEPA.</div>
+
+<p>Listing 53.3 makes the whole family concrete: the loss line never touches <code>imgs</code> again after encoding, which is the mechanical statement of "predict in representation space." Everything specific to images lives in the tokenizer and the masking, so the same loop generalizes to video and, in principle, to any patchable sensor stream.</p>
+
+<h2>V-JEPA 2: from video features to an action-conditioned world model</h2>
+<p>Extending the idea to video (V-JEPA, then V-JEPA 2 in 2025) means masking <em>spatiotemporal</em> tubes: the context is a subset of patches across space and time, and the model predicts the embeddings of masked tubes elsewhere in the clip. Trained self-supervised on over a million hours of internet video, V-JEPA 2 learns features that transfer to action recognition and, more importantly for sensing, encode intuitive physics: probed on the "surprise" benchmarks where an object should not pass through a wall, its prediction error spikes on physically impossible events, which is exactly the anticipation signal <a class="cross-ref" href="section-53.6.html">Section 53.6</a> will exploit. V-JEPA 2 then adds a second stage, <strong>V-JEPA 2-AC</strong> (action-conditioned), post-trained on a modest set of unlabeled robot interaction videos. Here the predictor is conditioned on the robot's action, so it forecasts the <em>next latent state given a candidate action</em>. That turns a passive video model into a controllable world model: to reach a goal image, the robot rolls out candidate action sequences in latent space and picks the one whose predicted embedding lands nearest the goal embedding, the latent planning we develop in <a class="cross-ref" href="section-53.5.html">Section 53.5</a>. It enables zero-shot pick-and-place on a robot the base model never saw, planning entirely in learned representation space.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a warehouse arm that plans without a simulator</h3>
+<p>Picture a bin-picking arm at a fulfillment center that must move a bottle from a cluttered tote to a shelf. The classical route is a hand-built physics simulator plus a reward-tuned policy, brittle whenever the tote lighting or the object set changes. An action-conditioned JEPA controller instead takes a single goal photograph of the bottle on the shelf and encodes it. At each control step it images the current scene, encodes it, and imagines several short action sequences by rolling the action-conditioned predictor forward in embedding space, a few tens of milliseconds each because no pixels are rendered. It executes the first action of the sequence whose predicted latent is closest to the goal latent, then re-plans. Because the world model was pretrained on generic human and robot video and only lightly adapted, the same controller handles a new bottle shape it never trained on: it does not need the pixels to be right, only the <em>embedding</em> of "bottle now on shelf" to match. That robustness to unmodeled visual detail is the direct dividend of not being a pixel predictor.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: load the pretrained encoder, do not pretrain it</h3>
+<p>Pretraining a V-JEPA 2 backbone is a million-GPU-hour undertaking; reproducing the masking, EMA schedule, multi-block target sampling, and distributed training from scratch is several thousand lines and a data pipeline you do not want to own. The released checkpoints reduce that to a handful of lines: <code>AutoModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")</code> plus the matching video processor gives you a frozen spatiotemporal encoder, and an attentive-probe head turns it into a task model in under 50 lines. The library owns the collapse-prevention bookkeeping (EMA target, stop-gradient, target-block sampling) that is easy to get silently wrong and whose failure looks like a loss that cheerfully drops to zero while the features become useless.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: JEPA as the non-generative bet on world models</h3>
+<p>The state of the art here is an explicit wager against generation. I-JEPA (2023) and V-JEPA / V-JEPA 2 (Bardes, Assran and colleagues, 2024 to 2025) argue that reconstructing every pixel, the path taken by Sora-style video generators and the interactive models of <a class="cross-ref" href="section-53.4.html">Section 53.4</a>, wastes capacity on detail irrelevant to reasoning and control. V-JEPA 2-AC's zero-shot robot manipulation, driven purely by latent-space planning, is the current evidence for the bet. Open questions that matter for sensing: how to fold multiple non-visual modalities (IMU, tactile, audio) into a shared JEPA embedding without a dominant modality collapsing the others, how to calibrate the prediction-error "surprise" signal so it is a trustworthy anomaly detector rather than a confident artifact, and whether the EMA target can be replaced by a principled objective. For embodied agents, the through-line runs to the vision-language-action models of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a>.</p>
+</div>
+
+<h2>When JEPA is the right world model, and when it is not</h2>
+<p>The <em>when</em> follows from what the objective throws away. Reach for a JEPA when you need strong, label-free representations of a high-bandwidth sensor stream and your downstream task is perception, anticipation, or latent-space control, where the exact reconstructed signal is irrelevant. It shines when unpredictable detail dominates the raw data, which is nearly always true for cameras, video, and dense depth. It is the <em>wrong</em> tool when you actually need the pixels or samples back: if the deliverable is a rendered future frame, a synthesized waveform, or an interactive playable environment, a generative model (Section 53.4) is what you want, because a JEPA has deliberately discarded the information needed to reconstruct. It is also weaker when the signal is low-dimensional and already clean, an inertial-only state estimator or a small tabular telemetry vector, where the reconstruction tax the method is designed to avoid was never large. In short: JEPA buys transferable understanding by giving up the ability to regenerate the input, and that trade is excellent for rich sensors and control, poor when the output itself must be a signal.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a pretrained I-JEPA or V-JEPA 2 encoder and probe its predictive-surprise signal. (1) Freeze the encoder and, on a small held-out video set, compute the predictor's embedding-space error for normal clips versus clips you edit to violate physics (an object that teleports, or a stitched frame where a ball vanishes). Report whether error separates the two. (2) Ablate the anti-collapse mechanism: retrain the toy loop in Listing 53.3 with the EMA disabled (target encoder shares weights and receives gradients) and show the loss collapsing to zero while a linear probe on the features degrades to chance. (3) Contrast the linear-probe accuracy of the JEPA features against a masked-autoencoder baseline trained for the same wall-clock time, and connect the gap to the decoder-tax argument in the text.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. State the single change to the loss function that distinguishes a JEPA from the reconstruction-based world model of Section 53.2, and name one class of sensor detail this change lets the model ignore. 2. JEPA uses no contrastive negatives; name the three architectural ingredients that prevent representational collapse instead. 3. What does the "AC" stage add to V-JEPA 2, and why is that the step that turns a passive video model into something a robot can plan with?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-53.4.html">Section 53.4</a>, we cross to the other side of the bet: generative interactive world models such as Genie, which <em>do</em> reconstruct the observation and, in exchange, let an agent act inside an imagined, playable environment learned from unlabeled video. Holding the JEPA trade-off in mind, discarding pixels for understanding, sharpens exactly what generation buys back and what it costs.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 53.5: Planning and control in latent space. Building Sensory AI." name="description"/>
+<title>Section 53.5: Planning and control in latent space | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 53: World Models and Predictive Sensing</a></div>
+<h1>Planning and control in latent space</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I sampled five hundred futures, threw away the ones that hit the wall, and averaged what remained. Then I moved one centimeter and did it all again."</p>
+<cite>A Deliberating AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you have a learned latent dynamics model in hand, the Recurrent State-Space Model of <a class="cross-ref" href="section-53.2.html">Section 53.2</a> or the joint-embedding predictor of <a class="cross-ref" href="section-53.3.html">Section 53.3</a>, that can roll a compact state forward under candidate actions. It uses the predict-then-update belief view of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, the sampling-based inference intuition of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, and the expectation-and-variance vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. You should be comfortable reading a control problem as maximizing an expected sum of rewards over a horizon.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why we plan in the head, not the world</h3>
+<p>A world model earns its keep the moment you use it to <em>decide</em>. Sections 53.2 through 53.4 built simulators of how sensor observations evolve; this section spends that simulator on control. The core move is <strong>latent-space planning</strong>: instead of searching over raw future observations (megapixels, point clouds, spectrograms) you search over compact latent states, where a single forward step is a few matrix multiplies rather than a full render. That compression is what makes it feasible to evaluate hundreds of imagined action sequences between one real control tick and the next. Two philosophies split the field. <strong>Background planning</strong> distills the model into a fast reactive policy offline, the Dreamer route you already met. <strong>Decision-time planning</strong> runs an explicit search <em>at every control step</em>, re-optimizing the plan as new sensor data arrives. The modern reference design, <strong>TD-MPC2</strong>, fuses both: it plans online with sampling-based Model Predictive Control while a learned value function and policy prior make that search short and sharp. Getting this right is the difference between a model that predicts well and an agent that acts well.</p>
+</div>
+
+<p>This section dissects three questions. What objective are we actually optimizing when we plan inside a latent world model? How do the two workhorse planners, the Cross-Entropy Method and Model Predictive Path Integral control, search action space without gradients? And why does the state of the art bolt a learned value function onto that search rather than plan to the horizon's end?</p>
+
+<h2>The receding-horizon objective in latent space</h2>
+<p><strong>What</strong> planning optimizes is an action sequence, not a single action. Given the current latent state \(s_t\) (a belief distilled from the sensor history by the model's encoder), a horizon \(H\), a learned transition \(s_{k+1} = f_\phi(s_k, a_k)\), and a learned reward head \(r_\phi\), we seek the sequence that maximizes predicted return:</p>
+
+$$
+a_{t:t+H}^{\star} = \arg\max_{a_{t:t+H}} \; \mathbb{E}\!\left[\sum_{k=t}^{t+H-1} \gamma^{k-t}\, r_\phi(s_k, a_k) \; + \; \gamma^{H}\, V_\psi(s_{t+H})\right].
+$$
+
+<p><strong>Why</strong> the trailing term \(V_\psi(s_{t+H})\) matters is the single most important idea in modern latent planning. A finite horizon is myopic: a forklift that only looks two seconds ahead will happily drive into a dead-end aisle that costs nothing within the window. The learned terminal value \(V_\psi\) summarizes all the reward beyond the horizon in one number, so a short, cheap rollout inherits long-horizon foresight. <strong>How</strong> the plan is used closes the loop: we compute the whole sequence but execute only its first action \(a_t\), then re-plan from the freshly encoded state at \(t+1\). This <em>receding-horizon</em> or Model Predictive Control (MPC) discipline is exactly the predict-then-act rhythm of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>'s filters, and it is what lets the agent absorb surprises: every new sensor reading resets the search, so modeling errors never compound past one step.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Re-planning turns a flawed model into a usable controller</h3>
+<p>No learned world model is exact, and its errors grow with rollout length. Naively, that dooms long-horizon planning. Receding-horizon control defuses it: because you only ever <em>commit</em> to the first action and re-optimize the instant a real observation lands, the plan is continuously corrected by the sensor stream. The model needs to be accurate for a few steps, not for the whole episode. This is why an imperfect latent simulator can still drive tight, stable control, and why the value function that caps the horizon is what buys long-term optimality on the cheap.</p>
+</div>
+
+<h2>Sampling-based planners: CEM and MPPI</h2>
+<p>The objective above is non-convex and the dynamics are a deep network, so gradient descent is fragile and prone to exploiting the model's blind spots. The dominant answer is <strong>zeroth-order, sampling-based search</strong>, the same population-of-hypotheses spirit as the particle filters in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, but over action trajectories instead of states.</p>
+
+<p><strong>The Cross-Entropy Method (CEM)</strong> keeps a Gaussian distribution over the action sequence. Each iteration: sample \(N\) candidate sequences, roll each through the latent model to score its return, keep the top \(k\) "elites," and refit the Gaussian's mean and variance to those elites. Repeat a handful of times and the distribution collapses onto high-reward action sequences. It is embarrassingly parallel: all \(N\) rollouts are one batched forward pass on a GPU.</p>
+
+<p><strong>Model Predictive Path Integral (MPPI)</strong> control is the softer, information-theoretic cousin that TD-MPC2 uses. Rather than a hard elite cutoff, it weights <em>every</em> sampled trajectory by the exponential of its return and takes a temperature-controlled weighted average:</p>
+
+$$
+\mu \;\leftarrow\; \frac{\sum_{i=1}^{N} \exp\!\big(\tfrac{1}{\tau} R_i\big)\, a^{(i)}_{t:t+H}}{\sum_{i=1}^{N} \exp\!\big(\tfrac{1}{\tau} R_i\big)}, \qquad R_i = \sum_k \gamma^{k}\, r_\phi(s_k^{(i)}, a_k^{(i)}) + \gamma^H V_\psi(s_{t+H}^{(i)}).
+$$
+
+<p><strong>Why</strong> the soft weighting helps: it uses information from mediocre samples too, which stabilizes the update when good trajectories are rare, and the temperature \(\tau\) tunes greediness continuously. <strong>How</strong> the search stays cheap in practice is two tricks. First, seed the sampling distribution with the previous step's solution shifted by one (warm-starting), since consecutive plans overlap almost entirely. Second, mix in a few trajectories proposed by a learned policy \(\pi_\theta\), so the search starts near a good answer rather than from scratch; this is the hybrid that makes decision-time planning affordable at control rates.</p>
+
+<pre><code class="language-python">import torch
+
+def mppi_plan(f, reward, value, policy, s0, act_dim,
+              H=5, N=512, iters=6, tau=0.5, gamma=0.99, mu=None):
+    """Plan one action in latent space by MPPI, warm-started + policy-guided."""
+    if mu is None:
+        mu = torch.zeros(H, act_dim)
+    std = torch.ones(H, act_dim)
+    for _ in range(iters):
+        eps = torch.randn(N, H, act_dim)
+        acts = (mu + std * eps).clamp(-1, 1)            # N candidate sequences
+        s = s0.expand(N, -1).clone()
+        ret = torch.zeros(N)
+        for k in range(H):                              # roll each through the model
+            a = acts[:, k]
+            ret += (gamma ** k) * reward(s, a).squeeze(-1)
+            s = f(s, a)                                 # latent transition, no sensor
+        ret += (gamma ** H) * value(s).squeeze(-1)      # terminal value caps horizon
+        w = torch.softmax(ret / tau, dim=0)             # path-integral weights
+        mu = (w[:, None, None] * acts).sum(0)           # weighted-mean update
+        std = ((w[:, None, None] * (acts - mu) ** 2).sum(0)).sqrt().clamp_min(0.1)
+    return mu[0], mu                                    # execute mu[0], warm-start next
+</code></pre>
+<div class="code-caption">Decision-time latent planning by MPPI. Every candidate action sequence is rolled through the learned dynamics <code>f</code> and scored by the learned <code>reward</code> plus a bootstrapped terminal <code>value</code>; trajectories are softmax-weighted by return and averaged. Returning <code>mu</code> lets the next control step warm-start from this solution, and a real implementation also injects a few <code>policy</code> rollouts into <code>acts</code> to sharpen the search.</div>
+
+<p>The listing above is the entire decision-time loop that TD-MPC2 runs at every control tick: sample, roll in latent space, weight by return, refit. Note that no sensor is touched inside the <code>for k</code> loop; all \(N \times H\) steps are pure imagination, which is precisely what makes evaluating hundreds of futures per tick tractable.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A dexterous hand re-grasping a slipping bottle</h3>
+<p>A 24-degree-of-freedom robot hand must keep a plastic bottle upright as its contents slosh. Tactile pads and joint encoders feed an encoder that produces a 512-dimensional latent state; TD-MPC2 was trained offline on logged manipulation episodes. At 50 Hz the controller re-plans: it draws 512 candidate 5-step finger-torque sequences, seeds them with the learned policy's guess plus last tick's shifted solution, and rolls all 512 through the latent model, decoding only the reward (grip stability) and a terminal value. When the bottle begins to slip, the imagined rollouts that keep the current grip score a sharp future reward drop through \(V_\psi\), while rollouts that tighten two fingers score higher, so within one 20 ms tick the hand re-grasps. The search never queried a real sensor for those 2,560 imagined steps, and it never risked dropping the bottle to learn the lesson. This closes the loop that robot perception in <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a> opens.</p>
+</div>
+
+<h2>Learning to plan: TD-MPC2 and the value-guided search</h2>
+<p><strong>What</strong> TD-MPC2 (Hansen et al., 2024) contributes is the recipe that made latent-space MPC a general controller rather than a per-task craft project. It learns, jointly and from the same replay buffer, a latent dynamics model, a reward head, a terminal value \(V_\psi\) trained by temporal-difference bootstrapping (the "TD" in the name), and a policy prior \(\pi_\theta\) that proposes actions to guide the MPPI search. <strong>Why</strong> the combination beats either ingredient alone: the value function supplies the long-horizon foresight a short rollout lacks, and the policy prior supplies a good starting point so the sampler needs only a few hundred trajectories over a 3-to-5-step horizon instead of thousands over twenty. The headline result mirrors DreamerV3's: a <em>single set of hyperparameters</em> masters more than 100 continuous-control tasks spanning locomotion, manipulation, and dexterous hands, and one network can be trained on many embodiments at once. That cross-domain robustness, not peak score on one benchmark, is what makes it the reference you reach for on a new sensor-driven control problem.</p>
+
+<p><strong>How</strong> it decides <em>when</em> to trust the plan versus the policy is a graceful fallback: early in training the dynamics model is unreliable, so the policy prior dominates; as the model sharpens, the planner contributes more. This dovetails with the crucial safety point that any latent-space controller must respect the model's uncertainty, exactly the calibration discipline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: an over-confident value on an out-of-distribution latent state is how planners get exploited into disaster, which is why functional-safety review of these controllers (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) treats the model's uncertainty estimate as a first-class control input.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">You configure a planner, you do not build one</h3>
+<p>The MPPI loop above is the readable core, but a production TD-MPC2 (multi-embodiment encoders, TD-learned ensemble value, prioritized replay, warm-started policy-guided planning, action-space normalization, and the numerically tuned defaults its robustness rests on) is roughly 2,000 lines to reproduce faithfully. The official <code>tdmpc2</code> repository collapses "learn a latent model and plan control on my sensor stream" into a config file plus a training call: declare the observation and action spaces, point it at logged episodes, and it trains the model, value, and policy together and hands you a <code>plan</code> method for online control. That is well over a 90% reduction in code you own, and the shipped hyperparameters are the very ones that make one config generalize across tasks.</p>
+</div>
+
+<h2>When to plan online, and when to just react</h2>
+<p><strong>When</strong> decision-time planning earns its cost: the reward or constraints change faster than you can retrain (a new obstacle, a shifting goal, a fault to avoid), the action space is continuous and the dynamics smooth enough to search, and you can afford a few hundred latent rollouts inside one control period. Robotics, agile flight, and adaptive process control all qualify. <strong>When</strong> a distilled reactive policy is the better tool: hard real-time budgets with microseconds per decision (a reflex on a microcontroller, per <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>), or settings where the certification burden of an online optimizer is unacceptable and a fixed, auditable policy is required. A common production pattern is to plan with TD-MPC2 offline or in the cloud, then distill the resulting behavior into the fast policy prior for on-device deployment, getting the planner's quality at the reflex's latency. As always, evaluate on leakage-safe splits: because the value and dynamics are trained on logged episodes, a single episode straddling the train/test boundary silently inflates every reported return.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>TD-MPC2 (Hansen, Su, and Wang, 2024) is the current reference for scalable latent-space planning, extending TD-MPC by making one hyperparameter set and one architecture work across 100-plus continuous-control tasks and multiple embodiments. Dreamer-family background planning (<a class="cross-ref" href="section-53.2.html">Section 53.2</a>) remains the leading alternative where a purely reactive policy suffices. The live frontiers: planning inside <em>non-reconstructive</em> latent spaces (V-JEPA-style world models from <a class="cross-ref" href="section-53.3.html">Section 53.3</a>, where there is no decoder to sanity-check a rollout, so uncertainty estimation carries the whole safety load); diffusion planners that generate whole trajectories at once rather than searching step by step; and coupling latent MPC with the semantic goals of vision-language-action models (<a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a>), where a language model sets the reward and a latent planner executes it. The unresolved tension is how to keep sampling-based search from exploiting model error on out-of-distribution states, the failure mode that most limits deployment.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: horizon, value, and myopia</h3>
+<p>Take any trained latent world model with a reward head (the toy RSSM from <a class="cross-ref" href="section-53.2.html">Section 53.2</a> wired to a simple control task will do) and the MPPI loop above. (1) Run it with terminal value disabled (\(V_\psi \equiv 0\)) at horizons \(H \in \{3, 5, 15, 30\}\) and record task return; you should see short horizons act myopically. (2) Now enable a bootstrapped value at \(H = 5\) and compare against the best value-free horizon. Report the compute cost (number of latent forward steps per decision) alongside return, and argue where the value-plus-short-horizon design lands on the quality-versus-cost curve. (3) Inject a small bias into the reward head on out-of-distribution states and show how the planner exploits it; propose one uncertainty-based guard that suppresses the exploit.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does receding-horizon re-planning let an inexact latent model still drive stable control, when a single long open-loop rollout from the same model would drift?</p>
+<p>2. What does the learned terminal value \(V_\psi(s_{t+H})\) provide that a longer planning horizon would, and why is it usually the cheaper way to get long-horizon foresight?</p>
+<p>3. How do CEM and MPPI differ in how they turn a batch of scored trajectories into the next search distribution, and what does MPPI's temperature control?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-53.6.html">Section 53.6</a>, we turn the same predictive machinery outward: instead of choosing actions, we use the world model to <em>anticipate</em> what the sensors are about to report, from surfacing a fault seconds before it trips an alarm to pre-fetching the next frame a wearable will need. Prediction as perception, not just prediction as control.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

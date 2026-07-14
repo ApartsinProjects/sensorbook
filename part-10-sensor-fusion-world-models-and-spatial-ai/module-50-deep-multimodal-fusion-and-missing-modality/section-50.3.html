@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.3: Gated fusion and mixture-of-experts. Building Sensory AI." name="description"/>
+<title>Section 50.3: Gated fusion and mixture-of-experts | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Gated fusion and mixture-of-experts</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"Do not ask me to trust every sensor equally at every instant. Ask me to decide, per input, whom to believe and whom to ignore."</p>
+        <cite>A Selective AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the modality-specific encoders of <a class="cross-ref" href="section-50.1.html">Section 50.1</a>, which turn each raw sensor stream into a feature vector, and the cross-attention fusion of <a class="cross-ref" href="section-50.2.html">Section 50.2</a>, which is the alternative this section deliberately contrasts against. It leans on the softmax, feed-forward blocks, and transformer building blocks of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and it echoes the reliability-weighting instinct from probabilistic fusion in <a class="cross-ref" href="../module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>. The new idea here is simple to state: let a small learned network decide, for each individual input, how much each modality (or each specialist subnetwork) should contribute.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Concatenation fuses modalities with fixed weights baked into the layer that follows it. Cross-attention fuses them with weights that depend on content, but every token still flows through the same dense network. Gated fusion and mixture-of-experts share one deeper idea: the network should route information conditionally, choosing on a per-input basis which pathways carry the signal. A <strong>gate</strong> is a learned dial that scales each modality's contribution before they combine, so a camera that just drove into a tunnel can be turned down and radar turned up, automatically, for that frame only. A <strong>mixture-of-experts</strong> generalizes the dial into a router that dispatches each input to a small subset of specialist subnetworks, buying enormous model capacity while only paying to run the few experts that fire. Both are answers to the same failure of static fusion: real sensors are unreliable in different ways at different moments, and a good fusion model must adapt its computation to the input in front of it.</p>
+    </div>
+
+    <h2>Gated fusion: letting the input decide the weights</h2>
+    <p>Static late fusion combines modality features \(h_a\) and \(h_v\) with weights the model learned once and applies to every sample. That is fine when both sensors are always trustworthy, and disastrous the instant one degrades. Gated fusion replaces the fixed weights with an <em>input-dependent</em> gate. The canonical building block is the Gated Multimodal Unit (GMU): each modality is first projected through its own nonlinearity, then a gate computed from both modalities decides the blend. For two modalities,</p>
+    \[ h_a = \tanh(W_a x_a), \quad h_v = \tanh(W_v x_v), \quad g = \sigma\!\big(W_g [x_a ; x_v]\big), \quad h = g \odot h_a + (1 - g) \odot h_v, \]
+    <p>where \(\sigma\) is the logistic sigmoid, \(\odot\) is element-wise multiplication, and \([x_a ; x_v]\) is the concatenation the gate looks at. The gate \(g\) is a vector, not a scalar, so the model can trust the camera for some feature dimensions and radar for others within the same fused vector. The <em>why</em> is that \(g\) is a function of the actual inputs: when \(x_a\) carries the statistical signature of a blinded camera (low contrast, saturated pixels), the gate learns to drive \(g \to 0\) and lean on the other modality. This is the deep-learning cousin of the covariance weighting in <a class="cross-ref" href="../module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>: there, a sensor with large \(R\) was down-weighted by the Kalman gain; here, a sensor that looks unreliable is down-weighted by a gate the network learned from data rather than from a hand-specified noise model.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A gate is a soft, differentiable switch, and that is exactly what makes it robust to missing or corrupted modalities. If one sensor drops out entirely, driving its features to a learned "absent" embedding, the gate can send its weight to zero and the fused representation degrades gracefully instead of collapsing. This is why gating is the natural mechanism behind the graceful-degradation training you will meet in <a class="cross-ref" href="section-50.4.html">Section 50.4</a>: you are not bolting robustness on afterward, you are building a model whose very fusion operator can already ignore an input it cannot trust. Attention can do this too, but a gate does it with a handful of parameters and no quadratic token interaction, so it is cheap enough to run on the edge devices of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+    </div>
+
+    <h2>Mixture-of-experts: conditional computation and specialization</h2>
+    <p>A gate blends fixed pathways. A mixture-of-experts (MoE) turns the blend into <em>routing</em> among many specialist subnetworks. You define \(N\) experts \(E_1, \dots, E_N\), each an ordinary feed-forward block, and a router \(G(x)\) that outputs a weight per expert. The output is a weighted sum of expert outputs:</p>
+    \[ G(x) = \operatorname{softmax}\!\big(W_r x\big), \qquad y = \sum_{i=1}^{N} G(x)_i \, E_i(x). \]
+    <p>Computed densely this is expensive, so the decisive trick is <strong>sparsity</strong>: keep only the top-\(k\) experts (typically \(k = 1\) or \(2\)) and zero the rest before the softmax renormalizes. Now each input activates just \(k\) of \(N\) experts, so you can grow \(N\) (and total parameters) enormously while keeping the per-input compute flat. That is the whole appeal of conditional computation: capacity scales with \(N\), cost scales with \(k\). The <em>why</em> for multimodal sensing is specialization. Different experts can specialize on different regimes: one expert learns the daytime-camera-dominant regime, another the rain-and-radar regime, another the night-thermal regime. The router learns to dispatch each input to the specialists that handle it best, which is a far richer form of adaptivity than a single dense network forced to average over all conditions. When experts are tied to modalities (a "mixture-of-modality-experts", where the router picks a vision expert for image tokens and an audio expert for audio tokens), the MoE also becomes a clean way to fuse the heterogeneous streams of a sensor-language model like those in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>.</p>
+
+    <p>Listing 50.3.1 implements both ideas end to end: a GMU that gates two modalities, and a sparse top-\(k\) MoE with an auxiliary load-balancing term. The router logits, the top-\(k\) mask, and the renormalized weights are the entire mechanism, and the code makes plain that an MoE is a gate with more branches plus a rule for keeping the branches busy.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class GatedMultimodalUnit(nn.Module):
+    """Input-dependent blend of two modality feature vectors."""
+    def __init__(self, d_a, d_v, d_out):
+        super().__init__()
+        self.fa = nn.Linear(d_a, d_out)
+        self.fv = nn.Linear(d_v, d_out)
+        self.gate = nn.Linear(d_a + d_v, d_out)   # gate sees BOTH modalities
+
+    def forward(self, xa, xv):
+        ha, hv = torch.tanh(self.fa(xa)), torch.tanh(self.fv(xv))
+        g = torch.sigmoid(self.gate(torch.cat([xa, xv], dim=-1)))
+        return g * ha + (1 - g) * hv, g            # return g to inspect reliance
+
+class SparseMoE(nn.Module):
+    """Top-k routing over N feed-forward experts, with load balancing."""
+    def __init__(self, d, n_experts=8, k=2, hidden=256):
+        super().__init__()
+        self.k = k
+        self.router = nn.Linear(d, n_experts)
+        self.experts = nn.ModuleList(
+            nn.Sequential(nn.Linear(d, hidden), nn.GELU(), nn.Linear(hidden, d))
+            for _ in range(n_experts))
+
+    def forward(self, x):                           # x: (batch, d)
+        logits = self.router(x)                     # (batch, n_experts)
+        probs = F.softmax(logits, dim=-1)
+        topv, topi = probs.topk(self.k, dim=-1)     # keep only k experts
+        topv = topv / topv.sum(-1, keepdim=True)    # renormalize the survivors
+        y = torch.zeros_like(x)
+        for slot in range(self.k):
+            idx = topi[:, slot]                      # which expert each row uses
+            w = topv[:, slot].unsqueeze(-1)
+            for e in idx.unique():
+                m = idx == e
+                y[m] += w[m] * self.experts[e](x[m])
+        # load-balancing loss: fraction routed x mean gate mass, summed
+        importance = probs.mean(0)
+        load = (topi == torch.arange(probs.size(-1))[:, None, None]).any(0).float().mean(0)
+        aux = (importance * load).sum() * probs.size(-1)
+        return y, aux</code></pre>
+    <div class="code-caption"><strong>Listing 50.3.1.</strong> A Gated Multimodal Unit and a sparse top-\(k\) mixture-of-experts. The GMU returns its gate \(g\) so you can audit which modality it trusted; the MoE routes each input to only \(k\) of \(N\) experts and returns an auxiliary load-balancing loss <code>aux</code> that must be added to the task loss during training. Growing <code>n_experts</code> raises capacity without raising per-input cost, since <code>k</code> stays fixed.</div>
+
+    <h2>Load balancing and the router's failure modes</h2>
+    <p>An MoE that trains naively collapses: the router discovers two or three experts early, sends everything to them, and the remaining experts, never receiving gradient, stay useless forever. This "expert collapse" is the central engineering hazard of sparse routing, and it is why Listing 50.3.1 returns an <code>aux</code> term. The <strong>load-balancing loss</strong> penalizes the product of each expert's routed fraction and its mean router probability, which is minimized when traffic is spread evenly, so the router is pushed to keep all experts busy. The <em>why</em> this cannot be skipped: without it, the effective model is a small dense network wearing an expensive costume, and you have paid for capacity you never use. A second failure mode is capacity overflow: with a fixed per-expert buffer, tokens beyond the buffer are dropped (skip the expert, pass through a residual), so a badly balanced router silently discards information. Getting the balance coefficient right, usually a small weight like \(10^{-2}\) on the auxiliary loss, is the difference between an MoE that specializes and one that thrashes. And because the router's choices are your fusion decisions, the auxiliary metric doubles as an interpretability handle, foreshadowing the fusion-attribution methods of <a class="cross-ref" href="section-50.6.html">Section 50.6</a>.</p>
+
+    <div class="callout practical-example">
+        <h4>In the field: camera-radar-lidar fusion for an autonomous shuttle</h4>
+        <p>A low-speed autonomous shuttle fuses a camera, an automotive radar, and a lidar into a bird's-eye-view perception stack (the geometry of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>). Early fusion by plain concatenation worked in clear daylight and fell apart the first foggy morning: the camera features went noisy, but the concatenation layer had no way to discount them, so pedestrian recall dropped sharply. The team replaced the concatenation with a per-region gated fusion block. Now, for each BEV grid cell, a gate computed from the three modality features decides the blend, and in fog the gate learns to down-weight the camera and lean on radar, whose signal (Chapter <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">44</a>) is barely affected by water droplets. When they later scaled to a dozen operating cities, they swapped the single fusion block for a sparse MoE whose experts specialized by condition (clear, rain, fog, night, glare). Per-frame latency stayed flat because only two experts fire per cell, yet the model absorbed the full diversity of conditions that a single dense block had been forced to average away. The router's expert histogram became a live dashboard: a spike in the "glare" expert at 5 pm was the fleet telling operations that low sun was stressing the cameras.</p>
+    </div>
+
+    <h2>When to reach for gating versus attention versus MoE</h2>
+    <p>These are not competitors so much as points on a cost-adaptivity curve, and the <em>when</em> matters. Reach for a <strong>gate</strong> when you have a small, fixed set of modalities whose reliability varies per sample and your compute budget is tight: it is a few parameters, adds negligible latency, and gives you the reliability dial that concatenation lacks. Reach for <strong>cross-attention</strong> (<a class="cross-ref" href="section-50.2.html">Section 50.2</a>) when the modalities interact at the token level, when <em>which</em> camera pixel matches <em>which</em> lidar point is the crux, because attention models those pairwise alignments that a single scalar gate cannot. Reach for a <strong>mixture-of-experts</strong> when you need large capacity and heterogeneous specialization but must hold inference cost down, the classic situation for a fleet model that must handle wildly different operating regimes on the same edge hardware. A common production design uses all three: attention aligns tokens, a gate weights modalities, and MoE layers give the network room to specialize, each doing the job it is cheapest at. And whichever you pick, the leakage-safe evaluation discipline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> still governs how you measure whether the added adaptivity actually helped.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>The hand-written top-\(k\) loop in Listing 50.3.1 is clear but slow, and it skips the scatter-gather dispatch, capacity buffers, and balanced-assignment routing that make MoE fast at scale. Libraries such as <code>pytorch</code>'s scaled MoE utilities, <code>fairseq</code>/<code>tutel</code>, and Hugging Face implementations of Mixtral-style sparse layers replace roughly 60 lines of routing, masking, and load-balancing bookkeeping with a single configured module:</p>
+        <pre class="language-python"><code class="language-python">from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from transformers import MixtralConfig
+cfg = MixtralConfig(hidden_size=256, intermediate_size=512,
+                    num_local_experts=8, num_experts_per_tok=2)
+moe = MixtralSparseMoeBlock(cfg)
+y, router_logits = moe(x)     # fused (batch, seq, 256); logits for the aux loss</code></pre>
+        <div class="code-caption"><strong>Listing 50.3.2.</strong> A production sparse-MoE block in about 6 lines, replacing the roughly 60 lines of hand-rolled routing, expert dispatch, and load balancing in Listing 50.3.1. The library owns the efficient token dispatch and returns the router logits so you can still compute and monitor the balancing loss; choosing <code>num_experts_per_tok</code> and what each expert should specialize on remains your modeling decision.</div>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Sparse MoE is the scaling engine behind current frontier models. Switch Transformer showed top-1 routing scales to trillions of parameters; Mixtral popularized top-2 routing among eight experts for open language models; GShard and Expert-Choice routing rethought the assignment so experts pick tokens rather than tokens picking experts, which sidesteps load imbalance by construction. For multimodal sensing specifically, LIMoE trained one sparse MoE jointly on images and text with a single router, and mixture-of-modality-experts designs (as in BEiT-3 and VLMo) keep separate expert pools per modality while sharing attention. Soft MoE removes the discrete top-\(k\) entirely, mixing tokens into slots so routing becomes fully differentiable and dropless. The open questions for sensor fusion are whether experts should specialize by modality, by operating condition, or by object class, and how to keep a router honest when a modality goes missing at test time, the exact robustness concern of <a class="cross-ref" href="section-50.4.html">Section 50.4</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Train the <code>SparseMoE</code> of Listing 50.3.1 on a two-modality classification task in which half the training batches have the camera modality zeroed out (simulating dropout). First train with the auxiliary load-balancing loss switched off and log, per epoch, how many of the eight experts ever receive traffic; you should watch the model collapse onto two or three. Then switch the balancing loss on with weight \(10^{-2}\) and confirm the traffic spreads across all experts. Finally, at test time, remove the camera entirely and record accuracy: does the router redistribute mass away from any camera-specialized expert, and does the GMU gate for the missing modality fall toward zero as hoped?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In the GMU, the gate \(g\) is a vector rather than a scalar. What extra modeling ability does a per-dimension gate give you that a single scalar per sample cannot?</p>
+        <p class="quiz-question">2. A sparse MoE has 64 experts but activates only 2 per input. Which quantity scales with 64 and which scales with 2, and why is that split the entire point of conditional computation?</p>
+        <p class="quiz-question">3. You remove the load-balancing loss and training accuracy plateaus low. Describe the failure mechanism and what you would observe in the per-expert routing histogram.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-50.4.html">Section 50.4</a>, we make the robustness promise of this section explicit: how to <em>train</em> a fusion model so that when a sensor fails at deployment, whether it drops out, freezes, or is spoofed, the network degrades gracefully instead of collapsing. Gates and routers gave us the mechanism to ignore an untrustworthy input; the next section builds the training regime, modality dropout and its relatives, that teaches the model to use that mechanism before it ever meets a broken sensor in the wild.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

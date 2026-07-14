@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.2: Classical SLAM (ORB-SLAM3, DROID-SLAM). Building Sensory AI." name="description"/>
+<title>Section 52.2: Classical SLAM (ORB-SLAM3, DROID-SLAM) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Classical SLAM (ORB-SLAM3, DROID-SLAM)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I drove a perfect loop of the warehouse and came back forty centimeters to the left of where I started. The floor had not moved. My belief had."</p>
+<cite>A Loop-Closing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you understand visual-inertial odometry from <a class="cross-ref" href="section-52.1.html">Section 52.1</a>: how tracking a camera and IMU frame to frame yields an incremental pose estimate that drifts. It leans on the sparse keypoint detectors and descriptors of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, on the nonlinear least-squares and pose-graph machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>, and on the stereo and RGB-D depth geometry of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>. You need comfort with rigid-body transforms in \(SE(3)\) and with reading a residual as something an optimizer drives to zero.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Odometry remembers the last second; SLAM remembers the whole room</h3>
+<p>Visual-inertial odometry answers "how did I move since the last frame?" and its errors compound: every small mis-estimate is welded onto the running total, so a long trajectory bends away from the truth. SLAM adds the second letter, <em>mapping</em>, and with it a new power: recognizing a place you have already seen. When the agent re-enters a previously mapped corridor, a <em>loop closure</em> ties the present pose to the past one, and a global optimization redistributes the accumulated drift across the entire trajectory at once. That single idea, turning a drifting chain into a globally consistent graph, is what separates a system that can localize inside a building for an hour from one that is lost after a hallway. This section covers the two reference designs that define the field: ORB-SLAM3, the mature geometric feature-based system, and DROID-SLAM, the learned dense alternative that trades hand-crafted features for a trained update operator.</p>
+</div>
+
+<p>Every SLAM system juggles the same four jobs: <strong>track</strong> the camera against the current map, <strong>map</strong> new geometry as keyframes and 3D points, <strong>close loops</strong> by recognizing revisited places, and <strong>optimize</strong> the whole estimate for global consistency. ORB-SLAM3 and DROID-SLAM answer these jobs with opposite philosophies, and understanding the contrast teaches you when to reach for each.</p>
+
+<h2>Feature-based SLAM: the ORB-SLAM3 design</h2>
+<p><strong>What</strong> ORB-SLAM3 does is track a sparse set of a few hundred to a few thousand ORB keypoints per frame, the oriented FAST corners with rotated BRIEF descriptors from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, chosen because they are fast to detect, cheap to match by Hamming distance, and invariant to rotation and modest scale change. <strong>Why</strong> sparse features win here is efficiency: representing the world by landmarks rather than pixels lets the whole system run in real time on a CPU while carrying an explicit, reusable map. The system keeps a subset of frames as <em>keyframes</em> and links them in a <em>covisibility graph</em>: two keyframes are connected when they observe the same landmarks, and that graph is the backbone for both local mapping and loop search.</p>
+
+<p><strong>How</strong> it stays accurate is <em>bundle adjustment</em>: the joint refinement of camera poses \(T_i \in SE(3)\) and 3D points \(\mathbf{p}_j\) so that the reprojection of every point lands on the pixel where it was actually seen. Formally it minimizes</p>
+$$\min_{\{T_i\},\{\mathbf{p}_j\}} \sum_{(i,j)} \rho\!\left( \big\lVert \mathbf{u}_{ij} - \pi(T_i, \mathbf{p}_j) \big\rVert^2_{\Sigma_{ij}} \right),$$
+<p>where \(\pi\) is the camera projection, \(\mathbf{u}_{ij}\) the observed pixel, \(\Sigma_{ij}\) the measurement covariance, and \(\rho\) a robust (Huber) kernel that stops a few bad matches from dominating. ORB-SLAM3 runs this in two scopes: <em>local</em> bundle adjustment over a sliding window of covisible keyframes for real-time refinement, and <em>full</em> bundle adjustment after a loop closure for global consistency, exactly the sparse nonlinear least-squares problem of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>.</p>
+
+<p>Three features make version 3 the reference rather than a research toy. First, it is <strong>tightly coupled visual-inertial</strong>: the IMU preintegration factors sit in the same optimization as the visual factors, so scale (unobservable from a single monocular camera) becomes observable and tracking survives brief visual blackouts. Second, it supports <strong>monocular, stereo, and RGB-D</strong> inputs through a shared pipeline, so the same code localizes a phone, a robot with a stereo rig, or a depth camera. Third, its <strong>Atlas</strong> system maintains multiple disconnected sub-maps: when tracking is lost, it starts a fresh map and later merges it if a place is recognized, which is what makes it robust to the kidnapped-robot problem.</p>
+
+<h2>Loop closure and relocalization: recognizing a place</h2>
+<p>The mechanism that turns odometry into SLAM is <em>place recognition</em>. ORB-SLAM3 uses a <strong>bag-of-visual-words</strong> index (DBoW2): each keyframe's ORB descriptors are quantized against a pre-trained vocabulary tree into a compact histogram, and finding loop candidates becomes a fast lookup for keyframes with similar histograms rather than an all-pairs image comparison. A candidate is only accepted after a geometric check, matching features and verifying a consistent rigid transform, so a lookalike wall does not trigger a false closure.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A loop closure is a single constraint that pays off globally</h3>
+<p>One recognized place adds exactly one edge to the pose graph, connecting the current keyframe to an old one with a measured relative transform. Yet that lone edge is worth more than thousands of odometry edges, because it is the only constraint that contradicts accumulated drift. Optimizing the graph then spreads the correction backward across every intermediate pose, snapping the trajectory into global agreement. This is why SLAM engineers obsess over recall of place recognition: a missed loop leaves drift uncorrected, while a single good closure can rescue an entire session. It is also why a false closure is catastrophic, welding two genuinely different places together, and why the geometric verification step is never optional.</p>
+</div>
+
+<p>The code below strips loop closure to its essence: a one-dimensional robot that drifts around a loop and returns to its start. A pose-graph optimization treats the known return-to-origin as a constraint and redistributes the error.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# A robot makes N steps around a loop; each odometry step should be +1.0 but drifts.
+N = 20
+true_step = 1.0
+rng = np.random.default_rng(0)
+odom = true_step + rng.normal(0.0, 0.05, N)      # noisy relative measurements
+poses = np.concatenate([[0.0], np.cumsum(odom)]) # dead-reckoned positions
+
+# Loop closure: we recognize that pose N is the SAME place as pose 0 (relative = 0).
+# Build a linear pose graph: odometry edges + one loop edge, solve least squares.
+rows, b = [], []
+for i in range(N):                               # odometry constraints x_{i+1}-x_i = odom_i
+    r = np.zeros(N + 1); r[i], r[i+1] = -1, 1
+    rows.append(r); b.append(odom[i])
+r = np.zeros(N + 1); r[0], r[N] = -1, 1          # loop constraint x_N - x_0 = 0
+rows.append(r); b.append(0.0)
+r = np.zeros(N + 1); r[0] = 1                     # anchor x_0 = 0 (gauge freedom)
+rows.append(r); b.append(0.0)
+
+A = np.array(rows)
+x_opt = np.linalg.lstsq(A, np.array(b), rcond=None)[0]
+print(f"drift before closure : {poses[N]-poses[0]:+.3f} m")
+print(f"drift after  closure : {x_opt[N]-x_opt[0]:+.3f} m")
+print(f"max pose correction  : {np.abs(x_opt-poses).max():.3f} m")
+</code></pre>
+<div class="code-caption">A minimal pose-graph loop closure. The dead-reckoned path ends tens of centimeters from its start; adding one loop constraint (pose \(N\) equals pose \(0\)) and solving the linear least-squares graph drives the closing error to zero and spreads the correction smoothly over all intermediate poses, exactly what full bundle adjustment does in three dimensions.</div>
+
+<p>Real ORB-SLAM3 solves the nonlinear \(SE(3)\) version of this graph over keyframes and landmarks, but the arithmetic in the snippet is the whole idea: drift measured at the loop is a residual, and the optimizer apologizes for it everywhere.</p>
+
+<h2>DROID-SLAM: learned dense bundle adjustment</h2>
+<p>DROID-SLAM answers the same four jobs with a trained network instead of hand-crafted features. <strong>What</strong> it computes is dense per-pixel correspondence between frames using a recurrent update operator borrowed from optical-flow research (the RAFT-style GRU), which iteratively revises a flow field and a per-pixel confidence. <strong>Why</strong> this helps is robustness: learned dense matching tolerates low-texture walls, motion blur, and repetitive patterns that starve a corner detector, and the confidence weights let the system downweight unreliable pixels automatically rather than through a hand-tuned threshold. <strong>How</strong> it stays geometrically honest is a <em>differentiable dense bundle adjustment</em> layer: after each network update, a Gauss-Newton step (a <em>dense BA layer</em>) jointly refines all camera poses and a per-pixel depth map over a frame graph so that the geometry is consistent with the predicted correspondences. Training end to end through that geometric layer is what makes the learned flow serve accurate poses rather than pretty pictures.</p>
+
+<p><strong>When</strong> DROID-SLAM is the right call is when you have a GPU and a hard visual environment; <strong>when</strong> it is the wrong call is a CPU-only or power-constrained target, because dense correlation volumes and iterative BA are heavy. ORB-SLAM3 runs comfortably on a laptop CPU; DROID-SLAM expects a capable GPU and more memory. The two systems bracket the design space: sparse-geometric-cheap versus dense-learned-robust.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>ORB-SLAM3 (Campos et al., 2021) remains the accuracy and robustness benchmark for real-time feature-based visual-inertial SLAM and is still the baseline nearly every new paper reports against. DROID-SLAM (Teed and Deng, 2021) set the bar for learned dense SLAM and generalizes across monocular, stereo, and RGB-D without retraining. The frontier has since split two ways: DPVO (2023) brought DROID's learned matching to a sparse, far cheaper patch-based formulation, and end-to-end pointmap systems such as DUSt3R and MASt3R-SLAM (2024 to 2025) drop explicit feature matching and camera calibration entirely, regressing dense 3D directly. The differentiable-BA idea keeps reappearing because it fuses learned front ends with the geometric back end that guarantees consistency, the same fusion that <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a> pushes toward photorealistic maps.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse AMR that stopped getting lost at the loading dock</h3>
+<p>An autonomous mobile robot ferrying totes across a distribution center ran stereo ORB-SLAM3. It localized beautifully among the shelving, where painted floor markings and rack edges gave dense corners, but repeatedly lost tracking at the loading dock: a wide, glossy, near-textureless concrete apron under changing daylight from the roller doors. Feature detection collapsed, the map fragmented into Atlas sub-maps, and the robot occasionally re-initialized with a scale jump. The team ran the same recorded sessions through DROID-SLAM offline and found the learned dense front end held correspondence across the blank apron where corners had vanished, because it could exploit faint gradients and lighting structure a detector discards. The shipped fix was pragmatic: keep ORB-SLAM3 on the CPU for the feature-rich aisles for battery life, and hand off to a GPU-backed dense tracker only in the geometrically starved dock zone, with loop closures from the aisle map re-anchoring the pose on return. Robustness came from matching the SLAM front end to the texture the environment actually offered.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: a full SLAM stack instead of a semester of geometry</h3>
+<p>Implementing tracking, keyframe selection, DBoW2 place recognition, and windowed bundle adjustment from scratch is several thousand lines of careful C++ and linear algebra. The reference systems ship it: cloning and building ORB-SLAM3 gives you a real-time visual-inertial SLAM binary you feed a calibrated camera and IMU stream, and <code>pip install</code>-able wrappers plus the authors' DROID-SLAM repo run a learned dense pipeline in a dozen lines of Python. That is on the order of 5000 lines of SLAM internals reduced to a config file and a call: the library owns the covisibility graph, the robust solver, and the loop-closure verification, leaving you to own calibration and evaluation. Build from scratch to learn the residuals; deploy the reference stack to ship.</p>
+</div>
+
+<h2>Choosing between them, and their shared blind spot</h2>
+<p>Pick ORB-SLAM3 when compute is scarce, when you want an explicit reusable landmark map, or when an IMU is available for scale and blackout robustness. Pick a learned dense approach when the scene is low-texture, motion-blurred, or repetitive and a GPU is on board. Both, however, share a deep assumption: the world is <em>static</em>. A person walking through frame, a forklift crossing the aisle, or a swaying curtain injects correspondences that are geometrically consistent yet belong to a moving object, corrupting both the pose and the map. Handling that is the subject of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>'s dynamic scenes and of Section 52.6. For now, remember that classical SLAM's global consistency is bought with a static-world promise the real world does not always keep.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: measure the value of a loop closure</h3>
+<p>Extend the pose-graph snippet to two dimensions: simulate a square loop of 40 noisy odometry steps returning near the origin. (a) Plot the dead-reckoned path and measure the closing error. (b) Add the loop constraint and re-solve; report how the maximum per-pose correction depends on where in the loop each pose sits. (c) Now inject one <em>false</em> loop closure between two poses that are physically far apart and re-solve. Describe how the false constraint corrupts the whole trajectory, and explain why ORB-SLAM3's geometric verification exists precisely to prevent this.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does adding a single loop-closure edge improve the entire trajectory rather than only the two poses it connects?</li>
+<li>ORB-SLAM3 represents the world with a few hundred landmarks per frame while DROID-SLAM reasons over every pixel. State one concrete advantage each choice buys and one cost it pays.</li>
+<li>What does the differentiable dense bundle adjustment layer contribute during DROID-SLAM's training that a network predicting flow alone would miss?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-52.3.html">Section 52.3</a>, we replace the sparse landmark cloud and the explicit point map with a learned <em>neural</em> representation of the scene. Neural SLAM systems such as NICE-SLAM store geometry and appearance in a continuous, differentiable field and optimize the camera pose by rendering against it, blurring the line between mapping and the neural-field reconstruction you will meet as a first-class citizen later in the chapter.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

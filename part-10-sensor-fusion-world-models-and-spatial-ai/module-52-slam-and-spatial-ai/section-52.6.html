@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.6: Dynamic-scene and semantic mapping. Building Sensory AI." name="description"/>
+<title>Section 52.6: Dynamic-scene and semantic mapping | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Dynamic-scene and semantic mapping</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"For years I assumed the world held still while I mapped it. Then a bus drove through my map, and I spent three keyframes politely pretending the wall behind it had moved."</p><cite>A Chastened AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every SLAM system in this chapter so far quietly assumed the world is a rigid, nameless geometric shell: points, splats, or fields that never move and never mean anything. Reality violates both assumptions constantly. People walk, doors swing, cars pull away, and the resulting moving pixels poison the pose estimate and smear the map with ghosts. Meanwhile a map that is only geometry cannot answer "park next to the second chair" or "go to the kitchen." This section fixes both gaps at once. <strong>Dynamic-scene mapping</strong> teaches SLAM to separate what moves from what stays, so the static map survives and the moving objects become first-class tracked entities. <strong>Semantic mapping</strong> attaches labels, object identities, and increasingly open-vocabulary language features to the geometry, turning a point cloud into a queryable model of the world. The two are deeply linked: knowing that a region is a "person" is exactly what tells you it is allowed to move.</p>
+</div>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the SLAM back-ends of the rest of the chapter, especially the feature-based tracking of <a class="cross-ref" href="section-52.2.html">Section 52.2</a> and the photometric Gaussian maps of <a class="cross-ref" href="section-52.4.html">Section 52.4</a>. It assumes you can run 2D instance and panoptic segmentation networks, the perception layer of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>, and understand the outlier-rejection view of estimation from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. The open-vocabulary part leans on the vision-language embeddings introduced in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>.</p>
+</div>
+
+<h2>Why moving objects break SLAM, and the three ways to cope</h2>
+<p>The core estimator behind classical SLAM minimizes reprojection error under a static-world assumption: a 3D landmark projects to where the camera geometry says it should, and any discrepancy is measurement noise. A moving object silently breaks that model. Its features are geometrically consistent frame to frame (they really are the same corner of the same bus), so a naive front-end happily matches them, then the back-end tries to explain their motion by moving the <em>camera</em> instead. A single bus filling a third of the frame can drag the trajectory meters off course and bake a translucent bus-shaped scar into the map.</p>
+<p>Three strategies handle this, in rising order of ambition. The first is <strong>reject</strong>: detect dynamic regions and simply exclude their features from tracking and mapping, treating them as outliers. The second is <strong>reconstruct</strong>: keep the static background clean but also model each moving object as its own rigidly moving submap, so you end up with the scene plus per-object trajectories. The third is <strong>deform</strong>: allow genuinely non-rigid geometry (a person bending, a cloth folding) and fit a time-varying representation, the regime dynamic Gaussian splatting now targets. Most deployed systems live in the first tier, the richest research lives in the third.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Dynamic objects are not just noise to be filtered; they are the most valuable thing in the scene for a robot that has to act. "Reject" makes SLAM robust. "Reconstruct" makes SLAM <em>useful</em>: the same segmentation that lets you exclude the walking person also hands you that person's position, velocity, and identity, which is precisely what a downstream planner needs to avoid them. Do not throw away the dynamic content, promote it.</p>
+</div>
+
+<h2>Detecting what moves: geometry, semantics, or both</h2>
+<p>How do you know a pixel is moving? Two independent signals exist, and the strongest systems fuse them. <strong>Geometric</strong> cues need no labels: after estimating an initial camera motion, a feature that violates multi-view epipolar geometry, or whose measured depth disagrees with the reprojected static prediction, is probably on a moving body. Formally, for a matched point with a candidate motion, the epipolar residual \(r = \mathbf{x}_2^\top \mathbf{F}\, \mathbf{x}_1\) should be near zero for static structure; large \(|r|\) flags a dynamic outlier, which classical robust back-ends already down-weight. The weakness is that geometric cues fail exactly when they matter most: an object moving along the epipolar line (a car driving straight ahead of you) produces a small residual and hides.</p>
+<p><strong>Semantic</strong> cues cover that blind spot. A segmentation network labels every pixel, and a prior list of movable classes (person, vehicle, animal) marks those regions as suspect regardless of whether they happen to be moving <em>this</em> instant. This is the design of the widely cited DynaSLAM (Bescos et al., 2018), which layers Mask R-CNN masking plus multi-view geometry on top of ORB-SLAM2 and then <em>inpaints</em> the background occluded by removed objects, and of DS-SLAM, which pairs SegNet with a moving-consistency check. The catch is the mirror image of the geometric failure: semantics over-reject. A <em>parked</em> car is labeled "vehicle" and discarded even though it is a perfectly good, rock-solid landmark. The fix is the fusion: use the class prior to decide what <em>could</em> move, then use the geometric consistency check to decide what <em>is</em> moving, and only reject the intersection.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Per-feature dynamic gate: fuse a semantic movable-class prior with a
+# geometric epipolar-consistency test. A feature is trusted as a static
+# landmark only if it is NOT flagged by both signals.
+def static_feature_mask(epi_residual, is_movable_class,
+                        resid_thresh=1.5e-3):
+    """epi_residual: |x2^T F x1| per matched feature (array).
+       is_movable_class: bool array, True if pixel's class can move.
+       Returns bool mask of features to KEEP for pose estimation."""
+    moving_geo = np.abs(epi_residual) > resid_thresh   # violates epipolar geom
+    suspect = is_movable_class & moving_geo            # movable AND actually moving
+    return ~suspect                                    # keep everything else
+
+res  = np.array([2e-4, 5e-3, 1e-4, 8e-3, 3e-4])
+movable = np.array([False, True, True, True, False])   # class prior
+keep = static_feature_mask(res, movable)
+print(keep)   # a parked car (movable but low residual) is KEPT
+</code></pre>
+<div class="code-caption">The gate keeps a feature unless it is both on a movable-class pixel <em>and</em> geometrically inconsistent. Index 2 is a movable class with a tiny residual (a parked car): it stays a landmark. Index 3 is movable and inconsistent (a walking person): it is dropped. This intersection logic is what stops semantic masking from throwing away half the usable structure in a parking lot.</div>
+
+<p>The code above is the heart of every "reject" system in one function. Everything else, the segmentation network, the fundamental-matrix estimate, the keyframe bookkeeping, feeds these two arrays. In practice the movable-class prior comes from a real-time panoptic model and the residual from the same robust estimator you already run for outlier rejection, so the marginal cost of dynamic handling is mostly the segmentation forward pass.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't train your own segmentor for the movable-class prior</h3>
+<p>The <code>is_movable_class</code> array above needs a segmentation model, and hand-rolling one is hundreds of lines plus a training pipeline plus a labeled dataset. Ultralytics YOLO ships instance segmentation as a two-line call: <code>model = YOLO("yolo11n-seg.pt")</code> then <code>masks = model(frame)[0].masks</code>, and you get per-pixel class masks at real-time rates on a modest GPU. Map the returned class ids through a small movable-class set (person, car, bicycle, dog) and you have the prior with about 5 lines instead of a bespoke perception stack. Segment Anything 2 (SAM 2) goes further and propagates a mask through video, giving temporally stable object masks for the "reconstruct" tier without per-frame re-detection.</p>
+</div>
+
+<h2>From labels to object-level and open-vocabulary maps</h2>
+<p>Rejecting dynamics keeps the map clean; semantic mapping makes the map <em>mean</em> something. The simplest form fuses per-pixel labels into the 3D representation: as each frame's segmentation is back-projected, every voxel, surfel, or Gaussian accumulates a running distribution over class labels, converging to a dense semantic map. SemanticFusion did this over a surfel map by Bayesian label fusion across frames; Kimera builds a real-time metric-semantic mesh alongside its VIO and pose-graph back-end. The next step up is <strong>object-level</strong> SLAM, where the map's units are whole objects rather than pixels. QuadricSLAM represents objects as dual quadrics (ellipsoids) that are jointly optimized with camera poses in the factor graph, and Fusion++ maintains a per-object TSDF. An object-centric map is compact, supports data association by object identity across large loops, and lets a robot reason about "the chair" as one movable entity, closing the loop back to dynamic handling.</p>
+<p>The 2023 shift is <strong>open-vocabulary</strong> mapping. Instead of committing to a fixed label set at training time, each 3D primitive stores a high-dimensional vision-language feature (a CLIP-style embedding, the machinery of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>). ConceptFusion fuses pixel-aligned foundation-model features into a 3D map so you can later query it with an arbitrary text or image prompt; LERF and the newer language-embedded Gaussian splats bake the same idea into radiance-field and splatting maps. A query becomes a dot product: embed the phrase "the red backpack," compare it against every primitive's stored feature, and the map lights up where the similarity is high, no retraining, no closed label list. This is the representation an <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">embodied agent</a> needs to follow a natural-language instruction into a space it has mapped but never been told the vocabulary of.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Field note: a warehouse AMR that must not map the forklifts</h3>
+<p>An autonomous mobile robot (AMR) patrols a busy distribution center where forklifts and pickers cross its path constantly. Its first mapping run, pure geometric SLAM, produced a map streaked with translucent forklift ghosts and a trajectory that drifted every time a forklift paced alongside it (a straight-line motion the epipolar check alone missed). The team added a panoptic segmentor with a movable-class prior (person, forklift, pallet-jack) fused with the geometric residual gate above. Two wins followed. The static map became crisp, racks and floor markings only, because moving vehicles were rejected before they touched the back-end. And the <em>rejected</em> detections were not discarded: each forklift became a tracked object with a position and velocity streamed to the fleet's traffic manager, feeding the same collision-avoidance layer that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> treats as a functional-safety requirement. The dynamic content the naive system tried to erase turned out to be the safety-critical signal.</p>
+</div>
+
+<h2>The moving frontier: dynamic reconstruction and consistency</h2>
+<p>The hardest regime is reconstructing geometry that genuinely deforms, not just rejecting it. Here the map itself becomes time-dependent: a set of Gaussians (or a neural field) whose positions and shapes are functions of \(t\), fit so that rendering at each timestamp matches that frame. This is where SLAM meets 4D reconstruction, and it inherits every ambiguity of monocular dynamic vision, motion and depth trade off against each other, so the community leans hard on learned depth and motion priors to constrain the fit.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Classical robustness lives in <strong>DynaSLAM</strong> and <strong>DS-SLAM</strong>; real-time metric-semantic mapping in <strong>Kimera</strong>. The live edge is dynamic and semantic Gaussian-splatting SLAM. <strong>DG-SLAM</strong> and related 2024 systems bring dynamic-object handling into splatting-based SLAM, while general 4D methods (Deformable-3DGS, 4D-GS) reconstruct non-rigid scenes from casual video. In parallel, open-vocabulary mapping is exploding: <strong>ConceptFusion</strong>, language-embedded 3D Gaussians, and pipelines pairing <strong>SAM 2</strong> mask propagation with CLIP features are converging on maps you query with plain language. The open problems are honest ones: temporal consistency of embeddings across frames, the memory cost of storing a 512-dimensional feature on every one of a million Gaussians, and evaluation, because no benchmark yet cleanly scores "did the dynamic object get reconstructed <em>and</em> correctly named," the very gap <a class="cross-ref" href="section-52.7.html">Section 52.7</a> confronts.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend <code>static_feature_mask</code> to a third input: a per-feature temporal flag <code>was_dynamic_recently</code> (True if this landmark's track was rejected as moving in any of the last <em>k</em> frames). Modify the logic so a landmark stays rejected for a short hysteresis window even once its instantaneous residual drops below threshold. In two or three sentences, explain why a person who briefly stops walking (residual momentarily near zero) should still be treated as dynamic, and what failure a purely instantaneous gate would cause when they resume moving.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Give the one scene geometry in which a purely geometric (epipolar) dynamic-object detector fails, and explain why a semantic movable-class prior catches it.</li>
+<li>Semantic masking alone over-rejects. Name the specific case it gets wrong and describe the fusion rule that recovers those landmarks.</li>
+<li>What does an open-vocabulary map store on each 3D primitive, and how does a natural-language query become a lookup over that map without any retraining?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-52.7.html">Section 52.7</a>, we ask the uncomfortable question this whole chapter has been deferring: how do you actually <em>measure</em> whether a SLAM system is good? We work through trajectory metrics (absolute and relative pose error), map-quality and rendering metrics, the standard benchmarks (TUM RGB-D, EuRoC, KITTI, Replica), and the leakage traps that make an impressive number on paper evaporate in the field.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

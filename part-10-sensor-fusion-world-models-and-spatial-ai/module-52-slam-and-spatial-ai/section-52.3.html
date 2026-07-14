@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.3: Neural SLAM (NICE-SLAM). Building Sensory AI." name="description"/>
+<title>Section 52.3: Neural SLAM (NICE-SLAM) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Neural SLAM (NICE-SLAM)</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"You gave the classical system a map made of dots and asked me to walk through the gaps between them. This one hands me a map that fills in the wall where no dot ever landed. I did not know I was allowed to want that."</p>
+        <cite>A Newly Dense AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the neural-field machinery of <a class="cross-ref" href="../module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>: a scene stored as a differentiable function and rendered by volumetric alpha-compositing along rays. It assumes the RGB-D camera model and depth conventions of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, the SLAM problem statement and the sparse feature-map baselines of <a class="cross-ref" href="section-52.2.html">Section 52.2</a> (ORB-SLAM3, DROID-SLAM), and the pose-and-map joint-optimization framing that factor-graph smoothing gave us in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. Where classical SLAM estimates a sparse point cloud plus poses, neural SLAM estimates a <em>dense, continuous, gap-filling</em> scene function plus poses, and it does so by the same gradient descent you already trust.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Classical SLAM gives you where the camera is and a scatter of 3D landmarks; it leaves the wall between the landmarks blank. Neural SLAM asks a bolder question: can the map itself be a neural scene representation that you build <em>online</em>, one frame at a time, while simultaneously tracking the camera against it? iMAP (Sucar and colleagues, 2021) showed it was possible with a single multilayer perceptron, but that one network tried to remember an entire room in its weights, so it forgot old rooms as it learned new ones and could not scale. NICE-SLAM (Zhu, Peng and colleagues, CVPR 2022) fixed both problems with one idea: replace the monolithic network with a <strong>hierarchy of learnable feature grids</strong> decoded by small, pretrained networks. Local geometry now lives in local grid cells, so writing a new corner of the scene no longer overwrites an old one, and the map scales to whole apartments. The payoff is a SLAM system whose map is dense, hole-filled, and continuous, trained by rendering loss, that fuses depth and color into a single differentiable world model. This is the conceptual bridge from the sparse geometry of Section 52.2 to the real-time splatting SLAM of the next section.</p>
+    </div>
+
+    <h2>Why put the map inside a neural field?</h2>
+    <p>A sparse SLAM map is efficient and accurate at the points it tracks, but it is mostly empty. For a robot that must plan a collision-free path, or a mixed-reality headset that must occlude a virtual object behind a real sofa, empty space between landmarks is a liability: you cannot walk through a map made of dots without guessing what fills the gaps. The dense-fusion answer of a decade ago, a truncated signed-distance volume (KinectFusion and its descendants), fills space but at a fixed voxel resolution that trades memory against detail and stores nothing it has not directly seen.</p>
+    <p>A neural field changes the accounting. The map is a function \(f_\theta(x)\) that maps any 3D point \(x\) to an occupancy (or signed distance) and a color, so it is <em>continuous</em>: you can query it at arbitrary resolution, and because the network has learned the statistics of surfaces, it interpolates plausibly across small gaps the sensor never quite covered. That is the "why" behind the hole-filling you see in neural SLAM reconstructions. The price is that every map update is now an optimization, not a fusion step, which is exactly the tension the rest of this section is about.</p>
+
+    <h2>The NICE-SLAM representation: a hierarchy of feature grids</h2>
+    <p>iMAP's flaw was catastrophic forgetting: one MLP is a global memory, and gradient steps for a new frame perturb weights that encoded old geometry. NICE-SLAM localizes the memory. The scene is stored as three geometry feature grids at coarse, mid, and fine resolution, plus a separate color feature grid. A grid holds a learnable feature vector at each cell corner; to query a point \(x\) you trilinearly interpolate the surrounding features, then pass them to a small <em>pretrained, frozen</em> multilayer perceptron that decodes occupancy. Because the mid and fine decoders are pretrained on shape priors and then left fixed, all online learning happens in the grid features, and a feature at one location influences only points near it. Updating the far corner of a room touches different grid cells than the near corner, so the network stops forgetting and starts scaling.</p>
+    <p>The hierarchy earns its keep by division of labor. The coarse grid captures room-scale structure and, crucially, can <em>predict</em> geometry into unobserved regions, giving the plausible fill-in. The mid and fine grids sharpen detail where the sensor actually looked. A point's occupancy \(o\) blends the levels, and the color grid, decoded by its own small network, supplies appearance for the photometric term.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The single design decision that turns a fragile neural-field demo into a working SLAM map is <em>where you put the learnable parameters</em>. Put them all in one global MLP (iMAP) and the map has global memory: every update risks every past observation, and capacity is capped by network size. Put them in a grid of local features decoded by a small frozen network (NICE-SLAM) and the memory becomes spatially local: updates are confined to the cells you touched, capacity grows with the grid, and a pretrained decoder injects a geometry prior that lets the coarse level hallucinate reasonable surfaces into the gaps. Local parameters buy anti-forgetting and scalability; the frozen prior buys hole-filling. That is the whole trick.</p>
+    </div>
+
+    <h2>Rendering, tracking, and mapping: the two-loop dance</h2>
+    <p>NICE-SLAM renders exactly like the neural fields of <a class="cross-ref" href="../module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>. To predict what a pixel sees, sample points \(x_i\) along its back-projected ray at depths \(d_i\), query the grids and decoders for occupancy \(o_i\) and color \(c_i\), convert occupancy to a per-sample termination weight \(w_i\), and alpha-composite. The rendered depth and color are weighted sums along the ray:</p>
+    \[ \hat{D} = \sum_i w_i\, d_i, \qquad \hat{I} = \sum_i w_i\, c_i, \qquad w_i = o_i \prod_{j<i}\left(1 - o_j\right). \]
+    <p>Because the RGB-D camera also <em>measures</em> a depth \(D\) at that pixel, supervision is dense and geometric, not just photometric. The loss over a batch of sampled pixels combines a depth term and a color term:</p>
+    \[ \mathcal{L} = \sum_{p} \left| \hat{D}_p - D_p \right| \;+\; \lambda \sum_{p} \left\| \hat{I}_p - I_p \right\|_1 . \]
+    <p>Now the SLAM part. There are two unknowns, the map (grid features) and the camera poses, and NICE-SLAM optimizes them in alternating loops, the neural echo of the pose-and-structure split you met in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. In <strong>tracking</strong>, the map is frozen and only the current camera pose is optimized: sample a few hundred pixels, render, and gradient-descend the six pose parameters to minimize \(\mathcal{L}\). In <strong>mapping</strong>, the pose is frozen and the grid features (and color decoder) are optimized over a window of selected keyframes to fold the new observations into the scene. Running tracking every frame and mapping less often, over a keyframe buffer, is what keeps the whole thing near interactive rates and, like keyframe bundle adjustment in Section 52.2, bounds drift.</p>
+
+    <p>Listing 52.3.1 strips the rendering-and-tracking core to its arithmetic: given occupancy predictions along one ray, it composites a depth, and given a measured depth it reports the residual that a pose gradient step would reduce. This is the inner computation NICE-SLAM runs for hundreds of rays per frame.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def render_ray(depths, occ, colors):
+    """Volumetric compositing along one ray.
+    depths: (S,) sample depths; occ: (S,) occupancy in [0,1]; colors: (S,3)."""
+    trans = np.cumprod(np.concatenate([[1.0], 1.0 - occ[:-1]]))  # prod_{j<i}(1-o_j)
+    w = occ * trans                                              # termination weight
+    D_hat = np.sum(w * depths)                                   # rendered depth
+    I_hat = np.sum(w[:, None] * colors, axis=0)                 # rendered color
+    return D_hat, I_hat, w
+
+# 32 samples along a ray, occupancy rising as we cross a surface near 2.0 m
+depths = np.linspace(0.5, 3.0, 32)
+occ    = 1.0 / (1.0 + np.exp(-8.0 * (depths - 2.0)))            # soft surface at 2 m
+colors = np.tile(np.array([0.6, 0.6, 0.62]), (32, 1))          # a grey wall
+
+D_hat, I_hat, w = render_ray(depths, occ, colors)
+D_meas = 2.05                                                   # RGB-D measurement
+depth_residual = abs(D_hat - D_meas)                            # drives the loss
+print(f"rendered depth = {D_hat:.3f} m, surface at ~{depths[w.argmax()]:.2f} m")
+print(f"measured depth = {D_meas:.2f} m, residual = {depth_residual:.3f} m")</code></pre>
+    <div class="code-caption"><strong>Listing 52.3.1.</strong> The rendering-and-supervision core of neural SLAM, by hand. <code>render_ray</code> turns occupancy along a ray into a termination weight and composites a depth and color; the depth residual against the RGB-D measurement is the quantity that tracking minimizes over pose and mapping minimizes over grid features. A full system runs this for hundreds of rays per frame and backpropagates through the grid interpolation and decoders.</div>
+
+    <p>Notice what Listing 52.3.1 makes visible: the surface localizes at the depth where occupancy transitions, and the residual is the same signal whether you are moving the camera (tracking) or reshaping the map (mapping). One rendering equation, two optimization targets.</p>
+
+    <div class="callout practical-example">
+        <h4>In the field: a warehouse inventory robot that must not clip a shelf</h4>
+        <p>A low-speed inventory robot roams a warehouse at night with an RGB-D camera, building a map it will use to plan collision-free lanes between racking. A sparse feature SLAM system localizes it beautifully but leaves the space between shelf legs unmapped, so the planner treats the aisle as an unknown void and crawls. Switching the mapping backend to a NICE-SLAM-style dense neural field, the robot now carries a continuous occupancy map: the coarse grid fills in the flat aisle floor and the shelf faces even where the camera glimpsed them only obliquely, and the planner reads clearance directly from queried occupancy. The engineering reality tempers the romance: the team runs mapping on a keyframe window every several frames to hit an interactive update rate on the robot's onboard GPU, resets tracking against the map to catch drift on long straight aisles (where featureless shelving starves a sparse tracker), and accepts that the neural map's hallucinated fill is a hypothesis, not a measurement, so the safety layer still trusts a direct depth reading over a queried one near any surface it is about to touch. The dense map made planning smooth; treating its predictions with calibrated caution kept it safe.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Listing 52.3.1 is one ray. A real neural-SLAM system needs multi-resolution grid encoders, trilinear feature interpolation with autograd, keyframe selection, the alternating tracking-mapping scheduler, and CUDA ray sampling, several thousand lines before it tracks a single frame. The <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">point-cloud</a> and neural-rendering ecosystems collapse most of it. Building the encoder on <code>tiny-cuda-nn</code>'s hash grid replaces a hand-written multi-level feature grid plus its backward pass, roughly 600 lines of CUDA, with about 10 lines of configuration:</p>
+        <pre class="language-python"><code class="language-python">import tinycudann as tcnn
+# a multiresolution hash grid encoder + tiny decoder, fused CUDA, ~10 lines
+encoding = tcnn.Encoding(n_input_dims=3, encoding_config={
+    "otype": "HashGrid", "n_levels": 16, "n_features_per_level": 2,
+    "log2_hashmap_size": 19, "base_resolution": 16, "per_level_scale": 1.5})
+decoder  = tcnn.Network(encoding.n_output_dims, n_output_dims=4,
+    network_config={"otype": "FullyFusedMLP", "activation": "ReLU",
+                    "n_neurons": 64, "n_hidden_layers": 2})
+feat = encoding(points)          # (N, 32) interpolated multi-level features
+occ_rgb = decoder(feat)          # (N, 4) occupancy + color, differentiable</code></pre>
+        <div class="code-caption"><strong>Listing 52.3.2.</strong> The learnable multi-resolution encoder and decoder in <code>tiny-cuda-nn</code>, the backbone that later neural-SLAM systems (Co-SLAM, ESLAM) adopt. The fused kernels own the grid, the interpolation, and the backward pass; the SLAM logic, tracking loop, keyframe policy, and loss design remains your job.</div>
+        <p>As Listing 52.3.2 shows, the library hands you a fast differentiable map function, not a SLAM system: the two-loop scheduler and the sensor-fusion choices are still yours to design.</p>
+    </div>
+
+    <h2>Strengths, limits, and where neural SLAM went next</h2>
+    <p>NICE-SLAM's wins are concrete. The map is dense and continuous, it fills holes, it fuses depth and color into one representation, and it is fully differentiable, so pose and geometry improve by the same gradient. Against iMAP it is markedly more accurate and scales from a single room to a multi-room apartment without forgetting. Those properties are why it became the reference point for the whole neural-SLAM line.</p>
+    <p>The limits are just as concrete, and they define the frontier. First, speed: rendering and per-frame optimization are heavier than sparse feature tracking, so vanilla NICE-SLAM runs well below the hundreds of frames per second a classical tracker reaches, and its real-time claim rests on running mapping infrequently over keyframes. Second, it needs a depth sensor; the geometric loss is what makes the dense map converge, so pure-monocular neural SLAM is much harder. Third, it has no loop closure or global bundle adjustment in the classical sense, so on long trajectories drift accumulates and the map can bend, a gap that the pose-graph tools of <a class="cross-ref" href="section-52.2.html">Section 52.2</a> address and that later work grafts back on. Fourth, the hallucinated fill is a prior-driven guess, which the uncertainty-and-calibration discipline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> insists you should quantify before a planner trusts it near an obstacle.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The neural-SLAM line moved fast after NICE-SLAM. Co-SLAM (2023) fuses a coordinate encoding with a hash grid for faster, smoother maps and joint tracking. ESLAM swaps volumetric occupancy for tri-plane feature maps and a truncated-signed-distance formulation, improving both speed and reconstruction. Point-SLAM anchors neural features on a growing point cloud instead of a dense grid, concentrating capacity where the sensor looked. GO-SLAM and others finally add loop closure and online global bundle adjustment, closing the drift gap against classical systems. And then the representation itself changed: replacing the ray-marched neural field with an explicit, rasterized cloud of Gaussians gives real-time, high-fidelity SLAM at last, which is exactly the pivot the next section takes up. The <code>tiny-cuda-nn</code> hash-grid and the Nerfstudio ecosystem remain the pragmatic starting points for building on any of this today.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 52.3.1 into a one-frame tracker for a single ray. Fix the occupancy-versus-depth surface (the map) and introduce a scalar pose offset \(\delta\) that shifts all sample depths by \(\delta\) before rendering (a crude stand-in for camera translation along the ray). Sweep \(\delta\) over a small range, plot the depth residual \(\lvert \hat{D}(\delta) - D_{\text{meas}} \rvert\), and confirm it is minimized near \(\delta = 0\). Then add Gaussian noise to <code>D_meas</code> and observe how the residual curve's minimum shifts, demonstrating why tracking against a noisy measurement biases the pose estimate and why averaging over many rays per frame is not optional.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. iMAP and NICE-SLAM both store the map in a neural representation, yet iMAP forgets old rooms and NICE-SLAM does not. What structural change explains the difference, and why does it also let the map scale?</p>
+        <p class="quiz-question">2. NICE-SLAM alternates a tracking loop and a mapping loop. What is held fixed and what is optimized in each, and why can both use the identical rendering loss?</p>
+        <p class="quiz-question">3. Neural SLAM produces a dense, hole-filled map, but a warehouse safety layer still prefers a raw depth reading over a queried occupancy near an obstacle. Give two reasons this caution is justified.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-52.4.html">Section 52.4</a>, we take the one change that dissolves neural SLAM's biggest weakness: swap the slow, ray-marched neural field for the explicit, GPU-rasterized Gaussian cloud of Chapter 51. Systems like MonoGS, SplaTAM, and Photo-SLAM keep the joint track-and-map idea but render in real time, turning the dense-map dream of this section into an interactive, photorealistic SLAM you can run live.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

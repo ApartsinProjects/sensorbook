@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 49.5: Factor-graph fusion (GTSAM), applying the estimator from Ch 11 to multi-sensor fusion. Building Sensory AI." name="description"/>
+<title>Section 49.5: Factor-graph fusion (GTSAM), applying the estimator from Ch 11 to multi-sensor fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 49: Probabilistic and Bayesian Fusion</a></div>
+<h1>Factor-graph fusion (GTSAM), applying the estimator from Ch 11 to multi-sensor fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A Kalman filter asks me to forget every sensor the instant I have read it. A factor graph lets me keep them all in the same room and let them argue until they agree."</p><cite>A Diplomatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p><a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a> built a general estimator: express the whole estimation problem as a factor graph, turn maximum-a-posteriori inference into sparse nonlinear least squares, and solve it incrementally with iSAM2 inside GTSAM. There the graph fused just two things, wheel odometry and landmark bearings, so it read like a SLAM tool. This section reveals its real job. A factor graph is the natural home for <strong>multi-sensor fusion</strong> because every heterogeneous sensor, a GPS fix, an IMU burst, a wheel encoder, a lidar scan match, a barometer, becomes one more <em>factor type</em> attached to a shared timeline of states. You do not design a bespoke fusion filter per sensor combination the way <a class="cross-ref" href="section-49.2.html">Section 49.2</a> did with stacked Kalman updates. You declare what each sensor measures as a residual, drop those residuals onto the same variables, and let the solver find the trajectory that best reconciles all of them at once. Adding a new sensor is adding a factor, not rewriting the estimator.</p>
+</div>
+
+<p>This section assumes the machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>: variables that live on manifolds, factors as whitened residuals, MAP as least squares, and the incremental Bayes-tree solve of iSAM2. It also builds on the covariance-weighted combination of <a class="cross-ref" href="section-49.1.html">Section 49.1</a> and stands as the smoothing counterpart to the filtering fusion of <a class="cross-ref" href="section-49.2.html">Section 49.2</a>. Here we focus on one question Chapter 11 deferred: how do genuinely different sensors, at different rates and different times, share one graph?</p>
+
+<h2>One graph, many sensor factor types</h2>
+
+<p>The organizing idea is that state and measurement are cleanly separated. The state is a chain of variables you care about: robot or vehicle poses \(x_0, x_1, \dots, x_k\) sampled at chosen keytimes, possibly augmented with velocity and IMU bias. Every sensor contributes factors that constrain those variables, and the factors fall into a small taxonomy by how many variables they touch. A <strong>unary factor</strong> constrains a single state to an absolute measurement: a GPS position fix on \(x_k\), a magnetometer heading, a barometric altitude. Its residual is simply \(r = h(x_k) \ominus z\), whitened by the sensor's noise model. A <strong>binary (between) factor</strong> constrains two consecutive states by a relative measurement: wheel odometry says \(x_{k}\) and \(x_{k+1}\) differ by roughly this rigid-body transform, and a preintegrated IMU factor does the same for pose, velocity, and bias together. Loop closures and inter-agent constraints are just between-factors that skip across the graph.</p>
+
+<p>Written as a product of these factors, the posterior is
+$$p(X \mid Z) \;\propto\; \prod_{j} \exp\!\Big(-\tfrac{1}{2}\,\lVert h_j(X_j) \ominus z_j \rVert^2_{\Sigma_j}\Big),$$
+and MAP inference minimizes the sum of the squared, covariance-whitened residuals, exactly the objective iSAM2 solves. What makes this a fusion engine rather than a single-sensor tool is that the product ranges over factors from <em>every</em> sensor with no special casing: a GPS unary and an IMU between-factor land on the same \(x_k\) and are weighed against each other purely through their noise models \(\Sigma_j\). A confident sensor (small \(\Sigma\)) pulls the estimate hard; a loose one nudges it. This is the covariance-weighted average of <a class="cross-ref" href="section-49.1.html">Section 49.1</a>, generalized from a single state to a whole trajectory and computed jointly.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A multi-sensor Kalman filter fuses by <em>marginalizing</em>: each measurement is folded into one covariance and the raw reading is discarded, so a late-arriving or out-of-order sensor cannot be re-weighed against the past. A factor graph fuses by <em>accumulating</em>: every sensor reading stays in the graph as a factor, so a GPS fix that arrives 200 ms after the pose it refers to still attaches to the correct state, and a smoothing solve lets a future loop closure correct a past bias. Fusion becomes a matter of which residuals you add, not the order they arrived in. That decoupling of measurement from time-of-processing is the single practical reason modern visual-inertial and GNSS-inertial systems, from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a> SLAM back ends onward, are smoothers and not filters.</p>
+</div>
+
+<h2>Time, rates, and extrinsics: the hard part of heterogeneity</h2>
+
+<p>Real sensors do not sample on a shared clock. A 200 Hz IMU, a 10 Hz wheel encoder, a 5 Hz GPS, and a 10 Hz lidar produce measurements at times that never line up with your chosen pose keytimes. Three modeling choices handle this. First, <strong>IMU preintegration</strong> compresses the fast inertial stream between two keyframes into a single between-factor, so 40 IMU samples become one factor rather than 40 states; this is the standard bridge from raw inertial data (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>) into the graph. Second, a measurement that lands between keytimes is attached either by inserting a state at that timestamp or by an interpolation factor that expresses it as a blend of the two bracketing states; getting these timestamps right is the synchronization discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Third, and elegantly, <strong>calibration parameters can themselves be variables</strong>. A constant but unknown sensor-to-body extrinsic transform, a per-sensor time offset, or a slowly drifting IMU bias each becomes an extra node that many factors touch, and the solver estimates it online alongside the trajectory. Online calibration is not a separate pipeline; it is one more thing the same optimizer recovers.</p>
+
+<p>The GPS example deserves care because it is a partial measurement. A single-antenna GPS reports position but not heading, so modeling a fix as a full pose prior would inject a fictitious, tightly-constrained orientation and corrupt the estimate. The correct model is a factor whose residual only touches the translation components, or equivalently a pose prior with near-infinite variance on heading. The code below shows exactly this: odometry between-factors carry the trajectory forward, and sparse GPS fixes anchor it globally through position-only constraints, so heading is recovered indirectly from the geometry of successive fixes rather than asserted.</p>
+
+<pre><code class="language-python">import numpy as np, gtsam
+from gtsam import Pose2, ISAM2, NonlinearFactorGraph, Values, symbol_shorthand
+X = symbol_shorthand.X                       # X(k) names pose k
+
+odom_noise = gtsam.noiseModel.Diagonal.Sigmas([0.15, 0.15, 0.05])   # dx, dy, dtheta
+# GPS gives x, y well but says NOTHING about heading -> huge sigma on theta
+gps_noise  = gtsam.noiseModel.Diagonal.Sigmas([0.8, 0.8, 1e6])
+
+isam = ISAM2()
+odom = Pose2(1.0, 0.0, 0.10)                  # commanded step: forward + gentle turn
+truth, est_pose = Pose2(0, 0, 0), Pose2(0, 0, 0)
+rng = np.random.default_rng(0)
+
+for k in range(12):
+    graph, initial = NonlinearFactorGraph(), Values()
+    if k == 0:
+        graph.add(gtsam.PriorFactorPose2(X(0), Pose2(0, 0, 0), gps_noise))
+        initial.insert(X(0), Pose2(0, 0, 0))
+    else:
+        graph.add(gtsam.BetweenFactorPose2(X(k - 1), X(k), odom, odom_noise))
+        est_pose = isam.calculateEstimate().atPose2(X(k - 1)).compose(odom)
+        initial.insert(X(k), est_pose)        # warm start on SE(2)
+        truth = truth.compose(odom)
+        if k % 3 == 0:                         # a GPS fix arrives every 3rd step
+            gx = truth.x() + rng.normal(0, 0.8)
+            gy = truth.y() + rng.normal(0, 0.8)
+            graph.add(gtsam.PriorFactorPose2(X(k), Pose2(gx, gy, 0.0), gps_noise))
+    isam.update(graph, initial)
+    p = isam.calculateEstimate().atPose2(X(k))
+    print(f"k={k:2d}  est=({p.x():5.2f},{p.y():5.2f},{p.theta():5.2f})")
+</code></pre>
+<div class="code-caption">Fusing dead-reckoning odometry with sparse, position-only GPS in GTSAM. Odometry <code>BetweenFactorPose2</code> factors propagate the pose; every third step a GPS fix is added as a <code>PriorFactorPose2</code> whose heading sigma is set to \(10^6\) so it constrains position only. iSAM2 reconciles the two sensors jointly, and heading is recovered from the pattern of fixes, not asserted by any one of them.</div>
+
+<p>The loop is the fusion. Two entirely different sensors, a relative-motion source and an absolute-position source with a hole in it, meet on the same variables, and the solver produces one drift-corrected trajectory. Swapping odometry for preintegrated IMU, or adding a lidar scan-match between-factor, changes which factors you <code>add</code> and nothing about the surrounding machinery.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an orchard robot losing GPS under the canopy</h3>
+<p>An autonomous orchard sprayer navigates rows of trees. In the open headland it has clean 5 Hz RTK-GPS; the instant it drives under a dense canopy the fixes drop out or turn multipath-noisy for thirty seconds, then return at the next gap. A stacked Kalman filter tuned for the open field diverges under the canopy because its GPS update is simply gone and wheel slip on soft soil corrupts odometry. The team moves the estimator to a GTSAM factor graph fusing wheel odometry, a low-cost IMU (preintegrated), and GPS. Under the canopy, only odometry and IMU factors are added, and the smoother coasts on dead reckoning with a covariance that grows to reflect the loss. When RTK returns at the row end, the new position factors attach to the poses recorded during the blackout and a single incremental solve straightens the whole thirty-second stretch retroactively, because those poses were never marginalized away. The sprayer's cross-row error stays within the 0.2 m it needs to avoid clipping trunks, and adding a later row-detection lidar factor was a twenty-line change, not a new filter.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: GTSAM factors versus a hand-rolled multi-sensor EKF</h3>
+<p>Writing a bespoke extended Kalman filter that fuses odometry, IMU, and intermittent position-only GPS means: deriving and coding the Jacobians of every measurement model, hand-managing the augmented state and covariance when you add IMU bias, special-casing out-of-order and dropped measurements, and re-deriving all of it the day someone adds a magnetometer. That is several hundred lines that grow with every new sensor. In GTSAM each sensor is one factor object with its noise model, roughly the fifteen lines above, and iSAM2 owns linearization, sparse factorization, and the incremental update. Adding a sensor is adding a factor type, a handful of lines, with no change to the solver. The reduction is easily 10-to-1 in code and, more importantly, near-zero marginal cost per additional sensor.</p>
+</div>
+
+<h2>Robustness: letting the graph reject a lying sensor</h2>
+
+<p>Fusion is only as trustworthy as its worst sensor. A multipath GPS fix, a wheel spinning on ice, or a mismatched lidar scan injects a factor whose residual is huge, and under a pure Gaussian (quadratic) cost a single gross outlier can drag the entire joint estimate off. The factor-graph answer is to replace the quadratic penalty on suspect sensors with a <strong>robust cost function</strong>, a Huber or Cauchy M-estimator, that grows linearly or sub-linearly for large residuals so an outlier's influence saturates instead of exploding. In GTSAM this is a one-line wrapper, <code>noiseModel.Robust</code> around the base noise model, applied to exactly the sensors you distrust. Because every measurement remains an inspectable factor with a residual, the same graph also gives you the raw material for the consistency and fault-detection tests of <a class="cross-ref" href="section-49.7.html">Section 49.7</a>: a factor whose whitened residual is persistently large is a sensor to flag, and the normalized innovation squared over a window is a ready-made chi-square monitor. Robust kernels keep a bad reading from poisoning the fix; the residual bookkeeping tells you which sensor to blame.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code above with an injected fault: at \(k = 6\), replace the GPS fix with a gross outlier 15 m from the truth. (a) Run it with the Gaussian <code>gps_noise</code> and record how far the estimated trajectory is pulled off, including neighboring poses. (b) Wrap the GPS noise model in <code>gtsam.noiseModel.Robust.Create(gtsam.noiseModel.mEstimator.Huber.Create(1.345), gps_noise)</code> and re-run. Quantify how much the robust kernel reduces the outlier's influence on \(x_6\) and its neighbors, and explain why the linear-mode residuals confine the damage.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why is a single-antenna GPS fix modeled as a position-only factor (huge heading variance) rather than a full pose prior, and what would go wrong if you used a full prior? 2. A wheel-encoder reading and an IMU-preintegration reading both connect \(x_k\) to \(x_{k+1}\). What determines which one moves the estimate more, and where in the model does that live? 3. Give one concrete reason a smoothing factor graph, not a Kalman filter, is the right estimator when GPS drops out for thirty seconds and then returns.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-49.6.html">Section 49.6</a>, we turn from computing the fused estimate to trusting it: how uncertainty propagates through a factor graph, how to read a marginal covariance out of the information matrix for any state you care about, and why a confident-looking mean with an honest covariance is worth far more to a downstream controller than a point estimate alone.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

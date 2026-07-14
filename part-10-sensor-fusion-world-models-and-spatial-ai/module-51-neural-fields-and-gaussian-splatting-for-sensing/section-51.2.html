@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.2: 3D Gaussian splatting basics. Building Sensory AI." name="description"/>
+<title>Section 51.2: 3D Gaussian splatting basics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>3D Gaussian splatting basics</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"You spent a chapter teaching me to query a scene one ray-marched sample at a time. Then you handed me a few million tiny ellipsoids and told me to just throw them at the film. I am not going to pretend I am not relieved."</p>
+        <cite>An Unburdened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the neural-field framing of <a class="cross-ref" href="section-51.1.html">Section 51.1</a>: a scene as a function that maps a 3D point and view direction to color and density, rendered by volumetric alpha-compositing. It reuses the pinhole camera model and projective geometry from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and the covariance-as-an-ellipsoid intuition from the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Where the previous section stored the scene inside a multilayer perceptron, this one stores it as an explicit cloud of primitives you can see, edit, and rasterize.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A neural radiance field is beautiful and slow: to color one pixel you march a ray, query a network at dozens of points, and integrate. 3D Gaussian splatting (introduced by Kerbl and colleagues at SIGGRAPH 2023) keeps the same image-formation physics but flips the representation from implicit to explicit. The scene becomes a few hundred thousand to a few million anisotropic 3D Gaussians, each a soft translucent blob carrying a position, a shape, an opacity, and a color. Rendering is no longer ray marching; it is <em>splatting</em>: project every Gaussian onto the image as a 2D ellipse and blend the ellipses front-to-back. Because projection and blending are exactly what GPUs rasterize for a living, the same scene that took a NeRF seconds per frame renders at hundreds of frames per second, and it still trains by plain gradient descent on a photometric loss. That combination of real-time speed, high fidelity, and full differentiability is why splatting became the default reconstruction backbone for the sensor re-simulation and world-model pipelines in the rest of this chapter.</p>
+    </div>
+
+    <h2>From points to primitives: the anisotropic 3D Gaussian</h2>
+    <p>The atom of the representation is a single 3D Gaussian, a smooth ellipsoidal density centered at a mean \(\mu \in \mathbb{R}^3\) with a covariance matrix \(\Sigma \in \mathbb{R}^{3\times 3}\):</p>
+    \[ G(x) = \exp\!\left(-\tfrac{1}{2}(x-\mu)^\top \Sigma^{-1} (x-\mu)\right). \]
+    <p>Think of it as a fuzzy point that knows its own shape. A tiny isotropic Gaussian behaves like a dot; a long thin one behaves like a needle that can line up with an edge or a blade of grass; a flat pancake can tile a wall. This anisotropy is the <em>why</em> a few million Gaussians can represent a whole room: each primitive stretches to cover the local geometry instead of forcing you to pile up millions of equal-sized voxels the way a naive occupancy grid or point cloud would (contrast the fixed-resolution grids of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>).</p>
+    <p>The catch is that an optimizer cannot freely update the six numbers of \(\Sigma\), because a valid covariance must stay symmetric and positive semi-definite, and gradient steps would wander out of that set. The trick is to store the shape in a form that is always valid by construction: a scale vector \(s \in \mathbb{R}^3\) (three axis lengths) and a rotation, encoded as a unit quaternion \(q\), assembled as</p>
+    \[ \Sigma = R\, S\, S^\top R^\top, \qquad S = \operatorname{diag}(s), \]
+    <p>where \(R\) is the rotation matrix built from \(q\). Any real \(s\) and any \(q\) yield a legal covariance, so the parameters are unconstrained and differentiable end to end. Alongside \(\mu\), \(s\), and \(q\), each Gaussian carries an opacity \(\alpha \in [0,1]\) and a color. To capture that a wet road or a glossy panel looks different from different angles, the color is not a single RGB triple but a low-order set of spherical-harmonic coefficients that are evaluated in the current view direction, the explicit-primitive echo of the view-dependent radiance you met in <a class="cross-ref" href="section-51.1.html">Section 51.1</a>.</p>
+
+    <h2>Splatting: projecting and compositing the primitives</h2>
+    <p>To render, each 3D Gaussian is pushed through the camera. Under a world-to-camera transform \(W\) and the local linear approximation \(J\) of the projective mapping (the Jacobian of the perspective divide), the 3D covariance projects to a 2D covariance on the image plane:</p>
+    \[ \Sigma' = J\, W\, \Sigma\, W^\top J^\top. \]
+    <p>This is the classic EWA (elliptical weighted average) splat: a 3D ellipsoid casts a 2D elliptical footprint. The mean projects with the ordinary pinhole equations of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, so each splat lands at a pixel location with an oriented Gaussian weight around it. A pixel's color is then the front-to-back alpha-composite of every splat that covers it, sorted by depth:</p>
+    \[ C = \sum_{i=1}^{N} c_i\, \alpha_i' \prod_{j=1}^{i-1}\left(1-\alpha_j'\right), \qquad \alpha_i' = \alpha_i\, G_i'(p), \]
+    <p>where \(G_i'(p)\) is the projected 2D Gaussian evaluated at pixel \(p\) and \(c_i\) is that Gaussian's view-evaluated color. This is the <em>same</em> over-compositing equation NeRF uses; the difference is that the transmittance product runs over a short sorted list of splats, not over dozens of ray-marched samples. The real engineering that makes it fast is tiling: the image is cut into 16-by-16 pixel tiles, each Gaussian is bucketed into the tiles it touches, and every tile blends only its own sorted splats, which maps cleanly onto GPU thread blocks.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>NeRF and Gaussian splatting share one equation and disagree on one question: <em>where do the samples come from?</em> NeRF asks a network "what is here?" at query points the renderer chooses along each ray, paying a forward pass per sample. Splatting instead stores the answer explicitly in primitives and asks only "which primitives land on this pixel?", a sorting-and-blending problem the GPU already solves for triangles. That single move, from querying an implicit function to rasterizing explicit primitives, is what buys two to three orders of magnitude in rendering speed while keeping the rendering fully differentiable, so the gradient of the image loss still flows back to every Gaussian's position, shape, opacity, and color.</p>
+    </div>
+
+    <h2>Fitting the scene: rendering loss and adaptive density control</h2>
+    <p>Where do the Gaussians come from? Optimization, driven by the same posed multi-view images that supervise a NeRF. Initialize the cloud from a sparse structure-from-motion point set (the COLMAP points you already compute for camera poses), then minimize a photometric loss between each rendered view and the real photo, typically a blend of \(L_1\) and a structural-similarity term:</p>
+    \[ \mathcal{L} = (1-\lambda)\,\mathcal{L}_1 + \lambda\,\mathcal{L}_{\text{D-SSIM}}. \]
+    <p>Because rasterization is differentiable, gradients update \(\mu\), \(s\), \(q\), \(\alpha\), and the color coefficients directly. But gradient descent alone cannot decide <em>how many</em> Gaussians a region needs, and that is the crucial extra ingredient: <strong>adaptive density control</strong>. Periodically the optimizer inspects the accumulated view-space position gradient of each Gaussian as a signal of "this region is not yet well explained," and acts on it. Under-reconstructed detail triggers densification: a small Gaussian in a high-gradient area is <em>cloned</em>, and a large Gaussian that straddles fine geometry is <em>split</em> into two smaller ones. Meanwhile Gaussians whose opacity has decayed below a threshold are <em>pruned</em>, and opacity is periodically reset so that floaters get a chance to die. This clone-split-prune loop is what lets a scene start from a few thousand sparse points and grow, automatically, into the millions of primitives that sharp reconstruction demands, spending capacity where the image error is, not uniformly.</p>
+
+    <p>Listing 51.2.1 makes the geometry concrete: it builds a valid 3D covariance from a scale and quaternion, projects one Gaussian to the image plane with the EWA formula, and evaluates its 2D footprint at a pixel. This is the arithmetic the CUDA rasterizer runs millions of times per frame, stripped to the parts you should be able to reason about by hand.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def quat_to_R(q):
+    w, x, y, z = q / np.linalg.norm(q)          # never trust a raw quaternion
+    return np.array([
+        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [2*(x*y+w*z),   1-2*(x*x+z*z),   2*(y*z-w*x)],
+        [2*(x*z-w*y),     2*(y*z+w*x), 1-2*(x*x+y*y)]])
+
+def cov3d(scale, quat):
+    R, S = quat_to_R(quat), np.diag(scale)
+    M = R @ S
+    return M @ M.T                              # Sigma = R S S^T R^T, always valid
+
+# one Gaussian in camera space (already transformed by W)
+mu   = np.array([0.10, -0.05, 2.0])            # 2 m in front of the camera
+Sig  = cov3d(scale=np.array([0.03, 0.20, 0.02]),  # a thin, tilted blade
+             quat=np.array([0.92, 0.0, 0.38, 0.0]))
+f = 800.0                                        # focal length in pixels
+
+# J = Jacobian of the perspective projection (u,v) = f*(X,Y)/Z at mu
+X, Y, Z = mu
+J = np.array([[f/Z, 0, -f*X/Z**2],
+              [0, f/Z, -f*Y/Z**2]])
+Sig2d = J @ Sig @ J.T                            # 2D splat covariance (EWA)
+
+center = np.array([f*X/Z, f*Y/Z])                # projected mean, in pixels
+pixel  = center + np.array([3.0, 1.0])           # a nearby pixel
+d = pixel - center
+weight = np.exp(-0.5 * d @ np.linalg.inv(Sig2d) @ d)   # G'(p) in [0,1]
+print(f"2D cov =\n{np.round(Sig2d,2)}\nsplat weight at pixel = {weight:.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 51.2.1.</strong> One Gaussian, splatted by hand. <code>cov3d</code> assembles a guaranteed-valid covariance from a scale and quaternion; the Jacobian <code>J</code> projects it to the 2D ellipse <code>Sig2d</code>; the final weight is the per-pixel Gaussian falloff that gets multiplied by opacity before alpha-compositing. A real renderer does exactly this for every Gaussian in a tile, then blends front to back.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Listing 51.2.1 is one splat; a usable renderer needs tile binning, depth sorting, a fused forward-and-backward CUDA kernel, and the densification bookkeeping, easily 3,000-plus lines of CUDA in the original reference implementation. The <code>gsplat</code> library (from the Nerfstudio project) exposes the whole differentiable rasterizer as a couple of calls:</p>
+        <pre class="language-python"><code class="language-python">import torch
+from gsplat import rasterization
+# means (N,3), quats (N,4), scales (N,3), opacities (N,), colors (N,3)
+img, alpha, meta = rasterization(
+    means, quats, scales, opacities, colors,
+    viewmats=W,          # (C,4,4) world-to-camera
+    Ks=K,                # (C,3,3) camera intrinsics
+    width=1920, height=1080)
+loss = ((img - target)).abs().mean()   # photometric loss; .backward() trains it
+loss.backward()                        # gradients flow to every Gaussian param</code></pre>
+        <div class="code-caption"><strong>Listing 51.2.2.</strong> The same forward rasterization in <code>gsplat</code>, collapsing thousands of lines of hand-tuned CUDA (tiling, sorting, EWA projection, the fused backward pass) into a single differentiable call whose output is trainable by <code>loss.backward()</code>. The library owns the kernels; choosing initialization, the loss weighting, and the densification schedule is still your modeling job.</div>
+        <p>As Listing 51.2.2 shows, the tool hands you the rasterizer, not the recipe: what to reconstruct, how to initialize, and when to densify remain design decisions.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>In the field: a phone-scanned digital twin of a pump skid</h4>
+        <p>A reliability team on a chemical plant floor wants an inspectable 3D record of a pump skid before a maintenance shutdown. An engineer walks a slow loop around the skid with a phone, capturing a two-minute video; a structure-from-motion pass recovers camera poses and a sparse point cloud, which seeds the Gaussian cloud. After a few minutes of optimization on a single GPU, adaptive density control has grown roughly 900,000 Gaussians: thin, tilted ones lining the pipe runs and gauge glass, flat ones tiling the baseplate, and the reconstruction renders novel viewpoints, the underside of a flange, an angle the engineer never physically stood at, at over 100 frames per second on a laptop. The reliability lead can orbit the skid, read a valve tag from a fresh angle, and compare it against last quarter's scan. The team's first instinct had been a dense NeRF, which reconstructed just as faithfully but rendered too slowly for a responsive walkaround on plant hardware; the explicit splats gave them the same fidelity at interactive rates, the reconstruction backbone that Chapters 51.3 and 55 turn into a full sensor-simulating digital twin (<a class="cross-ref" href="../module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>).</p>
+    </div>
+
+    <h2>Why explicit primitives win, and where they strain</h2>
+    <p>The explicit representation buys three things beyond raw speed. First, it is <em>editable</em>: because a Gaussian is a physical object with a position, you can select, move, delete, or recolor a region, which is far harder inside the tangled weights of a NeRF, and which matters when you want to insert or remove an actor for a synthetic scenario. Second, it composes with geometry pipelines: the Gaussians sit in metric 3D space, so they line up with lidar points and camera frusta, which is exactly what the joint lidar-camera splatting of <a class="cross-ref" href="section-51.4.html">Section 51.4</a> exploits, and what makes splatting a natural map backbone for the spatial-AI and SLAM systems of <a class="cross-ref" href="../module-52-slam-and-spatial-ai/index.html">Chapter 52</a>. Third, the fast, differentiable render is what makes real-time sensor re-simulation feasible at all.</p>
+    <p>Where does it strain? Memory: millions of Gaussians, each with a dozen-plus parameters, can run to hundreds of megabytes, a real concern for the edge deployment of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. The base method also assumes a <em>static</em> scene and photometrically consistent captures, so moving cars, changing exposure, and rolling-shutter wobble all violate its assumptions and produce floaters, motivating the dynamic and sensor-aware extensions later in the chapter. And a splat cloud is a great <em>renderer</em> but a mediocre <em>surface</em>: the Gaussians approximate appearance, not a watertight mesh, so extracting clean geometry needs dedicated variants. Knowing these limits is what separates a demo from a reconstruction you can put a sensor model on top of.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The 2023 method moved fast. Mip-Splatting adds scale-aware filtering that removes the aliasing and "erosion" artifacts you see when you zoom in or out past the training resolution. 2D Gaussian Splatting (2DGS) flattens each primitive into an oriented disk to recover far cleaner surfaces and normals for geometry-hungry tasks. Compression and anchor-based schemes (Scaffold-GS, and quantized or self-organizing variants) attack the memory footprint, pushing scenes toward on-device budgets. Dynamic-scene splatting (4D and deformable Gaussians) adds a time axis so the cloud can move, the prerequisite for reconstructing the driving logs that <a class="cross-ref" href="section-51.4.html">Section 51.4</a> and the SplatAD line of work depend on. The <code>gsplat</code> and Nerfstudio ecosystems track this frontier and are the pragmatic entry point for building on it today.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 51.2.1 into a two-Gaussian compositor. Place a second, more opaque Gaussian slightly closer to the camera and overlapping the first in image space. For a chosen pixel, compute each splat's projected weight \(G'(p)\), form \(\alpha_i' = \alpha_i G_i'(p)\), sort the two by depth, and evaluate the front-to-back over-compositing sum \(C = \sum_i c_i \alpha_i' \prod_{j&lt;i}(1-\alpha_j')\). Then swap the depth order of the two Gaussians <em>without</em> re-sorting and confirm the pixel color changes, demonstrating why correct depth sorting, not just projection, is load-bearing in a splat renderer.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is each Gaussian's shape stored as a scale vector plus a unit quaternion rather than as the six free entries of the covariance matrix \(\Sigma\)?</p>
+        <p class="quiz-question">2. NeRF and 3D Gaussian splatting use the same alpha-compositing equation, yet splatting renders orders of magnitude faster. What exactly is different, and why does that difference favor the GPU?</p>
+        <p class="quiz-question">3. Adaptive density control both adds and removes Gaussians. Name the three operations and the signal that triggers densification, and explain why pure gradient descent on a fixed number of Gaussians cannot do this on its own.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>We now have a fast, differentiable, explicit scene: a cloud of Gaussians that renders photorealistic camera views in real time. But a reconstruction is only useful for sensing if it can pretend to be a <em>sensor</em>. In <a class="cross-ref" href="section-51.3.html">Section 51.3</a>, we turn the splat cloud into a sensor simulator, re-rendering not just RGB images from new viewpoints but depth and lidar returns from the reconstructed geometry, so that one real capture can be replayed as many synthetic observations for training and testing perception stacks.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

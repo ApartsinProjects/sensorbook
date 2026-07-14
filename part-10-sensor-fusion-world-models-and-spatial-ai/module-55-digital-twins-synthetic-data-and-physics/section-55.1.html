@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 55.1: Predictive models of sensor dynamics. Building Sensory AI." name="description"/>
+<title>Section 55.1: Predictive models of sensor dynamics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 55: Digital Twins, Synthetic Data, and Physics-Informed ML</a></div>
+<h1>Predictive models of sensor dynamics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You keep asking me what the temperature is. What I can tell you is what the temperature was, filtered through a lump of metal with opinions of its own. Give me a model of the metal and I will give you back the present."</p>
+<cite>A Patiently Lagging AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the static measurement model of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, where a sensor was written as a (possibly noisy, possibly nonlinear) map from a physical quantity to a reading. Here we add time: the sensor becomes a dynamical system with its own state. Discretizing continuous dynamics to a sample rate is the sampling material of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the transition-model view of state that we lean on throughout comes from the Kalman family in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. The probabilistic reading of process and observation noise is developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. No prior exposure to digital twins is assumed; this section defines the forward model on which the rest of the chapter stands.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every digital twin, every synthetic-data generator, and every physics-informed model in this chapter rests on one primitive: a <em>forward model of the sensor</em> that, given how the measured quantity is moving, predicts what the sensor will actually output next. Chapter 2 treated a sensor as a static function; real sensors are slow, they resonate, they drift, they remember their recent past. A thermocouple lags the flame, an accelerometer rings after an impact, a glucose patch reports what your blood held ten minutes ago. A predictive model of sensor dynamics captures exactly this gap between the world and the reading, as a small runnable simulator of the transducer itself. Get this primitive right and the twin (Section 55.6), the synthetic training data (Section 55.2), and the inverse problems (Section 55.4) all inherit its fidelity. Get it wrong and everything downstream is a convincing fiction. This section defines the object, shows the three ways to build it, and names the physical effects that make it necessary.</p>
+</div>
+
+<h2>The sensor as a dynamical system</h2>
+<p>The <em>what</em>: a predictive model of sensor dynamics is a map from the trajectory of the true quantity \(u(t)\) to the trajectory of the sensor output \(y(t)\), mediated by an internal sensor state \(x(t)\). The simplest and most common case is a first-order linear sensor, the behavior of any transducer whose reading relaxes toward the true value with a single time constant \(\tau\):</p>
+\[ \tau\,\dot{x}(t) = u(t) - x(t), \qquad y(t) = x(t) + v(t). \]
+<p>Here \(x\) is what the sensing element has "equilibrated to" so far, \(\tau\) is how sluggish it is (large \(\tau\) means slow), and \(v\) is readout noise. The <em>why</em> of writing it this way is that it separates two things Chapter 2 conflated: the instantaneous calibration curve (how a reading maps to a value once everything settles) and the <em>dynamics</em> (how long settling takes and what the reading does in the meantime). Many sensors need a second-order model instead, \(\ddot{x} + 2\zeta\omega_n\dot{x} + \omega_n^2 x = \omega_n^2 u\), which adds resonance: a lightly damped accelerometer or pressure sensor overshoots and rings at its natural frequency \(\omega_n\) before settling. Both are special cases of a linear time-invariant system with a transfer function \(H(s) = Y(s)/U(s)\), and the sensor's bandwidth, rise time, and phase lag all fall out of \(H\). The predictive model <em>is</em> this operator, discretized to your sample rate so it can be stepped one tick at a time.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: the reading is a low-pass, phase-delayed shadow of the world</h3>
+<p>A first-order sensor is a one-pole low-pass filter applied to reality. That single fact explains most field surprises. Fast events are attenuated (a spike shorter than \(\tau\) barely registers), edges are smeared into exponentials, and every frequency is delayed by a frequency-dependent phase, so a periodic input comes back shrunk and shifted. This is why you cannot fix a slow sensor by recalibrating its gain: gain is a static property, but the loss of amplitude here <em>depends on how fast the signal moves</em>. The cure is a model of \(\tau\) (or \(H\)), which lets you both predict the lagged reading forward and, running the operator backwards, deconvolve an estimate of \(u\) from \(y\). The forward model and the lag correction are the same object used in two directions, and the same low-pass reasoning you met while denoising signals in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>.</p>
+</div>
+
+<h2>Three ways to build the forward model</h2>
+<p>The <em>how</em> spans a spectrum from pure physics to pure data. A <strong>white-box</strong> model writes the ODE from first principles and measures its few parameters (\(\tau\) from a step-response test, \(\omega_n\) and \(\zeta\) from a ringdown); it is interpretable, needs almost no data, and extrapolates, but only as far as your physics is honest. A <strong>black-box</strong> model ignores the physics and fits a sequence model (an ARX/state-space system identified from input-output logs, or a small recurrent or state-space network from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) directly to paired \((u, y)\) records; it captures effects you never wrote down but demands representative data and can extrapolate badly. A <strong>grey-box</strong> model, the workhorse of digital twins, keeps the physical ODE as scaffolding and learns only the parts the equations miss, and it earns its own section (55.5). The choice is governed by how much you trust your physics against how much labeled dynamics data you can gather. Whatever the family, the discretized model has the same shape as a Kalman transition and observation pair (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>): a state update \(x_{k} = f(x_{k-1}, u_{k-1})\) and an emission \(y_k = g(x_k)\), which is precisely why the twin can later be dropped straight into an estimator in Section 55.6.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def sensor_forward(u, tau, dt, x0=None, noise=0.0, rng=None):
+    """Predict a first-order sensor's output stream from the TRUE quantity u.
+    tau: sensor time constant (s); dt: sample period (s).
+    Exact zero-order-hold discretization of tau*x' = u - x."""
+    rng = rng or np.random.default_rng(0)
+    a = np.exp(-dt / tau)                 # how much of the old state survives one tick
+    x = float(u[0]) if x0 is None else x0
+    y = np.empty(len(u))
+    for k, uk in enumerate(u):
+        x = a * x + (1.0 - a) * uk        # relax toward the current true value
+        y[k] = x + (noise * rng.standard_normal() if noise else 0.0)
+    return y
+
+dt, tau = 0.1, 2.0                        # 10 Hz sampling, 2 s sensor lag
+t = np.arange(0, 20, dt)
+u_true = np.where(t < 5, 20.0, 80.0)      # a step from 20 to 80 units at t = 5 s
+y_pred = sensor_forward(u_true, tau, dt, noise=0.5)
+
+# time for the reading to cross 63% of the step: should land near tau after the step
+crossed = t[(t >= 5) & (y_pred >= 20 + 0.63 * 60)][0] - 5
+print(f"predicted 63% rise time: {crossed:.1f} s   (tau = {tau} s)")
+</code></pre>
+<div class="code-caption"><strong>Listing 55.1.</strong> A white-box forward model of a first-order sensor. The exact zero-order-hold update <code>x = a*x + (1-a)*u</code> steps the sensor state one sample at a time, turning a true step input into the smeared, lagged reading a real transducer would produce. The measured 63% rise time recovers the time constant <code>tau</code>, confirming the discretization; feed the same routine a real measurand trajectory and it predicts what your sensor will report.</div>
+<p>Listing 55.1 is the atom of the whole chapter: a routine that takes what the world is doing and returns what the sensor will say. Swap the one-line update for an identified state-space matrix or a learned network and the interface is unchanged, which is what lets Section 55.2 call it millions of times to manufacture synthetic sensor data.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: do not hand-roll discretization or system identification</h3>
+<p>Listing 55.1 hand-derives the first-order case for teaching. For anything higher-order or identified from data, reach for <strong>SciPy</strong> and <strong>python-control</strong>: <code>scipy.signal.StateSpace(...).to_discrete(dt)</code> discretizes an arbitrary LTI sensor exactly, and <code>lsim</code> simulates its response in one call, replacing a page of matrix-exponential bookkeeping with three lines. To fit the dynamics from input-output logs rather than derive them, <strong>SIPPY</strong> or <strong>sysidentpy</strong> identify an ARX or state-space model in well under 20 lines, versus a few hundred for a hand-written least-squares identifier with lag-order selection. The libraries own the parts that are easy to get subtly wrong: numerically stable matrix exponentials, correct handling of the input hold, and regularized parameter estimation.</p>
+</div>
+
+<h2>What real sensors add: drift, hysteresis, and cross-sensitivity</h2>
+<p>A clean linear \(\tau\) is the honeymoon. Real transducers layer on effects that a static calibration cannot see and that make a <em>dynamic</em> model necessary. <strong>Drift</strong> is slow wandering of the baseline or gain over hours to months (electrochemical gas sensors, MEMS bias), modeled as an extra slow state \(b(t)\) with its own random-walk dynamics added to the reading. <strong>Hysteresis</strong> means the output depends on the <em>direction</em> of change, so the reading on the way up differs from the reading on the way down at the same true value; it needs an internal memory state and cannot be captured by any single-valued curve. <strong>Cross-sensitivity</strong> couples in nuisance inputs, most often temperature: a strain gauge or a lidar's range both drift with their own temperature, so the honest model is \(y = g(x, T, \dots)\) with the extra channels as inputs. <strong>Saturation and slew limits</strong> clip and rate-limit the output nonlinearly near the range edges. The reason to name these explicitly is that each one is a specific, well-understood term you add to the forward model, and each is a fault mode a predictive-maintenance system (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) watches for; a twin that omits them will look healthy while the real instrument quietly degrades.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the ten-minute lie of a continuous glucose monitor</h3>
+<p>A continuous glucose monitor (CGM) does not measure blood glucose; its subcutaneous electrode measures glucose in interstitial fluid, which trails blood by roughly five to fifteen minutes because the sugar must diffuse out of the capillaries. Treat the reading as truth and you get dangerous artifacts: during a fast rise after a meal the CGM reads low, and worse, during a rapid fall toward hypoglycemia it reads reassuringly high while blood sugar is already crashing. Manufacturers model the sensor as a first-order (sometimes second-order) system with a diffusion time constant plus a slow sensitivity drift over the sensor's wear period, exactly the structure of this section. The forward model predicts the interstitial reading from a blood-glucose trajectory for validation and simulation; run in reverse it deconvolves an estimate of true blood glucose and, crucially, projects it a few minutes ahead to fire a predictive low-glucose alarm before the patient bottoms out. The lag is not noise to be averaged away; it is dynamics to be modeled, and modeling it is the difference between a warning and a hospital visit.</p>
+</div>
+
+<h2>Fitting and trusting the model</h2>
+<p>The <em>when</em> and the how-good. You need a predictive dynamics model whenever the measurand moves fast relative to the sensor (comparable to or faster than \(\tau\)), whenever you must simulate the sensor to make synthetic data or a twin, or whenever lag, drift, or cross-sensitivity would corrupt a decision. Fit it from a paired record of a known input and the sensor's response: a step or chirp excitation for white/grey-box parameters, or ordinary operating logs for black-box identification, always with the leakage-safe split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> so that test trajectories are genuinely unseen dynamics and not neighboring windows of a training run. Then evaluate on the axis that matters for a forward model: not one-step error, which is flattered by the signal barely changing between samples, but <em>free-running rollout</em> error, where the model is driven by the true input but predicts \(y\) for a long horizon from its own evolving state. A model with tiny one-step error can still drift catastrophically over a rollout if its \(\tau\) or its integrator is slightly off, and that rollout gap is exactly what Section 55.7 formalizes into a validation protocol for twins. Report it with a calibrated uncertainty band (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), because a forward model without error bars is an assertion, not a prediction.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: learned continuous-time sensor dynamics</h3>
+<p>When the sensor's physics is nonlinear, irregularly sampled, or partly unknown, the current direction is to learn the dynamics as a continuous-time function rather than a fixed-step recurrence. <strong>Neural ODEs</strong> (Chen et al., 2018) parameterize \(\dot{x} = f_\theta(x, u, t)\) with a network and integrate with a standard solver, handling the ragged timestamps common in real sensor logs; latent-ODE and ODE-RNN variants extend this to noisy partial observations. <strong>Koopman-operator</strong> methods (and Deep Koopman networks) instead learn a coordinate change in which the nonlinear sensor becomes approximately linear, recovering the transfer-function tooling of this section for a much wider class of transducers. Deep <strong>state-space models</strong> (S4, Mamba; <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) sit between the two, giving long-horizon, linear-time sequence dynamics that identify cleanly from data. The unifying theme is a differentiable forward model, which is precisely the ingredient the physics-informed inverse problems of Section 55.4 require.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using Listing 55.1: (1) Drive the model with a sinusoidal input \(u(t)=\sin(2\pi f t)\) and sweep \(f\); measure the output amplitude and phase lag at each frequency and confirm they trace the first-order Bode magnitude \(1/\sqrt{1+(2\pi f\tau)^2}\) and phase \(-\arctan(2\pi f\tau)\). (2) Add a slowly growing bias term \(b_k = b_{k-1} + \epsilon_k\) to the output and show that static recalibration cannot remove it while a two-state model (signal state plus bias state) can. (3) Turn the forward model around: given only the noisy laggy \(y\), estimate the true step amplitude and its time by fitting \(\tau\) and the input, and comment on how output noise limits how sharply you can recover a fast edge.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why can a slow sensor's amplitude loss not be fixed by recalibrating its gain, and what property of the input does the loss depend on? 2. Name three physical effects beyond a linear time constant that force a dynamic (not static) sensor model, and say what each adds to the forward model. 3. Why is free-running rollout error, rather than one-step error, the right way to judge a predictive dynamics model destined for a digital twin?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-55.2.html">Section 55.2</a>, we put this forward model to work as a factory. Once a sensor's dynamics, noise, drift, and cross-sensitivities are captured in a runnable model, you can drive it with an unlimited variety of simulated scenarios, including faults you could never safely stage on real hardware, and mint labeled synthetic sensor streams to train detectors on. The predictive model of dynamics built here is the engine; simulation and synthetic sensor data are what it produces.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

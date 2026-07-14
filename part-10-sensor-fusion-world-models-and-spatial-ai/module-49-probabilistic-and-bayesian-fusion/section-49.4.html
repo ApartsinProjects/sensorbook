@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 49.4: Data association (JPDA, MHT) and tracking. Building Sensory AI." name="description"/>
+<title>Section 49.4: Data association (JPDA, MHT) and tracking | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 49: Probabilistic and Bayesian Fusion</a></div>
+<h1>Data association (JPDA, MHT) and tracking</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The filter was flawless. It just spent three frames confidently tracking a guardrail it had mistaken for a motorcycle."</p><cite>A Chastened AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>A Kalman filter answers "given that <em>this</em> measurement belongs to <em>this</em> target, where is the target now?" But the radar returns four blips, two are clutter, one target went undetected this scan, and a new car just entered the scene. Nobody labeled which blip is which. That labeling problem, deciding which measurement updates which track, is <strong>data association</strong>, and it is the part of multi-target tracking that actually breaks systems in the field. A single wrong assignment poisons a track's state and covariance for many frames. This section builds the association layer that sits on top of the filters from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>: gating, the hard-decision nearest-neighbour assignment, the soft-decision JPDA, the deferred-decision MHT, and the track-lifecycle logic that ties them together.</p>
+</div>
+
+<p>This section assumes the Kalman prediction and update steps, the innovation \(\nu = z - H\hat{x}\), and the innovation covariance \(S = HPH^\top + R\) from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, plus the Mahalanobis-distance and chi-square ideas from the probability primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The measurement sources we associate (radar detections, lidar clusters) come from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a> and <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>.</p>
+
+<h2>The problem: measurements are unlabeled, and the world is messy</h2>
+
+<p>In single-target tracking the correspondence is trivial: one target, one measurement, feed it in. Multi-target tracking removes that luxury. At each scan the sensor produces a set of measurements corrupted by three realities. <strong>Clutter and false alarms</strong>: reflections, ground returns, and thermal noise produce detections with no real target behind them, typically modeled as a Poisson process with spatial density \(\lambda\). <strong>Missed detections</strong>: a real target is seen with probability of detection \(P_D < 1\), so some scans contain no measurement for a target that plainly exists. <strong>Unknown, time-varying cardinality</strong>: targets appear (track birth) and leave (track death), so even the <em>number</em> of things to track is a hidden variable.</p>
+
+<p>The association question is therefore combinatorial: over \(n\) tracks and \(m\) measurements there are exponentially many ways to match them, and each way must also account for the "this measurement is clutter" and "this track was missed" possibilities. Every association method is a different answer to how much of that combinatorial explosion you evaluate before committing.</p>
+
+<h2>Gating: shrink the problem before you solve it</h2>
+
+<p>No method should consider every measurement for every track. A <strong>validation gate</strong> discards pairings that are statistically impossible. For track \(t\) with predicted measurement \(\hat{z}_t\) and innovation covariance \(S_t\), measurement \(z_j\) is gated in only if its squared Mahalanobis distance falls under a threshold:</p>
+
+$$d^2_{tj} = (z_j - \hat{z}_t)^\top S_t^{-1} (z_j - \hat{z}_t) \le \gamma.$$
+
+<p>Because \(d^2\) is chi-square distributed with degrees of freedom equal to the measurement dimension, you pick \(\gamma\) from the chi-square inverse CDF for a chosen gate probability (for example \(\gamma \approx 9.21\) for a 2D measurement at 99%). Gating is what makes real-time tracking tractable: it turns a dense \(n \times m\) problem into a sparse one, and it is the shared front end of every method below.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The three association families differ only in what they do with an <em>ambiguous</em> gate, one where several measurements fall inside a track's gate or one measurement falls inside several gates. <strong>Nearest-neighbour</strong> commits to the single best pairing now. <strong>JPDA</strong> refuses to commit and blends all gated measurements weighted by probability. <strong>MHT</strong> refuses to commit <em>yet</em> and carries the alternatives forward until future scans disambiguate them. Everything else, the filter, the gate, the track logic, is the same. Association is a decision-timing choice: decide now, average now, or decide later.</p>
+</div>
+
+<h2>Global nearest neighbour: one clean assignment per scan</h2>
+
+<p>The simplest workable scheme scores every gated track-measurement pair and picks the single assignment that minimizes total cost. Using the negative log-likelihood of the innovation as the cost, \(c_{tj} = \tfrac{1}{2}d^2_{tj} + \tfrac{1}{2}\ln|2\pi S_t|\), the best one-to-one matching is the classic linear assignment problem, solved exactly in \(O(n^3)\) by the Hungarian (Kuhn-Munkres) algorithm. This is <strong>global</strong> nearest neighbour (GNN): unlike greedy per-track nearest neighbour, it resolves conflicts jointly so two tracks never grab the same measurement. GNN is fast, deterministic, and correct when targets are well separated. Its failure mode is exactly the crossing-targets case: when two gates overlap, one hard mistake swaps two tracks' identities and both filters diverge.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import chi2
+
+def gnn_associate(tracks, meas, gate_prob=0.99):
+    """tracks: list of (z_hat[2], S[2,2]); meas: array (m, 2).
+    Returns list of (track_idx, meas_idx) accepted assignments."""
+    n, m = len(tracks), len(meas)
+    gate = chi2.ppf(gate_prob, df=2)
+    BIG = 1e6
+    cost = np.full((n, m), BIG)
+    for t, (z_hat, S) in enumerate(tracks):
+        Sinv = np.linalg.inv(S)
+        for j in range(m):
+            nu = meas[j] - z_hat
+            d2 = float(nu @ Sinv @ nu)
+            if d2 <= gate:                                   # validation gate
+                cost[t, j] = 0.5 * d2 + 0.5 * np.log(np.linalg.det(2 * np.pi * S))
+    rows, cols = linear_sum_assignment(cost)                 # Hungarian, O(n^3)
+    return [(t, j) for t, j in zip(rows, cols) if cost[t, j] < BIG]
+
+tracks = [(np.array([0.0, 0.0]), np.eye(2)),
+          (np.array([5.0, 0.0]), np.eye(2))]
+meas = np.array([[0.2, -0.1], [4.8, 0.3], [9.0, 9.0]])       # last one is clutter
+print(gnn_associate(tracks, meas))                            # -> [(0, 0), (1, 1)]
+</code></pre>
+<div class="code-caption">Global nearest-neighbour association: chi-square gating followed by a Hungarian solve. Gated-out pairs get a large cost so the solver never picks them; the third measurement is unmatched clutter and correctly dropped. This is the association front end that the JPDA and MHT sections build upon.</div>
+
+<p>The <code>gnn_associate</code> function above is the entire hard-decision associator in roughly twenty lines, and in production it is often enough. The interesting engineering starts when GNN's single-best commitment is too brittle.</p>
+
+<h2>JPDA: never commit, average instead</h2>
+
+<p>Joint Probabilistic Data Association keeps one track per target but refuses to pick a winner. For each target it enumerates the feasible <em>joint</em> association events (respecting that a measurement comes from at most one target), computes each event's probability from the innovation likelihoods, the clutter density \(\lambda\), and \(P_D\), then marginalizes to a per-pairing probability \(\beta_{tj}\), the chance that measurement \(j\) belongs to track \(t\). The filter update uses a probability-weighted combined innovation:</p>
+
+$$\nu_t = \sum_{j} \beta_{tj}\,\nu_{tj}, \qquad \hat{x}_t^+ = \hat{x}_t + K_t \nu_t,$$
+
+<p>with an extra "spread of the means" term added to the covariance to account for the association uncertainty. Because it blends rather than commits, JPDA does not suffer the catastrophic identity swap that fells GNN when targets pass close together; the ambiguity is absorbed as inflated, honest uncertainty. Its cost is that the target count is assumed fixed and known, and that blending can pull a track toward a nearby clutter point or coalesce two tracks that get too close. Modern variants (JIPDA, which adds a track-existence probability) restore birth and death handling.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: automotive radar in stop-and-go traffic</h3>
+<p>An automotive front radar on a highway on-ramp tracks a cluster of vehicles merging at similar speeds. A 77 GHz radar throws off multipath and guardrail returns, so each scan carries real vehicles plus a scatter of clutter. Early prototypes used GNN and suffered a signature bug: when the ego car's neighbour changed lanes and briefly overlapped a car ahead in range-azimuth space, GNN swapped the two tracks, and the automatic-emergency-braking logic momentarily attributed the far car's closing speed to the near one. Switching the associator to JPDA fixed it without touching the constant-turn-rate motion model: during the ambiguous overlap the two tracks' innovations were blended with \(\beta\) weights near 0.5, their covariances inflated to signal low confidence, and the downstream planner correctly treated both as uncertain rather than confidently wrong. The lesson generalizes: in dense, crossing traffic, soft association buys safety margin that a better motion model cannot.</p>
+</div>
+
+<h2>MHT: defer the decision until evidence arrives</h2>
+
+<p>Multiple Hypothesis Tracking takes the opposite stance from JPDA's averaging: it keeps the alternatives <em>separate</em> and postpones the hard decision. At each scan MHT expands a tree of global hypotheses, each a consistent history of assignments (including "measurement was clutter" and "target was born" branches), and scores each hypothesis by its accumulated likelihood. A momentarily ambiguous pairing spawns two child hypotheses; a few scans later the motion evidence makes one history far more likely, and the tree is pruned back. This deferred-decision logic is the strongest classical associator in heavy clutter, because it lets future data correct present ambiguity, which neither GNN nor JPDA can do. The price is the hypothesis explosion: the tree grows combinatorially, so practical MHT lives or dies on aggressive <em>pruning</em> (keep the top-\(k\) hypotheses), <em>gating</em>, \(N\)-scan pruning (commit to decisions older than \(N\) frames), and clustering independent target groups. Track-oriented MHT with Murty's algorithm for the \(k\)-best assignments is the standard modern formulation.</p>
+
+<h2>Track lifecycle: birth, confirmation, death</h2>
+
+<p>No associator is complete without logic for when a track begins and ends, because cardinality is unknown. The workhorse is <strong>M-of-N</strong> logic: a tentative track is initiated from an unassigned measurement, promoted to <em>confirmed</em> only after it is updated in \(M\) of the last \(N\) scans (say 3 of 5), and deleted after a run of consecutive misses. This simple hysteresis is what suppresses clutter-born tracks (which fail to persist) while letting real targets survive occasional missed detections. Confirmation counting, gate probability, and deletion thresholds are the three knobs that trade false tracks against track continuity, and tuning them for the deployment clutter rate matters more than the choice of associator for most systems.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>You do not implement JPDA, MHT, and Murty's \(k\)-best from scratch. <a href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Radar</a>-grade tracking libraries ship them: the UK Defence lab's <code>Stone Soup</code> gives you GNN, JPDA, and MHT associators plus track management behind a common interface, and <code>motpy</code> or <code>FilterPy</code> plus SciPy's <code>linear_sum_assignment</code> cover the GNN path. A working JPDA tracker is roughly 30 lines of configuration against Stone Soup versus the several hundred lines of hypothesis enumeration, joint-event probability, and covariance-inflation bookkeeping you would otherwise write and debug. The library owns the numerically delicate parts (event enumeration, normalization, Murty ranking); you own the motion model, the clutter density \(\lambda\), \(P_D\), and the M-of-N thresholds, which are deployment-specific and no library can guess.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>The current state of the art reframes tracking through <strong>random finite sets (RFS)</strong>, which treat the whole set of targets as a single set-valued random variable, so birth, death, and association fall out of one Bayesian recursion instead of bolted-on heuristics. The GM-PHD filter propagates only the intensity (first moment) and is fast but loses identity; the <strong>Poisson Multi-Bernoulli Mixture (PMBM)</strong> filter is now the leading principled tracker, provably related to MHT while handling undetected targets cleanly, and is a strong baseline in automotive and lidar benchmarks. In parallel, learned end-to-end trackers, transformer-based data association such as <em>TransTrack</em> and <em>MOTR</em>, and graph-neural-network associators (related to <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a>) replace the hand-designed likelihood with a trained affinity, at the cost of the leakage-safe evaluation discipline from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> and calibrated uncertainty (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>).</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Simulate two targets moving on straight lines that cross at the origin, each observed with \(P_D = 0.9\) and Poisson clutter at density \(\lambda = 2\) per scan inside the field of view. (a) Track them with the <code>gnn_associate</code> function above wrapped around a constant-velocity Kalman filter and count how many runs suffer a track swap at the crossing. (b) Replace GNN with a JPDA associator (Stone Soup or your own two-target implementation) and re-measure the swap rate. (c) Explain, in terms of the \(\beta_{tj}\) weights near the crossing, why JPDA's covariance grows there and why that growth is the correct behavior rather than a defect.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>What statistical distribution governs the gate threshold \(\gamma\), and what two quantities set the gate for a given track and scan?</li>
+<li>State the one-sentence difference between GNN, JPDA, and MHT in terms of <em>when</em> the association decision is made.</li>
+<li>Why does M-of-N confirmation logic suppress clutter-born tracks, and which knob would you loosen if real targets were being deleted too aggressively in fog?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-49.5.html">Section 49.5</a>, we lift fusion from recursive filtering to the factor-graph estimator of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>, using GTSAM to fuse multiple sensors as a single optimization over the whole trajectory. Data association reappears there as a graph question: which factor connects which variable, and what happens when that link is wrong.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

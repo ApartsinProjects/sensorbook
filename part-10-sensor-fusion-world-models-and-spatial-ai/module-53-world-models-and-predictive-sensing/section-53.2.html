@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 53.2: Latent state-space and recurrent world models (DreamerV3). Building Sensory AI." name="description"/>
+<title>Section 53.2: Latent state-space and recurrent world models (DreamerV3) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 53: World Models and Predictive Sensing</a></div>
+<h1>Latent state-space and recurrent world models (DreamerV3)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to imagine a hundred futures before moving a muscle. So I compressed the world into forty numbers and dreamed inside them instead."</p>
+<cite>A Rehearsing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the world-model motivation from <a class="cross-ref" href="section-53.1.html">Section 53.1</a>: an agent needs an internal simulator of how sensor observations evolve. It leans on recurrent sequence models from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, on the probabilistic-latent-state view of Bayesian filtering from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and on the KL divergence, ELBO, and reparameterization machinery introduced in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. You should be comfortable reading a variational objective as a reconstruction term traded off against a prior-matching term.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">A Kalman filter that learned its own physics</h3>
+<p>A classical filter carries a compact hidden state and predicts the next measurement from it, but you hand it the dynamics and the sensor model by writing equations. A <strong>latent state-space world model</strong> keeps the same skeleton, a running belief that is updated by observations and rolled forward by a transition rule, but it <em>learns</em> both the dynamics and the decoder from raw sensor streams. The signature model of this family is the <strong>Recurrent State-Space Model (RSSM)</strong> at the heart of Dreamer. Once trained, it can shut its eyes: it predicts thousands of plausible future latent states without touching a real sensor, letting an agent rehearse behaviors "in imagination." <strong>DreamerV3</strong> is the version that made this reliable, mastering more than 150 tasks (from Atari to continuous control to collecting diamonds in Minecraft) with a <em>single fixed set of hyperparameters</em>. That robustness, not just raw score, is what makes it the reference design for anyone who wants a world model on a new sensor stream without a tuning marathon.</p>
+</div>
+
+<p>The whole chapter revolves around one question: can a machine hold a useful model of the physical world in its head? This section answers it with the most battle-tested recipe available, the recurrent latent state-space model, and dissects the three problems it solves: what the latent state looks like, how the model is trained from sensor sequences, and how imagination inside that state replaces expensive interaction with the real world.</p>
+
+<h2>The RSSM: a hybrid deterministic-stochastic state</h2>
+<p><strong>What</strong> the model maintains is a latent state split into two parts: a <em>deterministic</em> recurrent vector \(h_t\) carried by a GRU, and a <em>stochastic</em> vector \(z_t\) drawn from a distribution that \(h_t\) parameterizes. <strong>Why</strong> the split matters is subtle and is the central design insight of the RSSM. A purely deterministic recurrence cannot represent uncertainty (a fork in the road, an occluded object, sensor noise), so its long rollouts collapse to a single blurry average future. A purely stochastic chain, by contrast, forgets: it has no reliable channel to carry information many steps forward. Combining them gives you memory that persists (through \(h_t\)) and genuine multi-modal uncertainty that can branch (through \(z_t\)). In DreamerV3 the stochastic \(z_t\) is a vector of <em>categorical</em> variables (for example 32 classes across 32 groups) rather than a Gaussian, which sidesteps the posterior-collapse and gradient pathologies that plague Gaussian latents on high-dimensional observations.</p>
+
+<p><strong>How</strong> the pieces connect defines the model. At each step the recurrent core advances the deterministic state, and two distributions over \(z_t\) are produced: a <em>prior</em> that predicts the next stochastic state from memory and action alone, and a <em>posterior</em> that additionally sees the current observation \(x_t\):</p>
+
+$$
+h_t = f_\phi(h_{t-1}, z_{t-1}, a_{t-1}), \qquad
+\hat{z}_t \sim p_\phi(\hat{z}_t \mid h_t), \qquad
+z_t \sim q_\phi(z_t \mid h_t, x_t).
+$$
+
+<p>The prior \(p_\phi\) is the <em>dynamics predictor</em>, the part that lets the model dream forward with no sensor input. The posterior \(q_\phi\) is the <em>encoder</em> that corrects the belief when a real observation arrives, exactly the predict-then-update rhythm of the Kalman family in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, but with both the transition and the observation model learned by neural networks. Attached to the full model state \(s_t = (h_t, z_t)\) are lightweight prediction heads: a <em>decoder</em> that reconstructs \(x_t\), a <em>reward</em> head, and a <em>continue</em> head that predicts episode termination.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The prior is the physics; the posterior is the sensor</h3>
+<p>Training forces the prior \(p_\phi(\hat{z}_t \mid h_t)\) to match the posterior \(q_\phi(z_t \mid h_t, x_t)\). When it succeeds, the model can predict what its own encoder <em>would have</em> reported, without the observation. That single alignment is what converts a sequence autoencoder into a simulator: everything downstream (planning, anticipation, anomaly detection) exploits the ability to run the prior forward indefinitely. A large gap between prior and posterior is itself a signal: it means the world just did something the model did not expect, which is precisely a surprise or anomaly detector, connecting this design to the change-detection ideas of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Training: reconstruction, KL balancing, and free bits</h2>
+<p>The world model is trained by <strong>maximizing an evidence lower bound (ELBO)</strong> on observed sensor sequences, the same variational objective you met in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The loss has a reconstruction term (decode \(x_t\), reward, and continuation from \(s_t\)) and a dynamics term that pulls prior and posterior together:</p>
+
+$$
+\mathcal{L} = \underbrace{-\sum_t \ln p_\phi(x_t \mid s_t)}_{\text{reconstruction}} \; + \; \underbrace{\sum_t \beta \, \mathrm{KL}\!\left[\, q_\phi(z_t \mid h_t, x_t) \,\big\Vert\, p_\phi(\hat{z}_t \mid h_t) \,\right]}_{\text{dynamics / prior matching}} .
+$$
+
+<p><strong>How</strong> DreamerV3 makes this stable across wildly different sensor scales is a set of small but decisive tricks. <em>KL balancing</em> uses different learning rates for the two directions of the KL, so the prior is pulled hard toward the (slowly moving) posterior while the posterior is only lightly regularized, which stops the representation from collapsing. <em>Free bits</em> clip the KL term below a floor (around one nat) so the model does not waste capacity over-compressing already-simple states. Crucially, DreamerV3 wraps every regression target (rewards, reconstructions of unbounded signals) in a <strong>symlog transform</strong>, \(\operatorname{symlog}(x) = \operatorname{sign}(x)\ln(1+|x|)\), and predicts scalars with a <em>two-hot</em> discretized distribution. <strong>Why</strong> this earns its place: symlog squashes signals that range from millivolts to kilonewtons into a common scale, and it is exactly this normalization, plus percentile-based return scaling in the actor-critic, that lets one hyperparameter set survive across domains. That is the property that makes the model practical for a new sensor without re-tuning.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse forklift that rehearses the next two seconds</h3>
+<p>An autonomous forklift fuses a front depth camera, wheel odometry, and a lidar strip. Engineers train an RSSM offline on 40 hours of teleoperated logs, with observations symlog-normalized and encoded into a 512-dimensional deterministic state plus 32x32 categorical latents. At run time the model updates its belief at 20 Hz from live sensors, but before each steering command the planner rolls the <em>prior</em> forward 40 steps (two seconds) under a dozen candidate action sequences, entirely in latent space, decoding only the reward and collision heads. When a pallet edge is briefly occluded, the stochastic latent keeps two hypotheses alive (pallet present vs. clear aisle), and the imagined rollouts that assume "clear" carry a high modeled collision risk, so the planner slows. No real sensor was queried for those 480 imagined steps, and no forklift was risked to discover the danger. This is the latent-space planning that <a class="cross-ref" href="section-53.5.html">Section 53.5</a> formalizes.</p>
+</div>
+
+<h2>Imagination: learning behavior without touching the world</h2>
+<p><strong>What</strong> the trained world model unlocks is a second learner that never sees a raw sensor. Dreamer trains an <em>actor</em> and a <em>critic</em> purely on trajectories that the world model dreams: starting from real encoded states drawn from the replay buffer, it rolls the prior forward under the current policy, producing imagined states, rewards, and values for, say, 15 steps. <strong>Why</strong> this is transformative for sensing systems is data efficiency and safety. Real interaction with a physical plant, a patient, or a vehicle is slow, expensive, and sometimes hazardous; imagined interaction is a few matrix multiplies. The actor is optimized to maximize an imagined \(\lambda\)-return, and because the entire rollout lives in a differentiable latent space, gradients can flow straight through the learned dynamics. The world model turns a scarce resource (real experience) into an abundant one (dreamed experience), which is why Dreamer reaches strong performance from far fewer environment steps than model-free baselines.</p>
+
+<p>The relationship to other temporal models in this book is worth naming. The RSSM is a <em>learned, nonlinear, stochastic</em> state-space model; the deterministic linear-time state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> (S4, Mamba) share the "carry a compact state, update it in linear time" philosophy but drop the explicit stochastic branch and the generative decoder that make imagination possible. Choose an RSSM when you need to <em>generate</em> and <em>plan</em>; choose a Mamba-style backbone when you only need to <em>discriminate</em> or <em>forecast</em> a fixed target.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class RSSMStep(nn.Module):
+    """One recurrent state-space update: predict prior, then correct with obs."""
+    def __init__(self, deter=512, stoch=32, classes=32, act_dim=6, embed=1024):
+        super().__init__()
+        self.stoch, self.classes = stoch, classes
+        self.gru   = nn.GRUCell(stoch * classes + act_dim, deter)
+        self.prior = nn.Linear(deter, stoch * classes)            # dynamics predictor
+        self.post  = nn.Linear(deter + embed, stoch * classes)    # encoder posterior
+
+    def _dist(self, logits):                                      # categorical latent
+        logits = logits.view(-1, self.stoch, self.classes)
+        return torch.distributions.OneHotCategoricalStraightThrough(logits=logits)
+
+    def forward(self, h, z, action, embed):
+        h = self.gru(torch.cat([z.flatten(1), action], -1), h)   # advance memory
+        prior = self._dist(self.prior(h))                        # imagine next z
+        post  = self._dist(self.post(torch.cat([h, embed], -1))) # correct with sensor
+        z = post.rsample().flatten(1)                            # reparameterized sample
+        kl = torch.distributions.kl_divergence(post, prior).sum(-1)
+        return h, z, kl                                          # kl drives prior->post
+</code></pre>
+<div class="code-caption">A single RSSM transition, the core loop of DreamerV3's world model. The <code>prior</code> head is what dreams forward with no observation; the <code>post</code> head corrects the belief when an encoded observation <code>embed</code> arrives, and the returned <code>kl</code> is the dynamics loss that aligns them. Straight-through categorical sampling keeps the whole update differentiable so imagination gradients can pass through it.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">You do not hand-roll the RSSM</h3>
+<p>The snippet above is one transition; a full DreamerV3 (encoder, decoder, reward and continue heads, KL balancing, free bits, symlog two-hot losses, imagination rollouts, and the actor-critic) is roughly 1,500 to 2,000 lines to reproduce faithfully. Reference implementations such as the official <code>dreamerv3</code> repository and the PyTorch port collapse "train a latent world model on my sensor sequences and dream from it" into a config file plus a handful of calls: define an observation space, point it at a replay buffer of logged sensor episodes, and call <code>train</code>. That is well over a 90% reduction in code you own, and, more importantly, the library ships the numerically-tuned defaults (the very hyperparameters DreamerV3's robustness rests on) so you do not rediscover them by hand.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>DreamerV3 (Hafner et al., 2023) is the current reference for reliable latent world models and was the first to collect diamonds in Minecraft from scratch with no human data. The frontier now pushes three directions: scaling the recurrent world model with transformer backbones (TWM, IRIS, and STORM replace or augment the GRU with attention over latent tokens); learning world models directly from large multimodal sensor logs rather than game frames; and the joint-embedding predictive alternative that drops pixel reconstruction entirely, covered next in <a class="cross-ref" href="section-53.3.html">Section 53.3</a>. The open tension is representation choice: reconstruct observations (Dreamer) versus predict in a learned abstract space (JEPA). For noisy, high-bandwidth sensor streams where pixel-perfect reconstruction wastes capacity, that choice is an active and consequential debate.</p>
+</div>
+
+<h2>When to reach for a recurrent latent world model</h2>
+<p><strong>When</strong> this design is the right tool: your system is <em>partially observable</em> (any single sensor frame underdetermines the true state, so you need a belief that integrates history), you want to <em>plan or rehearse</em> rather than merely classify, and real-world interaction is costly enough that learning from imagined rollouts pays off. Wearables predicting the next few seconds of gait, industrial controllers rehearsing a valve sequence, and robots anticipating occluded obstacles all fit. <strong>When</strong> it is overkill: if you only need a fixed forecast horizon on a clean signal with abundant labels, a temporal convolutional or state-space forecaster from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> is simpler, cheaper, and easier to certify. And as always, evaluate on leakage-safe splits: because the model trains on logged episodes, an episode that straddles the train/test boundary silently inflates every reported number.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: dream vs. reality</h3>
+<p>Take a trained RSSM (or the toy step above wired into a loop) on a sensor sequence of your choice. (1) Encode the first 50 steps with the posterior, then roll the <em>prior</em> forward for 50 more steps with recorded actions but no observations, and plot the decoded prediction against ground truth. (2) Measure the per-step KL between prior and posterior on a normal segment and on a segment containing an injected fault. Report how many standard deviations the fault-segment KL sits above the normal mean, and argue whether prior-posterior KL is a usable anomaly-anticipation signal.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does the RSSM keep both a deterministic \(h_t\) and a stochastic \(z_t\) instead of one or the other? What failure mode does each part prevent?</p>
+<p>2. During imagination, which distribution generates the next latent state, the prior or the posterior, and why can it run without any sensor input?</p>
+<p>3. What does the symlog transform buy DreamerV3, and how does it connect to the claim that one hyperparameter set works across many domains?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-53.3.html">Section 53.3</a>, we question the one assumption DreamerV3 never drops: that the world model must reconstruct its observations. Joint-embedding predictive architectures (I-JEPA and V-JEPA 2) predict in an abstract representation space instead of pixel space, throwing away the decoder to spend capacity on what matters for prediction rather than on rendering every noisy detail of a sensor frame.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

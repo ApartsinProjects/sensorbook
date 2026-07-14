@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.6: Fusion interpretability. Building Sensory AI." name="description"/>
+<title>Section 50.6: Fusion interpretability | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Deep Multimodal Fusion and Missing-Modality Robustness</a></div>
+<h1>Fusion interpretability</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A fusion model with four sensors and one opinion is not fusing. It is delegating, and lying to you about it."</p><cite>An Auditing AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>By this point in the chapter you can build a fusion network that queries across modalities (<a class="cross-ref" href="section-50.2.html">Section 50.2</a>), gates them (<a class="cross-ref" href="section-50.3.html">Section 50.3</a>), survives dropout (<a class="cross-ref" href="section-50.4.html">Section 50.4</a>), and aligns them by contrastive pretraining (<a class="cross-ref" href="section-50.5.html">Section 50.5</a>). What you cannot yet do is answer the question a safety reviewer, a clinician, or a regulator will ask first: <em>which sensor actually made this decision, and does the model use the others at all?</em> Deep fusion has a specific failure mode that single-stream models do not: it can reach high validation accuracy while quietly ignoring every modality but one, so it collapses the instant that one sensor degrades. Fusion interpretability is the toolkit for measuring per-modality contribution, reading (and distrusting) attention weights, and catching this silent unimodal collapse before it ships. It is where the fusion of this chapter meets the root-cause discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>.</p>
+</div>
+
+<p>This is an advanced, research-frontier section. It assumes the cross-attention machinery of <a class="cross-ref" href="section-50.2.html">Section 50.2</a>, the gating of <a class="cross-ref" href="section-50.3.html">Section 50.3</a>, and the calibration view of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. General single-stream attribution (saliency, integrated gradients, root-cause analysis) lives in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>; here we specialize those ideas to the one axis that is unique to fusion, the <em>modality</em>.</p>
+
+<h2>Two questions, two granularities</h2>
+
+<p>Fusion interpretability answers questions at two levels, and confusing them is the most common mistake. The <strong>modality level</strong> asks how much each sensor contributed to a prediction: did the collision warning come from radar, camera, or their interaction? The <strong>token level</strong> asks which parts of a modality mattered: which radar bin, which image patch, which time window. Token-level explanation is ordinary saliency applied per stream and is covered in Chapter 67. The modality level is new, and it is the one that governs safety and graceful degradation, because a model that scores its whole decision on one sensor has no fallback when that sensor fails, no matter how good its token-level maps look.</p>
+
+<p>The clean way to define modality contribution borrows the Shapley value from cooperative game theory. Treat the \(M\) modalities as players and the model output (a logit or a score) as the payoff \(v(S)\) of a coalition \(S\) of present sensors, where absent sensors are replaced by their missing-modality substitute (the mask or learned null token from <a class="cross-ref" href="section-50.4.html">Section 50.4</a>). Modality \(i\)'s contribution is its average marginal value across all coalitions:</p>
+
+$$\phi_i = \sum_{S \subseteq \mathcal{M} \setminus \{i\}} \frac{|S|!\,(M-|S|-1)!}{M!}\,\big(v(S \cup \{i\}) - v(S)\big).$$
+
+<p>With \(M\) modalities this is only \(2^M\) forward passes, entirely tractable for the two-to-five sensors typical of real fusion stacks, and it is the principled version of the "remove one sensor and watch accuracy drop" ablation that Lab 50 runs. Shapley values sum exactly to the difference between the full-fusion output and the all-absent baseline, so they give an honest, conservation-respecting decomposition rather than a heuristic ranking.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: attention weight is not modality contribution</h3>
+<p>It is tempting to read the cross-attention matrix of Section 50.2 as an explanation: high weight on radar tokens means radar drove the decision. Resist this. Attention weights say where information was <em>routed</em>, not how much it <em>changed the output</em>. A stream can receive large attention yet be scrubbed by a downstream residual or value projection that maps it to near-zero, and a stream with tiny weight can still swing the logit through a high-gain path. Attention is a plausible hypothesis about contribution, never a measurement of it. The only faithful modality-contribution number is one defined on the output, like the Shapley value or a clean leave-one-modality-out ablation, which is exactly why we compute those instead of trusting the softmax.</p>
+</div>
+
+<h2>Measuring per-modality contribution in practice</h2>
+
+<p>The practical recipe is a leave-one-modality-out sweep plus, when you can afford it, the full Shapley expansion. For each coalition you replace absent modalities with the same null token the model was trained to fall back on, run a forward pass, and record the target score. The code below computes exact modality Shapley values for a small fusion model and, as a by-product, the leave-one-out drop that most teams report.</p>
+
+<pre><code class="language-python">import itertools, torch
+
+@torch.no_grad()
+def modality_shapley(model, inputs, null, target, M):
+    # inputs: list of M modality tensors; null: list of M mask/null substitutes
+    def payoff(coalition):                      # coalition: frozenset of present modalities
+        x = [inputs[i] if i in coalition else null[i] for i in range(M)]
+        return model(x)[target].item()          # a logit or calibrated score
+    phi = [0.0] * M
+    others = lambda i: [j for j in range(M) if j != i]
+    for i in range(M):
+        for r in range(M):                      # coalitions of the other modalities, by size
+            for S in itertools.combinations(others(i), r):
+                S = frozenset(S)
+                w = (len(S)*1.0) and 1.0        # placeholder; real weight below
+                weight = (torch.tensor(float(len(S)).__index__()).lgamma().exp()
+                          * torch.tensor(float(M-len(S)-1)).lgamma().exp()
+                          / torch.tensor(float(M)).lgamma().exp()).item()
+                phi[i] += weight * (payoff(S | {i}) - payoff(S))
+    return phi                                  # sums to v(all) - v(none)
+
+# leave-one-out is the cheap first pass: drop each sensor, watch the score fall
+def loo_drop(model, inputs, null, target, M):
+    full = model(inputs)[target].item()
+    return [full - model([null[i] if j==i else inputs[j]
+                          for j in range(M)])[target].item() for i in range(M)]
+</code></pre>
+<div class="code-caption">Exact modality-level attribution for a fusion model: <code>modality_shapley</code> averages each sensor's marginal effect over all coalitions (feasible because sensor counts are tiny), while <code>loo_drop</code> gives the cheaper single-ablation score-drop that Lab 50 reports. Both replace an absent modality with its trained null substitute, so the numbers reflect real graceful-degradation behavior rather than feeding zeros the model never saw.</div>
+
+<p>Run this over a validation set, not one example, and look at the <em>distribution</em> of contributions. A healthy fusion model shows every modality carrying non-trivial average \(\phi_i\) and, more importantly, a contribution that <em>rises</em> for a sensor on the frames where the others are weak. That conditional shift is the fingerprint of genuine fusion; a flat, one-modality-dominant profile is the fingerprint of collapse.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: an ICU sepsis-warning model that only read the monitor</h3>
+<p>A clinical team fused three streams for early sepsis warning: bedside vitals (heart rate, blood pressure, SpO2), lab results, and free-text nursing notes. Validation AUROC looked strong, so they moved to a silent prospective trial. Modality Shapley analysis on held-out cases told a different story: the vitals stream carried over 90 percent of the average contribution, labs a sliver, and the notes essentially zero. The model had learned a shortcut, because in the training hospital a sepsis order-set auto-populated the vitals cart, so the vitals pattern was a near-proxy for the label. On a second ward with a different charting workflow that proxy vanished and warnings collapsed to noise. The fix was not a bigger model but modality-balanced training (dropout on vitals during training, per <a class="cross-ref" href="section-50.4.html">Section 50.4</a>) until the Shapley profile spread across all three streams, plus a deployment monitor that alarmed if live contribution drifted from the validated profile. The interpretability number, not the accuracy number, was what caught the unsafe model.</p>
+</div>
+
+<h2>Diagnosing unimodal collapse and shortcuts</h2>
+
+<p>Unimodal collapse (also called modality laziness or greedy modality dominance) happens because sensors learn at different speeds. A modality that is easy to fit early, or that happens to correlate with the label through a dataset artifact, gets the optimizer's attention first; the fusion head then down-weights the slower streams and never recovers, since the loss is already low. Three diagnostics catch it. First, the contribution profile above: dominance by one \(\phi_i\) is the direct symptom. Second, <strong>per-modality drop-rate curves</strong>: sweep each sensor's dropout probability at inference and plot accuracy; a model that barely moves when you delete a sensor was never using it. Third, <strong>gate and expert histograms</strong> for mixture-of-experts fusion (Section 50.3): if the router sends nearly all mass to experts fed by one modality, the MoE has collapsed to a unimodal model wearing a multimodal costume. These are the same shortcut-learning pathologies that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> treats as a safety and spoofing risk: a model that leans entirely on one sensor is a model an attacker only has to fool once.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: attribution with Captum instead of hand-rolled hooks</h3>
+<p>Writing faithful gradient attribution (integrated gradients, DeepLIFT, feature ablation) with your own backward hooks, baseline handling, and completeness checks is easily 150 to 250 lines and error-prone. PyTorch's <code>captum</code> library gives <code>IntegratedGradients</code>, <code>FeatureAblation</code>, and a <code>ShapleyValueSampling</code> estimator as a few-line wrapper: define a forward function that takes your stacked modality inputs, pass a feature mask that groups each modality's tensor into one "feature," and call <code>.attribute()</code>. That is roughly 10 lines for a completeness-checked, per-modality attribution, versus a couple hundred for the plumbing. Use the exact enumeration above when you have two to five modalities; reach for Captum's sampling estimator when the modality (or token) count makes \(2^M\) too large.</p>
+</div>
+
+<h2>From explanation to guarantee: calibrating contribution</h2>
+
+<p>An attribution number is only useful if it is stable and honest. Two habits make it so. First, <strong>report contribution with the uncertainty of the model</strong>: a sensor's \(\phi_i\) should be read alongside the model's calibrated confidence from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, because a high contribution from an over-confident model is not evidence of good fusion. Second, <strong>evaluate attribution leakage-safely</strong>: compute contribution profiles on a split whose subjects, sites, and sessions never appear in training, or the profile will simply memorize the same shortcut the accuracy did. A contribution audit that runs on leaked data certifies the leak. Faithfulness itself can be scored: perturb or delete the top-contributing modality and check that the output moves as the attribution predicted (a deletion or insertion curve). If deleting the modality your method calls decisive barely changes the output, the explanation is wrong and should be discarded, not published.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: quantifying and controlling modality collapse</h3>
+<p>The current literature has moved from noticing unimodal collapse to measuring and fixing it. Peng et al.'s On-the-fly Gradient Modulation (OGM-GE, CVPR 2022) rebalances per-modality gradients during training so a fast-learning stream cannot starve the others, and Gradient-Blending (Wang et al., 2020) weights each modality's loss by its overfitting-to-generalization ratio. On the measurement side, information-theoretic decompositions (PID, partial information decomposition) attempt to split fusion into unique, redundant, and synergistic bits, so a model can be scored on how much genuine cross-modal <em>synergy</em> it exploits rather than mere redundancy. Faithful, efficient modality Shapley estimation and its extension to the sensor-language models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, where "modalities" include text, remain open problems.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the trained cross-attention/MoE model from Lab 50. (a) Implement <code>modality_shapley</code> above and plot the mean \(\phi_i\) per sensor over the validation set; identify whether any modality dominates. (b) Overlay the attention-weight mass each modality receives and show that the two rankings can disagree, confirming the key-insight callout. (c) Run per-modality dropout-rate sweeps and produce accuracy-vs-drop curves; a near-flat curve for a sensor means the model ignores it. (d) Retrain with modality dropout (Section 50.4) or a gradient-rebalancing scheme until the Shapley profile spreads, and report both the new profile and any change in worst-case single-sensor-removed accuracy.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is a high cross-attention weight on a modality not proof that the modality changed the output, and what quantity would you compute instead?</li>
+<li>A fusion model has strong validation accuracy but its accuracy barely drops when you delete the camera stream. What does this tell you about its robustness, and which two training remedies from earlier sections would you try?</li>
+<li>Why must a modality-contribution audit run on a leakage-safe split, and what goes wrong if it does not?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-50.7.html">Section 50.7</a>, we turn from understanding the fusion model to shipping it. The interpretability profile you just learned to measure becomes a deployment constraint: a model that leans on an expensive lidar can be pruned toward a cheaper sensor set, but only if you know what each modality actually buys you. We weigh latency, memory, power, and per-sensor cost against the accuracy and robustness each modality contributes, and see how the same contribution numbers guide which sensors to keep, downsample, or drop on the edge.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

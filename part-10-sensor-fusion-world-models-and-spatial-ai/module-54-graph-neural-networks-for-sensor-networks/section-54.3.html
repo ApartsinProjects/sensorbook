@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.3: Spatiotemporal GNNs (DCRNN, Graph WaveNet, BigST). Building Sensory AI." name="description"/>
+<title>Section 54.3: Spatiotemporal GNNs (DCRNN, Graph WaveNet, BigST) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Graph Neural Networks for Sensor Networks</a></div>
+<h1>Spatiotemporal GNNs (DCRNN, Graph WaveNet, BigST)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A single loop detector told me its own future. A thousand of them, wired into a graph, told me the traffic jam three exits down before it arrived."</p>
+<cite>A Forecasting AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you can already build the graph. <a class="cross-ref" href="section-54.2.html">Section 54.2</a> gave you spatial, process, and dynamic adjacency matrices; here we make them move in time. You should be comfortable with the two workhorse temporal backbones from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>: the gated recurrent unit and the dilated causal temporal convolution. Familiarity with why sensor clocks and sampling grids must be aligned before any cross-node model, from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, will save you from silently forecasting on misaligned time steps.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Two axes, one model</h3>
+<p>A sensor network forecast is a two-dimensional problem: a value at node \(i\) and time \(t+1\) depends on that node's <em>past</em> (the temporal axis) and on its <em>neighbors'</em> past (the spatial axis). Treat the two separately and you lose the interaction that makes networks worth modeling: a slowdown propagates <em>along the road</em>, a pressure drop travels <em>down the pipe</em>, a phase imbalance spreads <em>across the grid</em>. A <strong>spatiotemporal GNN</strong> couples the axes so that graph message passing and sequence modeling happen in the same forward pass. Three designs anchor the field and this section: <strong>DCRNN</strong> (2018) replaces the dense layers inside a recurrent cell with graph diffusion; <strong>Graph WaveNet</strong> (2019) stacks dilated convolutions over time and <em>learns</em> the graph it convolves over; and <strong>BigST</strong> (2024) rebuilds the whole pipeline at linear cost so it survives road networks with tens of thousands of nodes. Together they map the entire design space you will choose from.</p>
+</div>
+
+<p>Every model here answers three questions in its own way: how to move information across space, how to move it through time, and how to keep both affordable as the network grows. We take the three landmark architectures in order, because each was invented to fix a specific limitation of the one before it.</p>
+
+<h2>DCRNN: diffusion convolution inside a recurrent cell</h2>
+<p><strong>What</strong> the Diffusion Convolutional Recurrent Neural Network (Li et al., 2018) does is deceptively simple: take a standard sequence-to-sequence GRU and replace every matrix multiply inside the gates with a <em>graph diffusion convolution</em>. <strong>Why</strong> diffusion, and not the symmetric spectral convolution you might expect, is the key idea. Traffic and flow are <em>directed</em>: congestion spreads upstream against the flow differently than it clears downstream. DCRNN models signal propagation as a random walk that can travel both ways, so the graph convolution over signal \(X\) with \(K\) diffusion steps is</p>
+
+$$
+H = \sum_{k=0}^{K} \left( P_f^{k}\, X\, W_{f,k} \;+\; P_b^{k}\, X\, W_{b,k} \right),
+\qquad P_f = D_O^{-1} A, \quad P_b = D_I^{-1} A^{\top},
+$$
+
+<p>where \(P_f\) and \(P_b\) are the forward and backward transition matrices (row-normalized by out-degree and in-degree) and \(K\) is the number of hops the signal is allowed to diffuse. <strong>How</strong> the temporal axis is handled: this convolution is dropped into the GRU update, reset, and candidate gates, giving a <em>Diffusion Convolutional GRU</em>. An encoder consumes the observed window, and a decoder emits the multi-step forecast, trained with <em>scheduled sampling</em> so the decoder gradually learns to trust its own predictions rather than the ground truth it saw during teacher forcing. On the METR-LA (Los Angeles loop detectors) and PEMS-BAY (Bay Area) benchmarks this was the design that first made deep spatiotemporal forecasting clearly beat classical methods.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The graph is a prior, and priors can be wrong</h3>
+<p>DCRNN's power and its ceiling both come from one choice: the adjacency matrix is <em>given</em>, computed from road-network distance with a thresholded Gaussian kernel. That is a strong, sensible prior, and it is also a hard constraint. Two detectors on opposite sides of a highway interchange may be one meter apart in graph distance yet causally unrelated, while two far-apart on-ramps may be tightly coupled by a commuter pattern the map never encodes. A fixed geometric graph cannot represent that. This single limitation is the reason the next architecture exists.</p>
+</div>
+
+<h2>Graph WaveNet: learn the graph, convolve the time</h2>
+<p><strong>What</strong> Graph WaveNet (Wu et al., 2019) changes is both axes at once. On the spatial axis it introduces a <strong>self-adaptive adjacency matrix</strong> that is learned end to end, with no map required:</p>
+
+$$
+\tilde{A}_{\text{adp}} = \operatorname{softmax}\!\left( \operatorname{ReLU}\!\left( E_1 E_2^{\top} \right) \right),
+\qquad E_1, E_2 \in \mathbb{R}^{N \times c}.
+$$
+
+<p><strong>Why</strong> this matters: each node gets a learnable source embedding (a row of \(E_1\)) and target embedding (a row of \(E_2\)); their product discovers hidden dependencies directly from the data, the softmax makes each node's influences a normalized distribution, and the low rank \(c \ll N\) keeps it cheap. You can use \(\tilde{A}_{\text{adp}}\) alone (no prior graph at all) or add it to the distance graph, letting the model correct the map. <strong>How</strong> the temporal axis works is the other half of the name: instead of a recurrent cell, Graph WaveNet stacks <em>dilated causal convolutions</em> in the WaveNet style from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. Doubling the dilation each layer grows the receptive field exponentially, so a long horizon is captured in a handful of layers that all run in parallel, sidestepping the sequential bottleneck of an RNN. Each block interleaves a temporal convolution with a graph convolution over the (adaptive plus fixed) adjacency, so space and time are refined in alternation.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A water utility that found a pipe the map forgot</h3>
+<p>A municipal water utility instruments 900 pressure and flow sensors across its distribution network and wants 60-minute-ahead pressure forecasts to pre-empt main breaks. Their hydraulic model gives a pipe-connectivity graph, so they start with DCRNN. It forecasts well on trunk lines but stumbles at two districts that swing together for no reason the pipe map explains. Switching to Graph WaveNet with the adaptive adjacency added to the hydraulic graph, they inspect the learned \(\tilde{A}_{\text{adp}}\) after training and find a strong learned edge between those two districts: a decade-old emergency cross-connection, still valved open, that no drawing recorded. The model needed that edge to forecast; the utility needed to know the valve existed. The learned graph became an audit of the physical asset, a payoff we return to in <a class="cross-ref" href="section-54.7.html">Section 54.7</a> on interpretability.</p>
+</div>
+
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class STBlock(nn.Module):
+    """One Graph-WaveNet-style block: dilated causal conv, then adaptive graph conv."""
+    def __init__(self, ch, n_nodes, emb=10, dilation=1, k=2):
+        super().__init__()
+        self.filt = nn.Conv2d(ch, ch, (1, 2), dilation=(1, dilation))  # gated TCN
+        self.gate = nn.Conv2d(ch, ch, (1, 2), dilation=(1, dilation))
+        self.E1 = nn.Parameter(torch.randn(n_nodes, emb))   # source node embeddings
+        self.E2 = nn.Parameter(torch.randn(n_nodes, emb))   # target node embeddings
+        self.k = k
+        self.mix = nn.Conv2d(ch * (k + 1), ch, (1, 1))      # combine diffusion hops
+
+    def forward(self, x):                                   # x: [B, ch, N, T]
+        h = torch.tanh(self.filt(x)) * torch.sigmoid(self.gate(x))   # temporal axis
+        A = F.softmax(F.relu(self.E1 @ self.E2.t()), dim=1)          # learned graph
+        outs, z = [h], h
+        for _ in range(self.k):                             # diffuse k hops in space
+            z = torch.einsum('bcnt,nm-&gt;bcmt', z, A)
+            outs.append(z)
+        return self.mix(torch.cat(outs, dim=1))             # [B, ch, N, T-dilation]
+</code></pre>
+<div class="code-caption">The heart of a Graph WaveNet block. The gated <code>Conv2d</code> pair advances the temporal axis with a dilated causal kernel; the <code>E1 @ E2.t()</code> product builds the self-adaptive adjacency from scratch (no distance matrix); the <code>einsum</code> diffuses the signal across that learned graph. Stack these with doubling <code>dilation</code> and you have the full receptive field. The block is deliberately spatial-and-temporal in one forward pass, which is the defining property of this model family.</div>
+
+<p>The code above makes the coupling concrete: one block does a temporal convolution and a spatial diffusion back to back, and the adaptive adjacency <code>A</code> is a first-class learned parameter, not an input.</p>
+
+<h2>BigST: linear complexity for very large networks</h2>
+<p><strong>When</strong> both earlier models break is scale. DCRNN's recurrence is inherently sequential, and any model that materializes a dense \(N \times N\) adjacency (including the adaptive one) costs \(O(N^2)\) memory and compute per step. At a few thousand nodes that is fine; at a city-scale road network of 20,000 or more detectors it is fatal, which is exactly the regime <a class="cross-ref" href="section-54.5.html">Section 54.5</a> is devoted to. <strong>What</strong> BigST (Han et al., VLDB 2024) contributes is a spatiotemporal GNN with <em>linear</em> complexity in the number of nodes. <strong>How</strong> it gets there has two moves. First, it decouples the expensive long-sequence feature extraction into a preprocessing stage, so the graph model consumes compact per-node representations rather than raw long histories. Second, it replaces the quadratic all-pairs spatial interaction with a <em>linearized</em> approximation: a random-feature kernel rewrites the softmax attention over nodes so that the \(N \times N\) matrix is never formed, turning \(O(N^2)\) into \(O(N)\). The result forecasts on road networks an order of magnitude larger than the classic benchmarks while keeping accuracy competitive with the quadratic models, on a single GPU.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>The reference benchmarks remain METR-LA and PEMS-BAY, but the frontier has moved to <em>scale</em> and <em>efficiency</em>. BigST (VLDB 2024) and its linear-complexity peers push spatiotemporal GNNs past 20,000 nodes, where earlier quadratic models cannot fit. A parallel current questions whether an explicit graph module is even needed: patch-based and channel-mixing forecasters, and the Transformer variants from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, sometimes match graph models by treating each sensor as a token and letting attention rediscover the adjacency. The live debate is whether a learned graph is a genuine inductive bias worth its cost or a crutch that generic sequence models can absorb, a question sharpened by the arrival of time-series foundation models.</p>
+</div>
+
+<h2>Choosing among the three</h2>
+<p><strong>When</strong> to reach for each is a function of graph trust and network size. Use a <strong>DCRNN</strong>-style diffusion recurrent model when you have a trustworthy directed physical graph (a pipe network, a validated road map) and a few thousand nodes or fewer: the geometric prior is an asset and the recurrence is affordable. Use <strong>Graph WaveNet</strong> when your map is missing, incomplete, or suspect, or when you want the model to <em>discover</em> latent couplings; the adaptive adjacency plus parallel dilated convolutions is the most broadly effective mid-scale default. Reach for <strong>BigST</strong> or another linear-complexity design when \(N\) runs into the tens of thousands and a dense adjacency will not fit in memory. Across all three, the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is non-negotiable: split strictly along time, never shuffle windows across the train and test boundary, and normalize using only training-set statistics, or every reported error is optimistic.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">You do not implement DCRNN from the paper</h3>
+<p>A faithful DCRNN or Graph WaveNet (diffusion or adaptive graph convolution, gated temporal stack, encoder-decoder with scheduled sampling, masked metrics that ignore missing detectors) is 800 to 1,200 lines to reproduce carefully. Libraries such as <code>PyTorch Geometric Temporal</code> and the <code>LibCity</code> / <code>BasicTS</code> benchmarking suites ship <code>DCRNN</code>, <code>GraphWaveNet</code>, and their loaders for METR-LA and PEMS-BAY as importable models with tuned defaults. You define the adjacency and the window, then call <code>fit</code>: roughly a 90% cut in code you own, and, more valuable, the leakage-safe splits and masked MAE are already correct so you are not benchmarking your own bug.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: does the map help?</h3>
+<p>On PEMS-BAY (or any sensor-network dataset with coordinates), train the same temporal backbone three ways: (1) the fixed distance-based graph only, (2) the self-adaptive graph only, and (3) both combined. Report masked MAE at the 15-, 30-, and 60-minute horizons. Then take the learned \(\tilde{A}_{\text{adp}}\) and list the ten strongest edges that have <em>no</em> counterpart in the distance graph. Are they physically plausible (parallel roads, shared on-ramps), and does the horizon at which the adaptive graph helps most tell you something about how far ahead hidden couplings matter?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does DCRNN use a bidirectional random-walk (diffusion) convolution rather than a symmetric spectral one, and what property of traffic or flow motivates it?</p>
+<p>2. What are the two node-embedding matrices \(E_1\) and \(E_2\) in Graph WaveNet, and how do they combine to form an adjacency without any prior map?</p>
+<p>3. Where exactly does the \(O(N^2)\) cost appear in DCRNN and Graph WaveNet, and which one of BigST's two design moves removes it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-54.4.html">Section 54.4</a>, we turn the same message-passing machinery from forecasting to diagnosis. When a fault appears in a sensor network, the pattern of how anomalies propagate along the graph edges is itself the evidence: message passing can localize the failing node, distinguishing a broken sensor from a real physical event rippling through its neighbors.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

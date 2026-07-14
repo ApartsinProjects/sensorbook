@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.4: Gaussian-splatting SLAM (MonoGS, SplaTAM, Photo-SLAM). Building Sensory AI." name="description"/>
+<title>Section 52.4: Gaussian-splatting SLAM (MonoGS, SplaTAM, Photo-SLAM) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: SLAM and Spatial AI</a></div>
+<h1>Gaussian-splatting SLAM (MonoGS, SplaTAM, Photo-SLAM)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I used to store the world as a black-box function you had to query one ray at a time. Now I store it as a million little glowing ellipsoids I can throw at the screen. My latency thanks me."</p><cite>A Recently Rasterized AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Neural SLAM proved a moving camera could carve a dense, photorealistic map out of nothing but images. It just did so at a crawl, because every pixel of every query cost a march of network evaluations along a ray. Gaussian-splatting SLAM keeps the payoff, a map you can re-render from any viewpoint, and throws out the bottleneck: it represents the scene as an explicit cloud of 3D Gaussians and renders them by rasterization instead of ray marching. The result is the first family of dense photometric SLAM systems that track, map, and render at interactive rates on a single GPU, and increasingly on an embedded board bolted to a robot.</p>
+</div>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you know what a 3D Gaussian splat is (mean, anisotropic covariance, opacity, view-dependent color) and how differentiable rasterization composites them; that groundwork is laid in <a class="cross-ref" href="../module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>. It also builds directly on the ray-marched neural SLAM of <a class="cross-ref" href="section-52.3.html">Section 52.3</a>, and leans on camera geometry and RGB-D depth from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>. Pose optimization on the \(SE(3)\) manifold is used here in the same spirit as the smoothing back-ends of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>.</p>
+</div>
+
+<h2>Why the map representation changed</h2>
+<p>Neural SLAM stores the scene implicitly, as weights of a network that answers "what color and density is this point?" one query at a time. That is expressive but slow: rendering a single pixel means sampling dozens of points along a ray and evaluating an MLP at each. Gaussian splatting inverts the primitive. The map becomes an <em>explicit</em> set of anisotropic 3D Gaussians, each with a mean \(\mu_i\), a covariance \(\Sigma_i\) (factored into a scale and a rotation so it stays positive-definite), an opacity \(o_i\), and a color. Rendering projects each Gaussian to a 2D "splat" on the image plane and alpha-composites the sorted splats front to back:</p>
+\[ C(\mathbf{u}) = \sum_{i} c_i\, \alpha_i \prod_{j<i}\left(1 - \alpha_j\right), \qquad \alpha_i = o_i \exp\!\left(-\tfrac{1}{2}(\mathbf{u}-\mu_i')^\top \Sigma_i'^{-1}(\mathbf{u}-\mu_i')\right). \]
+<p>The primed quantities are the 2D projections of the 3D mean and covariance. The projection of the covariance is where the camera enters: with world-to-camera rotation \(W\) and the Jacobian \(J\) of the perspective projection at \(\mu_i\), the splat footprint is \(\Sigma_i' = J\,W\,\Sigma_i\,W^\top J^\top\). Because this whole pipeline is a differentiable rasterizer, gradients flow from a photometric loss back to every Gaussian parameter <em>and</em> back to the camera pose. That single fact is what makes splatting a SLAM engine and not just a viewer: the same loss that sculpts the map also localizes the camera.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Classical SLAM (Section 52.2) tracks by matching sparse features; neural SLAM tracks by ray-marching an implicit field. Gaussian-splatting SLAM tracks by <strong>differentiable rendering</strong>: freeze the map, render the current pose's predicted image, compare it to the real frame pixel by pixel, and slide the pose down the photometric gradient. The map is the measurement model. There is no feature detector, no descriptor, no data-association step to get wrong.</p>
+</div>
+
+<h2>Tracking and mapping as one photometric optimization</h2>
+<p>Every system in this family alternates two optimizations over the same explicit map. <strong>Tracking</strong> estimates the new camera pose \(T \in SE(3)\) by holding the Gaussians fixed and minimizing the residual between the rendered image \(\hat{I}(T)\) and the observed frame \(I\), typically a photometric term plus a depth or silhouette term when RGB-D is available:</p>
+\[ T^\star = \arg\min_{T \in SE(3)} \; \lambda_p \, \lVert \hat{I}(T) - I \rVert_1 \; + \; \lambda_d \, \lVert \hat{D}(T) - D \rVert_1 . \]
+<p>The pose is updated on the Lie algebra \(\mathfrak{se}(3)\) so the estimate stays a valid rigid transform. <strong>Mapping</strong> then flips which variables are frozen: it holds recent keyframe poses (mostly) fixed and optimizes the Gaussians against a window of keyframes, growing new Gaussians where the render is starved of geometry (densification) and deleting near-transparent or oversized ones (pruning). MonoGS derives the pose Jacobians analytically so tracking needs no autograd graph over the renderer, which is a large part of why it hits interactive rates. The heart of the projection, the step that turns a 3D ellipsoid into the 2D footprint you optimize against, is short enough to write out.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def project_covariance(mu_cam, cov3d, fx, fy):
+    """Project a 3D Gaussian covariance into the 2D image plane (EWA splatting).
+    mu_cam: Gaussian mean in the CAMERA frame (x, y, z), z > 0.
+    cov3d:  3x3 world/camera-aligned covariance (already rotated into cam frame).
+    Returns the 2x2 image-space covariance of the splat, in pixels^2."""
+    x, y, z = mu_cam
+    # Jacobian of the perspective projection u = fx*x/z, v = fy*y/z at mu_cam.
+    J = np.array([[fx / z, 0.0,    -fx * x / z**2],
+                  [0.0,     fy / z, -fy * y / z**2]])
+    cov2d = J @ cov3d @ J.T          # 2x2 footprint on the image plane
+    cov2d += np.eye(2) * 0.3         # low-pass dilation, keeps sub-pixel splats visible
+    return cov2d
+
+mu = np.array([0.10, -0.05, 2.0])          # 2 m in front of the camera
+cov3d = np.diag([0.02**2, 0.02**2, 0.05**2])  # a 2 cm x 2 cm x 5 cm ellipsoid
+print(np.round(project_covariance(mu, cov3d, fx=525.0, fy=525.0), 3))
+</code></pre>
+<div class="code-caption">The perspective-projection Jacobian <code>J</code> is exactly the term that couples camera pose to splat shape: differentiating the rendered image through this map is what yields the analytic pose gradient MonoGS tracks with. A distant Gaussian (large <code>z</code>) projects to a tiny footprint, which is why far geometry contributes weak pose constraints, the same depth-precision falloff you met with stereo and RGB-D in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>.</div>
+
+<p>The code above prints the pixel-space footprint of one splat; scale that to a million Gaussians rasterized and sorted per frame and you have the render that both localizes the camera and gets sculpted by the map optimizer. Because the whole thing is a rasterizer, not a ray marcher, the forward and backward passes are tile-parallel on the GPU, and that is the entire speed story.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the rasterizer</h3>
+<p>The differentiable tile rasterizer, the alpha-compositing forward pass and its analytic backward pass, is roughly 2,000 lines of hand-tuned CUDA. The <code>gsplat</code> library (from the Nerfstudio project) exposes it as two calls, <code>gsplat.project_gaussians(...)</code> and <code>gsplat.rasterize_gaussians(...)</code>, turning the excerpt above plus its full backward pass into about 15 lines of Python. You inherit fused CUDA kernels, correct gradients, and multi-GPU support for free; you write only the SLAM logic (keyframing, densification, pose optimization) on top. Build the projection once by hand to understand it, as we just did, then never ship your own kernel.</p>
+</div>
+
+<h2>The three systems: MonoGS, SplaTAM, Photo-SLAM</h2>
+<p>The three canonical 2024 systems stake out different corners of the input-and-speed design space. <strong>MonoGS</strong> (Matsuki et al., CVPR 2024, originally titled "Gaussian Splatting SLAM") is the purest expression of the idea: a <em>monocular</em> system that does direct photometric tracking straight against the Gaussian map with analytic pose Jacobians, adding geometric regularizers (isotropy and depth-order priors) to fight the scale ambiguity a single camera cannot resolve. It also runs with RGB-D or stereo when you have them. <strong>SplaTAM</strong> (Keetha et al., CVPR 2024) commits to RGB-D and leans on a clever trick: it renders a silhouette (an accumulated-opacity mask) alongside color and depth, so tracking only trusts pixels the map is actually confident about, and mapping only densifies where the silhouette says geometry is missing. That silhouette-guided masking makes its dense tracking notably robust. <strong>Photo-SLAM</strong> (Huang et al., CVPR 2024) is the pragmatist: it keeps a classical ORB feature front-end for pose tracking and bundle adjustment, and attaches a Gaussian "hyper-primitive" map purely for photorealistic rendering. That split lets it run monocular, stereo, or RGB-D, and, crucially, hit real time on an embedded Jetson-class board, which the pure-photometric systems struggle to do.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Field note: a warehouse robot that maps as it patrols</h3>
+<p>A logistics startup mounts a single global-shutter RGB camera on an autonomous floor robot that patrols aisles overnight. They want two things from one pass: an accurate trajectory for navigation, and a photorealistic 3D map an operator can later fly through to spot a fallen box or a mislabeled pallet. Classical ORB-SLAM3 gave them the trajectory but only a sparse point cloud no human could read. Swapping in a Photo-SLAM-style pipeline, ORB tracking for the pose, a Gaussian map for appearance, they keep the metric trajectory (stereo baseline fixes the monocular scale) and gain a map the operator scrubs through like a video game level. The Gaussian map streams to a workstation; the robot itself runs the ORB front-end on a Jetson Orin, exactly the embedded-deployment envelope <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> is about. The photometric map is the deliverable; the trajectory is the by-product.</p>
+</div>
+
+<h2>What breaks, and where the frontier is</h2>
+<p>Three failure modes recur. <strong>Scale drift</strong> haunts every monocular variant: a single camera recovers geometry only up to an unknown global scale, so MonoGS needs geometric priors and any metric use needs a depth sensor, a stereo baseline, or the learned depth priors of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-41-monocular-depth-foundation-models/index.html">Chapter 41</a>. <strong>Catastrophic forgetting</strong> is subtler: because mapping optimizes against a sliding window of recent keyframes, Gaussians for a room you left ten minutes ago can be nudged out of shape by gradients that never see that room again, so systems keep anchor keyframes and freeze old Gaussians to preserve them. The deepest gap is <strong>loop closure</strong>. Most early Gaussian-splatting SLAM systems are locally consistent but have no global back-end, so when a long trajectory returns to its start, the accumulated pose error shows up as a ghosted double-wall in the map. Fixing it means deforming a rigid explicit map after a loop is detected, which is harder than re-linking a factor graph.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The 2024 trio, <strong>MonoGS</strong>, <strong>SplaTAM</strong>, and <strong>Photo-SLAM</strong>, established real-time dense photometric SLAM on 3D Gaussians. The live frontier is global consistency: <strong>Gaussian-SLAM</strong> (Yugay et al.) pushed dense RGB-D accuracy, and <strong>LoopSplat</strong> (2024) added loop closure by registering Gaussian submaps directly and rigidly deforming the map on closure, the piece the originals lacked. Parallel work fuses splatting with lidar and inertial data for outdoor, metric-scale mapping, which is precisely the Gaussian-LIC system you meet next in <a class="cross-ref" href="section-52.5.html">Section 52.5</a>. Open problems: reflective and transparent surfaces that violate the opacity model, dynamic scenes (Section 52.6), and shrinking the memory of a million-Gaussian map to fit a phone.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the <code>project_covariance</code> function above, place one Gaussian at depth \(z = 1\ \mathrm{m}\) and an identical one at \(z = 5\ \mathrm{m}\), both with the same 3D covariance. Compare the areas of their 2D footprints (the determinant of <code>cov2d</code> scales with squared footprint area). Then argue, in two or three sentences, why a Gaussian-splatting tracker gets weak pose constraints from distant geometry and strong ones from nearby geometry, and connect that to why these systems drift faster in large open outdoor scenes than in cluttered rooms.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can Gaussian-splatting SLAM track a camera without ever detecting or matching a feature, and what plays the role of the measurement model instead?</li>
+<li>SplaTAM renders a silhouette alongside color and depth. What two distinct jobs does that silhouette do, one in tracking and one in mapping?</li>
+<li>Photo-SLAM keeps a classical ORB front-end rather than tracking purely photometrically. Name one capability that choice buys it that pure-photometric MonoGS lacks.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-52.5.html">Section 52.5</a>, we take the Gaussian map outdoors and metric. Pure-camera splatting SLAM fights scale drift and dark, textureless surfaces; bolting on a lidar for direct range and an IMU for high-rate motion turns the same photorealistic representation into a robust, drift-bounded mapper. We work through Gaussian-LIC and the tight-coupling that lets lidar geometry, inertial preintegration, and photometric splatting sharpen one map together.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

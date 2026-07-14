@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.3: Sensor re-simulation (lidar and camera) from reconstructed scenes. Building Sensory AI." name="description"/>
+<title>Section 51.3: Sensor re-simulation (lidar and camera) from reconstructed scenes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Sensor re-simulation (lidar and camera) from reconstructed scenes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I learned the whole block from a Tuesday drive, then billed it for a lidar sweep it never took."</p><cite>An Enterprising AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Sections 51.1 and 51.2 gave you a reconstruction: a neural field or a cloud of Gaussians that stores what the scene <em>is</em>, its geometry and appearance, independent of any one camera that saw it. That representation is scene-centric on purpose. Re-simulation is the step that turns it back into a <em>measurement</em>: you place a virtual sensor with a chosen pose, intrinsics, and scan pattern, cast its rays into the reconstruction, and read off what that specific instrument would have recorded. A camera reads radiance integrated over a pixel; a lidar reads the range and reflected intensity where its beam first terminates. Both come from the same reconstructed field, queried through two different measurement models. Get the model right and you can synthesize sensor data at poses no real vehicle ever occupied. Get it wrong, in the exposure curve, the ray-drop, the beam divergence, and you have manufactured clean fiction that quietly poisons every model you train on it.</p>
+</div>
+
+<p>This section assumes you can already build a reconstruction (Sections 51.1 and 51.2) and that you know a sensor is not a scene but a projection of it through a physical measurement model, the framing from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. The lidar geometry here rests on the range-and-return picture of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a>, and the point clouds we emit are consumed by the perception models of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>.</p>
+
+<h2>Re-simulation is a measurement model wrapped around a query</h2>
+<p>The <em>what</em>: re-simulation samples the reconstruction along the rays of a target sensor and converts the samples into that sensor's native output. The <em>why</em>: a reconstruction answers "what is at this 3D location and viewing direction," but a sensor never asks that; it asks "what does the world look like from <em>here</em>, through <em>my</em> optics, with <em>my</em> timing and noise." Those are different questions, and the bridge between them is the measurement model. The <em>how</em> factors cleanly into three stages that repeat for every modality. First, <strong>ray generation</strong>: from the sensor's pose and intrinsics, emit one ray per pixel or per laser return, in world coordinates. Second, <strong>scene query</strong>: evaluate the reconstruction along each ray, either by marching a neural density-and-color field (Section 51.1) or by \(\alpha\)-compositing the Gaussians a ray pierces (Section 51.2). Third, <strong>sensor readout</strong>: collapse the per-ray integral into the number the instrument would report, and add that instrument's noise and artifacts. The first and third stages are where camera and lidar diverge; the middle stage is shared, which is exactly why one reconstruction can feed both.</p>
+
+<h2>Camera re-simulation: radiance through a specific lens</h2>
+<p>A camera ray accumulates emitted radiance weighted by how likely the ray is to have reached each point. For a density field with volume density \(\sigma(t)\) and view-dependent color \(\mathbf{c}(t)\) along ray parameter \(t\), the rendered pixel is the familiar volume-rendering integral, with transmittance \(T(t)=\exp\!\big(-\int_0^{t}\sigma(u)\,du\big)\):</p>
+\[ \mathbf{C} = \int_{t_n}^{t_f} T(t)\,\sigma(t)\,\mathbf{c}(t)\,dt, \qquad w(t) = T(t)\,\sigma(t). \]
+<p>The weight \(w(t)\) is a probability density over where the ray terminates, and we will reuse it verbatim for lidar. What makes this a <em>camera</em> and not just a renderer is everything wrapped around the integral. The ray directions come from the real intrinsic matrix, including the actual focal length, principal point, and lens distortion, so a re-simulated frame lands on the same pixel grid your detector expects. The radiance then passes through the camera's photometric chain: exposure and gain, white balance, vignetting, and the tone curve, all of which the reconstruction should have absorbed as per-frame appearance embeddings during training so that a re-simulated view matches the target camera rather than an average of every camera that saw the scene. On a moving platform you must also honor <strong>rolling shutter</strong>: each image row is exposed at a slightly different time, so its rays are cast from a slightly different pose along the trajectory. Ignore that and a re-simulated pole leans the wrong way at speed, and any downstream model learns that lean as a feature.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The reconstruction and the sensor model are separable, and keeping them separate is the whole trick. One reconstruction of a street can be re-simulated as a wide-FOV fisheye, a cropped tele, a 128-beam lidar, or a low-line automotive lidar, just by swapping the ray generator and readout while the scene query stays fixed. This is why re-simulation scales: you pay the reconstruction cost once per scene, then amortize it across every sensor configuration, pose, and noise realization you care to draw. A pipeline that bakes the source camera's optics into the reconstruction throws that leverage away.</p>
+</div>
+
+<h2>Lidar re-simulation: range and intensity from the same field</h2>
+<p>A lidar does not integrate radiance; it times the first strong return. The natural estimator is the expected termination depth under the very weights \(w(t)\) the camera used, plus a returned intensity that stands in for surface reflectance:</p>
+\[ \hat{d} = \int_{t_n}^{t_f} t\,w(t)\,dt, \qquad \hat{I} = \int_{t_n}^{t_f} w(t)\,\rho(t)\,dt, \qquad p_{\text{drop}} = 1 - \int_{t_n}^{t_f} w(t)\,dt. \]
+<p>Three physical facts must be modeled or the point cloud will not fool anything. First, <strong>ray-drop</strong>: real lidar returns nothing on dark, wet, retroreflective, or grazing surfaces, and on the open sky. The accumulated weight below one is a first estimate of drop probability, but the empirical drop pattern is surface- and range-dependent enough that state-of-the-art systems learn a small ray-drop network from real sweeps rather than trusting the geometric estimate alone. Second, <strong>scan geometry</strong>: rays follow the sensor's real azimuth-elevation pattern and firing sequence, not a dense image grid, and because the sensor spins while the platform moves, each return is stamped and cast from its own pose, the lidar analogue of rolling shutter. Third, <strong>beam divergence</strong>: a laser footprint is not a mathematical ray but a widening cone, so a single return near a depth discontinuity blends foreground and background into the dual returns real units report. Skip these and you get suspiciously crisp edges and zero dropout, the tell-tale signature of synthetic lidar, and a source of the domain gap that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> warns will not survive contact with a real fleet.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def lidar_return(t, sigma, rho, drop_thresh=0.5, rng=None):
+    """Re-simulate one lidar beam through a sampled density field.
+    t: sample depths along the ray (m); sigma: density; rho: reflectance."""
+    dt = np.diff(t, prepend=t[0])
+    T  = np.exp(-np.cumsum(sigma * dt))          # transmittance to each sample
+    w  = T * (1.0 - np.exp(-sigma * dt))         # termination weight per sample
+    acc = w.sum()                                # total weight = 1 - p_drop
+    if acc &lt; drop_thresh:                        # too little energy came back
+        return None                              # ray-drop: no point emitted
+    d_hat = (t * w).sum() / acc                  # expected range
+    i_hat = (rho * w).sum() / acc                # returned intensity proxy
+    if rng is not None:                          # add the sensor's range noise
+        d_hat += rng.normal(0.0, 0.02)           # ~2 cm 1-sigma, typical spec
+    return d_hat, i_hat
+
+rng = np.random.default_rng(0)
+t = np.linspace(0.1, 60.0, 600)                  # 0.1..60 m along the beam
+sigma = np.zeros_like(t); sigma[(t &gt; 18) &amp; (t &lt; 18.3)] = 40.0  # a wall at 18 m
+rho   = np.where((t &gt; 18) &amp; (t &lt; 18.3), 0.7, 0.0)
+print(lidar_return(t, sigma, rho, rng=rng))      # ~(18.15 m, 0.7 intensity)
+print(lidar_return(t, np.zeros_like(t), rho))    # None: open sky drops out</code></pre>
+<div class="code-caption"><strong>Listing 51.3.</strong> A minimal lidar readout: march a sampled density field, form the termination weights \(w\), and collapse them to an expected range and intensity, dropping the return when too little energy comes back. The same weights that render a camera pixel produce the lidar point; only the readout differs. Real pipelines replace the fixed <code>drop_thresh</code> with a learned ray-drop network and add beam divergence, but the geometric core is exactly this.</div>
+
+<p>As Listing 51.3 shows, the camera and lidar share the density query and the weights \(w(t)\); the camera integrates color against them while the lidar integrates depth and reflectance and then decides whether a point survives. That shared core is what makes joint lidar-camera reconstruction, the subject of Section 51.4, both possible and efficient.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: re-simulating a lidar the test vehicle never carried</h3>
+<p>An autonomous-driving team has a fleet logged with a 64-beam roof lidar and eight cameras, but the next platform will ship a cheaper 32-beam unit mounted lower on the windshield. Rather than re-drive thousands of kilometers, they reconstruct a few hundred logged scenes as Gaussian splats using the camera and 64-beam data together, then re-simulate the <em>proposed</em> 32-beam sensor: its exact beam elevations, its firing sequence, its lower mounting pose, and a ray-drop network fitted to real 32-beam sweeps from a handful of validation drives. The re-simulated point clouds reveal, before any hardware exists, that the lower mount buries the near-field returns under the hood line and that the sparser beams miss low curbs at range. The team adjusts the mounting height and beam layout in simulation, saving a full prototype cycle. The catch they respect: the reconstruction was built from the 64-beam data, so re-simulated 32-beam sweeps cannot invent detail the source never captured, and they validate against the real 32-beam drives before trusting the numbers, a discipline formalized in Section 51.7.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Written from scratch, a camera re-simulator means implementing ray generation from intrinsics, the differentiable Gaussian rasterizer or ray-marcher, appearance embeddings, and the tiled compositing, comfortably several hundred lines of CUDA-backed code. A modern splatting toolkit such as <code>nerfstudio</code> or <code>gsplat</code> renders a novel camera view from a trained model in a handful of lines:</p>
+<pre class="language-python"><code class="language-python">from gsplat import rasterization
+# means, quats, scales, opacities, colors: a trained Gaussian scene
+img, alpha, _ = rasterization(
+    means, quats, scales, opacities, colors,
+    viewmats=cam_to_world_inv,   # your target camera pose
+    Ks=intrinsics,               # your target camera intrinsics
+    width=1920, height=1080)     # your target sensor resolution</code></pre>
+<div class="code-caption"><strong>Listing 51.4.</strong> One <code>rasterization</code> call renders a re-simulated camera frame at any chosen pose, intrinsics, and resolution, replacing roughly 300 lines of hand-written rasterizer with four. The library owns the differentiable compositing and tiling; it does <em>not</em> own your sensor model. Rolling shutter, the photometric chain, and the lidar ray-drop network are still yours to add on top.</div>
+<p>As Listing 51.4 shows, the toolkit collapses the rendering engine to a call, but the measurement model, the part that makes the output a <em>specific sensor's</em> reading rather than a generic render, remains the engineering that determines whether the synthetic data is trustworthy.</p>
+
+<h2>The realism gap: clean reconstructions make dangerous data</h2>
+<p>The central risk in re-simulation is that a reconstruction is <em>too clean</em>. Trained to reproduce pixels and depths, it happily emits noise-free, artifact-free, perfectly registered sensor data, which no real camera or lidar ever produces. A perception model trained on that fiction learns to expect fiction and degrades on real inputs. The remedy is to re-inject the sensor's own noise budget after the query, not before: photon and read noise and the tone curve for the camera, range jitter and intensity noise and ray-drop for the lidar, plus the ego-motion effects (rolling shutter, motion blur, spin-during-travel) that couple the sensor to the platform. This is the same synthetic-to-real discipline that governs digital twins in <a class="cross-ref" href="../module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>, and it is why any dataset mixing re-simulated with real sensor data must track provenance and enforce the leakage-safe splits of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: a re-simulated view of a scene whose real capture sits in your test set is leakage wearing a costume.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend Listing 51.3 into a full sweep. Generate rays for a spinning lidar with 32 beams over a vertical FOV of \(-25^\circ\) to \(+15^\circ\) and 1800 azimuth steps, cast them through a toy scene of two walls and a floor plane, and emit a point cloud. Now add realism in stages and watch the cloud change: (1) 2 cm range noise, (2) ray-drop that rises with grazing angle on the floor, (3) a per-return timestamp so the sweep is cast along a moving pose at 10 m/s. At each stage, describe one way the earlier, cleaner cloud would have misled a model from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. The camera integral and the lidar range estimator both use the weight \(w(t) = T(t)\sigma(t)\). What does \(w(t)\) represent physically, and why does the same quantity serve two such different sensors?</p>
+<p class="quiz-question">2. Give two distinct reasons a re-simulated lidar sweep might contain no return along a particular beam, and say which one is geometric and which is empirical.</p>
+<p class="quiz-question">3. A colleague bakes the source camera's exposure and lens distortion into the reconstruction itself to "save a step." What capability does this destroy, and how does it show up when they later try to re-simulate a different camera?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-51.4.html">Section 51.4</a>, we stop treating camera and lidar as two readouts bolted onto a shared field and instead reconstruct from both modalities jointly. SplatAD shows how rasterizing Gaussians for images and ray-casting them for lidar in one differentiable model lets each sensor's supervision sharpen the geometry the other depends on, closing the realism gap from both sides at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

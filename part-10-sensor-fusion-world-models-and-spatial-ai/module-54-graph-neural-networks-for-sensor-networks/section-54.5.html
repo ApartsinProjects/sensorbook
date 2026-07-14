@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.5: Scalability to large networks. Building Sensory AI." name="description"/>
+<title>Section 54.5: Scalability to large networks | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Graph Neural Networks for Sensor Networks</a></div>
+<h1>Scalability to large networks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My forward pass wanted the whole city in memory at once. The city, it turned out, did not fit. So I learned to look at neighborhoods."</p>
+<cite>A Right-Sized AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the message-passing update of <a class="cross-ref" href="section-54.1.html">Section 54.1</a>, the adjacency-matrix constructions of <a class="cross-ref" href="section-54.2.html">Section 54.2</a>, and the spatiotemporal models (DCRNN, Graph WaveNet, BigST) of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>. It also leans on the mini-batch and memory-budget instincts you built for deep sensor models in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and on the edge-deployment constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. Comfort with reading a per-layer FLOP and memory count, and with the notion of a weighted adjacency \(A \in \mathbb{R}^{N \times N}\), is assumed.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a graph that fits in your head does not fit in your GPU</h3>
+<p>A textbook GNN example has a few hundred nodes and trains on the full graph in one shot. A real sensor network does not: a metropolitan traffic grid has tens of thousands of loop detectors, a national power system carries hundreds of thousands of PMU and telemetry channels, a water utility instruments every junction across a county. The naive recipe (load the entire adjacency, run every layer over every node, backpropagate through all of it) has cost that grows with the number of nodes and, worse, with the receptive field: a \(k\)-layer network pulls in the \(k\)-hop neighborhood of every node it touches, and in a well-connected graph that neighborhood explodes toward the whole network within three or four hops. This section is about the three moves that break that scaling wall: <strong>sample the neighborhood</strong> so each node sees a bounded number of neighbors, <strong>partition the graph</strong> so each batch is a self-contained subgraph, and <strong>cache stale embeddings</strong> so you never recompute the parts that barely moved. Master these and a model that choked on a thousand nodes trains happily on a million.</p>
+</div>
+
+<h2>The scaling wall: neighborhood explosion, not node count</h2>
+<p><strong>What</strong> makes large-graph training hard is not simply that there are many nodes. It is that message passing couples them. In a full-graph forward pass, layer \(\ell\) computes, for every node \(i\),</p>
+$$h_i^{(\ell)} = \phi\!\left(h_i^{(\ell-1)}, \; \bigoplus_{j \in \mathcal{N}(i)} \psi\!\left(h_j^{(\ell-1)}\right)\right),$$
+<p>so to get one node's output at the final layer you need its neighbors' representations at the previous layer, which need <em>their</em> neighbors, and so on. <strong>Why</strong> this is fatal: with a \(k\)-layer network and average degree \(\bar{d}\), computing the loss for a single node touches on the order of \(\bar{d}^{\,k}\) nodes. On a traffic graph with \(\bar{d} \approx 6\) and \(k = 4\) that is already more than a thousand nodes per target, and the receptive fields of nearby targets overlap so heavily that the honest ceiling is the full graph. The activations you must hold for backpropagation therefore scale with \(N \cdot F\) (nodes times feature width) per layer, and for \(N\) in the hundreds of thousands that alone overruns a commodity GPU. <strong>When</strong> the wall bites: any network past a few thousand nodes, or any spatiotemporal graph where each node also carries a long time series, since the temporal dimension multiplies the per-node cost (see <a class="cross-ref" href="section-54.3.html">Section 54.3</a>).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The receptive field is the resource, not the node count</h3>
+<p>Every scalability method in this section is, underneath, a way to bound the receptive field. Full-graph training lets the field grow to the whole network; that is the entire problem. Neighbor sampling caps the field's <em>branching</em>, subgraph methods cap its <em>extent</em>, and historical-embedding methods cap its <em>freshness cost</em>. When you evaluate a new large-scale GNN, ignore the marketing and ask one question: how does it stop the \(k\)-hop neighborhood from swallowing the graph? Whatever the answer, that is the actual contribution.</p>
+</div>
+
+<h2>Neighbor sampling: bound the branching (GraphSAGE)</h2>
+<p><strong>What</strong> GraphSAGE does is refuse to look at all of a node's neighbors. At each layer it samples a fixed number \(S_\ell\) of neighbors per node, so a \(k\)-layer forward pass over a mini-batch of target nodes expands into a bounded tree of size \(\prod_{\ell} S_\ell\) per target rather than \(\bar{d}^{\,k}\). <strong>Why</strong> this is sound: the neighborhood aggregation \(\bigoplus\) is an expectation over neighbors (a mean, or a normalized sum), and a random sample is an unbiased-in-expectation estimate of that aggregate, so the model still learns the right function while paying a controlled, constant per-node cost. Choose \(S_1 = 25, S_2 = 10\) and each target's compute tree has at most 250 leaves regardless of whether the graph has ten thousand nodes or ten million. <strong>How</strong> you deploy it: build mini-batches of target nodes, sample their sampled subtrees on the fly, and train with ordinary stochastic gradient descent, exactly as you would batch time-series windows in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. <strong>When</strong> to prefer it: graphs where degree is high and skewed (a few hub sensors wired to hundreds of others), because a fixed sample size tames the hubs that would otherwise dominate both memory and the aggregate.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A water utility that could not load its own network</h3>
+<p>A regional water authority instrumented 90,000 junctions with pressure and flow sensors and wanted a GNN to forecast pressure and flag anomalies (the leak-localization task of <a class="cross-ref" href="section-54.4.html">Section 54.4</a>). Their first attempt loaded the full hydraulic graph and died on out-of-memory before the first epoch finished: the pipe network is sparse but has long chains, so a 5-layer model reached most of the county from any starting junction. Switching to neighbor sampling with \(S = (20, 15, 10)\) capped each target's compute at 3,000 leaf nodes, cut peak GPU memory from an impossible 40 GB estimate to 4 GB, and let the model train on a single card overnight. The forecast skill barely changed versus a small-graph pilot, because a junction's near-term pressure genuinely depends on its local neighborhood, not on a reservoir forty kilometers away. The lesson generalizes: sampling costs little accuracy precisely when the physics is local, which for pipes, roads, and power feeders it usually is.</p>
+</div>
+
+<h2>Subgraph training: bound the extent (Cluster-GCN and GraphSAINT)</h2>
+<p><strong>What</strong> these methods do is cut the graph into pieces and train on one piece at a time. <strong>Cluster-GCN</strong> runs a graph-partitioning step (typically METIS) to group densely-connected nodes into clusters, then treats each cluster (or a small union of clusters) as a self-contained mini-batch: message passing happens only within the subgraph, so there is no neighbor explosion because there are simply no edges leaving the batch during that step. <strong>GraphSAINT</strong> instead samples a subgraph by a random walk or node/edge sampler and corrects the resulting bias with normalization coefficients on nodes and edges, so the expected gradient matches the full-graph gradient. <strong>Why</strong> subgraph methods win over neighbor sampling on some workloads: neighbor sampling still recomputes overlapping subtrees for nearby targets and can suffer high variance when samples are small, whereas a subgraph batch amortizes one clean forward pass across all its nodes at once. <strong>How</strong> the tradeoff reads: partitioning removes the edges that cross cluster boundaries, so you lose some long-range coupling per step; you recover it by re-partitioning across epochs or by unioning several clusters per batch so boundaries land in different places each time. <strong>When</strong> to reach for it: very large, relatively homogeneous sensor graphs (a national metering grid) where clusters correspond to real regions (a substation's downstream feeders, a district metering area), so the partition respects physics instead of fighting it.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Sampling loaders you do not have to write</h3>
+<p>Implementing a correct multi-hop neighbor sampler by hand (deduplicating the sampled frontier, remapping node ids per layer, building the bipartite message-passing blocks, moving only the touched features to the GPU) is roughly 150 to 250 lines of fiddly, bug-prone code, and getting the id remapping wrong silently corrupts training. PyTorch Geometric's <code>NeighborLoader</code> and <code>ClusterLoader</code>, and DGL's <code>NeighborSampler</code>, reduce all of it to about five lines: you pass the graph, a list of per-layer fan-outs, and a batch of seed nodes, and the loader yields ready-to-run subgraphs. The library owns the partitioning (METIS), the frontier bookkeeping, and the feature gather; you own only the model and the training loop. Use the library loader as your default and hand-roll a sampler only when you need a sampling scheme the library does not ship.</p>
+</div>
+
+<p>The snippet below trains a 2-layer GraphSAGE model on a large sensor graph using PyTorch Geometric's neighbor-sampling loader, showing how few lines separate a toy full-graph script from one that scales.</p>
+
+<pre><code class="language-python">import torch
+from torch_geometric.nn import SAGEConv
+from torch_geometric.loader import NeighborLoader
+
+class SensorSAGE(torch.nn.Module):
+    def __init__(self, in_dim, hid, out_dim):
+        super().__init__()
+        self.conv1 = SAGEConv(in_dim, hid)
+        self.conv2 = SAGEConv(hid, out_dim)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index).relu()
+        return self.conv2(x, edge_index)
+
+# `data` is a large PyG graph: data.x = [N, F] sensor features, data.y targets.
+# fan-out (25, 10): sample 25 neighbors at layer 1, 10 at layer 2 per seed node.
+loader = NeighborLoader(data, num_neighbors=[25, 10],
+                        batch_size=1024, shuffle=True,
+                        input_nodes=data.train_mask)
+
+model = SensorSAGE(data.num_features, 128, data.num_classes)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for batch in loader:                       # each batch is a bounded subgraph
+    opt.zero_grad()
+    out = model(batch.x, batch.edge_index)
+    # loss only on the seed nodes of this batch (first batch.batch_size rows)
+    seed = slice(0, batch.batch_size)
+    loss = torch.nn.functional.cross_entropy(out[seed], batch.y[seed])
+    loss.backward()
+    opt.step()
+</code></pre>
+<div class="code-caption">Neighbor-sampled training of a GraphSAGE sensor model. The <code>num_neighbors=[25, 10]</code> fan-out caps each seed node's compute tree at 250 leaves, so peak memory depends on the batch and fan-out, never on the full node count \(N\). Loss is computed only on the batch's seed nodes to avoid double-counting sampled neighbors.</div>
+
+<h2>Historical embeddings and linear-time attention: bound the freshness cost</h2>
+<p><strong>What</strong> historical-embedding methods (GNNAutoScale and its relatives) exploit is that a node's representation changes slowly between gradient steps. Instead of recomputing every out-of-batch neighbor's embedding, they store the last computed embedding for each node in a cache (often in CPU memory or on disk) and reuse it as a stale-but-serviceable stand-in during message passing. <strong>Why</strong> this recovers full-graph accuracy that plain sampling can lose: the target node still aggregates over its <em>entire</em> real neighborhood, not a random subset, so there is no sampling variance; the only error is the small staleness of cached neighbors, which the theory bounds and which shrinks as training converges. <strong>How</strong> the bookkeeping works: after each forward pass you write the freshly computed embeddings back into the cache, so the pool of stale values is continuously refreshed. <strong>When</strong> it is the right tool: when accuracy matters more than the last increment of speed, and you have cheap host memory to hold one embedding vector per node.</p>
+
+<p>A complementary lever attacks the other axis, the temporal one. The BigST model you met in <a class="cross-ref" href="section-54.3.html">Section 54.3</a> replaces the quadratic spatial attention of a vanilla spatiotemporal transformer with a <em>linearized</em> attention whose cost grows linearly in the number of nodes, so a single model can forecast over more than ten thousand sensors without the \(O(N^2)\) attention matrix that makes full attention (the mechanism of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) impossible at that scale. The general principle: wherever an operation costs \(O(N^2)\) in the sensor count (dense attention, full pairwise distances, a dense adjacency matmul), find the linear-time surrogate before you find a bigger GPU.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where large-scale sensor GNNs stand now</h3>
+<p>The current frontier pairs subgraph or historical-embedding training with linear-time spatiotemporal backbones. BigST (2024) demonstrated long-range spatiotemporal forecasting on graphs beyond ten thousand nodes with linear complexity, and the OGB Large-Scale Challenge established that Cluster-GCN, GraphSAINT, and GNNAutoScale train competitively on graphs of a hundred million-plus edges. Open problems for sensor networks specifically: sampling schemes that respect <em>directed</em> flow (water and power move one way through a pipe or feeder, so a symmetric neighbor sample can mix upstream and downstream causes), partitions that stay valid when the graph is dynamic (sensors added, links reconfigured), and staleness bounds that hold under distribution shift (Chapter 66). Expect the next advances to come from co-designing the sampler with the physics of flow, not from generic graph tricks.</p>
+</div>
+
+<h2>Inference and deployment at scale</h2>
+<p>Training is only half the budget; a deployed sensor-network model must also <em>serve</em>. Two facts help. First, inference has no backward pass, so activation memory drops sharply and you can afford larger neighborhoods or even a full-graph pass in chunks. Second, at inference you frequently need to update only the nodes whose inputs just changed: a streaming sensor network delivers new readings continuously (the streaming setting of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>), and message passing lets you recompute the affected \(k\)-hop region rather than the whole graph. When even that is too much for an edge gateway, the compression toolkit of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> applies unchanged: quantize the weights, prune the least-used edges, and distill the large GNN into a smaller student. And throughout, keep the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: when you partition a graph for training, make sure your train and test node splits do not leak across cluster boundaries, or an over-optimistic score will follow.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: budget the receptive field</h3>
+<p>You have a sensor graph of \(N = 200{,}000\) nodes, average degree \(\bar{d} = 8\), feature width \(F = 64\), and you want a \(k = 4\)-layer GNN. (a) Estimate the number of nodes touched to compute the loss for one target under full-graph training, and argue why it approaches \(N\). (b) With neighbor sampling at fan-out \((15, 10, 5, 5)\), compute the worst-case leaf count per target and the resulting per-target activation memory in floats. (c) You switch to Cluster-GCN with 500 clusters of roughly equal size. Estimate the nodes per batch and name one long-range coupling this partition might sever. (d) State one sensor-network scenario where the severed coupling would actually hurt forecast accuracy, and one where it would not.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does node count alone understate the cost of full-graph GNN training, and what quantity actually governs the cost?</li>
+<li>Neighbor sampling and Cluster-GCN both bound the receptive field. In one sentence each, say what neighbor sampling caps and what Cluster-GCN caps.</li>
+<li>Historical-embedding methods keep the full neighborhood yet avoid recomputing it. What is the single source of error they introduce, and why does it shrink over training?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-54.6.html">Section 54.6</a>, we take these scalable models to the field, walking through how graph neural networks are actually deployed on traffic, energy, water, and industrial grids: what the graph looks like in each domain, which scaling method each network's size and topology demands, and the operational realities (missing sensors, reconfigured topology, regulatory constraints) that separate a benchmark score from a system a utility will trust.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

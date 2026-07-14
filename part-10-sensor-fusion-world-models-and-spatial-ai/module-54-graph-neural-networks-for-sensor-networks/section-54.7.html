@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.7: Interpretability. Building Sensory AI." name="description"/>
+<title>Section 54.7: Interpretability | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Graph Neural Networks for Sensor Networks</a></div>
+<h1>Interpretability</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"An accurate forecast a control-room operator will not act on is a research demo. Show me which three sensors and which two hours drove the alarm, and now it is a tool."</p>
+<cite>An Accountable AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the message-passing skeleton and the meaning of an edge from <a class="cross-ref" href="section-54.1.html">Section 54.1</a>, the spatiotemporal architectures (DCRNN, Graph WaveNet) of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>, and the fault-localization framing of <a class="cross-ref" href="section-54.4.html">Section 54.4</a>. It leans on the general interpretability vocabulary (saliency, attribution, faithfulness) developed for time series in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, and on the leakage-safe evaluation habits of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Gradients through a network come from the Deep Learning Refresher in Appendix B.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A graph neural network on a sensor network makes predictions by mixing signals across a specific set of relationships. That is its strength and, for a human, its problem: the answer is a function of hundreds of nodes, thousands of edges, and a rolling window of time, blended through several layers of nonlinear aggregation. When such a model raises an alarm on a power grid or forecasts congestion on a highway, an operator cannot act on a scalar. They need to know <em>which</em> sensors, <em>which</em> couplings, and <em>which</em> moments the model used, and whether those match physical reality. Interpretability for sensor GNNs is the discipline of turning an opaque prediction into a small, faithful, testable story told in the model's own native vocabulary: a subgraph of nodes and edges, a mask over features, a slice of the time window. Unlike a heatmap over an image, a GNN explanation lands on objects an engineer already understands, a transmission line, a pipe, a road segment, which is what makes it actionable, and what makes it dangerous when it is wrong.</p>
+</div>
+
+<h2>What there is to explain, and why it is different here</h2>
+<p>An image classifier explains itself with a saliency map over pixels; a sequence model highlights time steps. A sensor GNN has <em>three</em> attribution surfaces at once, and a useful explanation names all three. First, <strong>node importance</strong>: which sensors' current features drove this output. Second, <strong>edge importance</strong>: which relationships carried the decisive messages, since the model's whole premise is that information flows along edges. Third, <strong>temporal and feature importance</strong>: for the spatiotemporal models of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>, which time steps and which input channels mattered. The <em>why</em> this matters is not abstract. In a regulated setting (grid operations, water safety, clinical monitoring) an unexplained automated decision is often not permitted; <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a> takes up the legal side. Even without a regulator, an explanation is how you <em>debug the graph</em>: if the model attributes a burst-detection to an edge that does not correspond to a real pipe, you have caught either a bad topology or a spurious correlation before it fails in production.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: the explanation is a subgraph, so it is checkable against physics</h3>
+<p>Because a GNN reasons over nodes and edges that map to real objects, its explanation can be validated against a ground truth an image explanation never has: the physics of the system. If the model says a fault at bus 14 was diagnosed through the transmission lines to buses 9 and 11, an engineer can check whether those lines actually carry the fault current. This is the rare case where an explanation is <em>falsifiable</em>. A congestion forecast whose explanatory subgraph runs backward against one-way flow, or a leak alarm that ignores the trunk main and fixates on an isolated lateral, is telling you the model learned a coincidence, not the mechanism. The explanation's agreement with known conservation and connectivity is itself an evaluation metric, and one you should compute on held-out events under the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<h2>Three families of method</h2>
+<p>The <em>how</em> splits into three approaches with different costs and different failure modes. <strong>Attention weights</strong> are the cheapest: a graph attention network (GAT) already computes a learned coefficient \(\alpha_{ij}\) for each edge, and reading them off looks like an explanation for free. It sometimes is, but attention is a soft routing weight, not a guaranteed attribution; the same output can often be produced by very different attention patterns, so treat attention as a hypothesis to be verified, never as a certificate. <strong>Gradient and perturbation attribution</strong> ports the tools of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a> to the graph: integrated gradients over node features, or occlusion, where you zero a node or cut an edge and measure how much the prediction moves. <strong>Learned explanation masks</strong> are the GNN-specific frontier. GNNExplainer optimizes a continuous mask \(\mathbf{M} \in [0,1]^{|E|}\) over edges (and optionally over features) to find the smallest subgraph that preserves the model's prediction, by maximizing the mutual information between the masked-graph output and the original,</p>
+\[ \max_{\mathbf{M}}\; \mathrm{MI}\big(Y,\, (\mathbf{X}, \mathbf{A}\odot\sigma(\mathbf{M}))\big) \;-\; \lambda\,\lVert \mathbf{M} \rVert_1, \]
+<p>where the \(\ell_1\) penalty forces sparsity so the answer is a handful of edges a human can read, not a diffuse cloud. PGExplainer trains a small network to <em>predict</em> such masks, so once trained it explains new instances in a single forward pass instead of a per-instance optimization, which is what you need to explain a live fleet.</p>
+
+<pre class="language-python"><code class="language-python">import torch
+from torch_geometric.explain import Explainer, GNNExplainer
+
+# `model` is a trained GNN; `data` holds x, edge_index for one sensor-network snapshot.
+explainer = Explainer(
+    model=model,
+    algorithm=GNNExplainer(epochs=200, lr=0.01),
+    explanation_type="model",              # explain what the model does, not the label
+    node_mask_type="attributes",           # which input features matter
+    edge_mask_type="object",               # which edges (relationships) matter
+    model_config=dict(mode="regression", task_level="node", return_type="raw"),
+)
+
+expl = explainer(data.x, data.edge_index, index=14)   # explain the alarm at node 14
+edge_score = expl.edge_mask                            # one importance in [0,1] per edge
+top = edge_score.topk(3).indices                       # the 3 decisive relationships
+print("decisive edges:", data.edge_index[:, top].t().tolist())
+print("feature importance:", expl.node_mask[14].round(decimals=2).tolist())
+</code></pre>
+<div class="code-caption"><strong>Listing 54.7.</strong> Extracting a faithful explanation for a single node-level prediction with PyTorch Geometric's <code>Explainer</code> wrapper around GNNExplainer. The returned <code>edge_mask</code> ranks every relationship by how much removing it would change the prediction at node 14; the top few edges are the subgraph you hand to an operator, and <code>node_mask</code> tells you which input channels on that node carried the signal.</div>
+<p>Listing 54.7 makes the abstract mask concrete: the output is not a scalar confidence but the three edges and the feature channels the model actually used, expressed as objects an engineer can trace on a schematic.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: torch_geometric.explain unifies the whole family</h3>
+<p>Implementing GNNExplainer from scratch (the masked forward pass, the mutual-information objective, the entropy and sparsity regularizers, the per-instance optimization loop) is roughly 200 to 300 lines, and a faithful gradient attribution through sparse message passing is another 100. The <code>torch_geometric.explain</code> package collapses all of it to the dozen lines of Listing 54.7, and swapping <code>GNNExplainer</code> for <code>PGExplainer</code>, <code>AttentionExplainer</code>, or an integrated-gradients attribution is a one-word change to the <code>algorithm</code> argument. The same <code>Explainer</code> object also ships faithfulness metrics (fidelity and characterization score) through <code>torch_geometric.explain.metric</code>, so you evaluate an explanation with one more call rather than reimplementing the protocol.</p>
+</div>
+
+<h2>Is the explanation faithful? Measuring, not trusting</h2>
+<p>An explanation that looks plausible can still be unfaithful, describing what a human expects rather than what the model computed. So you <em>measure</em> faithfulness with a perturbation protocol. <strong>Fidelity-minus</strong> asks how much the prediction degrades when you keep only the explanatory subgraph and drop the rest; a faithful explanation loses little. <strong>Fidelity-plus</strong> asks how much it degrades when you remove exactly the explanatory subgraph and keep everything else; a faithful, decisive explanation loses a lot. <strong>Sparsity</strong> counts the edges retained, because an "explanation" that keeps half the graph explains nothing. A good method pushes fidelity-plus high and the retained set small at once. Two cautions carry over from the rest of the book. First, attention magnitude is not attribution: a heavily attended edge that, when cut, barely moves the output was not actually decisive, and only the perturbation test reveals that. Second, evaluate explanations on held-out events, never on the events the mask was fit to, or you measure memorization, exactly the leakage failure mode of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an explained alarm in a transmission-grid control room</h3>
+<p>A transmission operator runs a spatiotemporal GNN over 2,000 phasor measurement units to flag developing instability. The first deployment failed a human trial: the model was accurate, but dispatchers would not trust a red light with no reason, and a false alarm costs a needless load-shed. The team added GNNExplainer-style edge masks to every alert. Now a flagged oscillation arrives as a three-line story: nodes 812, 47, and 903, coupled through two specific 500 kV lines, over the last 90 seconds. A dispatcher recognizes that corridor instantly and confirms or dismisses in seconds. The explanation also caught a bug the accuracy metric had hidden: on a subset of alarms the decisive edge was a retired line still present in the stale topology file, so the model was routing through a relationship that no longer existed physically. Fixing the graph removed a class of false alarms that no aggregate error number had localized. This is the fault-attribution goal of <a class="cross-ref" href="section-54.4.html">Section 54.4</a> made auditable, and it connects directly to the condition-monitoring practice of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Reading the learned graph itself</h2>
+<p>A distinct opportunity, unique to the adaptive models of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>, is that some GNNs <em>learn</em> their adjacency. Graph WaveNet's self-adaptive adjacency matrix is, after training, a dense map of which sensors the model decided are coupled, learned from data rather than handed a topology. Inspecting it is a form of global interpretability: strong learned edges that match the known physical network are reassuring, and strong edges that do <em>not</em> are hypotheses about hidden couplings (a shared upstream disturbance, an unmodeled electrical path) worth investigating. The same caution from structure learning applies: a learned edge that improves prediction need not be a causal wire, since many adjacencies explain the same data equally well. Read the learned graph as a source of testable hypotheses, then confirm the important ones with an intervention or a perturbation test, not as a discovered ground truth.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: from correlational subgraphs to causal, self-explaining GNNs</h3>
+<p>The current frontier attacks the gap that GNNExplainer and PGExplainer leave open: their subgraphs are correlational, so they can latch onto a spurious edge that predicts well in-distribution and fails under shift, the concern of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Three directions lead. <strong>Causal explanation</strong> methods (CF-GNNExplainer and counterfactual masks) ask for the smallest edge change that <em>flips</em> the prediction, which is closer to an actionable intervention than a preserving subgraph. <strong>Self-explaining architectures</strong> (prototype and information-bottleneck GNNs such as ProtGNN and GSAT) build the sparse explanatory subgraph into the forward pass, so the model cannot use edges it did not surface. <strong>Standardized faithfulness evaluation</strong> (the GraphXAI benchmark of Agarwal and colleagues) supplies graphs with ground-truth explanations so competing methods can be scored rather than eyeballed. For safety-critical sensor networks the target is an explanation that is faithful, causal, and stable under the distribution shift a deployed fleet actually sees, a bar no method fully clears in 2026.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Train a two-layer graph-convolution model on the METR-LA traffic network for one-step speed prediction. (1) For ten congestion events, run GNNExplainer to extract the top-5 edge mask per event, and compute fidelity-plus (drop those edges, measure the prediction change) and fidelity-minus (keep only those edges). Report both against a random-edge baseline of the same size. (2) Overlay the explanatory edges on the road map: what fraction follow a real road segment versus a purely statistical correlation edge? (3) Repeat the fidelity computation on events the mask was <em>not</em> fit on and explain any gap in terms of the leakage principle of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Name the three attribution surfaces a sensor GNN exposes, and give a one-line example of a question each one answers. 2. Why is attention weight not a reliable explanation, and what perturbation test would you run to check whether a highly attended edge was actually decisive? 3. Define fidelity-plus and fidelity-minus, and explain why a good explanation should have high fidelity-plus <em>and</em> low retained-edge count at the same time.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 54</h3>
+<p>build a spatiotemporal GNN for sensor-network forecasting or anomaly localization (METR-LA/PEMS-BAY).</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>, the falsifiable explanations of this section meet their natural ally: physics. Digital twins and physics-informed models give the sensor network a simulated ground truth to check learned couplings against, and constrain the model so its explanations respect conservation laws by construction rather than by luck.</p>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">GNN explanation methods</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1903.03894">Ying, Bourgeois, You, Zitnik &amp; Leskovec (2019). GNNExplainer: Generating Explanations for Graph Neural Networks. NeurIPS.</a></p>
+<p class="bib-annotation">The founding method: optimize a sparse edge-and-feature mask that maximizes mutual information with the prediction. The subgraph objective and the PyG wrapper of Listing 54.7 come from here.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2011.04573">Luo, Cheng, Xu, Yu, Zhang, Chen, Yang &amp; Zhang (2020). Parameterized Explainer for Graph Neural Network (PGExplainer). NeurIPS.</a></p>
+<p class="bib-annotation">Trains a network to predict edge masks, giving amortized, single-pass explanations across instances, the version you need to explain a live sensor fleet rather than one snapshot.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2010.05788">Vu &amp; Thai (2020). PGM-Explainer: Probabilistic Graphical Model Explanations for Graph Neural Networks. NeurIPS.</a></p>
+<p class="bib-annotation">Explains a GNN with an interpretable probabilistic graphical model over the important nodes, capturing dependencies a flat importance score misses.</p>
+</div>
+
+<p class="bib-category">Attention, attribution, and their limits</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1710.10903">Velickovic, Cucurull, Casanova, Romero, Lio &amp; Bengio (2018). Graph Attention Networks. ICLR.</a></p>
+<p class="bib-annotation">Introduces learned per-edge attention coefficients, the cheapest and most tempting "free" explanation for a sensor GNN, and the one this section warns must be verified.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1902.10186">Jain &amp; Wallace (2019). Attention is not Explanation. NAACL.</a></p>
+<p class="bib-annotation">Shows that very different attention distributions yield the same prediction, so attention weight is not a faithful attribution. The direct justification for the perturbation-test caution here.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1703.01365">Sundararajan, Taly &amp; Yan (2017). Axiomatic Attribution for Deep Networks (Integrated Gradients). ICML.</a></p>
+<p class="bib-annotation">The gradient-attribution method ported to node features here; its completeness axiom is why integrated gradients is preferred over raw saliency for feature importance.</p>
+</div>
+
+<p class="bib-category">Surveys, benchmarks, and spatiotemporal models</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2012.15445">Yuan, Yu, Gui &amp; Ji (2022). Explainability in Graph Neural Networks: A Taxonomic Survey. IEEE TPAMI.</a></p>
+<p class="bib-annotation">Organizes the whole field into instance-level and model-level methods and defines the fidelity and sparsity metrics used in this section's faithfulness protocol.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.nature.com/articles/s41597-023-01974-x">Agarwal, Queen, Lakkaraju &amp; Zitnik (2023). Evaluating Explainability for Graph Neural Networks (GraphXAI). Scientific Data.</a></p>
+<p class="bib-annotation">Provides graphs with ground-truth explanations and a scoring harness, moving explanation evaluation from eyeballing to measurement; the benchmark named in the research-frontier callout.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1906.00121">Wu, Pan, Long, Jiang &amp; Zhang (2019). Graph WaveNet for Deep Spatial-Temporal Graph Modeling. IJCAI.</a></p>
+<p class="bib-annotation">Its self-adaptive adjacency matrix is the learned graph this section reads as a global interpretability artifact, and the source of hidden-coupling hypotheses.</p>
+</div>
+</section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

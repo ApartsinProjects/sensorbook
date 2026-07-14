@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 55.3: Domain randomization and sim-to-real. Building Sensory AI." name="description"/>
+<title>Section 55.3: Domain randomization and sim-to-real | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 55: Digital Twins, Synthetic Data, and Physics-Informed ML</a></div>
+<h1>Domain randomization and sim-to-real</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I trained on a simulator so clean it never lied to me. Then a real accelerometer handed me its warm, drifting, mislabeled truth, and I had no idea what to do with it."</p>
+<cite>A Sheltered AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you have a simulator that can emit labeled synthetic sensor streams, which is exactly what <a class="cross-ref" href="section-55.2.html">Section 55.2</a> built. It leans on the measurement-model view of a sensor as signal plus bias plus noise plus nonlinearity from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, because randomization is just deliberately jittering the parameters of that model. It also connects to distribution shift and test-time adaptation from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>: sim-to-real is a distribution shift you get to design in advance rather than discover in production.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Synthetic data is worthless if a model trained on it collapses the moment a real sensor is plugged in. That collapse has a name, the <strong>reality gap</strong>, and it is the central obstacle of every simulation program. A simulator is a specific, biased point in the space of possible worlds: one noise floor, one calibration, one mounting angle, one set of surface reflectivities. A model that fits that point learns the simulator, not the phenomenon. <strong>Domain randomization</strong> (DR) is the dominant fix. Instead of trying to build one perfectly realistic simulator, you build a <em>distribution</em> of imperfect ones and randomize their parameters every episode, so the real world becomes just another draw the model has already seen. This section explains what to randomize, how much, when to randomize versus when to instead measure and match, and how to tell whether the gap actually closed.</p>
+</div>
+
+<h2>The reality gap: why a clean simulator betrays you</h2>
+<p><strong>What</strong> goes wrong is a train-test mismatch between the synthetic distribution \(p_{\text{sim}}(x, y)\) your model was fit on and the real distribution \(p_{\text{real}}(x, y)\) it must serve. <strong>Why</strong> it is so damaging for sensors specifically: a good simulator nails the physics of the <em>scene</em> yet gets the <em>transducer</em> subtly wrong, and models are exquisitely sensitive to transducer quirks. Real inertial measurement units have turn-on bias that changes every power cycle, temperature-dependent scale factor, and axis-misalignment of a fraction of a degree. Real lidar returns drop out on wet asphalt and bloom on retroreflectors. Real radar drowns in multipath and clutter that no default clutter model reproduces. A network trained on a simulator that omits these effects learns to depend on a cleanliness that will never arrive. The failure is rarely graceful degradation; it is confident, silent wrongness, which is why we insist on the calibration discipline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> before trusting any sim-trained model.</p>
+
+<p>Formally, if \(f_\theta\) minimizes risk under \(p_{\text{sim}}\), its real-world risk carries an extra penalty that grows with the divergence between the two distributions. You can shrink that penalty two ways: move \(p_{\text{sim}}\) toward \(p_{\text{real}}\) (make the simulator more accurate), or <em>widen</em> \(p_{\text{sim}}\) until it contains \(p_{\text{real}}\) (make the simulator more varied). Domain randomization is the second strategy, and it is popular because widening a distribution is far cheaper than perfecting one.</p>
+
+<h2>Domain randomization: make reality one sample among many</h2>
+<p><strong>What</strong> DR does, in one sentence: it treats every uncertain simulator parameter as a random variable and resamples it on each training episode. <strong>Why</strong> it works is an invariance argument. If a model must succeed across a broad range of noise floors, gains, and geometries, gradient descent is pushed toward features that are <em>invariant</em> to those nuisances, because nuisance-dependent features stop paying off once the nuisance is randomized away. The seminal demonstration (Tobin et al., 2017) trained an object detector purely on randomized-texture renderings and transferred it to real images with no real labels; the dynamics-randomization line (Peng et al., 2018; OpenAI's dexterous in-hand manipulation) extended the idea from appearance to physics, randomizing masses, friction, and latency so a policy learned in simulation ran on a physical robot hand.</p>
+
+<p><strong>How</strong> you apply this to sensors is the practical heart of the matter. The randomization axes fall into three layers, summarized in the table below: the <em>scene</em> (what the world contains and how it is lit or shaped), the <em>transducer</em> (how the sensor converts the world into a signal), and the <em>pipeline</em> (timing, dropouts, and synchronization). The transducer layer is the one generic vision simulators forget and the one that matters most for the modalities in this book.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Randomization axes for synthetic sensor data, by layer. The transducer row is where most sim-to-real programs for IMU, lidar, and radar live or die.</caption>
+<thead>
+<tr><th>Layer</th><th>Randomize</th><th>Modality examples</th></tr>
+</thead>
+<tbody>
+<tr><td>Scene</td><td>object placement, materials, reflectivity, lighting, clutter, weather</td><td>lidar reflectivity, thermal emissivity, radar RCS</td></tr>
+<tr><td>Transducer</td><td>bias, scale factor, axis misalignment, noise floor, quantization, saturation</td><td>IMU turn-on bias, ADC gain, sensor mounting pose</td></tr>
+<tr><td>Pipeline</td><td>sample rate jitter, latency, packet loss, dropped frames, clock skew</td><td>multi-sensor time offsets, dropout of a modality</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Randomize the nuisances, never the label-bearing physics</h3>
+<p>The single rule that separates working DR from broken DR: randomize only the parameters the model should be <em>invariant</em> to, and hold fixed the physics that actually generates the label. If you are training a gait classifier from a wearable, randomize the accelerometer's bias, gain, and mounting angle freely, because a good classifier must ignore all of those. Do not randomize the biomechanics of walking, because that <em>is</em> the signal. Confuse the two and you either teach the model to ignore what matters or leave a nuisance un-randomized that reality will exploit. Every axis you randomize should answer the question, "would a competent human still read the same label?" If yes, randomize hard; if no, freeze it.</p>
+</div>
+
+<h2>How much to randomize: the diversity-realism tradeoff</h2>
+<p><strong>When</strong> DR helps and when it hurts is governed by a tradeoff. Too little randomization and \(p_{\text{sim}}\) fails to cover \(p_{\text{real}}\), so the gap persists. Too much and the task becomes so noisy that the model either cannot learn at all or retreats to a conservative, low-accuracy policy that survives every world by committing to none. The sweet spot is the <em>narrowest</em> distribution that still contains reality. Because you rarely know reality's parameters up front, two refinements matter. <strong>Guided</strong> or <strong>structured DR</strong> centers each parameter's range on a real measurement (you calibrate the sensor once, then randomize around the measured value) so you widen only as far as your uncertainty warrants. <strong>Automatic domain randomization</strong> (ADR, from OpenAI's Rubik's-cube-solving hand, 2019) starts each range narrow and expands it automatically as the model masters the current width, growing the curriculum only as fast as the learner can absorb it.</p>
+
+<p>The code below shows guided DR for a triaxial accelerometer: it wraps a clean simulated signal with the measurement model of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> and resamples the transducer parameters on every call, so each training window sees a different plausible sensor.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def randomize_imu(clean_xyz, rng, ranges):
+    """Apply a randomized accelerometer measurement model to a clean [T,3] signal.
+    clean_xyz : true specific force in sensor axes (m/s^2), shape [T, 3]
+    ranges    : dict of (low, high) draw bounds for each nuisance parameter
+    Returns a [T,3] window as a real sensor might have reported it."""
+    bias   = rng.uniform(*ranges["bias"],  size=3)          # turn-on bias, per axis
+    scale  = rng.uniform(*ranges["scale"], size=3)          # scale-factor error
+    tilt   = np.deg2rad(rng.uniform(*ranges["tilt_deg"]))   # small mounting misalignment
+    sigma  = rng.uniform(*ranges["noise"])                  # white-noise floor
+    # small-angle misalignment rotation about a random axis
+    ax = rng.normal(size=3); ax /= np.linalg.norm(ax) + 1e-9
+    K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+    R = np.eye(3) + np.sin(tilt) * K + (1 - np.cos(tilt)) * (K @ K)  # Rodrigues
+    meas = clean_xyz @ R.T                                  # mount the sensor askew
+    meas = meas * scale + bias                              # gain + bias
+    meas += rng.normal(scale=sigma, size=meas.shape)        # sensor noise
+    return meas
+
+rng = np.random.default_rng(0)
+ranges = {"bias": (-0.3, 0.3), "scale": (0.97, 1.03),
+          "tilt_deg": (-4.0, 4.0), "noise": (0.01, 0.08)}
+clean = np.zeros((256, 3)); clean[:, 2] = 9.81            # a device sitting still
+noisy = randomize_imu(clean, rng, ranges)
+print(noisy.mean(0), noisy.std(0))                        # every call differs
+</code></pre>
+<div class="code-caption">Guided domain randomization for an accelerometer window. Each call draws a fresh bias, scale factor, mounting tilt (via a small-angle Rodrigues rotation), and noise floor from calibration-centered ranges, then corrupts the clean signal with them. Train a downstream classifier on many such draws and it is forced to become invariant to the exact sensor, not just the exact simulator. The ranges are the whole game: too wide and learning stalls, too narrow and a real device escapes coverage.</div>
+
+<p>The point the snippet makes concrete is that DR is not a special model, it is a data pipeline: the same classifier architecture becomes robust purely because the corruption is resampled every step. Note the leakage caution from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: hold the randomization seeds for your validation set fixed and disjoint from training, or you cannot tell whether reported robustness is real or a lucky draw.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A lidar perception team that stopped chasing photorealism</h3>
+<p>An autonomous-vehicle perception team building a 3D object detector (the lidar stack of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>) spent months hand-tuning their simulator toward photorealism and still watched recall crater on rainy nights. The fix was not more realism but more variety: they randomized beam-level dropout probability, per-surface reflectivity, intensity calibration, and a rain-attenuation factor, sampling each anew per scene. Detectors trained on this widened distribution, with only a small slice of real labeled frames for fine-tuning, closed most of the night-and-rain gap that photorealistic-but-fixed rendering never touched. The lesson generalizes to radar too, where randomizing multipath and clutter (see <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>) matters more than any single "accurate" clutter model.</p>
+</div>
+
+<h2>Randomize, adapt, or identify: choosing the transfer strategy</h2>
+<p>DR is one of three sim-to-real strategies, and mature systems combine them. <strong>Domain randomization</strong> widens the source distribution and needs no real labels, so it is the default when real data is scarce or expensive. <strong>Domain adaptation</strong> instead aligns features between synthetic and real (adversarial feature matching, or sensor-to-sensor image translation with a CycleGAN), and is worth its complexity when you have plentiful <em>unlabeled</em> real data. <strong>System identification</strong>, sometimes called real-to-sim, runs the opposite direction: measure the real sensor's true parameters and set the simulator to match, shrinking the gap instead of covering it. The practical recipe most teams converge on is guided DR centered on system-identified parameters, plus a thin layer of real fine-tuning, evaluated against a held-out <em>real</em> test set. That final clause is non-negotiable: a sim-to-real claim validated only in simulation is not a claim, it is a hope, and the honest gap metric is target-domain error, discussed further under distribution shift in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the state of the art sits</h3>
+<p>The frontier has moved from hand-set ranges to <em>learned</em> and <em>closed-loop</em> randomization. Automatic domain randomization (ADR) grows ranges on a curriculum; DROID and related lines fit the randomization distribution to real trajectories so the simulator's spread is inferred, not guessed. In embodied AI, the Vision-Language-Action models of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a> increasingly lean on massively randomized simulation (Isaac Sim, large procedural scene generation) as the pretraining substrate, with sim-to-real transfer treated as a first-class benchmark. The open question is whether foundation-scale pretraining makes explicit randomization less necessary, because a model that has seen enough real-world diversity may already be invariant to the nuisances DR was invented to inject.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">You do not hand-roll the randomization engine</h3>
+<p>A from-scratch DR harness (per-parameter samplers, a curriculum scheduler that widens ranges on success, domain buffers, and vectorized environments) is several hundred lines you then have to debug. NVIDIA <code>Isaac Lab</code> and <code>Isaac Gym</code> expose randomization as declarative configuration: you list the parameters and their distributions, flag whether each resamples per step or per episode, and the engine handles sampling, GPU-parallel rollouts, and ADR-style scheduling. That is roughly an 80% reduction in orchestration code you own, and, more importantly, the parallel resets and per-environment seeding are already correct, so your robustness numbers are not an artifact of a sampling bug.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: find the coverage edge</h3>
+<p>Take the <code>randomize_imu</code> function above and a small activity classifier trained on clean synthetic gait data. Train three copies: no randomization, moderate ranges (the ones given), and 3x-wider ranges. Then evaluate all three on a real IMU recording (any public human-activity dataset). Plot target-domain accuracy versus randomization width. Locate the peak, and characterize the two failure modes on either side: under-coverage (a real sensor parameter falls outside the training range) versus over-coverage (the task became too noisy to learn). Which real parameter, when you measure it, sits closest to the edge of your moderate range?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. The reality gap can be closed by moving \(p_{\text{sim}}\) toward \(p_{\text{real}}\) or by widening \(p_{\text{sim}}\) to contain it. Which strategy is domain randomization, and why is it usually the cheaper one?</p>
+<p>2. Why must you randomize the accelerometer's mounting angle and bias but never the biomechanics that generate the activity label?</p>
+<p>3. Given plentiful unlabeled real data but no labels, would you reach first for domain randomization, domain adaptation, or system identification, and why?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-55.4.html">Section 55.4</a>, we stop treating physics as a data-generator we randomize around and start baking it directly into the loss. Physics-informed neural networks constrain a model with the governing differential equations of the sensor and the process, which turns the reality gap into a solvable inverse problem: instead of covering our ignorance with randomization, we encode what we actually know about the physics.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

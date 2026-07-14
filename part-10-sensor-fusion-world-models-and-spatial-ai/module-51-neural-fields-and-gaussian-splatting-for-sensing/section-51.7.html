@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.7: Validation of synthetic-from-real pipelines. Building Sensory AI." name="description"/>
+<title>Section 51.7: Validation of synthetic-from-real pipelines | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Validation of synthetic-from-real pipelines</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A synthetic frame that looks perfect to me and teaches my detector nothing is not data. It is wallpaper."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Everything earlier in this chapter builds a machine that takes real sensor logs, fits a scene, and emits new sensor readings: novel camera views (<a class="cross-ref" href="section-51.3.html">Section 51.3</a>), re-simulated lidar returns (<a class="cross-ref" href="section-51.4.html">Section 51.4</a>), and whole rare-event scenarios (<a class="cross-ref" href="section-51.5.html">Section 51.5</a>). That machine is only worth running if you can prove its output is trustworthy. This section is the audit. It answers three questions that a reconstruction pipeline must survive before its synthetic frames are allowed into a training set or a safety case: is the geometry and appearance faithful to what the sensor would truly measure, does the synthetic distribution actually cover the real one, and, the only question that ultimately pays the bills, does training on the synthetic data improve a downstream model on real held-out data. Get validation wrong and you ship a data engine that quietly poisons every model it feeds. Get it right and you have a defensible way to manufacture the long tail that reality refuses to hand you.</p>
+</div>
+
+<p>This is an advanced, research-frontier section. It assumes the splatting and re-simulation pipeline of <a class="cross-ref" href="section-51.2.html">Sections 51.2</a> through <a class="cross-ref" href="section-51.5.html">51.5</a>. It leans hard on two running threads of the book: leakage-safe evaluation, treated in general in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and formalized as benchmark protocol in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, and distribution shift, treated in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. If those chapters are unfamiliar, read their opening sections first; the whole point here is that a synthetic-data pipeline is a new and sneaky way to leak the test set into training.</p>
+
+<h2>Three layers of validation, and why you need all three</h2>
+
+<p>Validation of a synthetic-from-real pipeline stacks in three layers, from cheap and weak to expensive and decisive. The <strong>fidelity layer</strong> asks, per sample, how close a re-simulated reading is to a real one at the same pose: this is image and geometry error, and it is what neural-rendering papers report. The <strong>distributional layer</strong> asks whether the <em>set</em> of synthetic samples covers the real sensor distribution, because a pipeline can render every individual frame beautifully and still only ever produce sunny noon scenes. The <strong>task layer</strong> asks the one question that actually matters for a data engine: if you train a perception model on the synthetic data and test it on real held-out data, does it get better. Each layer catches failures the layer below is blind to. A pipeline can pass fidelity and fail distribution; it can pass both and still fail the task, because the errors it does make happen to sit exactly where your detector is sensitive. Never report only the first layer and call the pipeline validated.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: the only validation that counts is downstream and held-out</h3>
+<p>A high PSNR on a re-rendered view tells you the pixels are close; it says nothing about whether those pixels teach a network the right invariances. The decisive test is <em>train-on-synthetic, test-on-real</em> (TSTR): train a model on synthetic data alone (or on real-plus-synthetic) and evaluate it on a real test set that the reconstruction pipeline never saw. Its mirror, <em>train-on-real, test-on-synthetic</em> (TRTS), checks the reverse and exposes synthetic frames that a real-trained model finds trivially easy or bizarrely hard. Both are worthless if the real logs used to fit the scenes overlap, even by neighboring frames of the same drive, with the real test set. Because a splat is fitted to specific frames, evaluating on a nearby frame of the same sequence is a textbook leak: the scene memorized the answer. Split by scene, by session, by drive, never by frame.</p>
+</div>
+
+<h2>Fidelity: measuring the sim-to-real gap per sample</h2>
+
+<p>Fidelity metrics come in two families matched to the two sensor modalities this chapter re-simulates. For <strong>camera</strong> output you hold out a real image at a known pose, render the scene from that exact pose, and compare. Pixel-space peak signal-to-noise ratio (PSNR) and structural similarity (SSIM) measure low-level agreement, but they reward blur and miss the perceptual errors that break a detector, so pair them with a learned perceptual metric such as LPIPS, which correlates far better with how a downstream network sees the image. For <strong>lidar</strong> you compare the re-simulated point cloud against the real return: geometric error as a symmetric Chamfer distance or per-ray range error, plus intensity error if your model predicts reflectance, and, critically, a drop or spurious-point rate, because a re-simulator that silently deletes returns on dark or specular surfaces will teach a segmenter that those surfaces do not exist. The physics of why lidar drops returns on retroreflectors and wet asphalt is exactly the measurement-model material of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and a good re-simulator must reproduce those dropouts, not paper over them.</p>
+
+<p>The subtlety that trips people up is that these are <em>novel-view</em> metrics, and they only mean something on poses genuinely held out of fitting. A splat evaluated on one of its own training views reports a gorgeous PSNR that certifies nothing. So the fitting split must reserve a set of frames the optimizer never touched, and fidelity is reported only there. The helper below computes the standard camera trio the honest way and enforces the held-out contract by refusing to score a pose that appears in the training set.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def novel_view_fidelity(render, real, pose_id, train_pose_ids):
+    """Per-sample camera fidelity, but only on genuinely held-out poses."""
+    if pose_id in train_pose_ids:
+        raise ValueError(f"pose {pose_id} was used to fit the scene: leaked metric")
+    mse = np.mean((render.astype(np.float64) - real) ** 2)
+    psnr = 10.0 * np.log10((255.0 ** 2) / max(mse, 1e-9))
+    # SSIM / LPIPS omitted for brevity; use skimage.metrics + lpips in practice
+    return {"psnr_db": round(psnr, 2), "mse": round(mse, 2)}
+
+held_out = {17, 42, 88}          # frames reserved from fitting
+train_ids = set(range(200)) - held_out
+print(novel_view_fidelity(render_frame_42, real_frame_42, 42, train_ids))
+# -> {'psnr_db': 24.7, 'mse': 220.1}
+</code></pre>
+<div class="code-caption">A leakage-guarded fidelity check: it computes novel-view PSNR but raises if asked to score a pose that was part of the fitting set, which is the single most common way neural-rendering evaluations quietly inflate their numbers. In production you would add SSIM and LPIPS from established libraries and a matching Chamfer/range routine for the lidar branch.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: do not hand-roll perceptual metrics</h3>
+<p>The naive version above is a teaching stub. In practice, <code>torchmetrics</code> gives you PSNR, SSIM, LPIPS, and FID as drop-in modules, and <code>pytorch3d</code> gives you a batched, differentiable Chamfer distance for the lidar branch. A validation report that would be roughly 150 lines of careful numpy (correct SSIM windowing, a pretrained LPIPS backbone, stable FID covariance estimation) collapses to about 10 lines of module construction and <code>.update()</code> calls, and the library handles the pretrained weights, GPU batching, and the numerical edge cases that make a from-scratch FID silently wrong.</p>
+</div>
+
+<h2>Distribution and coverage: does the synthetic set span the real one</h2>
+
+<p>Per-sample fidelity is necessary but blind to the failure that most often ruins a data engine: mode collapse in what you choose to render. A pipeline that faithfully re-simulates only the conditions present in your source logs will produce a mountain of synthetic frames that are individually perfect and collectively redundant. Distributional validation treats the real and synthetic sets as two samples from two distributions and asks how far apart they are. In feature space, the Frechet Inception Distance (FID, and its cleaner successor for reused features) compares the mean and covariance of a perception backbone's activations on real versus synthetic images; for lidar, compare occupancy or point-density histograms and the distribution of returns per range bin. Beyond a single distance you want the two directional numbers of <strong>precision</strong> (are synthetic samples realistic, that is, do they fall inside the real manifold) and <strong>recall</strong> (does the synthetic set cover the real manifold, or has it collapsed onto a mode). A rare-event generator (<a class="cross-ref" href="section-51.5.html">Section 51.5</a>) is precisely a bet on recall: you are manufacturing regions of the distribution that the real logs undersample, so you must measure that you actually reached them and did not just re-render the easy middle.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: an automotive data engine that passed fidelity and failed on-road</h3>
+<p>An autonomous-driving team fits per-scene Gaussian splats from fleet drives and re-simulates novel camera and lidar views to augment a pedestrian detector, aiming at the rare case of a child stepping out between parked cars. Their re-rendered validation views scored 27 dB PSNR and a low LPIPS: fidelity looked excellent. But road testing showed no improvement on real near-miss events. The distributional audit found the miss: every synthetic child was inserted at midday under clear skies, because that is when the source drives happened, so the FID against a night-and-rain real set was enormous and recall was near zero for low-light. The synthetic set was faithful and useless. Adding varied relighting and re-simulating lidar with correct wet-road dropouts closed the FID gap, and only then did TSTR show a real recall gain on held-out night scenes. The lesson is that they would have shipped a poisoned augmentation had they trusted the fidelity layer alone. This connects directly to the BEV and 3D-occupancy detectors of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>, which consume exactly this kind of multi-view synthetic data.</p>
+</div>
+
+<h2>The task layer, leakage, and calibration</h2>
+
+<p>The task layer runs the TSTR and TRTS experiments and reads them against a real-only baseline. The number to move is downstream performance on the held-out real test set, whatever your task metric is: mean average precision for a detector, intersection-over-union for a segmenter. A synthetic pipeline earns its keep when real-plus-synthetic beats real-alone on that metric, especially on the tail slices you built the synthetic data to cover. Two guardrails make this trustworthy. First, <strong>leakage discipline</strong>: the drives whose logs were fitted into scenes must be entirely disjoint from the drives in the real test set, split by session and geography, or you are testing whether a splat can memorize, which it can. Second, <strong>calibration</strong>: a model trained partly on synthetic data often becomes overconfident on the synthetic-looking part of the real distribution, so re-check its calibration with the reliability diagrams and conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. A pipeline that raises accuracy while wrecking calibration has not passed; it has moved the problem somewhere a naive accuracy number will not show it.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: validating splat-based sensor simulators</h3>
+<p>The current frontier is joint lidar-camera neural simulators such as SplatAD and closed-loop driving-simulation stacks like NeuRAD and the UniSim line, which re-simulate full multi-sensor rigs from real drives. Their validation is still an open problem: the field has largely standardized on novel-view PSNR/SSIM/LPIPS plus lidar Chamfer and depth error, but there is active work on <em>closed-loop</em> validation, where the synthetic sensor stream drives a full autonomy policy and the metric is downstream driving behavior rather than per-frame pixels. Benchmarks such as nuScenes and Waymo Open provide the real reference distributions, and the emerging consensus is that a simulator is only validated to the extent that a policy trained or tested in it transfers to the real fleet. Expect the reported metric in the next few years to shift from image similarity toward held-out, task-conditioned transfer.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a Gaussian-splat scene fitted from a driving sequence. (1) Reserve every tenth frame from fitting and report novel-view PSNR, SSIM, and LPIPS on those held-out frames only. (2) Render 500 novel views under varied simulated lighting and compute FID against a real image set from a <em>different</em> drive; also estimate precision and recall in the backbone feature space. (3) Train a small object detector on real-plus-synthetic and on real-only, evaluate both on a real held-out drive split by session, and report the change in mAP overall and on the low-light slice. State which of the three layers, if any, your pipeline fails.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why is a PSNR of 30 dB on a training-set pose almost meaningless as validation, and what must be true of the pose for the number to count?</p>
+<p>2. A pipeline shows excellent per-frame LPIPS but a large FID against the real test distribution. What kind of failure is this, and which downstream symptom would you expect?</p>
+<p>3. You split your evaluation by frame instead of by drive, reserving frame 51 of a 100-frame sequence as the test frame. Explain precisely how the fitted splat leaks the answer.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 51</h3>
+<p>reconstruct a scene with Gaussian splatting and re-simulate a sensor view for augmentation.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Neural rendering and re-simulation for sensors</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2308.01898">Kerbl, Kopanas, Leimkuhler, Drettakis (2023). 3D Gaussian Splatting for Real-Time Radiance Field Rendering. ACM TOG (SIGGRAPH).</a></p>
+<p class="bib-annotation">The representation whose re-rendered views you validate here; its own evaluation reports novel-view PSNR/SSIM/LPIPS, the fidelity layer of this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2311.15260">Tonderski, Lindstrom, Hess, Ljungbergh, Svensson, Petersson (2023). NeuRAD: Neural Rendering for Autonomous Driving. CVPR 2024.</a></p>
+<p class="bib-annotation">A sensor-realistic neural simulator for driving; its ablations are a model of reporting both camera and lidar fidelity against real held-out sensor data.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2411.16816">Hess, Tonderski, Petersson, Astrom, Svensson (2024). SplatAD: Real-Time Lidar and Camera Rendering with 3D Gaussian Splatting for Autonomous Driving. 2024.</a></p>
+<p class="bib-annotation">Joint lidar-camera splatting; the current frontier for the kind of pipeline whose validation this section formalizes.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2308.01898v1">Yang, Chen, Wang, et al. (2023). UniSim: A Neural Closed-Loop Sensor Simulator. CVPR 2023.</a></p>
+<p class="bib-annotation">Argues for closed-loop, policy-level validation of sensor simulators rather than per-frame pixel similarity alone.</p>
+</div>
+
+<p class="bib-category">Fidelity and distributional metrics</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1801.03924">Zhang, Isola, Efros, Shechtman, Wang (2018). The Unreasonable Effectiveness of Deep Features as a Perceptual Metric (LPIPS). CVPR 2018.</a></p>
+<p class="bib-annotation">Establishes the learned perceptual metric that correlates with how networks see images, the fidelity metric to trust over raw PSNR.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1706.08500">Heusel, Ramsauer, Unterthiner, Nessler, Hochreiter (2017). GANs Trained by a Two Time-Scale Update Rule Converge to a Local Nash Equilibrium (FID). NeurIPS 2017.</a></p>
+<p class="bib-annotation">Introduces the Frechet Inception Distance, the workhorse of the distributional layer for synthetic image sets.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1904.06991">Kynkaanniemi, Karras, Laine, Lehtinen, Aila (2019). Improved Precision and Recall Metric for Assessing Generative Models. NeurIPS 2019.</a></p>
+<p class="bib-annotation">The precision/recall decomposition that separates "synthetic looks real" from "synthetic covers real," essential for auditing rare-event coverage.</p>
+</div>
+
+<p class="bib-category">Reference distributions and downstream validation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1903.11027">Caesar, Bankiti, Lang, et al. (2020). nuScenes: A Multimodal Dataset for Autonomous Driving. CVPR 2020.</a></p>
+<p class="bib-annotation">A standard real multi-sensor distribution against which synthetic camera and lidar sets are compared and on which held-out downstream tests are run.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1912.04838">Sun, Kretzschmar, Dotiwalla, et al. (2020). Scalability in Perception for Autonomous Driving: Waymo Open Dataset. CVPR 2020.</a></p>
+<p class="bib-annotation">A second large real reference distribution with session-level structure, enabling the split-by-drive discipline this section requires.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, the same reconstructed scenes stop being an offline data factory and start being built online: SLAM and Spatial AI turn the fit budget into a live mapping loop, and the validation instincts you built here (held-out poses, geometric error, no frame-level leakage) become the trajectory and map-quality benchmarks that decide whether a robot actually knows where it is.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

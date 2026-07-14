@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.6: Real-time reconstruction constraints. Building Sensory AI." name="description"/>
+<title>Section 51.6: Real-time reconstruction constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Neural Fields and Gaussian Splatting for Sensing</a></div>
+<h1>Real-time reconstruction constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Everyone quotes their render FPS. Nobody quotes the twenty minutes of fitting that had to happen first. Real time is the number you were too embarrassed to print."</p><cite>A Budget-Conscious AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous sections gave you the representations: neural radiance and signed-distance fields (<a class="cross-ref" href="section-51.1.html">Section 51.1</a>), 3D Gaussian splatting (<a class="cross-ref" href="section-51.2.html">Section 51.2</a>), sensor re-simulation from them (<a class="cross-ref" href="section-51.3.html">Section 51.3</a>), and joint lidar-camera fitting (<a class="cross-ref" href="section-51.4.html">Section 51.4</a>). All of that assumed you could afford to sit and optimize a scene offline. This section is about what changes when a clock is running: a robot mapping a corridor as it drives, a data engine that must re-simulate a sensor view fast enough to close a training loop, or an edge box that has a fixed power envelope and no dedicated render farm. "Real time" splits into two very different budgets that people constantly conflate, and knowing which one binds you decides whether you reach for a hash grid, a tile rasterizer, an anchor-based level-of-detail scheme, or a smaller sensor rig. This is the section that connects the beautiful reconstructions of this chapter to the hard limits of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> and the online mapping of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<p>This is an advanced, research-frontier section. It assumes the 3D Gaussian splatting pipeline of <a class="cross-ref" href="section-51.2.html">Section 51.2</a> (means, covariances, opacities, tile-based rasterization) and the neural-field acceleration ideas of <a class="cross-ref" href="section-51.1.html">Section 51.1</a>. Throughput, quantization, and edge deployment are treated generally in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>; here we specialize those constraints to scene reconstruction, where the workload is an optimization, not a single forward pass.</p>
+
+<h2>Two clocks: the render budget and the fit budget</h2>
+
+<p>The first thing to fix in your head is that a reconstructed scene has two separate real-time requirements, and a system can pass one while failing the other. The <strong>render budget</strong> is the per-frame time to synthesize a novel view once the scene exists: this is what "3D Gaussian splatting runs at 100-plus FPS" refers to, because rasterizing a fixed set of Gaussians is a feed-forward pass. The <strong>fit budget</strong> is the wall-clock to <em>build or update</em> the scene from incoming sensor data, and it is an iterative optimization: gradient steps, densification, pruning. Classic 3DGS renders in milliseconds but takes tens of minutes to fit; the original NeRF took a day to fit and seconds per frame to render. Confusing the two is the single most common mistake in system planning, because a data-engine that re-simulates from an <em>already-fitted</em> scene lives entirely in the render budget, while a robot building the map as it moves lives and dies by the fit budget.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: real-time rendering does not imply real-time reconstruction</h3>
+<p>Rasterizing Gaussians is a bounded, parallel, feed-forward operation, so its cost scales predictably with primitive count and pixel count. Fitting a scene is an optimization whose cost depends on how far the current parameters are from a good explanation of the data, which is unbounded in the worst case and highly non-uniform in practice. A method that renders at 200 FPS can still need 30 minutes to converge, and a method that fits incrementally in real time may cap its Gaussian count so aggressively that its render quality is mediocre. When someone claims a reconstruction technique is "real time," your first question is always <em>which clock</em>: frames-per-second of rendering, or seconds-per-scene of fitting. They trade against each other, and the honest system reports both.</p>
+</div>
+
+<h2>What eats the budget</h2>
+
+<p>Four knobs dominate both clocks. <strong>Primitive count</strong> is the number of Gaussians (or the size of the neural-field grid and hash table). It sets memory directly and render time nearly linearly, and it is the first thing densification blows up if you do not cap it. <strong>Output resolution and ray count</strong> set the pixel or lidar-return workload; volumetric NeRF pays for every sample along every ray, which is why acceleration structures that skip empty space matter so much. <strong>Iteration count and densification schedule</strong> govern the fit budget: more steps and more aggressive splitting buy quality at the cost of time and memory. <strong>Bandwidth</strong> is the often-forgotten one: streaming multi-camera video plus a spinning lidar at sensor rate can saturate the bus and starve the GPU before any compute happens, a constraint that echoes the sampling and synchronization limits of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. The art of real-time reconstruction is choosing which knob to sacrifice: an online mapper caps primitives and iterations to protect the fit clock, while an offline data engine spends freely on both because only the render clock ships.</p>
+
+<p>A useful planning move is to turn the render budget into an explicit Gaussian cap. If you measure your rasterizer's sustained throughput in Gaussians-per-second at your target resolution, a target frame rate directly bounds how many primitives the scene may contain. The helper below does that arithmetic and also converts a per-Gaussian memory footprint into the VRAM the scene will occupy, so you can catch an infeasible plan before you spend an hour fitting it.</p>
+
+<pre><code class="language-python">def splat_budget(target_fps, gaussians_per_sec, bytes_per_gaussian, vram_bytes):
+    """Plan a real-time Gaussian budget from a measured rasterizer throughput."""
+    frame_time_s = 1.0 / target_fps
+    max_by_speed = int(gaussians_per_sec * frame_time_s)   # render clock cap
+    max_by_vram  = int(vram_bytes / bytes_per_gaussian)    # memory cap
+    budget = min(max_by_speed, max_by_vram)
+    binding = "render-speed" if max_by_speed &lt; max_by_vram else "VRAM"
+    return {"max_gaussians": budget, "binding_constraint": binding,
+            "frame_time_ms": round(frame_time_s * 1e3, 2)}
+
+# Jetson-class edge GPU: ~120M Gaussians/s at 720p, 60 bytes each (pos+cov+color+opacity, fp16), 8 GB free
+print(splat_budget(target_fps=30, gaussians_per_sec=120_000_000,
+                   bytes_per_gaussian=60, vram_bytes=8 * 1024**3))
+# -&gt; {'max_gaussians': 4000000, 'binding_constraint': 'render-speed', 'frame_time_ms': 33.33}
+</code></pre>
+<div class="code-caption">A back-of-the-envelope budget planner: it turns a measured rasterizer throughput and a VRAM ceiling into the maximum number of Gaussians a scene may hold at a target frame rate, and reports which constraint binds. On the edge GPU in the example, render speed caps the scene at four million Gaussians well before the 8 GB of VRAM does, so densification must be told to stop there.</div>
+
+<p>Run <code>splat_budget</code> with your own measured numbers before you fit anything. The <code>binding_constraint</code> field tells you what to attack: if render speed binds, you need level-of-detail or a faster rasterizer; if VRAM binds, you need quantization or compression. Guessing wrong wastes the fit budget on a scene you cannot render.</p>
+
+<h2>Making it fit in real time</h2>
+
+<p>Every practical real-time method is some combination of five moves. <strong>Skip empty space.</strong> Instant-NGP's multiresolution hash encoding and occupancy grids let a neural field query only near surfaces, turning NeRF's day-long fit into seconds and its render into interactive rates; this is the acceleration that made neural fields deployable at all. <strong>Rasterize instead of ray-march.</strong> 3DGS replaces per-ray sampling with tile-based alpha-blended splatting, which is what buys its real-time render clock. <strong>Bound the primitives with level-of-detail.</strong> Anchor and scaffold schemes (Scaffold-GS, Octree-GS) spawn Gaussians on demand from a sparse anchor grid and pick detail by distance, so far-away geometry does not spend budget it does not need. <strong>Compress the primitives.</strong> Vector-quantizing Gaussian attributes and pruning low-contribution ones (LightGaussian and similar) can shrink a scene several-fold with little quality loss, directly relaxing the VRAM cap. <strong>Fit incrementally.</strong> For online reconstruction you never re-optimize the whole scene; you select keyframes, add primitives only where the current map fails to explain the new frame, and run a few local gradient steps, which is exactly the loop the Gaussian-splatting SLAM systems of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a> use to map at sensor rate.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: an autonomous-driving data engine that had to hit the training clock</h3>
+<p>An AV perception team wanted to re-simulate lidar and camera views from reconstructed street scenes to augment rare-event training (the pipeline of <a class="cross-ref" href="section-51.5.html">Section 51.5</a>). Their first attempt fit a full-quality Gaussian scene per log segment and rendered it, and the numbers looked fine in a notebook: 90 FPS render. But the data engine needed roughly forty re-simulated variants per segment across tens of thousands of segments, and the <em>fit</em> clock, not the render clock, was the wall. At twenty-five minutes per scene the reconstruction stage alone would have taken months of GPU time. The fix separated the two clocks deliberately: they fit each scene once, aggressively pruned and quantized it with a LightGaussian-style pass so it fit in a fraction of the VRAM, then generated all forty sensor variations purely in the cheap render clock, reusing the same frozen scene. Reconstruction stopped being the bottleneck because it happened once per scene instead of once per variant. The lesson is the one from the key-insight callout: they had been paying the expensive clock repeatedly for a job that only needed the cheap one.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: gsplat instead of a hand-written CUDA rasterizer</h3>
+<p>Writing a correct, fast, differentiable tile-based Gaussian rasterizer with backward passes, spherical-harmonic evaluation, and densification bookkeeping is well over a thousand lines of CUDA and is where most real-time projects lose weeks. The <code>gsplat</code> library (used by Nerfstudio) exposes the whole forward-and-backward rasterization path, densification, and pruning behind a few Python calls, with memory-efficient kernels that already implement much of the level-of-detail and compression tooling above. A from-scratch rasterizer of 1200-plus CUDA lines collapses to on the order of 20 lines of Python that call <code>gsplat.rasterization(...)</code>, and you inherit throughput optimizations you would otherwise re-derive by hand. Reach for it whenever the render clock, not novel research on the kernel itself, is what you actually need to move.</p>
+</div>
+
+<h2>On-device and streaming constraints</h2>
+
+<p>Moving reconstruction onto a robot or vehicle adds three limits a workstation hides. <strong>Memory</strong> is the hard wall: an edge GPU may have 8 to 16 GB shared with everything else, so the Gaussian cap from <code>splat_budget</code> is set by VRAM long before render speed, which is why on-device systems lean on quantization and anchor-based level-of-detail. <strong>Power and thermals</strong> cap sustained throughput below the burst number in a datasheet; a scene that renders at 60 FPS for ten seconds may throttle to 30 once the board heats up, so plan against sustained, not peak, throughput. <strong>Bandwidth and synchronization</strong> mean the sensors themselves gate the fit clock: you cannot fit faster than you can ingest and time-align frames, and a poorly synchronized rig injects geometric error that costs extra iterations to fit around. These are the same deploy-stage tradeoffs of latency, memory, and power that <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> formalizes; reconstruction is just an unusually memory-hungry and clock-sensitive instance of them. The practical rule of thumb: on the edge, budget for the sustained-power render clock and the VRAM cap first, and let those two numbers dictate primitive count, quality, and how much of the scene you keep resident versus stream from host memory.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: pushing both clocks at once</h3>
+<p>The field is attacking the fit clock and the memory wall together. Instant-NGP (Müller et al., 2022) made neural fields fit in seconds via hash encodings; 3D Gaussian Splatting (Kerbl et al., 2023) delivered real-time rendering by rasterizing. Since then, Scaffold-GS (Lu et al., 2024) and Octree-GS added anchor-based level-of-detail so quality does not scale primitive count linearly, while LightGaussian (Fan et al., 2023) and Taming 3DGS pushed compression and faster, more predictable fitting. On the incremental side, MonoGS, SplaTAM, and Gaussian-LIC (covered in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>) fold reconstruction into SLAM so the map is built at sensor rate. Open problems remain sharp: fully on-device fitting within a fixed power envelope, dynamic and deformable scenes at real-time rates, and reconstruction that degrades gracefully rather than catastrophically when the fit budget is cut, which is what safety-critical deployment ultimately demands.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a fitted 3DGS scene from Lab 51 (or a public one). (a) Measure your rasterizer's sustained Gaussians-per-second at 720p and feed it into <code>splat_budget</code> for target rates of 30, 60, and 120 FPS; report the primitive cap at each and which constraint binds. (b) Prune the scene to each cap using an opacity or contribution threshold and record the render FPS and a quality metric (PSNR or lidar depth error from <a class="cross-ref" href="section-51.3.html">Section 51.3</a>) at each level. (c) Separately, time the <em>fit</em> clock: how long to reconstruct the scene from scratch versus to update it after adding one new keyframe. (d) Plot render FPS and fit time against primitive count on the same axis and mark the operating point where a 30 FPS on-device budget and an 8 GB VRAM cap both hold.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>A paper reports "real-time 3D Gaussian splatting at 130 FPS." Which of the two clocks does this describe, and what number is it conspicuously not telling you?</li>
+<li>Your <code>splat_budget</code> call returns <code>binding_constraint: "VRAM"</code>. Name two techniques from this section that relax that specific limit, and one that would not help.</li>
+<li>Why does a robot building a map as it drives care far more about the fit clock than a data engine that re-simulates from a pre-built scene, and how does each system exploit that difference?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-51.7.html">Section 51.7</a>, we ask the question that hangs over every re-simulated sensor view: can you trust it? Having built scenes fast enough to be useful, we turn to validating synthetic-from-real pipelines, checking that a re-simulated lidar or camera frame is faithful enough to train and test on without quietly injecting the reconstruction's own artifacts, and tying that validation back to the leakage-safe evaluation discipline that runs through the whole book.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

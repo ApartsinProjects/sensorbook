@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.1: Sensors as nodes and relations. Building Sensory AI." name="description"/>
+<title>Section 54.1: Sensors as nodes and relations | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Graph Neural Networks for Sensor Networks</a></div>
+<h1>Sensors as nodes and relations</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A hundred meters says nothing about closeness. Two pipes on the same main are neighbors; two roads a wall apart are strangers. Give me the graph, not the map."</p>
+<cite>A Relationally Minded AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the per-node feature vectors and normalization habits of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, the multi-sensor complementarity framing of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, and the idea that a probabilistic model can be drawn as a graph of variables and couplings from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>. Basic linear algebra (matrix-vector products, the notion of a sparse matrix) is developed in Appendix A, and the neural building blocks (a learnable linear layer, a nonlinearity) come from the Deep Learning Refresher in Appendix B. No prior graph theory is required; the few terms we need are defined here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Most of this book has treated a signal as a sequence in time or an image on a grid. A deployed sensing system is rarely either. It is a <em>set</em> of sensors scattered across a physical system: traffic loops on a road network, phasor units on a power grid, pressure gauges on a water main, accelerometers bolted to a bridge. These sensors are not laid out on a line or a lattice; they are wired together by the physics of the thing they measure. A graph is the data structure that captures exactly that: each sensor is a node, each physical or statistical relationship between two sensors is an edge. Once you make that move, a whole class of models becomes available (graph neural networks) that respect the one thing a sequence model or a convolutional grid gets wrong about a sensor network: there is no natural order, and distance in meters is not the same as distance in the system. This section builds the representation; the rest of the chapter builds the models that run on it.</p>
+</div>
+
+<h2>Why a graph and not a grid or a sequence</h2>
+<p>The <em>what</em> is a shift in inductive bias. A convolutional network assumes a regular grid with a fixed neighborhood (the pixel to your left is always the pixel to your left). A recurrent or transformer sequence model assumes a meaningful order (token \(t\) comes after token \(t-1\)). A sensor network has neither. Renumber the twenty pumps in a water system and nothing physical changes, so any model whose output depends on that numbering has learned an artifact. And the sensors that matter to each other are set by connectivity, not by index or by raw Euclidean distance: two traffic detectors on the same road segment are strongly coupled even if a third detector on a parallel highway is physically closer. Forcing such data onto a grid or a sequence throws away the connectivity and smuggles in a false ordering.</p>
+<p>The <em>why</em> to prefer a graph is that it encodes the coupling structure directly and nothing else. Formally a graph is \(G = (V, E)\) with node set \(V\) of size \(N\) (one node per sensor) and edge set \(E \subseteq V \times V\) (one edge per relationship). Two matrices carry the numbers. The <strong>node feature matrix</strong> \(\mathbf{X} \in \mathbb{R}^{N \times F}\) stacks an \(F\)-dimensional feature vector per sensor: a current reading, a short window of recent readings, engineered features from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, or static metadata (sensor type, elevation, rated capacity). The <strong>adjacency matrix</strong> \(\mathbf{A} \in \mathbb{R}^{N \times N}\) has \(A_{ij} \neq 0\) when sensors \(i\) and \(j\) are related, and its nonzero pattern is the entire relational story. Sensor networks make \(\mathbf{A}\) sparse (each node touches a handful of neighbors, not all \(N-1\)), which is what makes the models later in the chapter scale.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight: the relational inductive bias is permutation equivariance</h3>
+<p>The defining property a graph model must have is <strong>permutation equivariance</strong>: if you relabel the nodes by a permutation \(\mathbf{P}\), sending \((\mathbf{X}, \mathbf{A})\) to \((\mathbf{P}\mathbf{X}, \mathbf{P}\mathbf{A}\mathbf{P}^\top)\), the per-node outputs come out permuted the same way and are otherwise identical. This is not a technicality; it is the whole reason to use a graph. A multilayer perceptron fed the flattened readings \([x_1, x_2, \dots, x_N]\) would treat "sensor 3" as a distinct input dimension and could memorize its position, so shuffling the sensors would break it. A graph model cannot even represent node identity except through connectivity and features, so it is forced to learn functions of the <em>relationships</em>, which is exactly the signal that generalizes across a fleet. Equivariance is the graph analogue of the translation invariance that makes convolutions work on images.</p>
+</div>
+
+<h2>What an edge means, and how you weight it</h2>
+<p>An edge is a claim that two sensors are informative about each other, and the interesting design question is <em>which kind</em> of relationship you encode. In practice three families recur. A <strong>physical/topological</strong> edge follows the plumbing: two nodes are connected if current, water, traffic, or force can flow directly between them (adjacent grid buses, pipes sharing a junction, road segments meeting at an intersection). A <strong>geometric</strong> edge connects sensors within a distance threshold or the \(k\) nearest in space, a reasonable proxy when the true topology is unknown. A <strong>statistical</strong> edge is learned from data: connect sensors whose readings are strongly correlated, or whose time series show a lead-lag dependency. These constructions, and the dynamic graphs where \(\mathbf{A}\) itself changes over time, are the subject of <a class="cross-ref" href="section-54.2.html">Section 54.2</a>; here the point is only that the edge set is a modeling choice with real consequences, not a given.</p>
+<p>Edges also carry <em>weights</em> and often <em>features</em>. A common choice for geometric graphs is a thresholded Gaussian kernel on distance,</p>
+\[ A_{ij} = \begin{cases} \exp\!\left(-\dfrac{d_{ij}^2}{2\sigma^2}\right), & d_{ij} \le \kappa \\[4pt] 0, & \text{otherwise,} \end{cases} \]
+<p>which makes nearby sensors strongly coupled and cuts the tail so the matrix stays sparse. Edge features go further, attaching a vector per edge: pipe diameter and length, the impedance of a transmission line, the free-flow speed of a road. The relationship, not just its existence, becomes something the model reads. Directionality matters too: flow-based systems are naturally <em>directed</em> (upstream influences downstream more than the reverse), so \(\mathbf{A}\) need not be symmetric, a fact <a class="cross-ref" href="section-54.3.html">Section 54.3</a> exploits with diffusion on directed graphs.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a city water distribution network</h3>
+<p>A utility instruments its distribution network with roughly 300 pressure and flow sensors across pumps, tanks, and junctions. The tempting first move is to hand every reading, as one long vector, to a standard neural net, but the utility's own hydraulic model already knows the pipe topology: which junctions are connected, each pipe's diameter and length. Encoding that as the graph pays off immediately. When a main bursts, the pressure anomaly does not spread to the geographically nearest gauge; it propagates along the pipes, sometimes to a sensor a kilometer away that shares the same trunk while a gauge fifty meters off on an isolated branch reads normal. A model built on Euclidean neighborhoods flags the wrong district; a model whose edges follow the pipes, with diameter as an edge feature so a fat trunk conducts the disturbance faster than a thin lateral, tracks the pressure wave to its source. The same node-and-relation framing later lets the utility localize the burst, the fault-attribution task of <a class="cross-ref" href="section-54.4.html">Section 54.4</a> and the condition-monitoring goal of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>From adjacency to one round of message passing</h2>
+<p>The <em>how</em> a model uses this structure is <strong>message passing</strong>, and its skeleton is simple enough to see in one equation before the full machinery of <a class="cross-ref" href="section-54.3.html">Section 54.3</a>. Each node starts with its feature vector \(\mathbf{h}_i^{(0)} = \mathbf{x}_i\). One layer updates every node by aggregating a transformed message from each neighbor and combining it with the node's own state,</p>
+\[ \mathbf{h}_i^{(\ell+1)} = \phi\!\left( \mathbf{h}_i^{(\ell)},\; \bigoplus_{j \in \mathcal{N}(i)} \psi\!\left(\mathbf{h}_i^{(\ell)}, \mathbf{h}_j^{(\ell)}, \mathbf{e}_{ij}\right) \right), \]
+<p>where \(\mathcal{N}(i)\) is the set of neighbors given by \(\mathbf{A}\), \(\psi\) builds a message (a learnable function of the two endpoints and the edge feature \(\mathbf{e}_{ij}\)), \(\bigoplus\) is a <em>permutation-invariant</em> aggregator (sum, mean, or max, so the result does not depend on neighbor order), and \(\phi\) updates the node. Stack \(L\) such layers and information reaches every node from its \(L\)-hop neighborhood: the anomaly at a burst pipe is felt one junction away after one layer, two junctions away after two. That aggregate-then-update pattern, with the invariant \(\bigoplus\), is what delivers the permutation equivariance of the earlier insight, and it is why the whole family shares one interface.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+# 5 sensors on a small water network; features = [pressure, flow]
+X = np.array([[52.1, 12.0], [51.8, 11.6], [49.3,  9.1],
+              [51.9, 11.8], [48.7,  8.4]], dtype=float)
+
+# Undirected topology: 0-1, 1-2, 1-3, 3-4  (who shares a pipe with whom)
+edges = [(0, 1), (1, 2), (1, 3), (3, 4)]
+N = X.shape[0]
+A = np.zeros((N, N))
+for i, j in edges:
+    A[i, j] = A[j, i] = 1.0            # symmetric: undirected pipes
+
+A_hat = A + np.eye(N)                   # add self-loops: keep your own state
+D = np.diag(A_hat.sum(1))
+D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D)))
+A_norm = D_inv_sqrt @ A_hat @ D_inv_sqrt   # symmetric normalization
+
+H1 = A_norm @ X                        # ONE round of message passing (mean-like)
+print(np.round(H1, 2))                 # each node now blends its neighbors' readings
+</code></pre>
+<div class="code-caption"><strong>Listing 54.1.</strong> A sensor network as \((\mathbf{X}, \mathbf{A})\), then a single symmetric-normalized aggregation \(\hat{\mathbf{A}}\mathbf{X}\), the linear core of a graph-convolution layer. Node 4 (a low, isolated branch) barely moves; node 1 (a hub touching three neighbors) is pulled toward the network average. A real layer wraps this in a learnable weight \(\mathbf{W}\) and a nonlinearity, \(\sigma(\hat{\mathbf{A}}\mathbf{X}\mathbf{W})\), but the relational mixing is exactly what you see here.</div>
+<p>Listing 54.1 makes the abstract equation concrete: the normalized adjacency \(\hat{\mathbf{A}}\) is the operator that moves information along relationships, and everything the chapter adds later (learnable weights, attention over edges, temporal recurrence) is a richer message function bolted onto this same skeleton.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: PyTorch Geometric owns the plumbing</h3>
+<p>Building the sparse adjacency by hand, batching graphs of different sizes, and writing a numerically stable, GPU-efficient scatter-aggregate is a few hundred lines you do not want to maintain. <strong>PyTorch Geometric</strong> (PyG) reduces the whole node-and-relation setup to a <code>Data(x=X, edge_index=edge_index, edge_attr=E)</code> object and a one-line layer such as <code>GCNConv(F_in, F_out)</code> that performs the normalized aggregation of Listing 54.1 with a learnable weight, on sparse tensors, on the GPU. A from-scratch graph-convolution layer with correct sparse batching runs 250 to 400 lines; PyG collapses it to under 15, and its <code>MessagePassing</code> base class lets you define a custom \(\psi\)/\(\bigoplus\)/\(\phi\) by overriding three short methods. The library owns the sparse scatter, the mini-batch of disjoint graphs, and the edge-index bookkeeping that is tedious to get right and easy to get silently wrong.</p>
+</div>
+
+<h2>When the graph framing helps, and when it misleads</h2>
+<p>The <em>when</em> is a judgment about structure. Represent your sensors as a graph when there is a real, sparse relational structure that a grid or sequence would distort: a physical network with known topology, or a fleet where correlations are strong, local, and stable enough to learn an edge set. The payoff is data efficiency (the model shares parameters across all nodes and learns functions of relationships that transfer to sensors it has not seen in that exact position) and interpretability (an edge is a hypothesis about coupling you can inspect, the theme of <a class="cross-ref" href="section-54.7.html">Section 54.7</a>). Be wary in three cases. If every sensor influences every other roughly equally, the graph is a complete graph and offers no useful bias over a plain set model. If the edges are wrong (a topology you guessed badly), message passing will confidently propagate information along fictional couplings, which is worse than no graph at all. And if you connect nodes indiscriminately, deep stacks smear every node toward the same vector, the <em>over-smoothing</em> pathology that <a class="cross-ref" href="section-54.5.html">Section 54.5</a> confronts at scale. A graph is a strong prior; like every prior in this book it helps precisely when it is true and hurts when it is not.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: learning the graph, not assuming it</h3>
+<p>The hardest assumption above is that you know the edges. A growing line of work makes \(\mathbf{A}\) itself a learned object. <strong>Graph structure learning</strong> methods infer the adjacency jointly with the predictor: Graph WaveNet (developed in <a class="cross-ref" href="section-54.3.html">Section 54.3</a>) learns a self-adaptive adjacency from node embeddings when no reliable topology exists, and neural relational inference treats the latent interaction graph as a variable to be inferred from observed dynamics. The current frontier couples this with scale (learning sparse structure over tens of thousands of nodes without an \(N^2\) blowup) and with physics (constraining the learned edges to respect known conservation laws, connecting to the physics-informed models of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>). The open problem is identifiability: many edge sets explain the same observations equally well, so a learned graph that predicts accurately need not be the true causal wiring, a caution that matters the moment anyone reads the edges as an explanation.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the METR-LA traffic dataset (207 loop detectors on Los Angeles highways). (1) Build two graphs: one from the road-network distances provided with the dataset using the thresholded Gaussian kernel above, and one from the empirical Pearson correlation of the speed series, keeping each node's top-8 correlated neighbors. Report how many edges the two graphs share. (2) Run the single-step aggregation of Listing 54.1 on a snapshot of speeds under each graph and identify a detector where the two graphs disagree sharply about the neighborhood; explain the disagreement in terms of physical versus statistical coupling. (3) Argue which graph you would trust more for detecting an incident that has never occurred at that location before, and connect your answer to the leakage-safe evaluation habit of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. State permutation equivariance in one sentence and explain why a plain multilayer perceptron on stacked sensor readings fails to have it. 2. Give two physically different meanings an edge between two sensors could encode, and name one case where the geographically nearest sensor is the <em>wrong</em> neighbor. 3. In the message-passing update, why must the aggregator \(\bigoplus\) be permutation-invariant, and what breaks if you replace it with something order-dependent such as concatenation?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-54.2.html">Section 54.2</a>, we turn the offhand phrase "an edge is a modeling choice" into a discipline: how to construct spatial graphs from geometry, process graphs from the physics of flow and connectivity, and dynamic graphs whose edges change as the system reconfigures. The node-and-relation representation built here is the fixed target; the next section is about how to draw the relations well.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

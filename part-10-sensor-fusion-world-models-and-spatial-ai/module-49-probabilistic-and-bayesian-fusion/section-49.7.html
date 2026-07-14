@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 49.7: Consistency checks and fault detection. Building Sensory AI." name="description"/>
+<title>Section 49.7: Consistency checks and fault detection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part X: Sensor Fusion, World Models, and Spatial AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 49: Probabilistic and Bayesian Fusion</a></div>
+<h1>Consistency checks and fault detection</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A filter that never doubts itself is not confident. It is broken, and it will take you down with it."</p>
+        <cite>A Self-Auditing AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the Gaussian innovation, its covariance, and the Mahalanobis distance from <a class="cross-ref" href="section-49.1.html">Section 49.1</a>, and the predict-update loop of the multi-sensor Kalman filter from <a class="cross-ref" href="section-49.2.html">Section 49.2</a> and <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. You will need the chi-square distribution and hypothesis-testing basics from the uncertainty primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The change-detection statistics used here (CUSUM, likelihood ratios) are developed from scratch in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>; we apply them to filter residuals rather than raw signals.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A Bayesian filter always produces an answer, even when a sensor has died, drifted, or is being spoofed. The estimate keeps flowing and the covariance keeps shrinking, projecting calm confidence over garbage. Consistency checking is how a fusion system audits <em>itself</em> at runtime: it compares the errors the filter actually makes against the errors its own covariance predicted it should make. When those two disagree, the model is wrong, and the same statistic that flags the disagreement tells you which sensor to distrust and by how much. This is the difference between a filter that merely runs and one you can put in a car, a pacemaker, or a flight controller. It turns a silent, overconfident estimator into a system that raises its hand and says: do not trust me right now.</p>
+    </div>
+
+    <h2>The innovation is the filter's confession</h2>
+    <p>The one quantity you can check at every timestep is the <strong>innovation</strong> \(\nu_k = z_k - \hat{z}_k\), the gap between the measurement that arrived and the measurement the filter predicted. The <em>what</em>: the innovation is the only place where the model meets reality before it is absorbed, so it carries every discrepancy the filter has not yet explained away. The <em>why</em> it is checkable is that a correctly modeled Gaussian filter makes a hard, testable promise about it. The innovation should be zero-mean, and its spread should match the <strong>innovation covariance</strong> \(S_k = H_k P_k^- H_k^\top + R_k\), which the filter computes anyway during the update: \(H_k P_k^- H_k^\top\) is the predicted-state uncertainty seen through the measurement, and \(R_k\) is the sensor noise. If the real innovations are consistently larger than \(S_k\) allows, the filter is <strong>overconfident</strong> (its covariance is a lie, the dangerous direction); consistently smaller and it is needlessly conservative.</p>
+    <p>To make "larger than \(S_k\) allows" precise, collapse the vector innovation to a scalar with the Mahalanobis form from <a class="cross-ref" href="section-49.1.html">Section 49.1</a>, giving the <strong>Normalized Innovation Squared</strong> (NIS):</p>
+    \[ \epsilon_k = \nu_k^\top S_k^{-1} \nu_k. \]
+    <p>The <em>how</em> of the test is a theorem: if the filter is consistent and the true noise is Gaussian, \(\epsilon_k\) follows a chi-square distribution with \(m\) degrees of freedom, where \(m\) is the measurement dimension. That distribution has a known mean (\(m\)) and known tail quantiles, so a single measurement gives you a calibrated yes/no: does this reading fall inside the ellipsoid my covariance drew for it?</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>NIS is checkable <em>online without ground truth</em>. Its cousin NEES (Normalized Estimation Error Squared, \(\tilde{x}_k^\top P_k^{-1} \tilde{x}_k\)) is the sharper consistency test because it uses the true state error \(\tilde{x}_k\), but you only know the true state in simulation or on a rig. In the field the innovation is all you have, and that is enough: a filter whose NIS statistic stays inside its chi-square band is certifying, timestep by timestep, that its reported uncertainty is honest. Tune your filter's process and measurement noise on a rig with NEES; then police it in production with NIS. Same theorem, two vantage points.</p>
+    </div>
+
+    <h2>Gating: reject the outlier before it poisons the estimate</h2>
+    <p>The first job of the NIS statistic is defensive. Before folding a measurement into the state, test it: if \(\epsilon_k\) exceeds a threshold \(\gamma\) drawn from the chi-square inverse CDF at a chosen confidence (say the 99th percentile), the reading is <strong>gated out</strong> and the update is skipped for that sensor this step. This is the same <em>validation gate</em> that guards data association in <a class="cross-ref" href="section-49.4.html">Section 49.4</a>, used here for fault rejection rather than track assignment. The <em>why</em> gating matters: a single wild measurement (a multipath GPS jump, a lidar return off a mirror, a wireless outlier) enters the Kalman update multiplied by the gain, and because the filter believes it, the bad value drags the mean and, worse, shrinks the covariance around the wrong place. One ungated outlier can corrupt an estimate for many subsequent steps. The gate is a chi-square bouncer at the door.</p>
+    <p>Gating on a single sample, though, is a coin flip against slow faults. A sensor that drifts by a few millimeters per second produces innovations that each sit comfortably inside the gate while their <em>sum</em> marches steadily off. The fix is to accumulate. Averaging NIS over a sliding window of \(N\) steps gives a statistic distributed as chi-square with \(mN\) degrees of freedom (scaled), which tightens the band around the mean and exposes a persistent bias that any single sample would hide. For a step change of unknown onset, the sequential tools of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, CUSUM and the generalized likelihood ratio, run directly on the innovation sequence and detect the change far faster than a fixed-window average, at the price of a tuned false-alarm rate.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from scipy.stats import chi2
+
+def nis(nu, S):
+    """Normalized Innovation Squared for one measurement update."""
+    return float(nu.T @ np.linalg.solve(S, nu))
+
+m = 2                                    # measurement dimension (e.g. x, y)
+gate = chi2.ppf(0.99, df=m)              # single-step 99% gate ~ 9.21
+
+rng = np.random.default_rng(0)
+S = np.array([[0.20, 0.05], [0.05, 0.30]])   # innovation covariance from the filter
+L = np.linalg.cholesky(S)
+
+# Healthy stream: innovations really are N(0, S)
+healthy = [nis(L @ rng.standard_normal(m), S) for _ in range(500)]
+
+# Faulted stream: sensor develops a slow bias after step 250
+faulted, bias = [], np.zeros(m)
+for k in range(500):
+    if k > 250:
+        bias += np.array([0.004, 0.0])       # creeping drift, invisible per-sample
+    faulted.append(nis(L @ rng.standard_normal(m) + bias, S))
+
+print(f"healthy mean NIS  {np.mean(healthy):.2f}  (expect ~{m})")
+print(f"healthy gate viol {np.mean(np.array(healthy) > gate)*100:.1f}%  (expect ~1%)")
+print(f"faulted mean NIS  {np.mean(faulted):.2f}")
+# A 20-step moving average crosses the fault long before any single sample trips the gate
+mov = np.convolve(faulted, np.ones(20)/20, mode="valid")
+alarm = np.argmax(mov > chi2.ppf(0.99, df=m*20)/20) + 20
+print(f"windowed alarm at step {alarm}  (true onset 250)")</code></pre>
+    <div class="code-caption"><strong>Listing 49.7.</strong> Consistency monitoring of a filter's innovations. The healthy stream's mean NIS sits at the measurement dimension \(m\) with roughly a 1% gate-violation rate, exactly what the chi-square theory predicts. The injected drift barely moves any single sample but lifts the windowed statistic through its threshold within a few dozen steps, catching a fault that per-sample gating would miss.</div>
+
+    <p>As Listing 49.7 shows, the healthy filter certifies its own honesty (mean NIS at \(m\), violations near the design rate), while the same statistic, accumulated, surfaces a creeping bias that no individual reading betrays. That gap between per-sample and windowed detection is exactly the tradeoff you tune for your latency and false-alarm budget.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an automotive GNSS/IMU stack detects a spoofed satellite fix</h3>
+        <p>A self-driving shuttle fuses inertial dead reckoning with GNSS in an extended Kalman filter. Entering a tunnel-mouth urban canyon, the GNSS receiver locks onto a multipath reflection, then later onto a low-power spoofing transmitter, both of which slide the reported position sideways by half a lane over several seconds. The raw fixes look plausible: correct format, tight reported accuracy, smooth motion. What betrays them is the innovation against the IMU-propagated state. The GNSS NIS climbs and stays above its chi-square gate while the IMU-only prediction remains self-consistent, so the fusion layer <em>isolates</em> the fault to the GNSS channel, gates those fixes out, and coasts on inertial propagation with a visibly (and honestly) growing covariance until clean fixes return. The vehicle degrades to dead reckoning instead of confidently steering into the next lane. This residual-based fault isolation is the runtime backbone of the sensor-spoofing defenses in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+    </div>
+
+    <h2>From detection to isolation: which sensor lied?</h2>
+    <p>Detecting that <em>something</em> is wrong is half the job; a safety case needs to know <em>which</em> source failed so the estimator can drop it and keep running. This is fault detection and isolation (FDI), and Bayesian fusion offers two complementary handles. The first is <strong>analytical redundancy</strong>: run a bank of filters, each excluding one sensor, and compare their innovation histories. If dropping sensor \(j\) restores every other channel's NIS to its healthy band, sensor \(j\) is the culprit. This is the residual-structuring idea behind the receiver autonomous integrity monitoring (RAIM) used in aviation GNSS, generalized to arbitrary sensor sets. The second handle is <strong>hardware redundancy</strong> read through the same statistic: with three or more sources measuring one quantity, a per-channel innovation cross-check performs a probabilistic majority vote, outvoting the deviant even when you cannot say a priori which one it is.</p>
+    <p>The <em>when</em> to reach for which: analytical redundancy is cheap in sensors but costly in computation and modeling (you must trust every excluded-filter model), so it fits mass-market systems that cannot afford triplicated hardware. Hardware redundancy is expensive in parts but robust and simple to certify, so it dominates aerospace and medical devices where a missed fault is catastrophic. Most serious stacks blend the two, and both ultimately rest on the same claim this section has built: a residual that violates its own predicted covariance is evidence, and the pattern of which residuals violate is the diagnosis.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolled consistency monitoring means maintaining the innovation and its covariance, forming the Mahalanobis quadratic with a stable solve (never an explicit inverse), looking up chi-square quantiles for your dimension and confidence, and wiring the windowed accumulator, easily fifty lines with a numerics pitfall at every step. A modern filtering stack folds gating into the update itself:</p>
+        <pre class="language-python"><code class="language-python">from filterpy.kalman import KalmanFilter
+from filterpy.stats import mahalanobis
+import scipy.stats as st
+
+kf = KalmanFilter(dim_x=4, dim_z=2)      # set F, H, Q, R, P as usual
+kf.predict()
+d2 = mahalanobis(z, kf.H @ kf.x, kf.S) ** 2      # == NIS, S computed by the filter
+if d2 &lt;= st.chi2.ppf(0.99, df=2):
+    kf.update(z)                          # accept: consistent measurement
+# else: gate out this reading, coast on the prediction</code></pre>
+        <div class="code-caption"><strong>Listing 49.8.</strong> With <code>filterpy</code>, the innovation covariance <code>kf.S</code> and the Mahalanobis helper collapse a page of consistency plumbing into three lines, turning gate-or-coast into a one-line branch. The library computes \(S_k\) and the stable solve; the engineer still owns the confidence level, the window length, and the isolation logic, because no library knows your fault model.</div>
+        <p>As Listing 49.8 shows, the library removes the linear algebra and the quantile lookup, roughly a 15-to-3 line reduction, but not the judgment: choosing the false-alarm rate and deciding what "coast" means for your application stay with you.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier: learned and adaptive consistency</h3>
+        <p>Classical NIS/NEES assumes Gaussian noise and a known \(R_k\); real sensors violate both under weather, occlusion, and adversarial interference. The current frontier makes the check itself adaptive. <strong>Adaptive Kalman filtering</strong> estimates \(R_k\) and \(Q_k\) online from the innovation sequence so the consistency band tracks changing noise, and <strong>variational Bayes</strong> filters treat the noise covariance as a latent variable inferred jointly with the state. On the learning side, deep state estimators now output calibrated covariances that feed the same chi-square machinery, and conformal-prediction wrappers (see <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) give distribution-free residual bands with finite-sample coverage guarantees, replacing the Gaussian assumption entirely. The open problem is fast, provable fault isolation when the noise model is itself being learned, a live concern for the functional-safety cases of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend Listing 49.7 with a <em>bias</em> fault instead of a drift: at step 300, add a constant offset of \(1.5\sigma\) to one innovation channel and keep it there. First, measure how often a single-step 99% gate catches it (the detection probability per sample). Then implement a CUSUM detector on the innovation and report its mean detection delay. Finally, sweep the offset from \(0.5\sigma\) to \(3\sigma\) and plot detection delay against fault magnitude for both detectors. Which detector wins for small faults, and what does that cost you in false alarms on the healthy segment?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Your filter's mean NIS over a long run is 0.6 when the measurement dimension is 3. Is the filter overconfident or underconfident, and which way should you adjust the noise covariances?</p>
+        <p class="quiz-question">2. Why can NIS be monitored in a deployed vehicle while NEES generally cannot? What does each one need that the other does not?</p>
+        <p class="quiz-question">3. A slow sensor drift passes every single-step chi-square gate yet the estimate is clearly diverging. Name two statistics that would catch it and explain what property of the drift each one exploits.</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 49</h3>
+        <p>fuse two noisy sensors with different error profiles; visualize posterior uncertainty and detect an injected fault.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>, we leave the Gaussian world where consistency has a closed-form chi-square test and enter deep multimodal fusion, where a network blends camera, lidar, and audio through learned encoders. The auditing question sharpens rather than disappears: when a modality drops out or turns adversarial, how does a neural fusion model notice, and how does it degrade gracefully instead of hallucinating confidence? The consistency instinct you built here, comparing predicted uncertainty against realized error, becomes the design principle for missing-modality robustness.</p>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Filter consistency and estimation theory</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://onlinelibrary.wiley.com/doi/book/10.1002/0471221279">Bar-Shalom, Y., Li, X.-R., and Kirubarajan, T. (2001). Estimation with Applications to Tracking and Navigation. Wiley.</a></p>
+            <p class="bib-annotation">The canonical treatment of NIS, NEES, and chi-square gating for tracking filters; the source most engineers cite for filter-consistency tests.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.cs.unc.edu/~welch/kalman/media/pdf/Kalman1960.pdf">Kalman, R. E. (1960). A New Approach to Linear Filtering and Prediction Problems. Journal of Basic Engineering.</a></p>
+            <p class="bib-annotation">The origin of the innovation and its covariance, the two quantities every consistency check in this section is built on.</p>
+        </div>
+
+        <p class="bib-category">Fault detection, isolation, and integrity monitoring</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://link.springer.com/book/10.1007/0-387-26319-5">Basseville, M. and Nikiforov, I. V. (1993). Detection of Abrupt Changes: Theory and Application. Prentice Hall.</a></p>
+            <p class="bib-annotation">The definitive reference on CUSUM and generalized likelihood ratio detectors applied to residual sequences, the workhorses for catching slow and abrupt filter faults.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.ion.org/publications/abstract.cfm?articleID=101300">Parkinson, B. W. and Axelrad, P. (1988). Autonomous GPS Integrity Monitoring Using the Pseudorange Residual. Navigation.</a></p>
+            <p class="bib-annotation">Introduces RAIM, residual-based fault detection and exclusion for GNSS, the aviation ancestor of the isolation logic used in modern GNSS/IMU fusion.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://link.springer.com/book/10.1007/978-3-540-30368-5">Isermann, R. (2006). Fault-Diagnosis Systems: An Introduction from Fault Detection to Fault Tolerance. Springer.</a></p>
+            <p class="bib-annotation">Systematic coverage of analytical versus hardware redundancy and residual structuring, the FDI framework this section applies to sensor fusion.</p>
+        </div>
+
+        <p class="bib-category">Robust and adaptive fusion</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/572216">Julier, S. J. and Uhlmann, J. K. (1997). A Non-divergent Estimation Algorithm in the Presence of Unknown Correlations. American Control Conference.</a></p>
+            <p class="bib-annotation">Covariance Intersection, the provably consistent fusion rule for unknown cross-correlation that keeps a fused estimate from becoming overconfident.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/4753930">Sarkka, S. and Nummenmaa, A. (2009). Recursive Noise Adaptive Kalman Filtering by Variational Bayesian Approximations. IEEE Transactions on Automatic Control.</a></p>
+            <p class="bib-annotation">A variational-Bayes filter that infers the measurement-noise covariance online, letting the consistency band adapt when sensor noise changes.</p>
+        </div>
+    </section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
