@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.7: Compute-efficient deployment. Building Sensory AI." name="description"/>
+<title>Section 15.7: Compute-efficient deployment | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Transformers for Sensor Data</a></div>
+<h1>Compute-efficient deployment</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I scored one point higher on the benchmark and drew four times the current. The battery, unimpressed, filed a complaint."</p>
+<cite>A Power-Budgeted AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Every earlier section in this chapter bought accuracy: attention over time and channels, patchification, positional grounding, long-context tricks, masked pretraining. This section spends the bill. A transformer that classifies gait beautifully in a notebook is worthless on a wristband if a single inference drains 40 mJ and arrives 300 ms late. Deployment is where the model meets a fixed silicon budget, a real battery, a hard latency deadline, and a thermal envelope that will throttle you if you ignore it. The good news is that transformers are unusually forgiving targets for compression: their compute is dominated by a few large dense matrix multiplies and a couple of attention kernels, so a small number of well-chosen optimizations (quantization, kernel fusion, cache reuse, distillation) move the numbers a lot. The discipline is measuring the right numbers. This section is about turning a trained sensor transformer into an artifact that hits a stated latency, energy, and memory target on a named piece of hardware, and knowing which knob to turn when it does not.</p>
+</div>
+
+<p>This section assumes the transformer architecture built across <a class="cross-ref" href="section-15.1.html">Sections 15.1</a> through <a class="cross-ref" href="section-15.6.html">15.6</a>, and the general edge-optimization toolkit is developed at depth in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>; here we focus on what is specific to <em>attention-based sensor models</em>. We keep the chapter's notation: a window is \(N\) tokens of width \(D\), stacked into \(L\) layers with \(H\) heads.</p>
+
+<h2>Know your cost model before you optimize</h2>
+<p>You cannot shrink what you have not measured. A transformer layer has two cost centers. The position-wise projections and the feed-forward block are dense matrix multiplies whose cost scales as \(O(N D^2)\); attention itself scales as \(O(N^2 D)\). For short sensor windows (a few hundred tokens) the \(D^2\) term dominates and you are compute-bound on the linear layers; for the long windows of <a class="cross-ref" href="section-15.4.html">Section 15.4</a> the \(N^2\) term takes over and you become memory-bandwidth-bound on attention. Which regime you are in decides everything: quantizing weights helps the linear-bound case, while fusing the attention kernel helps the bandwidth-bound case. The three quantities a deployment target actually specifies are latency (milliseconds per window), energy (millijoules per inference, the real currency on a battery), and peak memory (activation plus weight footprint that must fit in on-chip SRAM or tight DRAM). Report all three, because optimizing one silently trades against the others: a larger batch cuts per-window energy but raises latency and peak memory.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Energy per inference is the metric that ships, not FLOPs</h3>
+<p>FLOP counts are seductive because they are architecture-only and easy to compute, but they mispredict deployed cost badly. Two models with equal FLOPs can differ 5x in energy because one is bandwidth-bound (moving activations in and out of DRAM, which costs roughly two orders of magnitude more energy per byte than an on-chip multiply) and the other keeps its working set in SRAM. On a sensor node the dominant energy term is often data movement, not arithmetic. So the winning optimizations are frequently the ones that reduce bytes moved: lower-precision activations, kernel fusion that avoids writing intermediates to DRAM, and keeping the KV cache small. Measure joules on the actual device; treat FLOPs as a rough sanity check only.</p>
+</div>
+
+<h2>Quantization: the highest-leverage single move</h2>
+<p>Quantization maps 32-bit floats to low-bit integers, typically 8-bit (INT8), sometimes 4-bit. The <em>what</em> is a per-tensor or per-channel affine map \(x \approx s\,(q - z)\) with scale \(s\) and zero-point \(z\); the <em>why</em> is that INT8 matmuls run 2x to 4x faster and use roughly a quarter of the memory bandwidth of FP32, and many microcontroller and DSP targets have no fast float unit at all; the <em>how</em> comes in two flavors. Post-training quantization (PTQ) calibrates \(s\) and \(z\) from a few hundred representative windows and needs no retraining, which is the right first attempt. Quantization-aware training (QAT) simulates the rounding during fine-tuning so the network learns weights robust to it, recovering the last point or two of accuracy when PTQ falls short. Transformers have one notorious wrinkle: activation outliers in the attention and layer-norm paths blow up the quantization range, so keep layer-norm and the softmax in higher precision and quantize the big linear layers aggressively. Do the accuracy check on a leakage-safe split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), because a quantized model that memorized a subject will look fine on a leaky test and fail in the field.</p>
+
+<p>The snippet below applies dynamic INT8 quantization to the linear layers of a trained sensor transformer and measures the size reduction, the cheapest experiment in the whole optimization budget.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn, io
+
+def size_kb(m):
+    buf = io.BytesIO(); torch.save(m.state_dict(), buf)
+    return buf.getbuffer().nbytes / 1024
+
+model = torch.load("sensor_transformer.pt").eval()   # your trained patch transformer
+
+# Dynamic PTQ: weights -> INT8, activations quantized on the fly at runtime.
+qmodel = torch.quantization.quantize_dynamic(
+    model, {nn.Linear}, dtype=torch.qint8)
+
+x = torch.randn(1, 128, 64)                            # one window: 128 tokens, D=64
+print(f"fp32 {size_kb(model):7.1f} KB -> int8 {size_kb(qmodel):7.1f} KB")
+torch.testing.assert_close(model(x), qmodel(x), atol=5e-2, rtol=5e-2)  # sanity
+</code></pre>
+<div class="code-caption">Dynamic post-training INT8 quantization of the linear layers, with a size readout and a tolerance check. Typical result is a 3.5x to 4x shrink of the linear-layer weights with sub-point accuracy loss; the assert guards against a botched conversion.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">One call instead of a hand-rolled quantizer</h3>
+<p>Writing the calibration loop, per-channel scale estimation, fake-quant nodes, and INT8 kernels by hand is 200-plus lines and easy to get subtly wrong. <code>torch.quantization.quantize_dynamic</code> (above) is one call for the PTQ baseline; <code>torch.ao.quantization</code> or <code>onnxruntime</code>'s quantization tools handle static PTQ and QAT with calibration in a dozen lines, and export to a runtime (ONNX Runtime, TensorRT, TFLite) that ships fused INT8 kernels for your target. The library owns the numerics and the hardware-specific kernel selection; you own choosing which layers stay in higher precision.</p>
+</div>
+
+<h2>Distillation, pruning, and cache reuse</h2>
+<p>When quantization alone misses the budget, three further moves apply. <em>Knowledge distillation</em> trains a small student transformer (fewer layers, narrower \(D\), fewer heads) to match the soft outputs and, often, the attention maps of a large teacher; the student reaches accuracy its size alone would not, because the teacher's smoothed targets carry more information than hard labels. This pairs naturally with the masked pretraining of <a class="cross-ref" href="section-15.6.html">Section 15.6</a>: distill from a heavy pretrained model into a deployable one. <em>Structured pruning</em> removes whole heads or feed-forward channels (unstructured sparsity rarely helps real hardware because it needs sparse-matmul support the target lacks); many attention heads turn out redundant on sensor tasks, so head pruning is a reliable 20-to-40 percent win. Finally, for <em>streaming</em> inference where a new sample arrives every few milliseconds, the <em>KV cache</em> stores the keys and values of past tokens so each step recomputes attention only for the newest token, turning per-step cost from \(O(N^2)\) into \(O(N)\); this is the single most important trick for real-time causal deployment, and its memory footprint (\(2 L H\) times cache length times head dimension) is often the binding constraint, which is why efficient-attention variants and the state-space models of <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> exist.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A hearing aid running a transformer denoiser at 10 mW</h3>
+<p>A hearing-aid team ports an attention-based speech-and-environment classifier onto a low-power DSP with a 10 mW active budget and a 10 ms end-to-end latency deadline, because audio delay past that becomes perceptible. The FP32 research model needs 55 mW and 22 ms: dead on arrival. They apply the stack in order. INT8 PTQ (keeping layer-norm in FP16) cuts energy 3.2x and, more importantly, lets the working set live in on-chip SRAM so activations never hit DRAM, which is where most of the power was going. Pruning six of twelve attention heads, chosen by their low average attention entropy, removes 30 percent of the attention cost with a 0.4-point accuracy drop. A KV cache makes the model causal-streaming so each 8 ms audio frame costs a single-token update rather than a full-window recompute. The shipped model runs at 8.9 mW and 7 ms, inside both budgets, and the team validates on a held-out set of unseen acoustic scenes to be sure the pruning did not overfit the calibration environments.</p>
+</div>
+
+<h2>Kernels, runtimes, and the deployment target</h2>
+<p>Optimizations chosen on paper only pay off if the runtime emits kernels that exploit them. Three practical levers: <em>operator fusion</em> collapses the attention softmax, scaling, and matmuls into one kernel (FlashAttention is the canonical example) so intermediate scores are never written to DRAM, which is a large bandwidth and energy win on long windows; <em>graph-level compilation</em> (ONNX Runtime, TensorRT, TVM, TFLite, ExecuTorch) fuses adjacent linear-plus-activation ops, picks INT8 kernels, and lays out memory for the specific chip; and <em>batching or windowing policy</em> trades latency for throughput, which matters on a gateway aggregating many sensors but hurts a single-stream wearable. The target dictates the toolchain: a Cortex-M microcontroller wants TFLite Micro or CMSIS-NN and lives inside a few hundred kilobytes (the province of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>), a phone-class NPU wants NNAPI or Core ML, and a Jetson-class edge GPU wants TensorRT. Always benchmark on the actual device under the real thermal load, because a bench measurement taken cold will not survive sustained duty cycling.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is moving</h3>
+<p>The current frontier pushes below INT8. SmoothQuant and GPTQ-style 4-bit weight quantization, first proven on large language models, are migrating to time-series and sensor transformers, and hardware-aware kernels such as FlashAttention-2 and FlashAttention-3 keep cutting the bandwidth cost of attention. On the sensor-foundation-model side, models like MOMENT and Google's Large Sensor Model raise the question of how to deploy a pretrained giant on a wristband at all; the answer is increasingly distillation into a small task-specific student plus INT8 or INT4 export. Meanwhile the linear-time state-space models of <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> compete by removing the quadratic term entirely, and hybrid attention-SSM designs try to keep the transformer's accuracy at the SSM's deployment cost. Watch also the uncertainty question: an aggressively quantized model can become overconfident, so pair compression with the calibration checks of <a class="cross-ref" href="../module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take your trained patch transformer from the chapter lab. (1) Profile it on a target device (or a CPU with a thread cap as a proxy) and report latency, peak memory, and, if you can, energy per window; identify whether you are linear-bound or attention-bound by varying \(N\) and \(D\). (2) Apply INT8 PTQ and re-measure all three, plus accuracy on a leakage-safe split. (3) Prune the two lowest-entropy attention heads and re-measure. (4) Plot accuracy against energy for the three variants and state which one you would ship for a wearable with a 20 mJ per-window budget, and why.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why can two models with identical FLOP counts differ several-fold in deployed energy, and what physical cost does FLOPs ignore?</p>
+<p>2. Which transformer sub-layers should you keep in higher precision when quantizing, and what failure mode motivates this?</p>
+<p>3. What does a KV cache change about the per-step cost of causal streaming inference, and which resource does it trade away to get that?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 15</h3>
+<p>train a patch transformer for sensor classification; compare with CNN/TCN baselines.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Quantization and compression</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2211.10438">Xiao, Lin, Seznec, Wu, Demouth, Han (2023). SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models. ICML.</a></p>
+<p class="bib-annotation">Introduces the outlier-smoothing trick that makes INT8 quantization of attention models work despite activation outliers, the exact failure mode called out for sensor transformers here.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2210.17323">Frantar, Ashkboos, Hoefler, Alistarh (2023). GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers. ICLR.</a></p>
+<p class="bib-annotation">The reference method for pushing transformer weights to 3 to 4 bits with minimal accuracy loss, now migrating from language models to time-series and sensor transformers.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1503.02531">Hinton, Vinyals, Dean (2015). Distilling the Knowledge in a Neural Network. NeurIPS Deep Learning Workshop.</a></p>
+<p class="bib-annotation">The original knowledge-distillation paper; the foundation for compressing a heavy pretrained sensor transformer into a deployable student.</p>
+</div>
+
+<p class="bib-category">Efficient attention kernels</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2205.14135">Dao, Fu, Ermon, Rudra, Re (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. NeurIPS.</a></p>
+<p class="bib-annotation">The IO-aware fused attention kernel that removes the DRAM round-trip for attention scores, the canonical operator-fusion win cited in the runtime discussion.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2307.08691">Dao (2023). FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. arXiv.</a></p>
+<p class="bib-annotation">The follow-up that further improves attention throughput; part of the ongoing frontier of cutting attention bandwidth cost.</p>
+</div>
+
+<p class="bib-category">Pruning and edge deployment</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1905.10650">Michel, Levy, Neubig (2019). Are Sixteen Heads Really Better than One? NeurIPS.</a></p>
+<p class="bib-annotation">Empirical evidence that many attention heads are redundant and can be pruned, the basis for the head-pruning move used in the hearing-aid example.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1712.05877">Jacob, Kligys, Chen, Zhu, Tang, Howard, Adam, Kalenichenko (2018). Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference. CVPR.</a></p>
+<p class="bib-annotation">The affine integer-quantization scheme and quantization-aware training recipe underlying INT8 deployment on float-free sensor hardware.</p>
+</div>
+
+<p class="bib-category">Sensor and time-series foundation models</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami, Szafer, Choudhry, Cai, Li, Dubrawski (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p>
+<p class="bib-annotation">A large pretrained time-series transformer that concretely raises the deploy-a-giant-on-a-small-device problem this section answers with distillation and quantization.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>, we take the deployment pressure of this section to its logical conclusion and ask what happens if we remove the quadratic attention cost altogether. State-space models (S4, S5, and the selective Mamba family) process sequences in linear time with a bounded recurrent state, promising transformer-class accuracy at a fraction of the memory and energy on long sensor streams, and we will benchmark that promise head to head.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

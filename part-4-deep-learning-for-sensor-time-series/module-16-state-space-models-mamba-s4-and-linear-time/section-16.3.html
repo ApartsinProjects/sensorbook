@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.3: Selective state spaces (Mamba). Building Sensory AI." name="description"/>
+<title>Section 16.3: Selective state spaces (Mamba) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>Selective state spaces (Mamba)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A fixed memory forgets on a schedule. I decided to forget only when the signal told me nothing."</p>
+        <cite>A Selectively Attentive AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the structured state-space models of <a class="cross-ref" href="section-16.2.html">Section 16.2</a>: the linear recurrence \(h_t = \bar{A}h_{t-1} + \bar{B}x_t\), the diagonal-plus-low-rank parameterization of S4, and the dual view where the same operator runs as a fast parallel convolution during training and a constant-memory recurrence at inference. It assumes the quadratic-cost argument for attention from <a class="cross-ref" href="section-16.1.html">Section 16.1</a> and comfort with the multivariate sensor tensor of shape \((\text{channels} \times \text{time})\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Familiarity with gated recurrences from <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> will make the selection mechanism feel natural.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>S4 gave us a linear-time sequence model, but it paid for that speed with a rigid memory: its state-update matrices are the same at every timestep, chosen once and applied blindly whether the current sample is a meaningful event or dead air between events. That is fine for smooth, stationary signals and clumsy for the bursty, event-sparse streams that dominate sensing, where a footstep, a heartbeat, or a fault transient hides in long stretches of nothing. Mamba fixes this by making the state-space parameters <em>functions of the input</em>. At each step the model reads the current sample and decides how much to write into memory and how fast to let old memory decay. This one change, called selection, lets a linear-time recurrence do the content-dependent routing that people previously thought required attention. The price is that the fast convolution trick of S4 no longer applies, so Mamba is made practical by a hardware-aware parallel scan that keeps the whole recurrence on the GPU's fast memory.</p>
+    </div>
+
+    <h2>The limitation selection removes: linear time-invariance</h2>
+    <p>Every S4-style model of <a class="cross-ref" href="section-16.2.html">Section 16.2</a> is <em>linear time-invariant</em> (LTI). The discretized matrices \(\bar{A}\), \(\bar{B}\), and \(\bar{C}\) are learned parameters that do not depend on \(t\) or on the data flowing through them. That property is exactly what enables the convolutional view: because the recurrence weights are constant, unrolling it produces a single fixed kernel that can be applied by FFT in \(O(L \log L)\). The constancy that buys the speed is also the model's cage. An LTI system processes the tenth sample of a quiet baseline with the identical dynamics it applies to a sharp impact spike. It cannot say "this sample matters, hold it" or "this stretch is noise, let it fade," because the coefficients that would make that decision are frozen at training time.</p>
+    <p>For sensor streams this is a real handicap. Consider an inertial measurement unit on a wrist: minutes of near-constant gravity vector punctuated by a half-second gesture. A useful model must remember the gesture for many steps while aggressively discarding the flat baseline, and which is which depends on the content of the samples, not on their position. LTI models solve a fixed convolution problem; they have no mechanism to route information conditionally. Attention has exactly that mechanism, comparing content to content, which is why <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a> models excel at selective recall, and why they cost \(O(L^2)\) to do it. Selection is the attempt to get the routing without the quadratic bill.</p>
+
+    <h2>The selection mechanism: input-dependent parameters</h2>
+    <p>Mamba, introduced by Gu and Dao in 2023 (the architecture is also called S6, for "selective S4"), makes three of the state-space quantities functions of the input token \(x_t \in \mathbb{R}^{D}\). Instead of a single learned \(B\), \(C\), and step size \(\Delta\), each is produced by a small linear projection of the current sample:</p>
+    <p>$$B_t = \mathrm{Lin}_B(x_t), \qquad C_t = \mathrm{Lin}_C(x_t), \qquad \Delta_t = \mathrm{softplus}\big(\mathrm{Lin}_\Delta(x_t)\big)$$</p>
+    <p>The continuous \(A\) matrix stays fixed and diagonal, but the discretization now uses the per-step \(\Delta_t\), so the effective transition \(\bar{A}_t = \exp(\Delta_t A)\) and input map \(\bar{B}_t\) change at every timestep. The recurrence becomes time-<em>varying</em>:</p>
+    <p>$$h_t = \bar{A}_t \, h_{t-1} + \bar{B}_t \, x_t, \qquad y_t = C_t \, h_t$$</p>
+    <p>Read \(\Delta_t\) as a data-driven gate, the same idea as the forget gate of an LSTM from <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, now expressed in continuous-time language. A large \(\Delta_t\) means "take a big step": strongly incorporate the current input and let older state decay quickly, the right response to a salient event. A small \(\Delta_t\) means "barely move": ignore this sample and preserve the accumulated memory, the right response to a flat, uninformative stretch. Because \(B_t\) and \(C_t\) are also input-dependent, the model additionally chooses <em>what</em> of the current sample to write into state and <em>what</em> to read out, giving it content-based routing along the whole sequence.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Selection converts the step size \(\Delta_t\) into a learned, per-sample resolution knob. Where classical sampling theory (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>) fixes your temporal resolution once at acquisition time, Mamba lets the model re-choose an effective resolution at every timestep: fine when something is happening, coarse when nothing is. This is why a selective SSM can skim thousands of idle samples cheaply and still snap to full attention on the rare informative burst, exactly the behavior event-sparse sensor streams demand.</p>
+    </div>
+
+    <h2>Why selection breaks convolution, and how the scan restores speed</h2>
+    <p>Making the parameters vary with the input destroys linear time-invariance, and with it the convolutional kernel. There is no longer a single fixed filter to FFT, because the "filter" is different at every position. Naively that pushes you back to a sequential recurrence, \(L\) steps that cannot be parallelized, which is death on modern accelerators that want thousands of lanes busy at once. Mamba's second contribution is what makes it usable: the time-varying recurrence is computed with a <strong>parallel associative scan</strong>. The recurrence \(h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t\) is an associative operation over the sequence, so a Blelloch-style scan evaluates all \(L\) states in \(O(L)\) work and \(O(\log L)\) parallel depth rather than \(L\) sequential stages.</p>
+    <p>The authors go further with a hardware-aware implementation. The expanded state, of size (batch \(\times\) channels \(\times\) state dimension), is large and would be ruinous to write to and from the GPU's slow high-bandwidth memory at every step. Mamba's kernel keeps the scan inside the fast on-chip SRAM, materializing the big state only transiently and recomputing it during the backward pass instead of storing it, a kernel-fusion strategy in the spirit of FlashAttention. The result is a model that is genuinely linear in sequence length, trains in parallel, and at inference runs as a plain recurrence with \(O(1)\) memory per step, the constant-state property that makes SSMs attractive for streaming and on-device sensing in the first place.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: continuous fall detection on a hearing-aid IMU</h3>
+        <p>A hearing-aid maker wants fall detection to run forever on a device with a tiny battery and a 6-axis IMU sampled at 100 Hz. A transformer over a 30-second context is 3000 tokens per channel, and its attention memory grows with the window, so the team is forced into short windows that miss the slow pre-fall instability. They switch the encoder to a two-layer Mamba block. During the many minutes of ordinary walking and sitting, the learned \(\Delta_t\) stays small, so the recurrence coasts and the state barely changes, keeping average energy low. When the acceleration signature of a stumble arrives, \(\Delta_t\) spikes, the model writes the transient sharply into state, and \(C_t\) surfaces it to the classifier. Because inference is a fixed-size recurrence, the memory footprint is constant whether the context is 30 seconds or 30 minutes, so the same model can carry hours of running context without growing. On their test set the selective model matches the short-window transformer's precision while cutting steady-state inference energy by roughly half, the difference between a feature that ships and one that drains the battery by noon.</p>
+    </div>
+
+    <h2>A minimal selective recurrence</h2>
+    <p>The listing below implements the core of one selective SSM channel as a readable sequential recurrence, the inference-time form. It is not the fused parallel-scan kernel you would train with, but it makes the time-varying update concrete: notice that \(\Delta\), \(B\), and \(C\) are recomputed from each input sample inside the loop, which is precisely what an LTI S4 layer does not do.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def selective_ssm_step(x, A, W_delta, W_B, W_C):
+    # x: (T, D) one sequence, D channels. A: (D, N) diagonal state dynamics (log-neg).
+    T, D = x.shape
+    N = A.shape[1]
+    h = torch.zeros(D, N)                       # constant-size hidden state
+    ys = []
+    for t in range(T):                          # sequential = the streaming form
+        xt = x[t]                               # (D,)
+        delta = F.softplus(x[t] @ W_delta)      # (D,) input-dependent step size
+        B = x[t] @ W_B                          # (N,) input-dependent write map
+        C = x[t] @ W_C                          # (N,) input-dependent read map
+        A_bar = torch.exp(delta[:, None] * A)   # (D, N) per-step decay, A<0
+        B_bar = delta[:, None] * B[None, :]     # (D, N) discretized input gain
+        h = A_bar * h + B_bar * xt[:, None]     # selective state update
+        ys.append(h @ C)                        # (D,) read out
+    return torch.stack(ys)                       # (T, D)</code></pre>
+    <div class="code-caption">A single selective state-space channel written as the constant-memory streaming recurrence. The gate <code>delta</code> and the maps <code>B</code>, <code>C</code> are recomputed from every sample, so the dynamics vary with content. Training uses a mathematically equivalent parallel scan instead of this Python loop.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>You never write the scan or the fused CUDA kernel yourself. The reference <code>mamba-ssm</code> package exposes the whole thing as <code>from mamba_ssm import Mamba; layer = Mamba(d_model=128, d_state=16, d_conv=4, expand=2)</code>, a single line that replaces roughly 150 lines of hand-rolled discretization, associative-scan logic, and memory-aware backward pass, and it dispatches to the hardware-aware kernel automatically. For sensor tensors, feed it \((\text{batch} \times \text{time} \times \text{channels})\) just like a transformer block. When the CUDA kernel is unavailable (CPU or a bare edge target), the same library offers a slower pure-PyTorch fallback so your code stays identical across environments.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current state of the art is <strong>Mamba-2</strong> (Dao and Gu, 2024), whose State Space Duality framework reframes the selective scan as a form of structured masked attention, unifying the SSM and attention views and unlocking a matrix-multiplication-based kernel that is several times faster to train than the original selective scan while allowing much larger state dimensions. On the sensing side, selective SSMs are the backbone of a wave of 2024 to 2025 architectures covered next in <a class="cross-ref" href="section-16.4.html">Section 16.4</a>, including bidirectional variants that let non-causal, offline sensor analysis see both past and future, an option streaming attention cannot cheaply match. Open questions remain around how well a scalar-gated linear recurrence captures very long-range, precisely-indexed dependencies compared with full attention, which motivates the hybrid designs of <a class="cross-ref" href="section-16.6.html">Section 16.6</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the <code>selective_ssm_step</code> function above and construct a 500-step input that is zero everywhere except for a single unit impulse at \(t = 50\). Run it twice: once forcing <code>delta</code> to a small constant (say 0.01) and once forcing it large (say 2.0). Plot the resulting hidden-state magnitude over time for both. Explain, in terms of \(\bar{A}_t = \exp(\Delta_t A)\), why the small-\(\Delta\) run remembers the impulse far longer than the large-\(\Delta\) run, and connect this to when you would want each behavior on a real event-sparse stream. Then make \(\Delta\) input-dependent again and verify that the model preserves the impulse while decaying the surrounding zeros.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why does making \(B\), \(C\), and \(\Delta\) input-dependent prevent Mamba from being trained as a single fixed convolution, and what replaces the convolution?</li>
+            <li>An LTI S4 layer and a selective S6 layer both run at inference as an \(O(1)\)-memory recurrence. What capability does the selective layer gain, and on what kind of sensor signal would you expect the gap between them to be largest?</li>
+            <li>The parallel scan has \(O(L)\) work but \(O(\log L)\) depth. Why does that depth number, rather than the work number, explain why Mamba trains efficiently on a GPU?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-16.4.html">Section 16.4</a>, we take the selective state-space block from a general-purpose primitive to purpose-built sensor and time-series architectures: SiMBA's channel-mixing for multivariate streams, TimeMachine's multi-scale design, and the bidirectional Bi-Mamba variants that let offline analysis attend to both past and future. You will see how the one idea developed here, input-dependent dynamics inside a linear-time recurrence, gets wired into models that compete directly with the transformers of <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a> on long-horizon sensor tasks.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

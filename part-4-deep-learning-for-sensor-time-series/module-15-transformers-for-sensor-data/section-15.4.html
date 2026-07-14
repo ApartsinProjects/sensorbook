@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.4: Long-context and efficient attention. Building Sensory AI." name="description"/>
+<title>Section 15.4: Long-context and efficient attention | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Transformers for Sensor Data</a></div>
+<h1>Long-context and efficient attention</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"They handed me a window long enough to remember the whole shift, then a compute budget that could barely afford the last five seconds. Efficiency is just me learning which seconds to forget."</p>
+        <cite>A Budget-Conscious AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you have met scaled dot-product attention and the multi-head block in <a class="cross-ref" href="section-15.1.html">Section 15.1</a>, and that you understand how a raw sensor stream is cut into tokens in <a class="cross-ref" href="section-15.2.html">Section 15.2</a>, because patch length is the single biggest lever on the cost we are about to fight. Basic complexity notation (\(O(\cdot)\)) and the idea of a receptive field from <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> are all the extra background you need.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A transformer's superpower is that every token can look at every other token in one hop. Its curse is the bill for that privilege: attention costs grow with the <em>square</em> of the sequence length. Text sequences top out at a few thousand tokens, but a sensor sampled at kilohertz rates produces sequences that are orders of magnitude longer, and the plain attention matrix simply will not fit in memory. This section is about buying back the long context that sensing genuinely needs (a vibration signature, a slow drift, an overnight sleep stage) without paying the quadratic price. The tools split into three families: make the attention pattern sparse, replace the softmax with a linear-cost approximation, or keep the exact math and just compute it more cleverly on the hardware. Knowing which lever to pull, and when to abandon attention entirely, is what separates a model that trains on a workstation from one that only ever exists in a paper.</p>
+    </div>
+
+    <h2>Why quadratic attention breaks on long sensor windows</h2>
+    <p>Self-attention builds an \(L \times L\) score matrix, where \(L\) is the number of tokens. For queries, keys, and values of width \(d\), computing \(QK^\top\), softmaxing it, and multiplying by \(V\) costs on the order of</p>
+    \[ O(L^2 d) \text{ time and } O(L^2) \text{ memory}. \]
+    <p><strong>What</strong> this means concretely: double the window and you quadruple the work. <strong>Why</strong> it bites sensing harder than language is a matter of raw arithmetic. A sentence is maybe 30 tokens; a page is 500. Now take an industrial accelerometer sampled at \(20\,\mathrm{kHz}\). A ten-second capture is \(200{,}000\) raw samples. Even after patchification collapses, say, 64 samples into one token, you are left with roughly \(3{,}000\) tokens, and the score matrix has \(3{,}000^2 \approx 9\) million entries <em>per head, per layer</em>. Push the window to a full minute of high-rate data and the matrix crosses a billion entries; the memory alone exceeds a commodity GPU before a single gradient flows. <strong>When</strong> does this matter? Precisely when the phenomenon you care about is slow or intermittent relative to the sample rate: a bearing fault that rings once per revolution, a cardiac arrhythmia that appears in one beat out of a thousand, a machine that drifts out of tolerance over an hour. Downsample to shorten the sequence and you blur the very event you are hunting.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The quadratic wall is not a hardware problem you outgrow with a bigger GPU; it is a scaling law. Each generation of accelerator roughly doubles memory, but doubling the window quadruples the demand, so hardware loses the race by construction. Long-context sensing is therefore an <em>algorithmic</em> problem: you must change what attention computes, not just where it runs.</p>
+    </div>
+
+    <h2>Sparse and local attention: exploit the structure of signals</h2>
+    <p>Full attention assumes any token might be decisively relevant to any other. Physical signals rarely honor that assumption. The value of a sample is dominated by its recent neighbors (local temporal correlation), plus a sparse set of far-away anchors (a periodic beat, a shift-start marker, a global summary). <strong>Sparse attention</strong> hard-codes this prior by letting each token attend to only a chosen subset of the others, dropping the cost from \(O(L^2)\) toward \(O(L)\).</p>
+    <p>The workhorse pattern is <strong>sliding-window (local) attention</strong>: token \(i\) attends only to the \(w\) tokens on either side, costing \(O(L w)\) with \(w \ll L\). This is attention's answer to the dilated receptive field you met in <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, and like a stack of dilated convolutions, stacking windowed-attention layers grows the effective receptive field linearly with depth, so distant tokens still communicate indirectly. To restore true global reach cheaply, designs such as Longformer and BigBird add two ingredients: <strong>dilated windows</strong> that skip tokens to cover more span at fixed cost, and a handful of <strong>global tokens</strong> that every position attends to and that attend to everyone, giving an \(O(L)\) information highway. A single \([\text{CLS}]\)-style global token is often enough to route a whole-window classification decision. The design question is always the same: what is the physical range of dependency in this signal, and how few links can honor it?</p>
+
+    <div class="callout practical-example">
+        <h4>In Practice: 24-hour predictive maintenance on a pump</h4>
+        <p>A water-utility maintenance team streams vibration from a pump's drive-end bearing at \(25.6\,\mathrm{kHz}\) and wants a transformer that flags an emerging outer-race fault a week before failure. The fault signature is a faint impact that repeats at the ball-pass frequency, buried in an hour of otherwise healthy running. Full attention over an hour is hopeless. The deployed model uses a \(512\)-token sliding window (covering a few seconds of local waveform shape, enough to see one impact cluster) plus four global tokens that each summarize a 15-minute quadrant of the capture. The local windows catch the shape of each impact; the global tokens accumulate <em>how often</em> impacts recur across the hour, which is the actual diagnostic. Memory drops from tens of gigabytes to under one, and the model runs on the edge gateway in the pump house rather than shipping raw waveforms to the cloud. This same span-versus-cost tradeoff drives the condition-monitoring pipelines in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+    </div>
+
+    <h2>Linear attention: replace the softmax, not just the pattern</h2>
+    <p>Sparse patterns still compute an exact softmax over the links they keep. A different family attacks the math itself. The bottleneck is that softmax forces you to form \(QK^\top\) explicitly before you can normalize. <strong>Linear attention</strong> replaces the softmax kernel with a feature map \(\phi(\cdot)\) so that the similarity between query \(i\) and key \(j\) factorizes as \(\phi(q_i)^\top \phi(k_j)\). Once it factorizes, the associativity of matrix multiplication lets you reorder the computation:</p>
+    \[ \big(\phi(Q)\,\phi(K)^\top\big)V \;=\; \phi(Q)\,\big(\phi(K)^\top V\big). \]
+    <p>The left side builds the \(L \times L\) matrix; the right side first builds a \(d \times d\) matrix and never materializes anything of size \(L^2\). The cost falls to \(O(L d^2)\), linear in sequence length. Performer approximates the true softmax kernel with random features so the results stay close to exact attention, while simpler schemes (for example \(\phi(x) = \mathrm{elu}(x) + 1\)) trade a little fidelity for speed and, usefully, admit a recurrent form that streams one token at a time. That streaming form is why linear attention is attractive for the always-on, never-ending inputs of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>. The catch, which you should treat as a working rule rather than a footnote, is that linear attention often underperforms exact attention when the task hinges on sharp, precise matches between two specific distant tokens, because the low-rank feature map smears fine distinctions. Reach for it when context is long and the signal is smooth; be skeptical when a single needle in the haystack decides the label.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The current default for long-context transformers is not an approximation at all but an exact, IO-aware kernel. <strong>FlashAttention</strong> (Dao et al., 2022) and its successors FlashAttention-2 (2023) and FlashAttention-3 (2024, tuned for NVIDIA Hopper GPUs) compute the standard softmax attention while never writing the full \(L \times L\) matrix to slow high-bandwidth memory; they tile the computation and fuse it in fast on-chip SRAM, cutting memory from \(O(L^2)\) to \(O(L)\) and running several times faster with bit-for-bit the same output. Because it changes only the memory-access pattern and not the math, FlashAttention has largely displaced approximate methods wherever exact attention still fits after the memory saving, and it is the kernel silently invoked by PyTorch's <code>scaled_dot_product_attention</code>. For sensor windows that are long but not astronomically so, the modern first move is FlashAttention plus modest patch merging, and only then sparse or linear attention if you are still over budget.</p>
+    </div>
+
+    <p>You do not implement any of this by hand. PyTorch exposes the fused, memory-efficient kernels behind one function, and it selects FlashAttention automatically when the inputs qualify. Listing 15.4 shows the whole thing.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+# 8 heads, a long sensor window of L=4096 tokens, head width 64
+B, H, L, d = 2, 8, 4096, 64
+q = torch.randn(B, H, L, d, device="cuda", dtype=torch.float16)
+k = torch.randn(B, H, L, d, device="cuda", dtype=torch.float16)
+v = torch.randn(B, H, L, d, device="cuda", dtype=torch.float16)
+
+# One call: fused, IO-aware, exact softmax attention.
+# is_causal=True masks the future so a token never attends forward in time.
+out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print(out.shape)   # torch.Size([2, 8, 4096, 64]); no 4096x4096 matrix ever stored</code></pre>
+    <div class="code-caption"><strong>Listing 15.4.</strong> A single <code>scaled_dot_product_attention</code> call over a 4096-token window. PyTorch dispatches to the FlashAttention kernel when the dtype and shapes allow, so the \(4096 \times 4096\) score matrix is never materialized in high-bandwidth memory. The <code>is_causal</code> flag enforces temporal ordering, which matters whenever a streaming sensor model must not peek at future samples.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A correct, numerically stable FlashAttention kernel is roughly 300 to 500 lines of CUDA with online-softmax bookkeeping, tiling, and careful reductions; a naive from-scratch attention that materializes the score matrix is a dozen lines but blows up at long \(L\). The single <code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code> call in Listing 15.4 replaces both, giving you the exact result of the naive version at the memory footprint of the hand-tuned kernel, a reduction from hundreds of lines (or an out-of-memory crash) to one. It also transparently upgrades when you install a newer FlashAttention build. What the library will <em>not</em> decide for you is your window length and patch size; those remain the modeling choices that set the bill in the first place.</p>
+    </div>
+
+    <h2>Choosing an efficient-attention strategy</h2>
+    <p>The three families answer different questions, and Table 15.4 lines them up. Full attention is your accuracy reference and the right choice whenever the post-patchification sequence fits in memory, which, thanks to FlashAttention, now covers many sensor tasks people assumed needed approximation. Reach for sparse or local attention when the signal has a clear locality structure and a few known long-range anchors, because you can encode that prior directly and cheaply. Reach for linear attention when the context is very long, the dynamics are smooth, and you want a streaming-friendly recurrent form. And when the sequence is truly enormous and the dependencies are long and diffuse, the honest answer is often to leave attention behind entirely for a state-space model, the linear-time architecture that <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> is devoted to.</p>
+
+    <div class="table-container">
+    <table>
+        <caption>Table 15.4: Efficient-attention families and when each fits a sensor workload.</caption>
+        <thead>
+            <tr><th>Family</th><th>Cost</th><th>Keeps exact softmax?</th><th>Best when</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Full (FlashAttention)</td><td>\(O(L^2 d)\) time, \(O(L)\) memory</td><td>Yes</td><td>Sequence fits after patch merging; accuracy is paramount</td></tr>
+            <tr><td>Sparse / local + global</td><td>\(O(L w)\)</td><td>Yes, on kept links</td><td>Strong locality with a few long-range anchors</td></tr>
+            <tr><td>Linear / kernel</td><td>\(O(L d^2)\)</td><td>No (approximate)</td><td>Very long, smooth context; streaming inference</td></tr>
+            <tr><td>State-space (Ch 16)</td><td>\(O(L)\)</td><td>N/A (not attention)</td><td>Enormous windows, long diffuse dependencies</td></tr>
+        </tbody>
+    </table>
+    </div>
+
+    <p>Two disciplines cut across all four rows. First, the cheapest efficient attention is the token you never create: aggressive but sensible patchification (<a class="cross-ref" href="section-15.2.html">Section 15.2</a>) shrinks \(L\) before any attention runs, and halving \(L\) quarters the full-attention bill for free. Second, whatever you choose, evaluate it under the leakage-safe protocol this book insists on, splitting by recording or subject rather than by window, so a long context does not quietly let the model memorize a device it will also be tested on; the machinery for that lives in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are given a 5-minute ECG at \(500\,\mathrm{Hz}\) (150,000 samples) and must classify a rare arrhythmia that shows up in isolated single beats. (a) With a patch size of 50 samples, how many tokens \(L\) result, and roughly how many entries does a full attention matrix hold per head? (b) Argue whether sliding-window attention alone is safe here, given that the diagnostic event is local to one beat but its <em>clinical significance</em> depends on the surrounding rhythm. (c) Propose a concrete window size \(w\) plus a global-token scheme and justify each number physically. Contrast your design with reaching for a state-space model instead.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does doubling the sensor window quadruple full-attention cost, and why can a bigger GPU never win that race?</p>
+        <p class="quiz-question">2. In the identity \((\phi(Q)\phi(K)^\top)V = \phi(Q)(\phi(K)^\top V)\), which grouping avoids ever forming an \(L \times L\) matrix, and what property of matrix multiplication makes the rewrite legal?</p>
+        <p class="quiz-question">3. FlashAttention is called an "exact" method yet saves memory. If it does not approximate the softmax, where does the \(O(L^2) \to O(L)\) memory saving come from?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-15.5.html">Section 15.5</a>, we turn from the length axis to the channel axis and confront a design fork that quietly decides both accuracy and cost: should each sensor channel be modeled on its own (channel-independent), or should attention mix channels so the model can learn cross-sensor structure (channel-mixing)? The efficient-attention budget you just built is exactly what that choice spends.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

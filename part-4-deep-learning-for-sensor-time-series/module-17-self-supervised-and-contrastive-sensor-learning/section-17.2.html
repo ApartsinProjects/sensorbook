@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.2: Contrastive learning with sensor augmentations. Building Sensory AI." name="description"/>
+<title>Section 17.2: Contrastive learning with sensor augmentations | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Self-Supervised and Contrastive Sensor Learning</a></div>
+<h1>Contrastive learning with sensor augmentations</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Show me the same walk twice, once with the watch loose and once tightened, and I will learn that both are walking. Nobody had to tell me the word."</p>
+<cite>A Self-Supervised AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you accept the premise of <a class="cross-ref" href="section-17.1.html">Section 17.1</a>: labels are scarce but raw sensor windows are nearly free. It builds directly on the augmentation catalogue for sensor streams from <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> (jitter, scaling, time warping, channel dropout) and on any encoder that turns a window into a vector, whether the 1D CNN of <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> or the transformer of <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. You need the softmax and cross-entropy from Appendix B, cosine similarity, and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Contrastive learning is a way to teach an encoder useful structure without a single label, using one deceptively simple instruction: an example and a distorted copy of itself should land close together in embedding space, while two unrelated examples should land far apart. The trick is that <em>you</em> get to define "a distorted copy" through augmentations, and for sensors those augmentations encode real physics: the same activity recorded with the watch worn tighter, the same vibration with a little more amplifier noise, the same gait sampled a beat faster. By declaring which changes are irrelevant, you implicitly declare what the representation must be invariant to, and the network discovers the rest. Done well, a contrastive encoder pretrained on millions of unlabeled windows needs only a few dozen labels per class to match a fully supervised model, because the hard part, learning what "different activity" even means, is already finished. Done carelessly, one bad augmentation quietly deletes the signal you were trying to predict.</p>
+</div>
+
+<h2>The objective: pull positives together, push negatives apart</h2>
+<p>Fix an encoder \(f_\theta\) that maps a window \(x\) to an embedding, followed by a small projection head \(g\) that maps it to a unit vector \(z=g(f_\theta(x))/\lVert\cdot\rVert\). Take a batch of \(N\) windows. Augment each one twice with independently sampled transforms, giving \(2N\) views. The two views of the same window are a <strong>positive pair</strong>; every other view in the batch is a <strong>negative</strong>. For a positive pair \((i,j)\) the normalized temperature-scaled cross-entropy loss, NT-Xent, is</p>
+<p>$$\ell_{i,j} = -\log \frac{\exp(\operatorname{sim}(z_i,z_j)/\tau)}{\sum_{k=1}^{2N}\mathbb{1}_{[k\neq i]}\exp(\operatorname{sim}(z_i,z_k)/\tau)},$$</p>
+<p>where \(\operatorname{sim}(u,v)=u^{\top}v\) is cosine similarity on the unit sphere and \(\tau\) is a temperature, typically 0.1 to 0.5. Read it as a softmax classification: given anchor \(i\), pick its true partner \(j\) out of the \(2N-1\) candidates. Minimizing the loss maximizes agreement between views of the same underlying signal relative to everything else in the batch. This is the SimCLR recipe, and it transfers to time series almost unchanged; what changes, and what this section is about, is the augmentation family.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Contrastive learning does not learn "what a signal is." It learns "what a signal is <em>up to</em> the augmentations you chose." The augmentation set is the entire inductive bias. If you include time warping as a positive-generating transform, you are asserting that speed is nuisance, which is right for activity recognition but catastrophic for cadence or heart-rate estimation, where speed is the label. Choosing augmentations is therefore not a preprocessing detail; it is where you inject domain knowledge, and it deserves the same scrutiny as choosing a loss.</p>
+</div>
+
+<h2>Augmentations that respect sensor physics</h2>
+<p>A useful augmentation must be <em>semantics-preserving</em>: it should change things a downstream label does not care about, and leave the label intact. Because sensor signals come with a known measurement model (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>), you can reason about this precisely rather than guessing. The workhorse family for inertial and physiological streams:</p>
+<ul>
+<li><strong>Jitter</strong>: add Gaussian noise. Mimics thermal and quantization noise; safe when your labels are not noise statistics.</li>
+<li><strong>Scaling</strong>: multiply the whole window by a random factor near 1. Mimics gain drift and sensor-to-sensor sensitivity spread.</li>
+<li><strong>Magnitude and time warping</strong>: smoothly stretch amplitude or the time axis with a random spline. Time warping mimics pace variation; use it only when pace is nuisance.</li>
+<li><strong>Permutation</strong>: cut the window into segments and shuffle them. Forces the encoder toward local, order-robust features; aggressive, and it destroys long-range structure.</li>
+<li><strong>Channel dropout / masking</strong>: zero out an axis or a time span. Mimics a dead sensor and pairs naturally with the masked objective of <a class="cross-ref" href="section-17.3.html">Section 17.3</a>.</li>
+<li><strong>Rotation</strong>: apply a random 3D rotation to a tri-axial accelerometer or gyroscope window. This one is special: it encodes the true physical fact that a watch can sit at any orientation on the wrist, so a rotation-invariant embedding is exactly what activity recognition wants. See the inertial treatment in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>.</li>
+</ul>
+<p>Two augmentations composed usually beat one, because a single transform can be inverted or ignored, while a random composition presents a genuinely harder invariance to learn. Empirically, the jitter-plus-scaling and permutation-plus-jitter pairs are strong defaults for human-activity data; rotation is the highest-value addition when your sensor is body-worn and mounting is uncontrolled.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">The augmentation that erases your label</h3>
+<p>Every augmentation is a claim about invariance, and a wrong claim leaks label information away silently, with no error message. Time warping applied to a photoplethysmography stream destroys the exact quantity a heart-rate model needs. Aggressive scaling erases the amplitude that separates a gentle tap from a hard press on a tactile sensor. Permutation shreds the P-QRS-T ordering that an ECG classifier depends on (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). The failure is invisible during pretraining, where the loss still drops nicely, and only surfaces as a disappointing fine-tuning curve. Always ask: does my downstream label survive this transform? If not, remove it.</p>
+</div>
+
+<h2>Negatives, batch size, and the false-negative trap</h2>
+<p>The denominator of NT-Xent treats every other window in the batch as a negative, so the number of negatives is roughly the batch size. More negatives sharpen the contrast and generally help, which is why contrastive methods historically wanted large batches or a memory queue of past embeddings (the MoCo design). But sensor batches hide a subtlety: because activities are repetitive and classes are few, two <em>different</em> windows in the same batch are often the same activity. Treating them as negatives, a <strong>false negative</strong>, actively pushes apart embeddings that should be neighbors. This matters far more for a five-class activity dataset than for a thousand-class image set. Mitigations include drawing batches so that windows from the same subject-and-session are unlikely to collide, keeping the temperature \(\tau\) from becoming too small (which over-penalizes hard negatives), and using approaches that lean less on negatives at all, the predictive and relational objectives of <a class="cross-ref" href="section-17.4.html">Sections 17.4</a> and <a class="cross-ref" href="section-17.5.html">17.5</a>. And as always, positives must never straddle a train/test boundary: augment <em>after</em> splitting, or you leak (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</p>
+
+<p>The listing below implements the NT-Xent loss for a batch of \(2N\) stacked embeddings and a single sensor augmentation. It is the computational heart of every method in this section; the prose above describes exactly what each line enforces.</p>
+
+<pre class="language-python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def nt_xent(z, temperature=0.2):
+    # z: (2N, D), rows 0..N-1 are view-A, rows N..2N-1 are view-B of the SAME windows
+    z = F.normalize(z, dim=1)
+    N = z.shape[0] // 2
+    sim = z @ z.t() / temperature                 # (2N, 2N) cosine sims
+    sim.fill_diagonal_(float("-inf"))             # an anchor is never its own positive
+    # positive of row i is its counterpart N rows away (and vice versa)
+    targets = torch.arange(2 * N, device=z.device)
+    targets = (targets + N) % (2 * N)
+    return F.cross_entropy(sim, targets)          # softmax "find your partner"
+
+def jitter_scale(x, sigma=0.05, scale=0.1):
+    # x: (B, C, T) accelerometer window; two independent draws give a positive pair
+    x = x + sigma * torch.randn_like(x)                       # thermal-noise mimic
+    x = x * (1 + scale * torch.randn(x.size(0), x.size(1), 1, device=x.device))
+    return x                                                   # gain-drift mimic
+</code></pre>
+<div class="code-caption">NT-Xent contrastive loss and a jitter-plus-scaling augmentation. Two independent calls to <code>jitter_scale</code> on the same batch produce the positive pair; stacking both views and passing the encoder output to <code>nt_xent</code> completes one SimCLR step. The <code>fill_diagonal_</code> and modular <code>targets</code> lines are where "same window = positive, everything else = negative" is enforced.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: label-scarce gait monitoring on a fitness band</h3>
+<p>A wearables team has 40,000 hours of tri-axial accelerometer data from a fitness band but only 300 short, expert-annotated clips of six activities (walk, run, stairs, cycle, sit, stand). Training a supervised CNN on 300 clips overfits badly and collapses across users. Instead they pretrain a 1D-CNN encoder contrastively on two-second windows sampled from the full 40,000 hours, using rotation plus jitter plus scaling as the augmentation set, chosen because the band's orientation on the wrist is uncontrolled and gain varies across manufacturing lots. After pretraining with no labels, they freeze the encoder and fit a linear classifier on the 300 clips. It reaches within two points of the accuracy a supervised model needs 15x more labels to hit, and, because rotation invariance was baked in, it generalizes to users who wear the band upside down, a failure mode the supervised baseline never survived. This label-efficiency curve is exactly what Lab 17 asks you to reproduce, and it connects to the activity-recognition pipeline of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the contrastive scaffold</h3>
+<p>Written from scratch, a correct contrastive trainer is roughly 250 to 400 lines once you add the projection head, the two-view collate function, gradient accumulation for large effective batches, a memory queue, and mixed precision. Libraries such as <code>lightly</code> (SimCLR, MoCo, BYOL heads and losses) or <code>tsai</code> (time-series-first, with the TS-TCC and TS2Vec recipes prewired) reduce this to about 20 lines: you supply the encoder and the augmentation callable, and the library owns the view generation, the NT-Xent bookkeeping, the queue, and the optimizer schedule. Keep the augmentation choice in your own hands, that is the domain knowledge, and let the library own the plumbing.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: where sensor contrastive learning stands</h3>
+<p>SimCLR and MoCo established the image recipe; the sensor-native line adapts it to temporal structure. TS-TCC (Time-Series Temporal and Contextual Contrasting) pairs a strong-versus-weak augmentation view with a cross-view temporal prediction task and remains a strong human-activity baseline. TS2Vec (covered next, in <a class="cross-ref" href="section-17.4.html">Section 17.4</a>) contrasts at multiple time scales and hierarchical resolutions rather than over a single global embedding. The frontier question is no longer "does contrastive pretraining help" (it clearly does) but "which augmentations are physically valid per modality," with recent work learning or searching the augmentation policy instead of fixing it by hand, and blending contrastive with masked objectives so a single encoder captures both invariance and reconstruction. For deployment, the same encoder increasingly feeds the cross-device and cross-user pretraining of <a class="cross-ref" href="section-17.6.html">Section 17.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public accelerometer HAR dataset. (1) Pretrain a small 1D-CNN encoder with NT-Xent using jitter-plus-scaling, then fit a linear probe on 1%, 5%, and 25% of the labels; plot the label-efficiency curve against a supervised model trained on the same fractions. (2) Now add time warping to the augmentation set and repeat. (3) Replace the activity label with a <em>cadence</em> regression target and rerun step 2. Explain, using the invariance argument from this section, why time warping helped in step 2 but hurt in step 3.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>In NT-Xent, what exactly plays the role of the "class" that the softmax is trying to predict, and how many candidates does it choose among for a batch of \(N\) windows?</li>
+<li>Why does a false negative hurt a 5-class activity contrastive run more than a 1000-class image run, and name one way to reduce it?</li>
+<li>You want a representation for respiratory-rate estimation from a chest-strap signal. Which two augmentations from this section would you refuse to use, and why?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-17.3.html">Section 17.3</a>, we drop the need for negatives and augmentation pairs altogether and instead mask out chunks of the window, training the encoder to reconstruct what it cannot see. Masked autoencoding for time series trades the "pull-and-push" geometry of contrastive learning for a generative one, sidesteps the false-negative trap entirely, and turns out to pair beautifully with the channel-masking augmentation you just met here.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

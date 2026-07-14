@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.1: RNNs, GRUs, LSTMs. Building Sensory AI." name="description"/>
+<title>Section 14.1: RNNs, GRUs, LSTMs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>RNNs, GRUs, LSTMs</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I remember everything, which is exactly the problem. The trick was learning what to forget on purpose."</p>
+        <cite>A Gated AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you are comfortable with sampled signals and the notion of a fixed-rate stream from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and with the neural-network mechanics (backpropagation, activations, minibatch training) refreshed in Appendix B and applied to sensor windows in <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. It is useful to have met the state-carrying, one-step-at-a-time structure of a recursive filter in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, because a recurrent network is that same idea with a learned, nonlinear update rule. No prior exposure to sequence models is required.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A recurrent neural network processes a sensor stream the way a Kalman filter does: it keeps a compact summary of everything seen so far, a hidden state, and updates it one sample at a time. Unlike the Kalman filter, it does not know the physics; it <em>learns</em> the update rule from data. This is a natural fit for sensing, where signals arrive as an ongoing stream and the meaning of the current sample depends on what came before it. The plain recurrent cell captures this idea in three lines of algebra but is notoriously hard to train over long horizons because gradients vanish. The LSTM and GRU are the two engineering fixes that made recurrence practical, each adding gates that let the network decide what to remember, what to overwrite, and what to expose. This section builds all three from the recurrence up, shows exactly why the plain version forgets, and gives you the judgment to pick the right cell for a sensor task.</p>
+    </div>
+
+    <h2>The recurrent idea: a state that carries the past forward</h2>
+    <p>A feedforward window model looks at a fixed slice of the stream and treats every slice independently. That works, but it forces you to commit to a window length up front and it throws away the connection between one window and the next. A recurrent network takes the opposite stance. It reads the stream sample by sample and maintains a hidden state vector \(h_t\) that is meant to summarize the relevant history. At each step it combines the new input \(x_t\) with the previous state to produce the next state:</p>
+    <p>$$h_t = \tanh(W_x x_t + W_h h_{t-1} + b)$$</p>
+    <p>The same weight matrices \(W_x\) and \(W_h\) are reused at every time step, which is the temporal analogue of the weight sharing a convolution performs across space. That sharing is what lets one small network handle sequences of any length and is the reason an RNN has a fixed parameter count no matter how long the stream runs. The <em>why</em> is compression: \(h_t\) is a learned, lossy encoding of the past, and the network is trained so that whatever it chooses to keep is exactly what the task needs. For a wearable classifying gait, \(h_t\) might come to encode the phase of the current stride; for a fault detector it might encode how long a vibration has been elevated. The recurrence is trained by <em>backpropagation through time</em>: you unroll the loop across the sequence and treat it as a very deep feedforward network that happens to share weights across its layers.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A recurrent network is a state-space model whose transition function is learned rather than derived. The Kalman filter of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> writes down \(h_t = A h_{t-1} + B x_t\) from known dynamics and gives you calibrated uncertainty for free. An RNN replaces \(A\) and \(B\) with a nonlinear learned map, buying the ability to model dynamics you cannot write down, at the cost of the interpretability and the built-in uncertainty. Choosing between them is the classical-versus-learned tradeoff that runs through this whole book, viewed one sample at a time.</p>
+    </div>
+
+    <h2>Why plain RNNs forget: vanishing and exploding gradients</h2>
+    <p>The elegance of the shared recurrence hides a defect that kept RNNs marginal for years. When you backpropagate the loss at step \(T\) back to an input at step \(t\), the gradient is a product of many Jacobians, one per step in between, each carrying a factor that involves \(W_h\) and the derivative of \(\tanh\). Multiplying \(T - t\) such factors together makes the gradient behave like a number raised to a large power: if the repeated factor has magnitude below one, the gradient shrinks toward zero (it <em>vanishes</em>); if above one, it grows without bound (it <em>explodes</em>). The practical consequence is that a plain RNN cannot learn dependencies that span more than a few dozen steps, because the error signal linking a late output to an early cause has decayed to nothing before it arrives.</p>
+    <p>For sensing this is a real ceiling, not a corner case. A five-second event sampled at 100 Hz is 500 time steps; a slowly developing bearing fault or a sleep-stage transition spans thousands. The exploding side is easier to patch (you clip the gradient norm to a threshold, which the training recipes of <a class="cross-ref" href="section-14.7.html">Section 14.7</a> treat in detail), but vanishing is structural: no learning-rate trick recovers a signal that has already decayed to numerical noise. This is precisely the problem the gated cells were invented to solve.</p>
+
+    <p>The listing below makes the decay concrete. It feeds a long random sequence through a plain RNN cell and an LSTM cell, then measures how much the loss at the final step still depends on the very first input.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+T, dim = 200, 16                       # a 200-step sequence, e.g. 2 s of 100 Hz sensor data
+x = torch.randn(1, T, dim, requires_grad=True)
+
+for name, cell in [("vanilla RNN", nn.RNN(dim, dim, batch_first=True)),
+                   ("LSTM", nn.LSTM(dim, dim, batch_first=True))]:
+    x.grad = None
+    out, _ = cell(x)                   # run the recurrence over all T steps
+    out[:, -1, :].sum().backward()     # loss depends only on the LAST step's output
+    # how strongly does the final-step loss still 'feel' the very first input?
+    first_step_grad = x.grad[:, 0, :].abs().mean().item()
+    print(f"{name:12s} gradient reaching step 0: {first_step_grad:.2e}")</code></pre>
+    <div class="code-caption"><strong>Listing 14.1.1.</strong> The gradient reaching the first time step is orders of magnitude larger for the LSTM than for the plain RNN. The vanilla cell has already forgotten the beginning of the sequence by the time it reaches the end; the LSTM's protected cell state keeps the long-range gradient alive. Numbers vary with the seed, but the gap is consistent.</div>
+
+    <p>As Listing 14.1.1 shows, the difference is not a matter of tuning. The plain recurrence attenuates the long-range gradient by construction, and the LSTM's architecture is what preserves it. The next two subsections explain how.</p>
+
+    <h2>LSTM: gates and a protected cell state</h2>
+    <p>The Long Short-Term Memory cell adds a second state vector, the <em>cell state</em> \(c_t\), that acts as a memory conveyor belt. Information flows along \(c_t\) with only gentle, mostly additive edits, so gradients travel back along it without the repeated multiplicative shrinkage that kills the plain RNN. Three learned <em>gates</em>, each a sigmoid producing values between zero and one, control the edits. The forget gate \(f_t\) decides how much of the old memory to keep, the input gate \(i_t\) decides how much new candidate information \(\tilde{c}_t\) to write, and the output gate \(o_t\) decides how much of the memory to expose as the visible hidden state:</p>
+    <p>$$c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t, \qquad h_t = o_t \odot \tanh(c_t)$$</p>
+    <p>where \(\odot\) is elementwise multiplication and each gate is computed from \(x_t\) and \(h_{t-1}\). The <em>why</em> of the design is entirely in that first equation: when the forget gate is near one and the input gate near zero, the cell copies its memory forward unchanged, giving a near-perfect gradient path (the "constant error carousel" in the original formulation). The network learns, per dimension and per time step, when to hold a value steady across hundreds of steps and when to let it change. For a clinical monitor tracking whether a patient has been tachycardic, one cell dimension can latch that fact and carry it for minutes while other dimensions track the fast beat-to-beat signal.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an LSTM watching a haul-truck engine</h3>
+        <p>A mining fleet operator instrumented its haul trucks with vibration, oil-temperature, and load sensors and wanted early warning of turbocharger degradation. A window CNN flagged failures only once they were loud, which was too late to schedule maintenance. The failure signature was a slow drift: elevated vibration that mattered only if it persisted <em>and</em> coincided with high load over many minutes, a dependency far longer than any practical convolution window. An LSTM fixed the problem because its cell state could accumulate the persistence evidence: one memory dimension effectively counted how long vibration had stayed above baseline under load, holding that count steady across the quiet stretches between rough patches of road. The forget gate learned to reset the count when the truck idled. This is the prognostics pattern developed fully in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>, and it is the kind of long-horizon, stateful memory that gating exists to provide. As always, the model was evaluated with truck-disjoint splits so a leak of one vehicle's data into both train and test could not inflate the lead time.</p>
+    </div>
+
+    <h2>GRU: fewer gates, comparable power</h2>
+    <p>The Gated Recurrent Unit is a streamlined cell that keeps the gating idea but drops the separate cell state. It merges the forget and input gates into a single <em>update</em> gate \(z_t\) that interpolates between the old state and a new candidate, and adds a <em>reset</em> gate \(r_t\) that controls how much past state feeds the candidate:</p>
+    <p>$$h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t$$</p>
+    <p>The convex combination is the crucial line: when \(z_t\) is near zero the state is copied forward unchanged, giving the GRU the same protected gradient path as the LSTM through a leaner mechanism. A GRU has three weight matrices where an LSTM has four, so it uses roughly 25 percent fewer parameters and runs a little faster for the same hidden size. On many sensor benchmarks the two are within noise of each other; the GRU tends to win when data or compute is tight, and the LSTM's extra capacity can pull ahead on the longest, most complex dependencies. For an edge deployment on a microcontroller (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>), the GRU's smaller footprint is often the deciding factor.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Writing an LSTM by hand means implementing four gate projections, the cell-state update, the hidden-state readout, and correct minibatch handling of variable-length sequences, roughly forty lines that are easy to get subtly wrong (a swapped gate or a missing bias initialization can silently cripple training). Every framework ships all three cells as one line, fused and GPU-accelerated:</p>
+        <pre class="language-python"><code class="language-python">import torch.nn as nn
+rnn  = nn.RNN(input_size=6, hidden_size=64, num_layers=2, batch_first=True)
+lstm = nn.LSTM(input_size=6, hidden_size=64, num_layers=2, batch_first=True)
+gru  = nn.GRU(input_size=6, hidden_size=64, num_layers=2, batch_first=True)</code></pre>
+        <div class="code-caption"><strong>Listing 14.1.2.</strong> Each constructor replaces about forty lines of from-scratch cell code with one, and the library version also fuses the gate math into a single optimized kernel. Swapping cell types to compare them becomes a one-word edit, which is exactly the experiment Lab 14 asks you to run.</div>
+    </div>
+
+    <h2>Choosing a cell for a sensor stream</h2>
+    <p>The decision is rarely "RNN, LSTM, or GRU" in isolation; it is a set of coupled choices. Reach for a plain RNN essentially never for real tasks, except as a teaching baseline or when the dependency is provably short and latency is critical. Between the gated cells, start with a GRU as the default (fewer parameters, faster, usually as accurate) and switch to an LSTM only if a validation comparison shows it winning on your longest dependencies. Set the hidden size by the complexity of the state you expect to track, not by reflex; sensor tasks often do well with 32 to 128 units, far smaller than language models. Stack two layers before you consider three, and make the network <em>bidirectional</em> only for offline analysis, because a bidirectional cell reads the whole sequence including the future and therefore cannot run in a live stream, a constraint that <a class="cross-ref" href="section-14.5.html">Section 14.5</a> makes central to streaming deployment. Finally, remember that recurrence is now one option among several: the temporal convolutions of <a class="cross-ref" href="section-14.2.html">Section 14.2</a>, the transformers of <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and the linear-time state-space models of <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> all compete for the same jobs, and the last of these is best read as the gated RNN's idea rebuilt for parallel hardware.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Build a synthetic "delayed recall" task: a sequence of random vectors where the label is a copy of the very first vector's sign, so the network must carry information from step 0 to step \(T\). (1) Train a plain <code>nn.RNN</code>, an <code>nn.GRU</code>, and an <code>nn.LSTM</code> at \(T = 20, 100, 500\) and plot final accuracy against \(T\). (2) At which \(T\) does the plain RNN collapse to chance while the gated cells still solve the task? (3) Add gradient-norm clipping to the RNN and report whether it helps the vanishing problem, the exploding problem, both, or neither, and explain why in terms of the Jacobian-product argument.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. State the update equations for the plain RNN state and the LSTM cell state side by side, and point to the exact term in the LSTM equation that keeps long-range gradients from vanishing.</p>
+        <p class="quiz-question">2. A GRU has fewer parameters than an LSTM of the same hidden size. Which gate combination is responsible for the reduction, and what capability, if any, do you give up?</p>
+        <p class="quiz-question">3. Your task is a live wearable classifier that must emit a label every 20 ms as data arrives. Explain why a bidirectional LSTM is disqualified regardless of its offline accuracy.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-14.2.html">Section 14.2</a>, we set recurrence aside and build temporal convolutional networks, which attack the same long-sequence problem from the opposite direction: instead of carrying a state through time, they stack causal convolutions to see far into the past all at once, trading the RNN's sequential memory for parallelism and a fixed, analyzable receptive field.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

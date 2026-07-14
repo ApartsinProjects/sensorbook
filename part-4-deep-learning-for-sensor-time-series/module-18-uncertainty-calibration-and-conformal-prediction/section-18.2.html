@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.2: Calibration and temperature scaling for time series. Building Sensory AI." name="description"/>
+<title>Section 18.2: Calibration and temperature scaling for time series | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Uncertainty, Calibration, and Conformal Prediction</a></div>
+<h1>Calibration and temperature scaling for time series</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"When I say I am 90 percent sure, I want to be wrong exactly one time in ten. A confident liar is worse than an honest doubter."</p>
+<cite>A Well-Calibrated AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the aleatoric-versus-epistemic split from <a class="cross-ref" href="section-18.1.html">Section 18.1</a>: calibration is about making the <em>aleatoric</em> story, the probability your model reports, honest. You need softmax, cross-entropy, and negative log-likelihood from Appendix B, the notion of a proper scoring rule from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, which turns out to be the load-bearing idea once we move from images to streams. Any classifier or forecaster from Chapters 14 and 15 will do as the model whose confidences we are about to repair.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A modern neural network is usually a good ranker and a bad probabilist. It will put the right class on top far more often than it deserves the 99.8 percent it prints next to it. That gap between stated confidence and empirical accuracy is <strong>miscalibration</strong>, and it is not cosmetic: a fall detector that cries "97 percent certain" on every twitch, or an arrhythmia model whose "borderline" and "definite" look identical to the cardiologist, will be switched off by the people who depend on it. Calibration is the cheap, post-hoc repair. The flagship trick, <strong>temperature scaling</strong>, is a single learned number that rescales the logits until the reported probabilities tell the truth, changing not one prediction's rank and costing a few dozen lines of code. The catch, and the reason this is a Part IV section and not an appendix footnote, is that every derivation of temperature scaling assumes the calibration data are exchangeable with the test data. Sensor streams are autocorrelated and drift, so a calibration set carved out carelessly will lie to you about how well you calibrated. This section teaches the method and the time-series traps in the same breath.</p>
+</div>
+
+<h2>What calibration means, and how to measure it</h2>
+<p>Let a classifier output a probability vector \(\hat{p}(x)\) with predicted class \(\hat{y}=\arg\max_k \hat{p}_k(x)\) and confidence \(\hat{c}=\max_k \hat{p}_k(x)\). Perfect calibration is the statement</p>
+<p>$$\mathbb{P}\big(\hat{y}=y \,\big|\, \hat{c}=c\big) = c \quad\text{for all } c\in[0,1].$$</p>
+<p>Read literally: among all windows the model called "80 percent," it should be right 80 percent of the time. We cannot condition on a continuous \(c\), so we bin. Sort predictions into \(M\) confidence bins \(B_1,\dots,B_M\), and compare each bin's average confidence to its empirical accuracy. The <strong>Expected Calibration Error</strong> is the weighted average gap,</p>
+<p>$$\mathrm{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n}\,\big|\operatorname{acc}(B_m) - \operatorname{conf}(B_m)\big|,$$</p>
+<p>and plotting \(\operatorname{acc}(B_m)\) against \(\operatorname{conf}(B_m)\) gives the <strong>reliability diagram</strong>: the diagonal is perfect, points below it are overconfident (the usual failure), points above are underconfident. ECE is a diagnostic, not a training loss; it is not a proper scoring rule and can be gamed. Report it alongside negative log-likelihood or Brier score, which are proper (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>), so that improving calibration cannot secretly wreck sharpness.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Accuracy and calibration are orthogonal. A model can be 92 percent accurate and grossly overconfident, or 70 percent accurate and perfectly calibrated. Temperature scaling exploits exactly this independence: because it applies one monotone rescaling to every logit vector, it cannot change which class is largest, so <em>accuracy is provably unchanged</em>. You are free to fix the probabilities without touching the decisions. That is why it is safe to bolt onto a frozen, already-validated model, which is precisely what a deployed sensor pipeline wants.</p>
+</div>
+
+<h2>Temperature scaling: one number, learned after training</h2>
+<p>Train the network normally. Freeze it. Now introduce a single scalar \(T>0\), the temperature, and soften every logit vector \(z(x)\) before the softmax:</p>
+<p>$$\hat{p}_k(x;T) = \frac{\exp\big(z_k(x)/T\big)}{\sum_j \exp\big(z_j(x)/T\big)}.$$</p>
+<p>With \(T=1\) nothing changes. \(T>1\) flattens the distribution toward uniform (less confident); \(T<1\) sharpens it. Because \(T\) scales all logits equally, the argmax and hence every predicted label is invariant. You fit \(T\) by minimizing negative log-likelihood on a held-out <strong>calibration set</strong> that the network never trained on, a one-dimensional convex-in-practice optimization solved in a handful of iterations. This is Guo et al.'s 2017 result: across modern architectures a single temperature recovers near-perfect calibration, outperforming heavier fixes like Platt scaling, isotonic regression, or Bayesian binning on the metric that matters, while adding exactly one parameter. The code below fits \(T\) on cached logits.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import minimize_scalar
+
+def temperature_scale(logits, labels):
+    # logits: (n, K) raw pre-softmax outputs on the CALIBRATION split
+    # labels: (n,) integer class ids
+    def nll(T):
+        z = logits / T
+        z = z - z.max(axis=1, keepdims=True)          # stable softmax
+        logp = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+        return -logp[np.arange(len(labels)), labels].mean()
+    res = minimize_scalar(nll, bounds=(0.05, 10.0), method="bounded")
+    return res.x
+
+def ece(probs, labels, n_bins=15):
+    conf = probs.max(axis=1); pred = probs.argmax(axis=1)
+    correct = (pred == labels).astype(float)
+    bins = np.linspace(0, 1, n_bins + 1)
+    e = 0.0
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.any():
+            e += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return e
+
+T = temperature_scale(cal_logits, cal_labels)         # e.g. T = 1.9
+scaled = np.exp(cal_logits / T)
+scaled /= scaled.sum(axis=1, keepdims=True)
+print(f"T={T:.2f}  ECE {ece(softmax(test_logits), test_labels):.3f} "
+      f"-> {ece(softmax(test_logits / T), test_labels):.3f}")
+</code></pre>
+<div class="code-caption">Fitting a single temperature by NLL on a held-out calibration split, then reporting ECE before and after. A typical overconfident sensor classifier lands at \(T\approx 1.5\) to \(2.5\); the second ECE print is usually several times smaller than the first. Note that <code>test_labels</code> never enter the fit.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let the library own the optimizer loop</h3>
+<p>The snippet above is deliberately from-scratch to show the mechanics. In practice you should not hand-roll the LBFGS loop, the numerically stable softmax, and the binning. <code>torchcal</code>, <code>netcal</code> (its <code>TemperatureScaling</code>, <code>BetaCalibration</code>, and <code>HistogramBinning</code> classes), or <code>torch-uncertainty</code> reduce the whole fit-and-evaluate cycle to about 3 lines: construct the scaler, call <code>fit(cal_logits, cal_labels)</code>, call <code>transform(test_logits)</code>, and read ECE from the same package. That is a drop from roughly 40 lines to 3, and the library handles multi-class edge cases, class-wise ECE, and reliability-diagram plotting that you would otherwise reimplement and quietly get wrong.</p>
+</div>
+
+<h2>Why time series breaks the textbook recipe</h2>
+<p>Every guarantee above rests on one assumption: the calibration split is a representative, exchangeable sample of what test time looks like. For a shuffled image benchmark that is nearly free. For a sensor stream it is where projects fail silently. Three specific traps:</p>
+<ul>
+<li><strong>Autocorrelation inflates your effective calibration set.</strong> Ten thousand consecutive accelerometer windows from one afternoon are not ten thousand independent samples; they may be worth a few dozen. A temperature fit on them is fit to that afternoon's operating point, and its ECE estimate is optimistically tiny. Calibrate on windows spanning many sessions, subjects, and devices, and evaluate calibration with a block or subject-wise split, never a random per-window shuffle (the leakage rule of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</li>
+<li><strong>Drift makes a fixed \(T\) stale.</strong> A sensor that ages, a patient whose baseline shifts, a machine entering a new load regime: the logit distribution moves, and the temperature that was honest in March is overconfident by September. Temperature scaling is a static, one-shot repair; under genuine distribution shift you need the adaptive machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> and the online conformal methods of <a class="cross-ref" href="section-18.5.html">Section 18.5</a>.</li>
+<li><strong>Step-level versus sequence-level.</strong> A model emitting a probability every 20 ms produces highly dependent confidences; calibrating each timestep independently ignores that a whole event (one fall, one arrhythmia episode) is the real decision unit. Calibrate at the granularity your downstream consumer acts on.</li>
+</ul>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the ICU monitor that everyone muted</h3>
+<p>A bedside model flags atrial fibrillation from a wearable ECG patch (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). Validation accuracy is excellent, yet nurses report it "always says 99 percent," so they stop reading the confidence and eventually silence it, the classic alarm-fatigue failure. A reliability diagram confirms severe overconfidence. The team fits one temperature on a calibration set drawn from <em>different patients</em> than both training and test, taking care that no patient's beats straddle two splits. The fit returns \(T = 2.3\); post-scaling ECE falls from 0.19 to 0.03, accuracy is byte-for-byte identical, and now a "72 percent" genuinely means roughly seven in ten. The nurses' triage rule, "escalate above 90 percent, watch between 60 and 90," becomes meaningful, and the monitor gets turned back on. Nothing about the network changed; one honest number did.</p>
+</div>
+
+<h2>Calibrating regression and forecast intervals</h2>
+<p>Most sensor deep learning is regression or forecasting, not classification, and "calibration" generalizes cleanly. A probabilistic forecaster emits quantiles or a predictive distribution; it is calibrated if its stated coverage matches reality. Concretely, for every level \(\alpha\), the fraction of test targets falling below the predicted \(\alpha\)-quantile should equal \(\alpha\), and a 90 percent prediction interval should contain the truth 90 percent of the time. The regression analogue of the reliability diagram plots nominal coverage against empirical coverage; the analogue of temperature scaling is a learned rescaling of the predicted standard deviation \(\hat{\sigma}\to s\,\hat{\sigma}\), or a monotone recalibration map fit on held-out residuals (Kuleshov et al., 2018). The same three time-series traps apply, sharpened: interval calibration under autocorrelation and drift is exactly the pressure that motivates conformal prediction.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Post-hoc calibration and conformal prediction are converging. The current practice for sensor streams is to combine a lightweight recalibration of the base model (temperature or \(\sigma\)-scaling for sharpness) with a distribution-free coverage wrapper on top, because temperature scaling gives well-shaped probabilities while split conformal (<a class="cross-ref" href="section-18.4.html">Section 18.4</a>) gives the finite-sample coverage guarantee that a single scalar cannot. On non-stationary sensor data the frontier work, Adaptive Conformal Inference and conformal PID control (Gibbs and Candes, 2021 onward), treats the miscalibration itself as a signal to be tracked online, updating the effective quantile every step so coverage holds even as the stream drifts, which is exactly where a frozen temperature fails. Expect the two ideas, sharp probabilities from calibration and honest coverage from conformal, to arrive as one library call rather than two.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a multi-session human-activity dataset. (1) Train any classifier from <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, then plot its reliability diagram and compute ECE. (2) Fit a temperature two ways: on a <em>random per-window</em> calibration split, and on a <em>subject-disjoint</em> split. Report both temperatures and the test ECE each produces on held-out subjects, and explain the gap using the autocorrelation argument. (3) Simulate drift by scaling the test-session gains by 1.3, refit ECE, and describe what a static \(T\) can and cannot repair. Keep accuracy printed at every step to confirm it never moves.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can temperature scaling never change a model's accuracy, and why is that property so convenient for a deployed pipeline?</li>
+<li>You fit \(T\) on 50,000 consecutive windows from one recording and see ECE 0.01. Give two reasons this number is likely too optimistic, and how you would re-measure it.</li>
+<li>ECE is not a proper scoring rule. What can go wrong if you select a model or a temperature by minimizing ECE alone, and what should you report alongside it?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-18.3.html">Section 18.3</a>, we stop repairing a single point estimate after the fact and instead ask the model to represent its own uncertainty from the start: deep ensembles, MC-dropout, Bayesian layers, and evidential deep learning. Temperature scaling fixed the confidence you already had; those methods try to produce a trustworthy distribution in the first place, and they capture the epistemic gap that a lone temperature, however honest, cannot see.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

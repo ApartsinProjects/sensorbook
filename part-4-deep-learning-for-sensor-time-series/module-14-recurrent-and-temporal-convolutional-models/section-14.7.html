@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.7: Practical training recipes. Building Sensory AI." name="description"/>
+<title>Section 14.7: Practical training recipes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>Practical training recipes</h1>
+</header>
+<main class="content" id="main-content">
+
+  <blockquote class="epigraph">
+    <p>"My loss went to zero, my val curve looked gorgeous, and then a colleague pointed out that all my validation windows came from subjects I had already trained on."</p>
+    <cite>A Chastened AI Agent</cite>
+  </blockquote>
+
+  <div class="callout big-picture">
+    <h3 class="callout-title">The architecture is the easy part</h3>
+    <p>By now you can build an LSTM or a temporal convolutional network, size its receptive field, attach the right head, and run it as a stream. None of that matters if the training run itself is broken. Sensor sequence models fail to train for reasons that have almost nothing to do with the layer stack: exploding gradients through time, a loss that rewards the model for ignoring the rare event you actually care about, augmentations borrowed from computer vision that quietly destroy physical meaning, and validation splits that leak a subject's future into its own past. This section is the recipe book: the optimization, regularization, batching, and evaluation choices that turn a correct architecture into a model that generalizes to a sensor it has never seen. These recipes are architecture-agnostic; they apply equally to the RNNs of <a class="cross-ref" href="section-14.1.html">Section 14.1</a>, the TCNs of <a class="cross-ref" href="section-14.2.html">Section 14.2</a>, and the transformers of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>.</p>
+  </div>
+
+  <p>This section assumes the encoders and heads of Sections 14.1 through 14.4, the batching and masking of variable-length windows, and the normalization and windowing pipeline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. It leans hard on one non-negotiable discipline: the subject-disjoint, no-peeking-at-the-future evaluation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Every recipe below is downstream of getting the split right, because a tuning decision measured on a leaky validation set optimizes for a number that will not survive deployment.</p>
+
+  <h2>The loss is the specification, not a default</h2>
+  <p>The single most consequential training choice for sensor models is the loss, because sensor labels are almost always imbalanced. A fall detector sees minutes of walking for every fraction of a second of falling; a bearing runs healthy for months before it fails; an arrhythmia is a handful of beats in a day-long ECG. Train plain cross-entropy on that and the optimizer discovers the cheapest possible solution: always predict "normal", collect 99.7% accuracy, and never fire. The fix is to make the rare class expensive to miss. <strong>Class-weighted cross-entropy</strong> multiplies each class's loss by a weight inversely proportional to its frequency. <strong>Focal loss</strong> goes further, down-weighting easy, confidently-correct samples by a factor \((1-p_t)^\gamma\) so the gradient concentrates on the hard minority, which for detection tasks usually beats static class weights. For heavily skewed segmentation, <strong>soft Dice or Tversky losses</strong> optimize overlap directly and are far less seduced by the majority background than per-pixel cross-entropy.</p>
+
+  <div class="callout key-insight">
+    <h3 class="callout-title">Optimize the loss that matches the metric you report</h3>
+    <p>If you will be judged on event-level recall at a fixed false-alarm rate, do not train cross-entropy and hope. Accuracy is not the metric; the confusion matrix under class imbalance is. Pick a loss whose gradient pushes on the errors your deployment actually punishes, and validate on the same metric you will publish. The house rule of construct-matched evaluation, one metric co-computed with the loss it justifies, applies here: a model tuned on accuracy and reported on recall is two different experiments wearing one checkpoint.</p>
+  </div>
+
+  <h2>Optimization for sequences: clip, warm up, decay</h2>
+  <p>Recurrent networks propagate gradients through as many multiplications as there are timesteps, so a window of \(T=500\) samples is a 500-deep computation graph. That depth makes the gradient norm volatile: one bad batch can produce a gradient a thousand times larger than the running average and blow the weights out in a single step. <strong>Gradient clipping</strong> is the cheap, load-bearing defense. Clip the global gradient norm to a fixed ceiling (a value of 1.0 to 5.0 is a good starting range) before every optimizer step, and the training that was diverging on batch 40 becomes boring and stable. TCNs are less prone to this than LSTMs because their gradients flow through a fixed convolutional depth rather than an unrolled recurrence, but clipping costs nothing and protects both.</p>
+  <p><strong>AdamW</strong> is the default optimizer for these models: it adapts per-parameter step sizes, which suits the heterogeneous gradient magnitudes of gated recurrent cells, and its decoupled weight decay is a cleaner regularizer than Adam's L2 coupling. Pair it with a schedule that <strong>warms up</strong> the learning rate over the first few hundred steps, then <strong>decays</strong> it, typically with a cosine curve. Warmup matters because a large initial learning rate on a freshly initialized recurrent state produces exactly the gradient explosions clipping is fighting; easing in lets the normalization statistics and gate biases settle first. The training loop below wires clipping, warmup-plus-cosine, AdamW, and mixed precision into the few lines that carry most of the stability.</p>
+
+  <pre><code class="language-python">import torch, math
+from torch.optim import AdamW
+
+def make_scheduler(opt, warmup, total):
+    def lr_lambda(step):
+        if step &lt; warmup:                       # linear warmup
+            return step / max(1, warmup)
+        p = (step - warmup) / max(1, total - warmup)
+        return 0.5 * (1 + math.cos(math.pi * p)) # cosine decay to 0
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+opt   = AdamW(model.parameters(), lr=3e-3, weight_decay=1e-2)
+sched = make_scheduler(opt, warmup=300, total=10_000)
+scaler = torch.cuda.amp.GradScaler()            # mixed precision
+
+for x, y, mask in train_loader:
+    opt.zero_grad()
+    with torch.cuda.amp.autocast():
+        loss = masked_loss(model(x), y, mask)   # ignore padded steps
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    scaler.step(opt); scaler.update(); sched.step()</code></pre>
+  <div class="code-caption">A stability-first training step for sequence models. The three lines that matter most are <code>clip_grad_norm_</code> (tames the through-time gradient), the cosine schedule with <code>warmup=300</code> (prevents the early-step blowup), and <code>masked_loss</code> (never trains on padding). Everything else is standard AdamW with mixed precision.</div>
+
+  <div class="callout library-shortcut">
+    <h3 class="callout-title">Schedules, clipping, and early stopping for free</h3>
+    <p>A hand-rolled trainer with warmup, cosine decay, gradient clipping, mixed precision, checkpointing, and early stopping is a few hundred lines you will maintain forever. PyTorch Lightning collapses it: pass <code>gradient_clip_val=1.0</code> to the <code>Trainer</code>, return the scheduler from <code>configure_optimizers</code>, and add <code>EarlyStopping(monitor="val_recall", mode="max", patience=10)</code> as a callback. That is roughly 200 lines of boilerplate and its associated off-by-one bugs replaced by three arguments, and the AMP and multi-GPU plumbing comes along for free.</p>
+  </div>
+
+  <h2>Regularization and augmentation that respect physics</h2>
+  <p>Sensor models overfit fast because labeled sensor data is scarce, so regularization earns its keep. <strong>Weight decay</strong> and <strong>dropout</strong> are the baseline, but recurrent dropout must be applied with the same mask across timesteps (variational dropout) rather than resampled each step, or it corrupts the recurrence itself. The higher-leverage lever is <strong>data augmentation</strong>, and here sensor work diverges sharply from vision. An augmentation is only legal if the label survives it. Adding Gaussian noise, small time warps, magnitude scaling, and random cropping of windows all preserve "this is walking". But flipping the sign of an accelerometer axis inverts gravity and turns walking into physical nonsense; time-reversing an ECG destroys the causal P-QRS-T ordering; rotating a three-axis IMU is valid only if you rotate all three channels by the same rotation matrix, because the axes are physically coupled. The measurement models of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> tell you which transforms are label-preserving; borrow a vision augmentation blindly and you train the model on data that cannot occur.</p>
+
+  <div class="callout practical-example">
+    <h3 class="callout-title">Industrial vibration: the recipe that saved the run</h3>
+    <p>A team building a bearing fault classifier for a fleet of factory pumps had a TCN that trained to 96% on their held-out windows and detected almost nothing on a new pump. Three recipe changes fixed it, none of them architectural. First, they switched from random-window to <em>machine-disjoint</em> validation, which immediately dropped the honest score to 71% and revealed the real problem. Second, they replaced cross-entropy with focal loss, because incipient faults were 2% of the data and the model had been predicting "healthy" everywhere. Third, they replaced their vision-style augmentation (which included time-reversal) with jitter, magnitude scaling, and small time-warps drawn from the actual RPM variation across pumps. The reworked recipe reached 88% machine-disjoint recall on unseen pumps, and the diagnostics that had once looked worse were the ones telling the truth.</p>
+  </div>
+
+  <h2>Windowing, batching, and honest validation</h2>
+  <p>Two mechanical choices decide whether your batches are even coherent. <strong>Window length</strong> must exceed the receptive field of <a class="cross-ref" href="section-14.3.html">Section 14.3</a> and must contain the temporal pattern the label describes; a two-second window cannot learn a gait cycle that takes three. <strong>Batching variable-length sequences</strong> requires padding to the longest member and a mask so the loss ignores the pad, exactly the masked loss the code above assumes; bucket sequences of similar length together to keep padding waste low. For very long sequences that will not fit in memory, <strong>truncated backpropagation through time</strong> splits the sequence into chunks, carries the recurrent state forward across chunk boundaries (detached from the graph), and backpropagates only within each chunk. Set the truncation length to comfortably exceed the longest dependency you need the model to learn, because gradients never flow past the truncation boundary.</p>
+  <p>The recipe that overwhelmingly determines the deployed number is the split. Random-window splits leak because consecutive windows from one subject or one machine are nearly identical, so a window in validation has a near-twin in training. Split by <em>subject</em>, by <em>device</em>, or by <em>time period</em>, never by window, and normalize using statistics computed on the training split alone, then applied unchanged to validation, so no test-set statistic ever touches training. Early-stop on the leakage-safe validation metric, and treat the resulting curve as the truth. The formal protocols for this live in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, and when labels are scarce enough that no split leaves you enough to train on, the self-supervised pretraining of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> is the recipe that buys back label efficiency.</p>
+
+  <div class="callout research-frontier">
+    <h3 class="callout-title">Where the recipe is moving</h3>
+    <p>The 2023 to 2026 shift is away from training a bespoke model per task and toward fine-tuning a pretrained time-series backbone. Models such as MOMENT and TimesFM, and wearable-specific efforts like Google's Large Sensor Model (LSM), are trained on enormous unlabeled sensor corpora and then adapted with a small labeled set, which changes the recipe: lower learning rates, layer-wise decay, and often a frozen backbone with a trained head. When you have a few hundred labeled windows rather than a few hundred thousand, the modern recipe is increasingly "fine-tune a foundation model" rather than "train from scratch", a tradeoff the book returns to across Part V.</p>
+  </div>
+
+  <div class="callout exercise">
+    <h3 class="callout-title">Exercise: ablate the recipe, not the architecture</h3>
+    <p>Take one fixed TCN and one imbalanced sensor task (for example fall detection from wrist IMU). Hold the architecture constant and ablate the recipe: (a) cross-entropy versus focal loss, (b) with and without gradient clipping, (c) random-window versus subject-disjoint split, (d) physics-respecting augmentation versus a vision-style set that includes axis flips and time-reversal. Report event-level recall at a fixed false-alarm rate for every combination. Rank the four recipe choices by their effect size and confirm the claim of this section: the split and the loss move the honest number more than most architecture changes would.</p>
+  </div>
+
+  <div class="callout self-check">
+    <h3 class="callout-title">Self-check</h3>
+    <ol>
+      <li>Under 100:1 class imbalance, plain cross-entropy reaches 99% accuracy and fires on nothing. Name two loss changes that fix this and say which errors each one's gradient emphasizes.</li>
+      <li>Why is gradient clipping more critical for a 500-step LSTM than for a shallow TCN, and what failure does it prevent in the first few training steps if you skip warmup?</li>
+      <li>You augment IMU walking data by flipping the sign of the vertical accelerometer axis and your model gets worse. Why is this augmentation illegal, and what is a label-preserving alternative?</li>
+    </ol>
+  </div>
+
+  <div class="callout lab"><h3 class="callout-title">Lab 14</h3><p>compare LSTM and TCN on a multivariate sensor task, including a streaming variant.</p></div>
+
+  <h2>What's Next</h2>
+  <p>In <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, we replace the recurrence and the fixed convolution with attention over time and channels, which lets a model relate any two timesteps directly, at a compute cost that forces its own set of training recipes: patchification, positional encoding for sensor identity, and the efficient-attention tricks that keep long sensor sequences affordable.</p>
+
+  <section class="bibliography" id="bibliography">
+    <h2 class="bibliography-title">Bibliography</h2>
+
+    <p class="bib-category">Optimization and regularization</p>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/1711.05101">Loshchilov, I., &amp; Hutter, F. (2019). Decoupled Weight Decay Regularization (AdamW). ICLR.</a></p>
+      <p class="bib-annotation">Introduces AdamW, the default optimizer for sequence models here; decoupling weight decay from the adaptive step is the fix that makes regularization behave predictably.</p>
+    </div>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/1211.5063">Pascanu, R., Mikolov, T., &amp; Bengio, Y. (2013). On the difficulty of training recurrent neural networks. ICML.</a></p>
+      <p class="bib-annotation">The paper that diagnoses exploding and vanishing gradients through time and motivates gradient clipping, the single most load-bearing stability trick for RNN training.</p>
+    </div>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/1608.03983">Loshchilov, I., &amp; Hutter, F. (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. ICLR.</a></p>
+      <p class="bib-annotation">Origin of the cosine learning-rate schedule used in the training loop; warmup plus cosine decay is the standard recipe for stable convergence.</p>
+    </div>
+
+    <p class="bib-category">Losses for imbalance</p>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/1708.02002">Lin, T.-Y., Goyal, P., Girshick, R., He, K., &amp; Dollar, P. (2017). Focal Loss for Dense Object Detection. ICCV.</a></p>
+      <p class="bib-annotation">Introduces focal loss; its down-weighting of easy examples is directly why it beats class-weighted cross-entropy on the heavy imbalance typical of sensor detection.</p>
+    </div>
+
+    <p class="bib-category">Augmentation and pretraining for sensor time series</p>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/2007.15951">Iwana, B. K., &amp; Uchida, S. (2021). An empirical survey of data augmentation for time series classification with neural networks. PLOS ONE.</a></p>
+      <p class="bib-annotation">Systematic catalogue of time-series augmentations (jitter, scaling, warping) and their effect on accuracy; the reference for choosing label-preserving transforms.</p>
+    </div>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami, M., Szafer, K., Choudhry, A., et al. (2024). MOMENT: A Family of Open Time-series Foundation Models. ICML.</a></p>
+      <p class="bib-annotation">A pretrained time-series backbone that changes the recipe from train-from-scratch to fine-tune; illustrative of the frontier shift noted in this section.</p>
+    </div>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/2310.10688">Das, A., Kong, W., Sen, R., &amp; Zhou, Y. (2024). A decoder-only foundation model for time-series forecasting (TimesFM). ICML.</a></p>
+      <p class="bib-annotation">Google's TimesFM; a concrete example of the pretrained backbone plus light fine-tuning recipe now competitive with bespoke models.</p>
+    </div>
+    <div class="bib-entry-card">
+      <p class="bib-ref"><a href="https://arxiv.org/abs/2402.02887">Narayanswamy, G., Liu, X., Ayush, K., et al. (2024). Scaling Wearable Foundation Models (Large Sensor Model, LSM). arXiv.</a></p>
+      <p class="bib-annotation">Google's wearable foundation model trained on large-scale unlabeled sensor data; grounds the claim that fine-tuning is displacing from-scratch training for scarce-label sensor tasks.</p>
+    </div>
+  </section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

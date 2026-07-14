@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.7: Reporting uncertainty to downstream systems. Building Sensory AI." name="description"/>
+<title>Section 18.7: Reporting uncertainty to downstream systems | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Uncertainty, Calibration, and Conformal Prediction</a></div>
+<h1>Reporting uncertainty to downstream systems</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A confidence score nobody downstream reads is just a number keeping the log file warm."</p><cite>A Pragmatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous six sections earned you a defensible uncertainty estimate: a calibrated probability, a conformal prediction set, an adaptive interval, an abstention flag. None of that matters until a downstream consumer can read it, trust its meaning, and change its behavior because of it. This section is about the last mile: how to package uncertainty into a contract that a Kalman filter, a fusion node, a motion planner, an alerting rule, or a human operator can act on without misreading what the number means. Get the schema and its semantics right and uncertainty becomes a load-bearing signal across your whole stack. Get it wrong and a well-calibrated model still causes a downstream failure, because the consumer treated a 90% interval as a hard bound, or dropped the covariance on the floor.</p>
+</div>
+
+<p>This section assumes you have a prediction with an attached uncertainty object from earlier in the chapter, and it builds on the probability and estimation vocabulary from <a href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Where uncertainty feeds a recursive estimator we lean on the Kalman machinery of <a href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and where it crosses a fusion boundary we anticipate <a href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>.</p>
+
+<h2>What a downstream consumer actually needs</h2>
+<p>Different consumers need different shapes of uncertainty, and shipping the wrong shape is a silent bug. A recursive Bayesian filter needs a <em>variance or covariance</em> so it can weight your measurement against its prior; handing it a conformal prediction set is useless because the filter has no slot for a discrete set. A safety monitor needs a <em>hard interval with a coverage guarantee</em> so it can reason about worst case; handing it a Gaussian standard deviation forces it to assume normality your residuals may violate. A classification router needs <em>per-class calibrated probabilities plus an abstain flag</em>; a human dashboard needs a scalar it can threshold and a plain-language qualifier.</p>
+<p>The practical rule: report uncertainty in the <em>native algebra of the consumer</em>, and report the raw sufficient statistic rather than a lossy summary whenever bandwidth allows. A predictive distribution can always be reduced to a variance or an interval downstream, but you cannot reconstruct a distribution from a single scalar. When you must compress, compress at the edge of the consumer, not at the source.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Uncertainty is a typed contract, not a number. A field named <code>confidence: 0.9</code> is ambiguous: is it a calibrated probability, a softmax max, a conformal miscoverage budget, or a heuristic? The consumer cannot tell, so it will guess, and it will guess wrong under drift. Name the type (variance, quantile pair, prediction set, coverage level) and the guarantee, or you have shipped a number that means whatever the reader assumes.</p>
+</div>
+
+<h2>A serialization contract that survives the wire</h2>
+<p>A durable uncertainty report carries five things: the point estimate, an explicit uncertainty representation tagged by kind, the <em>semantics</em> of that representation (the nominal coverage or the distributional family), provenance (model version, calibration timestamp, whether adaptive conformal was active), and a validity window. The provenance fields are what let a downstream monitor in <a href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a> later ask "was this interval produced by the recalibrated model or the stale one?" The code below defines such a contract and, critically, a converter that turns a conformal interval into the measurement-noise variance a Kalman update expects.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, asdict
+from enum import Enum
+import json, math
+
+class Kind(str, Enum):
+    GAUSSIAN = "gaussian"          # carries mean + variance
+    INTERVAL = "interval"          # carries [lo, hi] + coverage
+    PREDICTION_SET = "pred_set"    # carries a set of labels + coverage
+
+@dataclass
+class UncertaintyReport:
+    value: float                   # point estimate
+    kind: Kind
+    payload: dict                  # kind-specific fields
+    coverage: float | None         # nominal guarantee, e.g. 0.9
+    model_version: str
+    calibrated_at: str             # ISO timestamp of last recalibration
+    adaptive: bool                 # was ACI/PID active this step?
+
+    def to_json(self) -> str:
+        d = asdict(self); d["kind"] = self.kind.value
+        return json.dumps(d)
+
+def interval_to_measurement_variance(r: UncertaintyReport) -> float:
+    """Feed a conformal interval into a Kalman R by matching coverage width
+    to a Gaussian sigma. For 90% two-sided coverage, half-width = 1.645*sigma."""
+    assert r.kind == Kind.INTERVAL and r.coverage is not None
+    lo, hi = r.payload["lo"], r.payload["hi"]
+    half_width = (hi - lo) / 2.0
+    tail = (1.0 - r.coverage) / 2.0            # one-sided tail mass
+    z = _inv_norm_cdf(1.0 - tail)              # z for that quantile
+    sigma = half_width / z
+    return sigma * sigma                       # variance -> Kalman R entry
+
+def _inv_norm_cdf(p: float) -> float:          # Acklam approximation
+    a=[-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,
+       1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00]
+    b=[-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,
+       6.680131188771972e+01,-1.328068155288572e+01]
+    c=[-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,
+       -2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00]
+    d=[7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,
+       3.754408661907416e+00]
+    pl=0.02425
+    if p&lt;pl:
+        q=math.sqrt(-2*math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p&lt;=1-pl:
+        q=p-0.5; rr=q*q
+        return (((((a[0]*rr+a[1])*rr+a[2])*rr+a[3])*rr+a[4])*rr+a[5])*q/(((((b[0]*rr+b[1])*rr+b[2])*rr+b[3])*rr+b[4])*rr+1)
+    q=math.sqrt(-2*math.log(1-p))
+    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+
+rep = UncertaintyReport(
+    value=21.4, kind=Kind.INTERVAL,
+    payload={"lo": 19.8, "hi": 23.0}, coverage=0.90,
+    model_version="tcn-v7", calibrated_at="2026-07-10T04:00:00Z", adaptive=True)
+print(rep.to_json())
+print("Kalman R entry:", round(interval_to_measurement_variance(rep), 4))
+</code></pre>
+<div class="code-caption">A tagged uncertainty report and the conformal-interval-to-Kalman-R bridge referenced above. The <code>interval_to_measurement_variance</code> converter matches the reported coverage half-width to a Gaussian sigma, so a distribution-free interval from Section 18.4 can drive the classical filter of Chapter 9. Note that this bridge reintroduces a normality assumption at the consumer, which is exactly the kind of lossy compression best done near the consumer, not at the source.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: schema validation</h3>
+<p>Hand-rolling the dataclass above plus type checks, enum coercion, range validation, and JSON round-tripping is roughly 60 to 80 lines once you cover the edge cases. A <code>pydantic</code> <code>BaseModel</code> with typed fields and a validator does the same in about 15 lines, and it rejects a malformed report (a coverage of 1.7, a missing <code>lo</code>) at the boundary instead of three hops downstream inside the filter. The library handles parsing, coercion, and error messages; you write only the field types and the one cross-field invariant.</p>
+</div>
+
+<h2>Propagating uncertainty through fusion and control</h2>
+<p>A report that stops at the first consumer is half wasted. In a real stack the estimate flows onward: a per-sensor variance enters a fusion node, the fused covariance enters a planner, the planner widens its safety margin. Each hop must preserve the uncertainty's meaning under the transform applied to the value. When a downstream node applies a nonlinear function \(g\) to your estimate, a first-order propagation of variance is $$\sigma_y^2 \approx \left(\frac{\partial g}{\partial x}\right)^2 \sigma_x^2,$$ which is exactly the linearization the extended Kalman filter uses and which fails when \(g\) is strongly curved near the operating point. That failure is why some pipelines forward samples or full distributions rather than a scalar variance: a sample-based representation propagates through any \(g\) by construction, at the cost of bandwidth. The choice between forwarding a variance, an interval, or a set of samples is a bandwidth-versus-fidelity decision you should make deliberately per link, and it interacts with the streaming and latency budgets of <a href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">temporal models</a> running on the edge.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: an AMR that trusts its own doubt</h3>
+<p>An autonomous mobile robot in a warehouse fuses a wheel-odometry velocity estimate with a lidar-derived pose. The perception model emits, per frame, an <code>UncertaintyReport</code> whose interval widens whenever the aisle is featureless and adaptive conformal inflates the quantile. The fusion node converts that interval to a covariance with the bridge above and feeds it as the measurement noise \(R\). On a clear day the lidar variance is small, the filter leans on vision, and the robot drives at full speed. When a forklift kicks up dust and residuals grow, the reported interval doubles within a few frames, \(R\) grows, the filter down-weights vision and leans on odometry, and the planner reads the inflated fused covariance and drops speed until the pose tightens. Nothing crashed, no threshold was tripped manually: the robot slowed because the uncertainty contract carried its doubt intact from perception through fusion to control. The abstention and fallback logic of Section 18.6 sits underneath this as the floor, for the case where the interval blows past any usable width.</p>
+</div>
+
+<h2>Monitoring the contract in production</h2>
+<p>A shipped uncertainty contract is a promise ("90% of my intervals cover the truth") that you must audit against reality, because coverage silently decays under the distribution shift covered in <a href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. The observability layer should log, per report, the point estimate, the interval width, the coverage claim, and later, when ground truth or a delayed label arrives, whether the interval actually covered. A rolling empirical coverage that drifts below the nominal level is the earliest, cheapest drift alarm you own, and it is far more actionable than raw accuracy because it points directly at the uncertainty head. Log the <code>model_version</code> and <code>calibrated_at</code> fields alongside so that a coverage regression can be attributed to a specific deploy. This closes the loop with the fleet operations discipline of <a href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>: the same telemetry that proves your calibration in the lab must keep proving it in the field.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend <code>UncertaintyReport</code> with a <code>PREDICTION_SET</code> path for a 5-class activity classifier. Write a converter that turns a prediction set into a scalar "route to human" flag: abstain when the set size exceeds 2 at 90% coverage. Then design the wire message a Kalman-style tracker would need if it consumed instead a Gaussian report, and explain in two sentences why the set-based classifier and the variance-based tracker cannot share one serialization field named <code>confidence</code>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why is reporting a single scalar <code>confidence</code> insufficient for a consumer that must reason about worst case, and what minimal extra field fixes it?</li>
+<li>The bridge from a conformal interval to a Kalman \(R\) reintroduces a normality assumption. Where in the pipeline is that assumption least harmful, and why?</li>
+<li>Your production coverage has drifted from 0.90 to 0.78 while accuracy is unchanged. Which reported provenance fields let you localize the cause, and what would you inspect first?</li>
+</ol>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>Time-series foundation models such as TimesFM, Chronos, and MOMENT increasingly emit probabilistic forecasts natively (quantile heads or sampled trajectories) rather than point predictions, which pushes the reporting problem upstream into the model interface itself. The open questions in 2025 and 2026 are how to serialize a foundation model's full predictive trajectory efficiently for edge consumers, how to attach a distribution-free coverage guarantee to a zero-shot forecast whose calibration set is a moving target, and how downstream agentic controllers should consume and reason over a probabilistic forecast rather than collapsing it to a mean. Conformalizing foundation-model outputs online, without a clean exchangeable calibration set, is the sharpest edge of this work.</p>
+</div>
+
+<div class="callout lab"><h3 class="callout-title">Lab 18</h3><p>compare split conformal vs ACI on a drifting sensor stream; verify coverage and interval width.</p></div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Conformal prediction and calibration foundations</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2107.07511">Angelopoulos &amp; Bates (2023). A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification. Foundations and Trends in Machine Learning.</a></p><p class="bib-annotation">The reference tutorial for the coverage semantics you are serializing; its prediction-set and interval definitions are exactly the contracts a downstream consumer must be told the meaning of.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://proceedings.mlr.press/v70/guo17a.html">Guo, Pleiss, Sun &amp; Weinberger (2017). On Calibration of Modern Neural Networks. ICML.</a></p><p class="bib-annotation">Shows why a raw softmax score is not a calibrated probability, the core reason a bare confidence field is an untyped and untrustworthy contract.</p></div>
+
+<p class="bib-category">Predictive uncertainty in deep models</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://proceedings.neurips.cc/paper/2017/hash/9ef2ed4b7fd2c810847ffa5fa85bce38-Abstract.html">Lakshminarayanan, Pritzel &amp; Blundell (2017). Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles. NeurIPS.</a></p><p class="bib-annotation">A canonical source of the predictive distribution you would forward to a fusion node; motivates why reporting a distribution beats a compressed scalar when bandwidth allows.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2106.09022">Fannjiang et al. (2022) and the Adaptive Conformal Inference line, Gibbs &amp; Candes (2021). Adaptive Conformal Inference Under Distribution Shift. NeurIPS.</a></p><p class="bib-annotation">The adaptive-coverage method whose active/inactive state you record in the report provenance so downstream monitors can attribute coverage drift.</p></div>
+
+<p class="bib-category">State estimation and fusion consumers</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.cs.unc.edu/~welch/kalman/">Welch &amp; Bishop (2006). An Introduction to the Kalman Filter. UNC-Chapel Hill Technical Report.</a></p><p class="bib-annotation">Defines the measurement-noise matrix R that the interval-to-variance bridge in this section targets; the classic reference for the recursive consumer of your variance report.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.probabilistic-robotics.org/">Thrun, Burgard &amp; Fox (2005). Probabilistic Robotics. MIT Press.</a></p><p class="bib-annotation">The reference for how robotic fusion and planning nodes consume covariance and propagate it through motion, the downstream stack the AMR example walks through.</p></div>
+
+<p class="bib-category">Foundation-model probabilistic outputs</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2310.10688">Das, Kong, Sen &amp; Zhou (2024). A Decoder-Only Foundation Model for Time-Series Forecasting (TimesFM). ICML.</a></p><p class="bib-annotation">Represents the shift toward models that emit quantile or probabilistic forecasts natively, moving the uncertainty-reporting interface upstream into the model itself.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2403.07815">Goswami et al. (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p><p class="bib-annotation">A general-purpose time-series foundation model whose outputs a downstream sensor stack must serialize and monitor exactly as this section prescribes.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>, we leave bespoke per-task models behind and enter the pretrain-once, adapt-anywhere era of time-series foundation models. The reporting discipline you just built becomes even more load-bearing there: a zero-shot forecaster emits full predictive distributions with no clean calibration set, so the contract, the coverage audit, and the provenance fields are how you keep a general-purpose model honest on your specific sensors.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

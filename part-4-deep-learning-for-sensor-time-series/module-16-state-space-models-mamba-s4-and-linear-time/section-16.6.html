@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.6: Hybrid SSM-attention architectures. Building Sensory AI." name="description"/>
+<title>Section 16.6: Hybrid SSM-attention architectures | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>Hybrid SSM-attention architectures</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I stopped arguing about whether to remember cheaply or recall exactly. I bought one of each and put them in the same tower."</p>
+        <cite>A Pragmatic AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the selective state-space block of <a class="cross-ref" href="section-16.3.html">Section 16.3</a>, its constant-memory streaming recurrence, and the quadratic-cost argument for attention from <a class="cross-ref" href="section-16.1.html">Section 16.1</a>. It leans on the transformer mechanics (queries, keys, values, sliding-window and full attention) developed in <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and on the accuracy, latency, and memory tradeoffs just laid out in <a class="cross-ref" href="section-16.5.html">Section 16.5</a>. Familiarity with the multivariate sensor tensor of shape \((\text{batch} \times \text{time} \times \text{channels})\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> is assumed throughout.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The SSM-versus-transformer debate has a quietly boring answer: the strongest long-context models in 2024 and 2025 are neither pure SSM nor pure attention, but a blend. A selective state-space layer aggregates a long history into a fixed-size state at linear cost, which is exactly what you want for skimming thousands of idle sensor samples. But that same fixed state is a bottleneck when the task needs precise, content-addressed recall: pointing back to the one sample forty seconds ago that matches the current one. Attention does that lookup natively, at quadratic cost. Hybrid architectures interleave the two so the SSM layers carry the bulk of the sequence cheaply and a sparse budget of attention layers supplies the exact recall the recurrence cannot. The design question stops being "which one" and becomes "how many attention layers, placed where, over what window." This section gives you the vocabulary and the ratios to answer that for a sensing workload.</p>
+    </div>
+
+    <h2>Why pure SSMs leave capability on the table</h2>
+    <p>A selective SSM compresses everything it has seen into a state vector \(h_t \in \mathbb{R}^{N}\) of fixed dimension. That compression is the source of its efficiency and also its ceiling. Formally the model must route all information from position \(i\) to a later position \(j\) through the low-dimensional channel \(h\), so any task requiring exact recall of many distinct earlier items competes for the same \(N\) coordinates. The canonical stress test is associative recall, sometimes called the copying or key-value lookup task: present a stream of (key, value) pairs, then a query key, and demand the matching value. Attention solves this perfectly regardless of distance, because its query directly compares against every stored key. A scalar-gated linear recurrence degrades as the number of pairs approaches its state capacity. Gu, Dao, and collaborators documented exactly this gap, and it is the empirical motivation behind every hybrid design that followed.</p>
+    <p>For sensing the gap is neither fatal nor negligible; it depends on the task. Regression and detection over smooth or event-sparse streams (fall detection, respiration tracking, bearing-wear prognostics as in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) lean on aggregation, where SSMs are already excellent. Tasks that must match a present pattern against a specific earlier occurrence, cross-reference many channels at once, or align a query event to a precise landmark in a long buffer, are where a thin layer of attention pays for itself. Hybrids exist to buy that capability without paying the full \(O(L^2)\) tax on every layer.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Think of the two primitives as complementary memory systems, not competitors. The SSM is a running summary with \(O(1)\) update and lossy compression; attention is a lossless scratchpad with \(O(L)\) lookup per query. A hybrid spends most of its depth on cheap summarization and reserves a few expensive lookups for the moments that need them. The knob that matters is the <em>attention fraction</em>: the share of layers (or the share of the token budget) that gets full or windowed attention. Push it toward zero and you recover a pure SSM's speed and its recall ceiling; push it toward one and you recover a transformer's precision and its quadratic bill. Good hybrids sit far toward the SSM end, often one attention layer per six or seven SSM layers, and lose almost nothing on real tasks.</p>
+    </div>
+
+    <h2>Three ways to wire the blend</h2>
+    <p>Hybrids differ mainly in <em>how</em> the two layer types share a sequence. Three patterns cover the field. The first is <strong>vertical interleaving</strong>: stack the network as a repeating motif of several SSM blocks followed by one attention block, so information flows through many cheap layers and is occasionally re-indexed by an exact lookup. AI21's <strong>Jamba</strong> (2024) is the reference example, alternating Mamba and Transformer layers (with mixture-of-experts feed-forward blocks) at roughly a 7-to-1 SSM-to-attention ratio, which let it handle a 256K-token context at a fraction of a comparable transformer's memory. The second is <strong>local attention plus global SSM</strong>: give attention only a short sliding window so its cost is linear in sequence length, and let the SSM carry the genuinely long-range dependencies. Microsoft's <strong>Samba</strong> (2024) interleaves Mamba with sliding-window attention this way; Google DeepMind's <strong>Griffin</strong> and its <strong>Hawk</strong> recurrence mix gated linear recurrences with local attention on the same principle. The third is <strong>parallel fusion</strong>: run an SSM branch and an attention branch over the same input and combine their outputs, used in several vision and sensor backbones (for example MambaVision) where the two views are merged per block rather than stacked.</p>
+    <p>The patterns are not exclusive; production models mix them. What they share is a design commitment: keep the quadratic operator rare or windowed, and let the linear operator do the heavy lifting. That is what makes the whole stack scale to the long contexts that sensor buffers reach, while retaining a lookup mechanism the SSM alone lacks.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: multi-lead cardiac monitoring on a wearable patch</h3>
+        <p>A clinical team builds a 14-day arrhythmia patch that records 3-lead ECG at 250 Hz, the setting of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>. They want on-device detection of atrial fibrillation, which requires two very different competences: summarizing minutes of rhythm to judge R-R interval irregularity, and recognizing that the present beat morphology <em>matches</em> a template beat seen earlier in the record so it can be flagged as the same ectopic type. A pure Mamba encoder nails the first and is mediocre at the second, confusing morphologically similar ectopics. A pure transformer over the multi-minute window blows the patch's memory budget. Their hybrid uses six Mamba blocks to carry the long rhythm context at constant memory, then a single sliding-window attention layer with a two-second window that lets the current beat compare against the handful of recent beats and lock onto the matching morphology. The attention layer adds under fifteen percent to per-inference compute yet closes most of the morphology-matching gap, and because the SSM state is fixed-size the patch still streams for the full two weeks without a memory blow-up. The blend ships where neither pure design could.</p>
+    </div>
+
+    <h2>Placement, ratio, and window: the three dials</h2>
+    <p>Once you accept a hybrid, three hyperparameters govern its behavior. The <strong>attention ratio</strong> sets how many attention layers appear per SSM layer; empirically one-in-six to one-in-eight recovers nearly all of a full transformer's recall on language and time-series benchmarks while keeping cost close to a pure SSM. <strong>Placement</strong> matters because attention is most useful once the SSM layers have already built rich local features, so hybrids tend to place attention in the middle and upper stack rather than at the very input. The <strong>attention window</strong> trades exactness for cost: full (global) attention gives unlimited-distance lookup at \(O(L^2)\) per such layer, while a sliding window of size \(w\) costs \(O(L w)\) and caps lookup distance at \(w\). For sensor streams the right window is a physical quantity: set it to the longest interval over which two events can be causally related (a gait cycle, a breath, a machine revolution), a decision that ties directly back to the sampling and timing analysis of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Because these choices interact, treat them as a small joint search on a leakage-safe validation split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), not as one-at-a-time tuning.</p>
+
+    <h2>Building a hybrid block</h2>
+    <p>The listing below stacks the pieces you already know: several Mamba layers, then one windowed-attention layer, each with a residual connection and normalization. It shows the interleaving pattern concretely and makes the attention-ratio dial explicit as a single integer. In deployment the Mamba layers run as constant-memory recurrences, and only the rare attention layer holds a short key-value buffer.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+from mamba_ssm import Mamba  # pip install mamba-ssm
+
+class WindowedAttention(nn.Module):
+    def __init__(self, d, heads=4, window=64):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.window = window
+    def forward(self, x):                       # x: (B, T, D)
+        T = x.size(1)
+        i = torch.arange(T, device=x.device)
+        # allow position j to see only the last `window` steps (causal + local)
+        mask = (i[None, :] > i[:, None]) | (i[None, :] < i[:, None] - self.window)
+        out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
+        return out
+
+class HybridBlock(nn.Module):
+    def __init__(self, d, ssm_per_attn=6, window=64):
+        super().__init__()
+        layers = []
+        for _ in range(ssm_per_attn):           # cheap linear-time summarizers
+            layers += [Mamba(d_model=d, d_state=16, d_conv=4, expand=2)]
+        layers += [WindowedAttention(d, window=window)]  # one exact lookup
+        self.layers = nn.ModuleList(layers)
+        self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in layers])
+    def forward(self, x):                        # x: (B, T, D)
+        for layer, norm in zip(self.layers, self.norms):
+            x = x + layer(norm(x))               # pre-norm residual
+        return x</code></pre>
+    <div class="code-caption">One hybrid motif: six selective SSM layers carry the long context at linear cost, then a single sliding-window attention layer supplies content-addressed recall over a bounded horizon. Changing <code>ssm_per_attn</code> is the attention-ratio dial; <code>window</code> caps the lookup distance and its cost.</div>
+
+    <p>The block reads exactly like the interleaving pattern described above: <code>ssm_per_attn</code> is the ratio dial and <code>window</code> is the cost-versus-reach dial. Stacking a few <code>HybridBlock</code> modules gives a full encoder whose steady-state inference memory is dominated by fixed-size SSM states plus one short attention buffer, not by a context-length-squared attention matrix.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>You do not assemble hybrids layer by layer for real work. Hugging Face <code>transformers</code> ships ready configs: <code>AutoModel.from_pretrained("ai21labs/Jamba-v0.1")</code> loads a pretrained Mamba-attention-MoE hybrid, and the <code>JambaConfig</code> exposes <code>attn_layer_period</code> and <code>attn_layer_offset</code> so the entire interleaving schedule is two integers rather than the roughly 60 lines of block-wiring, masking, and residual plumbing above. Griffin-style and Samba-style recurrent-plus-local-attention stacks are similarly available as single-line model loads. The library also handles the streaming key-value cache for the windowed attention layers and the recurrent state cache for the SSM layers in one unified generation call, which is the part that is genuinely fiddly to get right by hand.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The 2024 to 2025 frontier is dominated by hybrids: <strong>Jamba</strong> and <strong>Jamba-1.5</strong> (AI21) at 256K context, <strong>Samba</strong> (Microsoft) combining Mamba with sliding-window attention, <strong>Griffin</strong> and <strong>Hawk</strong> (Google DeepMind) mixing gated linear recurrences with local attention, and <strong>Zamba</strong> sharing a single attention block across a Mamba backbone to cut parameters. NVIDIA's studies on hybrid recipes report that roughly an 8 percent attention fraction recovers most of a transformer's quality at a fraction of the inference cost. The open questions for sensing are where to spend the scarce attention budget when the informative events are rare and irregular, whether cross-<em>channel</em> attention (over sensor axes) or cross-<em>time</em> attention deserves the budget, and how these hybrids behave under the distribution shift and calibration demands of <a class="cross-ref" href="section-16.7.html">Section 16.7</a> and <a class="cross-ref" href="../module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Build a synthetic associative-recall benchmark for sensors: generate sequences of 1000 steps where each step is a small feature vector, plant twenty (key, value) pairs at random positions, and at the end append one of the planted keys as a query; the target is its value. Train three models of matched parameter count: a pure Mamba stack, a pure windowed-transformer, and the <code>HybridBlock</code> above with <code>ssm_per_attn=6</code>. Sweep the number of planted pairs from 5 to 60 and plot recall accuracy versus pair count for all three. Confirm that the pure SSM degrades as pairs approach its state capacity, the transformer stays flat, and the hybrid tracks the transformer at a fraction of the compute. Then vary <code>window</code> and report the smallest window that still solves the task, relating it to how far apart keys and queries sit.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>In one sentence, what capability does a pure selective SSM lack that a single attention layer restores, and why does the fixed-size state cause that limitation?</li>
+            <li>A hybrid uses sliding-window attention of size \(w\) instead of full attention. What does the model give up, what does it gain in cost, and how would you choose \(w\) for a gait-analysis stream?</li>
+            <li>Two designs use the same attention ratio but one places attention only in the top third of the stack and the other spreads it evenly. Give a reason the top-heavy placement often works better.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-16.7.html">Section 16.7</a>, we close the chapter with a decision guide: given a concrete sensing task, its context length, latency and energy budget, and recall demands, when should you reach for a pure SSM, a hybrid, or a plain transformer from <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. You will turn the ratios and dials introduced here into a short checklist you can apply before writing a line of model code.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

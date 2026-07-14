@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.6: Cross-device, cross-user, cross-modal pretraining. Building Sensory AI." name="description"/>
+<title>Section 17.6: Cross-device, cross-user, cross-modal pretraining | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Self-Supervised and Contrastive Sensor Learning</a></div>
+<h1>Cross-device, cross-user, cross-modal pretraining</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You trained me on your left wrist. I now meet a chest strap, a stranger, and a microphone in the same second. Tell me again which of us is the anomaly."</p>
+<cite>A Well-Traveled AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the self-supervised machinery of the earlier sections: the contrastive objective and its augmentation view of invariance from <a class="cross-ref" href="section-17.2.html">Section 17.2</a>, masked reconstruction from <a class="cross-ref" href="section-17.3.html">Section 17.3</a>, and any encoder that maps a window to a vector (<a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>). It leans on the sampling, resampling, and time-alignment discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, the leakage-safe splitting rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, and the measurement-model reasoning of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Familiarity with distribution shift (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>) sharpens why any of this is hard.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Everything you pretrained so far quietly assumed the deployment world looks like the pretraining world: the same watch model, worn by similar people, streaming the same channels. Reality breaks all three assumptions at once. A model trained on one accelerometer meets a different chip with a different noise floor and mounting (the <strong>device gap</strong>); it meets a new person whose gait, resting heart rate, and skin tone move the signal statistics (the <strong>user gap</strong>); and increasingly it must fuse channels that were never jointly labeled, learning that a spike in acceleration and a change in the photoplethysmography (PPG) waveform are two views of the same run (the <strong>modality gap</strong>). Cross-device, cross-user, cross-modal pretraining is the art of building one encoder whose representation survives all three shifts, so that the label-efficiency win of self-supervision does not evaporate the moment the model leaves the lab. The unifying idea is simple and powerful: treat device, subject, and modality not as fixed conditions but as <em>additional axes of nuisance variation to be made invariant to, or additional views to be aligned</em>, using the very same positive-and-negative geometry you already know.</p>
+</div>
+
+<h2>Three gaps, one geometry</h2>
+<p>Name the shifts precisely, because each demands a different move. The <strong>device gap</strong> is a change in the measurement model: a new IMU has a different sensitivity, bias, sampling rate, and axis convention, so the same motion produces a numerically different window. The <strong>user gap</strong> is a change in the underlying signal source: person B's ECG morphology, stride length, or perfusion differs from person A's, so even an identical device yields a different distribution. The <strong>modality gap</strong> is structural: accelerometer, gyroscope, PPG, audio, and barometer live in different physical units, at different rates, with different information about the same latent event.</p>
+<p>The reason one section can cover all three is that self-supervised learning already gives you the two verbs you need. To close a gap by <em>invariance</em>, you make windows that differ only along the nuisance axis into a positive pair, so the encoder is trained to ignore that axis. To close a gap by <em>alignment</em>, you take two genuinely different signals of the same event and pull their embeddings together, exactly the cross-modal contrastive move that CLIP made famous for images and text. Device and user gaps are usually attacked by invariance; the modality gap is usually attacked by alignment, though the boundary blurs.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The choice of what counts as a positive pair <em>is</em> your generalization target. Sample your two contrastive views from the <strong>same time window on two different devices</strong>, and you are commanding device invariance. Sample the anchor and positive from <strong>different subjects performing the same labeled activity</strong>, and you push toward user invariance (at the cost of erasing person-specific detail, which is wrong if the downstream task is biometric identity). Sample <strong>accelerometer and PPG from the same wall-clock instant</strong> as a positive, and you are learning a shared cross-modal space. The augmentation catalogue of <a class="cross-ref" href="section-17.2.html">Section 17.2</a> was one special case of this: a synthetic second view. Here the second view is often a <em>real</em> second sensor, which is strictly better evidence than any augmentation you could invent.</p>
+</div>
+
+<h2>Closing the device and user gaps</h2>
+<p>Device invariance has three complementary levers. First, <strong>canonicalize the input</strong> so devices are less different before the network sees them: resample every stream to a common rate (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), normalize units, and, for tri-axial inertial data, remove the orientation nuisance with rotation augmentation or a gravity-aligned frame. Second, <strong>treat device identity as an augmentation</strong>: if you have any windows recorded simultaneously on two devices, they are a free, physically exact positive pair, better than jitter or scaling because the difference is the true hardware gap rather than a guess at it. Third, <strong>discourage the encoder from encoding device identity at all</strong>, either with a domain-adversarial head that is trained to predict the device while the encoder is trained to fool it, or simply by including enough device diversity that device becomes uninformative.</p>
+<p>The user gap yields to the same toolkit with one addition: <strong>batch and split by subject</strong>. Positives drawn across subjects who share an activity push the representation toward person-agnostic features, and, critically, evaluation must use leave-one-subject-out or grouped splits so that no window from a test person ever appears in training. Subject-level leakage is the single most common way a wearable paper reports a number it cannot reproduce in the field; the grouped-split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is not optional here. When some personalization is allowed at deployment, a small per-user adapter or a few labeled calibration windows recovers most of the person-specific accuracy without retraining the backbone, the pattern developed for wearable foundation models in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Negative transfer is real</h3>
+<p>Pooling more devices, users, and modalities is not monotonically good. If two sources genuinely disagree about what a signal means, forcing them into one representation degrades both, a phenomenon called <strong>negative transfer</strong>. A wrist PPG and a fingertip pulse oximeter measure related but not identical physiology; aligning them too aggressively can blur the exact feature a downstream task needs. The tell is a pretraining loss that drops smoothly while every downstream probe gets worse. Guard against it by measuring per-source downstream accuracy, not just the aggregate, and by allowing modality-specific or device-specific parameters (a private encoder branch, a learned source token) so the model can keep what should stay separate.</p>
+</div>
+
+<h2>Closing the modality gap by alignment</h2>
+<p>Cross-modal pretraining treats time-synchronized channels as paired views of one event and learns a shared embedding space with a symmetric contrastive loss. Give each modality \(m\) its own encoder \(f_m\) mapping a window to a unit vector. For a batch of \(N\) synchronized instants, modality-A embedding \(z^A_i\) and modality-B embedding \(z^B_i\) from the same instant \(i\) are a positive pair; all mismatched instants are negatives. The InfoNCE loss, run in both directions and averaged, is</p>
+<p>$$\mathcal{L} = -\frac{1}{2N}\sum_{i=1}^{N}\left[\log\frac{\exp(z^A_i\!\cdot z^B_i/\tau)}{\sum_{j}\exp(z^A_i\!\cdot z^B_j/\tau)} + \log\frac{\exp(z^B_i\!\cdot z^A_i/\tau)}{\sum_{j}\exp(z^B_i\!\cdot z^A_j/\tau)}\right].$$</p>
+<p>This is exactly the sensor analogue of image-text alignment, with wall-clock synchronization playing the role that human captions play for images. After pretraining, the shared space supports <strong>zero-shot cross-modal retrieval</strong> (find the PPG segment that matches this accelerometer burst) and, more usefully, <strong>graceful missing-modality behavior</strong>: because every modality maps into the same space, a downstream head trained on the fused embedding still functions when one sensor drops out, the robustness property studied in depth in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. The alignment also opens the door to describing signals in language, the sensor-to-text bridge of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>.</p>
+
+<p>The listing below is the complete cross-modal contrastive step. Two per-modality encoders produce embeddings for the same synchronized batch; the symmetric InfoNCE above is computed as two cross-entropies over the shared similarity matrix, matching the equation term for term.</p>
+
+<pre class="language-python"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def cross_modal_infonce(z_a, z_b, temperature=0.1):
+    # z_a, z_b: (N, D) embeddings; row i of BOTH is the SAME synchronized instant
+    z_a = F.normalize(z_a, dim=1)
+    z_b = F.normalize(z_b, dim=1)
+    logits = z_a @ z_b.t() / temperature          # (N, N): logits[i, j] = A_i . B_j
+    targets = torch.arange(z_a.size(0), device=z_a.device)  # positive of i is i
+    loss_a2b = F.cross_entropy(logits, targets)   # accel query -> match its PPG
+    loss_b2a = F.cross_entropy(logits.t(), targets)  # PPG query -> match its accel
+    return 0.5 * (loss_a2b + loss_b2a)            # symmetric, CLIP-style
+</code></pre>
+<div class="code-caption">Symmetric cross-modal InfoNCE for two time-synchronized sensor streams. The diagonal of <code>logits</code> holds the true (same-instant) pairs; the two <code>cross_entropy</code> calls implement the two directions of the loss above. Swap <code>z_a</code>/<code>z_b</code> for any modality pair (accelerometer and PPG, audio and vibration, radar and camera). Correct synchronization is the whole ballgame: a fixed offset between the streams silently poisons every positive pair.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: one encoder for a fragmented smart-ring fleet</h3>
+<p>A digital-health startup ships three smart-ring hardware revisions. Rev 1 has only an accelerometer at 25 Hz; Rev 2 adds green PPG at 100 Hz; Rev 3 adds red and infrared PPG and a skin-temperature channel. Labeled sleep-stage data exists for a few hundred Rev 2 users only. Training separately per revision wastes the millions of unlabeled Rev 1 and Rev 3 hours and produces three models to maintain. Instead the team pretrains a single encoder: accelerometer windows are canonicalized to a common rate and made rotation-invariant, simultaneous accelerometer-and-PPG windows from Rev 2 and Rev 3 supply real cross-modal positive pairs via the InfoNCE loss above, and inherited masking lets the model consume windows with whichever channels are present, so Rev 1 (accelerometer only) still contributes. Batches are grouped by user and evaluated leave-one-subject-out. The result is one backbone that runs on all three rings, degrades gracefully when PPG is missing, and, fine-tuned on the small Rev 2 sleep labels, transfers zero-shot to Rev 3, whose extra channels it had never seen labeled. This is the fragmented-fleet reality that motivates the large sensor models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't rebuild the multi-encoder trainer</h3>
+<p>A correct multi-modal contrastive trainer, with per-modality encoders, synchronized multi-stream loading, resampling, a missing-modality collate that pads absent channels, gathering embeddings across GPUs for a large negative pool, and the symmetric loss, is roughly 400 to 600 lines. Frameworks such as <code>lightly</code> (SSL heads and losses), <code>tsai</code> (time-series-first pipelines), or a small wrapper around <code>torchmultimodal</code> reduce the core loop to about 30 lines: you provide one encoder per modality and a synchronized dataset, and the library owns the cross-GPU gather, the temperature schedule, and the InfoNCE bookkeeping. Keep synchronization and the choice of what is paired in your own hands; that is the domain knowledge no library can supply.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: learning from incomplete, multi-device, multi-rate data</h3>
+<p>The frontier has moved from single-sensor SSL to models built to be cross-device and cross-modal from the start. Google's Large Sensor Model (LSM) and its successor LSM-2 pretrain on very large, heterogeneous wearable corpora and introduce <em>adaptive and inherited masking</em>, which lets one model learn from windows with arbitrary missing channels and devices rather than discarding incomplete data. Apple-style biosignal foundation models pretrain PPG, ECG, and accelerometer jointly at population scale, aligning modalities so a single backbone serves many downstream tasks (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>). Open questions remain sharp: how to align modalities that are only loosely synchronized or sampled at wildly different rates; how to prevent negative transfer when pooling clinical-grade and consumer-grade sensors; and how to do cross-user pretraining without centralizing biometric data at all, which is where privacy-preserving and federated training (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>) meets self-supervision. Verify any named model and its claims before citing; this literature moves fast.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public multi-device human-activity dataset that records the same activities on a wrist and a waist sensor (or synthesize one by holding out a device). (1) Pretrain an encoder using only single-device augmentation positives, then evaluate leave-one-device-out: train a linear probe on wrist windows, test on waist. Record the drop. (2) Now add cross-device positives (same time window, both devices) to the pretraining and repeat. Quantify how much of the device gap the cross-device positives closed. (3) Add a domain-adversarial head that predicts the device from the embedding. Does making the embedding device-unpredictable help the leave-one-device-out probe, or does it start erasing signal the activity task needs? Explain the result using the negative-transfer discussion above.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Distinguish the device gap, the user gap, and the modality gap in one sentence each, and say for each whether it is more naturally closed by <em>invariance</em> or by <em>alignment</em>.</li>
+<li>In cross-modal InfoNCE, what real-world quantity plays the role that human captions play in image-text CLIP, and what goes wrong if it is off by a fixed offset?</li>
+<li>You pretrain on pooled clinical ECG and consumer wrist PPG and every downstream probe gets worse while the pretraining loss keeps dropping. Name the failure and two concrete design changes that would let the model keep the sources appropriately separate.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-17.7.html">Section 17.7</a>, we stop assuming a good representation and start measuring one. You will learn the probing toolkit, linear and few-shot probes, retrieval and clustering metrics, and leakage-safe evaluation, that tells you whether all this cross-device, cross-user, cross-modal pretraining actually produced features worth deploying, or merely a loss curve that looked reassuring.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

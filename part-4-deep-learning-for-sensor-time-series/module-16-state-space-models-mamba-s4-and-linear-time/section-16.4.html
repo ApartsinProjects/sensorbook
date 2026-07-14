@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.4: Time-series SSM variants (SiMBA, TimeMachine, Bi-Mamba). Building Sensory AI." name="description"/>
+<title>Section 16.4: Time-series SSM variants (SiMBA, TimeMachine, Bi-Mamba) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>Time-series SSM variants (SiMBA, TimeMachine, Bi-Mamba)</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"Mamba taught me to read a signal front to back in linear time. Then someone showed me the recording was already finished, and I had been reading it with one eye closed."</p>
+        <cite>A Retrospective AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the selective state-space recurrence of <a class="cross-ref" href="section-16.3.html">Section 16.3</a>: you should be comfortable with the Mamba block, its input-dependent \(\Delta, B, C\) parameters, and the hardware-aware scan. From <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a> you need the distinction between channel-independent and channel-mixing designs, and from <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> the idea that a bidirectional pass sees context a causal one cannot. Everything else is developed here.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Plain Mamba was designed for language: a strictly causal, single-direction, single-channel stream where you predict the next token from the past. Sensor time series break all three assumptions at once. A classified window is usually already recorded in full, so forcing causality throws away half the available context. A sensor node is rarely one channel; it is nine axes of IMU, twelve leads of ECG, dozens of taps on a machine. And the phenomena you care about live at many timescales simultaneously. The three variants in this section, Bi-Mamba, SiMBA, and TimeMachine, are the community's answers to exactly these gaps. Bi-Mamba restores non-causal context by scanning forward and backward. SiMBA fixes how channels talk to each other and stabilizes deep stacks. TimeMachine nests Mamba modules to read a signal at several resolutions at once. None of them abandons the linear-time promise of Chapter 16; each spends that budget more wisely for perception rather than generation.</p>
+    </div>
+
+    <h2>Why vanilla Mamba is not the end of the story</h2>
+    <p>Recall the core Mamba recurrence, a selective linear state-space update run over the sequence:</p>
+    \[ h_t = \bar{A}_t\, h_{t-1} + \bar{B}_t\, x_t, \qquad y_t = C_t\, h_t. \]
+    <p><strong>What</strong> makes this powerful is that \(\bar A_t, \bar B_t, C_t\) depend on the input, so the model chooses what to remember. <strong>Why</strong> it needs adapting for sensing comes down to three structural mismatches. First, the recurrence is <em>causal</em>: \(h_t\) sees only \(x_1 \dots x_t\). That is correct for generation and for the streaming inference of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, but wasteful when you are classifying a complete, already-captured window and the discriminative evidence sits after the moment you are encoding. Second, a single Mamba scan mixes <em>time</em> beautifully but says nothing about how to mix <em>channels</em>; treated naively, a multivariate signal is either flattened (destroying which sensor is which) or run channel-by-channel (destroying cross-sensor coupling). Third, one scan operates at one effective timescale set by \(\Delta\), yet a fault signature and a slow thermal drift want different resolutions. <strong>When</strong> these mismatches bite is precisely the sensing regime: offline windows, many correlated channels, multi-scale dynamics. Each variant below targets one mismatch head-on.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Attention gets bidirectionality, channel mixing, and multi-scale reach almost for free because every token sees every other token. An SSM buys its linear-time cost by giving that up: a scan is inherently ordered, directional, and single-track. So every time-series Mamba variant is, at heart, a strategy for buying back one of those transformer conveniences without buying back the quadratic bill. Read each design by asking: which transformer luxury is it re-adding, and what does the extra scan cost?</p>
+    </div>
+
+    <h2>Bi-Mamba: reading the window in both directions</h2>
+    <p>The cheapest fix addresses causality. A <strong>bidirectional Mamba</strong> block runs two selective scans: one over the sequence as given, one over its time-reversed copy, then recombines them so every position is informed by both its past and its future. Concretely, for input \(x \in \mathbb{R}^{L \times d}\) you compute a forward output and a backward output and fuse them:</p>
+    \[ y = f_{\rightarrow}(x) + \operatorname{flip}\!\big(f_{\leftarrow}(\operatorname{flip}(x))\big), \]
+    <p>where \(f_{\rightarrow}\) and \(f_{\leftarrow}\) are two Mamba scans with separate weights and \(\operatorname{flip}\) reverses the time axis. This is the pattern Vision Mamba (Vim) introduced for images and that Bi-Mamba-style forecasters carried into time series. <strong>Why</strong> it helps sensing: the significance of a transient often depends on what follows it. A momentary dropout in a PPG trace is benign if the pulse recovers cleanly and alarming if it precedes an arrhythmia, and only a backward pass lets the encoding of the dropout know which happened. The cost is honest and modest: two scans instead of one, so roughly double the compute and parameters of a plain Mamba layer, still linear in \(L\). The rule of thumb: use bidirectional scanning whenever the whole window is available at inference (classification, retrospective detection, forecasting from a fixed lookback) and stay strictly causal, single-direction, only when you must emit outputs as samples arrive.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+from mamba_ssm import Mamba  # pip install mamba-ssm
+
+class BiMamba(nn.Module):
+    """Bidirectional Mamba: one forward scan, one backward scan, fused."""
+    def __init__(self, d_model):
+        super().__init__()
+        self.fwd = Mamba(d_model=d_model)   # scans x as given
+        self.bwd = Mamba(d_model=d_model)   # scans time-reversed x
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):                    # x: (batch, length, d_model)
+        f = self.fwd(x)
+        b = self.bwd(x.flip(dims=[1])).flip(dims=[1])
+        return self.norm(f + b)              # every step sees past AND future
+
+x = torch.randn(4, 2048, 128, device="cuda")   # 4 windows, 2048 steps, 128 features
+out = BiMamba(128).to("cuda")(x)
+print(out.shape)   # torch.Size([4, 2048, 128]); cost is 2 scans, still O(L)</code></pre>
+    <div class="code-caption"><strong>Listing 16.4.</strong> A bidirectional Mamba block built from two <code>mamba_ssm.Mamba</code> scans. The backward branch reverses the time axis, scans, and reverses back so its output re-aligns with the forward branch before the two are summed. Total cost stays linear in the window length \(L\); the only price over plain Mamba is the second scan.</div>
+
+    <p>Listing 16.4 is the whole idea in a dozen lines because the heavy machinery, the hardware-aware selective scan, lives inside the library call. That is worth pausing on.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A correct selective-scan kernel with its custom CUDA forward and backward passes is well over a thousand lines; writing the bidirectional wrapper on top of a hand-rolled scan would add hundreds more for the flip bookkeeping and gradient plumbing. The <code>mamba_ssm</code> package collapses the scan to a single <code>Mamba(d_model=...)</code> call, so the entire Bi-Mamba block in Listing 16.4 is about fifteen lines instead of well over a thousand. The library owns numerical stability, the associative-scan parallelization, and mixed precision; you own only the modeling choice of when a second, backward scan is worth its compute.</p>
+    </div>
+
+    <h2>SiMBA: fixing channel mixing and deep-stack stability</h2>
+    <p>Bidirectionality solves time. It does not solve channels, and it does not, on its own, make a deep Mamba stack train stably. <strong>SiMBA</strong> (Simplified Mamba-Based Architecture) tackles both. Its design principle is a clean division of labor: use Mamba for <em>sequence mixing</em> (across time) and a dedicated frequency-domain operator called <strong>EinFFT</strong> for <em>channel mixing</em> (across sensors). EinFFT transforms the channel dimension with an FFT, applies a learned complex-valued weighting via an Einstein-summation MLP, and inverts it, which mixes channels globally at \(O(d \log d)\) cost while, crucially, keeping the activations well-conditioned. That last point is the practical payoff: naive Mamba stacks were observed to grow unstable as depth increased, and SiMBA's structured spectral channel mixing was shown to tame that, letting the architecture scale to larger networks and reach state-of-the-art results on standard multivariate forecasting benchmarks. <strong>When</strong> to reach for it: many correlated channels where cross-sensor structure is diagnostic (think a full 12-lead ECG or a wide industrial tag set), and deep models where plain-Mamba training has been finicky.</p>
+
+    <div class="callout practical-example">
+        <h4>In Practice: multi-axis vibration on a wind-turbine gearbox</h4>
+        <p>A turbine operator instruments a gearbox with eight accelerometers plus tachometer and temperature, sampled together over ten-minute windows to catch an emerging gear-tooth crack. The failure signature is not in any single channel; it is a phase relationship that appears across the radial and axial accelerometers as the shaft loads up, modulated by temperature. A per-channel Mamba misses the coupling entirely, and a flattened one drowns it in noise. A SiMBA-style encoder scans each channel in time with Mamba while EinFFT mixes the eight axes in the frequency domain, so the model can learn "energy at the gear-mesh frequency rising in the radial axes while the axial axes lag." The bidirectional variant of the same block reads each window retrospectively, which matters because the crack signature is clearest in the load-up transient that sits mid-window. This is the multivariate condition-monitoring pattern developed in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+    </div>
+
+    <h2>TimeMachine: many Mambas for many timescales</h2>
+    <p>The third gap is scale. <strong>TimeMachine</strong> attacks long-horizon multivariate forecasting by composing four Mamba modules into a nested, two-level structure that provides global and local context at multiple resolutions from a single linear-time backbone. The outer level captures long-range, coarse structure across the lookback; the inner level refines fine detail. Just as important, TimeMachine makes the channel question <em>adaptive</em> rather than fixed: it selects between channel-mixing and channel-independent processing based on the number of channels and the data regime, so a two-sensor stream and a hundred-sensor stream are handled differently by design instead of by a hand-tuned switch. The result keeps Mamba's linear scaling and low memory footprint while matching or beating transformer forecasters on long-context benchmarks. <strong>Why</strong> this matters for sensing specifically: real deployments span a huge channel-count range, from a single wearable strap to a plant-wide SCADA feed, and a model that auto-adapts its channel strategy is far easier to ship across that range than one you must re-architect per site.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The 2024 wave of time-series Mamba variants moved fast. <strong>SiMBA</strong> (Patro and Agneeswaran, 2024) paired Mamba sequence mixing with EinFFT channel mixing and reported state-of-the-art results on multivariate time-series forecasting and strong ImageNet transfer, closing much of the gap to the best transformers. <strong>TimeMachine</strong> (Ahamed and Cheng, 2024) used four Mamba modules for multi-scale, content-adaptive channel handling in long-term forecasting at linear cost. Bidirectional scanning entered vision through <strong>Vision Mamba (Vim)</strong> (Zhu et al., 2024) and was adapted for forecasting by Bi-Mamba-style designs the same year. The frontier now is less about single benchmarks and more about which of these ideas, bidirectionality, spectral channel mixing, multi-scale nesting, compose cleanly, and whether an SSM backbone can anchor the sensor foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>. Treat published leaderboard wins with the leakage-safe skepticism of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>: many time-series benchmarks split by window, which can flatter any high-capacity model.</p>
+    </div>
+
+    <h2>Choosing a variant</h2>
+    <p>Table 16.4 lines the three up against the mismatch each one fixes. Read it as a decision aid, not a ranking: they are complementary, and production models often combine them (a bidirectional, SiMBA-style channel-mixing block inside a multi-scale stack).</p>
+
+    <div class="table-container">
+    <table>
+        <caption>Table 16.4: Time-series Mamba variants and the sensing gap each addresses.</caption>
+        <thead>
+            <tr><th>Variant</th><th>Fixes</th><th>Key mechanism</th><th>Reach for it when</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Bi-Mamba</td><td>Causality</td><td>Forward + time-reversed scan, fused</td><td>Full window available offline; evidence follows the encoded moment</td></tr>
+            <tr><td>SiMBA</td><td>Channel mixing, stability</td><td>Mamba (time) + EinFFT spectral channel mix</td><td>Many correlated channels; deep stacks that trained unstably</td></tr>
+            <tr><td>TimeMachine</td><td>Multi-scale, channel-count range</td><td>Four nested Mambas; adaptive channel strategy</td><td>Long-horizon forecasting across varied channel counts</td></tr>
+        </tbody>
+    </table>
+    </div>
+
+    <p>Two cross-cutting disciplines carry over from the rest of the book. Bidirectionality is off-limits for any truly streaming deployment, so decide your inference mode before you pick a variant, not after. And whichever you choose, split by recording, subject, or machine rather than by window when you evaluate, so a long bidirectional context does not quietly memorize a device it will also be tested on.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are building a fall detector for a wrist wearable with a 6-axis IMU, using 4-second windows at \(100\,\mathrm{Hz}\). (a) The device must alert within 300 ms of impact. Argue whether a Bi-Mamba block is admissible here, and if not, what part of its benefit you forfeit. (b) The six axes are strongly coupled during a fall (the arm swings as the body drops). Sketch how a SiMBA-style split (Mamba over time, EinFFT over the six channels) would represent that coupling, and contrast it with running one Mamba per axis. (c) Estimate the compute multiplier of Bi-Mamba over plain Mamba and state why it stays \(O(L)\).</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Which transformer convenience does each of Bi-Mamba, SiMBA, and TimeMachine buy back, and what extra cost does each pay for it?</p>
+        <p class="quiz-question">2. Why is bidirectional scanning a modeling error, not just an optimization, for a strictly streaming sensor task?</p>
+        <p class="quiz-question">3. SiMBA mixes channels with an FFT-based operator rather than another time scan. What two things does that spectral channel mixing provide that a plain deeper Mamba stack did not?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-16.5.html">Section 16.5</a>, we stop adding variants and start measuring. We put SSMs and transformers on the same bench and compare them where deployment actually decides: accuracy at long horizons, inference latency, memory footprint, and how each one fits inside the tight power and silicon budgets of an on-device sensor system.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

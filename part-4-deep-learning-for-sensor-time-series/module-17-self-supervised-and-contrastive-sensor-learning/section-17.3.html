@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.3: Masked reconstruction (MAE for time series). Building Sensory AI." name="description"/>
+<title>Section 17.3: Masked reconstruction (MAE for time series) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Self-Supervised and Contrastive Sensor Learning</a></div>
+<h1>Masked reconstruction (MAE for time series)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Hide half the signal from me and ask me to guess it back. Do that a million times and I will have learned what a heartbeat is, without anyone telling me."</p><cite>A Self-Supervised AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Contrastive learning (Section 17.2) teaches an encoder by pulling augmented views of the same window together. Masked reconstruction takes a different bet: it hides part of a signal and trains the model to fill in the gap. That single objective, "predict what you cannot see", turns out to be an unreasonably effective pretraining task for sensors. It needs no augmentation design, no negative pairs, no careful temperature tuning, and it degrades gracefully when data are already full of holes, which is the normal condition of real sensor fleets. This section explains how the Masked Autoencoder (MAE) idea, born in vision, was adapted to time series, why patching and a high mask ratio matter, and when reconstruction beats contrastive learning for the label-scarce regime that motivated this whole chapter.</p>
+</div>
+
+<p>This section assumes you are comfortable with the patch-and-transformer encoder from <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, the augmentation vocabulary and the encoder-projection setup from Section 17.2, and the leakage-safe windowing discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. If patch tokenization is unfamiliar, read that chapter first; everything below builds on tokens, not raw samples.</p>
+
+<h2>The masked reconstruction objective</h2>
+
+<p>Take a multivariate window \(x \in \mathbb{R}^{C \times T}\) with \(C\) channels and \(T\) timesteps. Split it along time into non-overlapping patches of length \(p\), giving \(N = T/p\) tokens per channel. Sample a random subset \(\mathcal{M}\) of token positions to mask, replace those tokens (or drop them), and pass the rest through an encoder \(f_\theta\). A lightweight decoder \(g_\phi\) then reconstructs the original values at the masked positions. The loss is a plain reconstruction error over only the masked tokens:</p>
+
+$$\mathcal{L}_{\text{MAE}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \left\lVert g_\phi\big(f_\theta(x_{\setminus \mathcal{M}})\big)_i - x_i \right\rVert_2^2.$$
+
+<p><strong>Why it works.</strong> To fill a masked gap the encoder cannot copy neighbours blindly; it must internalize the structure of the signal, the periodicity of a gait cycle, the QRS morphology of an ECG beat, the spectral envelope of a bearing's vibration. Reconstruction forces the network to compress that structure into its hidden states, and those hidden states are exactly the representation you keep. <strong>Why only masked tokens.</strong> Scoring the loss on visible tokens lets the model cheat with an identity map and learns nothing transferable; restricting the loss to \(\mathcal{M}\) makes prediction the only path to low error.</p>
+
+<h2>Design choices that decide success</h2>
+
+<p><strong>Mask ratio.</strong> Vision MAE masks about 75 percent of patches. Time series are more redundant along time, so effective ratios run high too, commonly 40 to 60 percent for periodic biosignals and higher for slow environmental streams. Too low a ratio makes the task trivial (linear interpolation solves it); too high starves the encoder of context. Treat it as the single most important hyperparameter.</p>
+
+<p><strong>Masking geometry.</strong> Random per-token masking is the default, but two variants matter for sensors. <em>Channel-independent</em> masking hides different tokens in different channels, which teaches cross-channel inference (guess the missing accelerometer axis from the other two). <em>Block</em> masking hides contiguous spans, which forces genuine temporal extrapolation instead of pointwise smoothing. PatchTST-style channel-independent patching plus block masking is a strong recipe for multivariate sensor data.</p>
+
+<p><strong>Asymmetric encoder-decoder.</strong> Following the original MAE, the encoder sees only visible tokens (so compute scales with the kept fraction, not the full length), and a small decoder reconstructs. The decoder is deliberately weak and thrown away after pretraining; a strong decoder would do the reconstruction work itself and leave the encoder lazy.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Masked reconstruction and contrastive learning optimize different things. Contrastive objectives learn <em>invariances</em>: what stays the same across augmentations, which is ideal for coarse classification. Masked reconstruction learns <em>generative structure</em>: the fine-grained shape of the signal, which is ideal for dense tasks like imputation, forecasting, and anomaly detection where you must reproduce the waveform, not just label it. If your downstream task needs the shape back, mask; if it needs a robust category, contrast. Many strong sensor foundation models combine both.</p>
+</div>
+
+<h2>A minimal MAE for sensor windows</h2>
+
+<p>The code below strips the idea to its core: patchify, mask, encode the visible tokens, decode, and score the masked positions only. It runs on any window tensor and is deliberately small so the moving parts stay visible.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class TinyTS_MAE(nn.Module):
+    def __init__(self, n_ch, patch=16, d=128, mask_ratio=0.5):
+        super().__init__()
+        self.patch, self.mask_ratio = patch, mask_ratio
+        self.embed = nn.Linear(n_ch * patch, d)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d, 4, batch_first=True), num_layers=4)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, d))
+        self.decoder = nn.TransformerEncoderLayer(d, 4, batch_first=True)
+        self.head = nn.Linear(d, n_ch * patch)     # reconstruct patch values
+
+    def forward(self, x):                            # x: (B, C, T)
+        B, C, T = x.shape
+        p = self.patch; N = T // p
+        tok = x[..., :N*p].reshape(B, C, N, p).permute(0, 2, 1, 3).reshape(B, N, C*p)
+        z = self.embed(tok)                          # (B, N, d)
+        n_mask = int(self.mask_ratio * N)
+        idx = torch.rand(B, N, device=x.device).argsort(1)
+        keep, masked = idx[:, n_mask:], idx[:, :n_mask]
+        vis = torch.gather(z, 1, keep[..., None].expand(-1, -1, z.size(-1)))
+        vis = self.encoder(vis)                      # encode visible only
+        full = self.mask_token.expand(B, N, -1).clone()
+        full.scatter_(1, keep[..., None].expand(-1, -1, z.size(-1)), vis)
+        rec = self.head(self.decoder(full))          # (B, N, C*p)
+        target = tok
+        m = torch.zeros(B, N, device=x.device).scatter_(1, masked, 1.0)
+        loss = (((rec - target) ** 2).mean(-1) * m).sum() / m.sum()
+        return loss
+</code></pre>
+<div class="code-caption">A self-contained masked autoencoder for multivariate sensor windows: patchify along time, encode only the kept tokens, splice learned mask tokens back in, and compute the reconstruction loss on masked patches alone. After pretraining, discard <code>head</code> and <code>decoder</code> and keep <code>embed</code> plus <code>encoder</code> as the feature extractor.</div>
+
+<p>Note the two lines that carry the whole method: the loss multiplies by the mask indicator <code>m</code> so visible patches contribute nothing, and the encoder runs on <code>vis</code> (the kept tokens) rather than the full sequence, which is where the compute savings come from. Everything else is bookkeeping.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: Reach for a Maintained MAE</h3>
+<p>The teaching model above is roughly 30 lines and still omits positional encodings, channel-independent masking, mixed precision, and multi-rate handling. Production pipelines lean on pretrained masked encoders instead. Loading <strong>MOMENT</strong> (a masked-reconstruction time-series model) from Hugging Face is about 4 lines and gives you a validated encoder, patch tokenizer, and imputation head for free, replacing several hundred lines of training loop, masking utilities, and checkpoint management. Write the toy MAE once to understand the objective; ship the library encoder.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Pretraining on a Wearable ECG Fleet</h3>
+<p>A cardiac-patch startup collects millions of hours of single-lead ECG from a home-monitoring wearable, but only a few thousand beats carry cardiologist labels. They pretrain a patch MAE with 50 percent block masking on the entire unlabeled corpus, forcing the encoder to reconstruct hidden slices of the waveform, including missing P-waves and clipped R-peaks. The learned encoder is then fine-tuned on the small labeled set for arrhythmia classification. Because the model already knows what a normal beat looks like from reconstruction, it reaches the same F1 with roughly a tenth of the labels a from-scratch model needs, and the reconstruction head doubles as a dropout-gap imputer when the electrode briefly loses contact. This directly serves the label-efficiency curve that <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a> builds cardiac models around.</p>
+</div>
+
+<h2>When masking wins, and when it does not</h2>
+
+<p><strong>Masking wins</strong> when data are abundant but labels are scarce (the premise of Section 17.1), when the downstream task is dense or generative (imputation, forecasting, waveform anomaly detection), and when the data already contain missingness, since a masked model treats real gaps and synthetic masks identically. That last property is why large sensor foundation models such as Google's LSM-2 build masking directly into their handling of incomplete inputs, a thread we pick up in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+
+<p><strong>Masking struggles</strong> when the sensor is dominated by high-frequency noise (the model wastes capacity reconstructing unpredictable jitter; denoise first, see <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>), and when you only ever need a coarse label, where a contrastive encoder often transfers with fewer pretraining steps. A blunt but useful diagnostic: if you would be happy plotting the reconstruction and calling it "good enough to trust", masking is learning something real; if the reconstructions are visually flat means, raise the mask ratio or switch objectives.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current sensor-domain state of the art blends masked reconstruction with the ideas around it. <strong>MOMENT</strong> and <strong>Ti-MAE</strong> established patch masking for general time series; <strong>PatchTST</strong> showed channel-independent patching is a strong backbone; <strong>SimMTM</strong> reframes masked modeling as reconstruction from neighbouring series in representation space rather than pointwise; and <strong>LSM-2</strong> (2025) treats masking and real missingness as one problem for wearable-scale pretraining. The open questions are the mask ratio and geometry schedule (fixed versus curriculum), and how to keep reconstruction from over-investing in trivially predictable low-frequency content. Report pretraining and fine-tuning on strictly separated subject splits, or the label-efficiency gains are an artifact of leakage.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public accelerometer HAR dataset. Pretrain the <code>TinyTS_MAE</code> above at mask ratios of 0.15, 0.50, and 0.80, then freeze each encoder and fit a linear probe for activity classification on 5 percent of the labels. Plot probe accuracy against mask ratio. (a) Which ratio wins, and does the reconstruction loss at convergence predict the probe accuracy? (b) Switch from random to block masking at your best ratio; does temporal extrapolation help or hurt this particular task? Explain the result in terms of what each masking geometry forces the encoder to learn.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is the reconstruction loss computed on masked tokens only, and what fails if you include the visible ones?</li>
+<li>Give one downstream task where masked reconstruction should beat contrastive learning, and one where the reverse holds, and justify each from what the objective optimizes.</li>
+<li>A colleague reports beautiful reconstructions but useless downstream features. Name two likely causes tied to design choices in this section.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-17.4.html">Section 17.4</a>, we move from reconstructing what is hidden to predicting what comes next in representation space. Temporal predictive coding and TS2Vec drop pixel-perfect reconstruction in favour of contrastive prediction across time and hierarchical scales, giving representations that are often more robust for classification while sidestepping the noise-reconstruction trap we just diagnosed.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

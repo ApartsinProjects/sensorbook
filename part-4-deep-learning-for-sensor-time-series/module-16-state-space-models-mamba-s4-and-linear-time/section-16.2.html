@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.2: Structured state-space models (S4, S5). Building Sensory AI." name="description"/>
+<title>Section 16.2: Structured state-space models (S4, S5) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>Structured state-space models (S4, S5)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I kept one small vector in my head and let ten million samples flow past it. Ask me anything about the whole recording; I never had to look back."</p>
+<cite>A Structured AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the linear state-space model you already met as a physical object: the continuous dynamics \(\dot{x}=Ax+Bu\) that drive the Kalman family in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and the discretization of a continuous signal onto a fixed sample clock from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. It assumes you understand why a global convolution kernel and a recurrence can compute the same output (<a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>), and it directly answers the quadratic-cost problem raised in <a class="cross-ref" href="section-16.1.html">Section 16.1</a>. Familiarity with complex eigenvalues and elementwise (Hadamard) products is enough for the math here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A structured state-space model (SSM) is a linear recurrence borrowed from control theory and dropped into a deep network as a sequence layer. It carries a hidden state \(x\) of a few dozen dimensions, updates it once per sample with a fixed linear rule, and reads out the signal you want. That single idea has two faces. During inference it runs as a recurrence: constant memory, one matrix-vector step per sample, so a streaming sensor feed of arbitrary length costs \(O(1)\) per step. During training it unrolls into one long convolution whose kernel can be precomputed and applied with an FFT, giving fully parallel \(O(L\log L)\) passes over a length-\(L\) window. You get the streaming thrift of an RNN and the parallel throughput of a convolution from the same weights. The catch, and the reason "structured" is in the name, is that a naive linear recurrence either forgets everything or is too expensive to build the convolution kernel for. S4 and S5 are the two engineering answers that make the trick both stable over very long horizons and fast to train.</p>
+</div>
+
+<h2>One linear system, two equivalent views</h2>
+<p>Start from the continuous single-input single-output system that Chapter 9 wrote for a physical plant:</p>
+<p>$$\dot{x}(t) = A\,x(t) + B\,u(t), \qquad y(t) = C\,x(t) + D\,u(t).$$</p>
+<p>Here \(u(t)\) is one channel of your sensor signal, \(x(t)\in\mathbb{R}^{N}\) is a latent state (\(N\) is typically 16 to 64), and \(A,B,C,D\) are learned rather than derived from physics. To run this on sampled data at step size \(\Delta\), discretize it exactly as Chapter 3 taught, most commonly with the bilinear (Tustin) transform, giving discrete matrices \(\bar{A}=(I-\tfrac{\Delta}{2}A)^{-1}(I+\tfrac{\Delta}{2}A)\) and \(\bar{B}=(I-\tfrac{\Delta}{2}A)^{-1}\Delta B\). The layer now reads, for samples \(k=0,1,2,\dots\),</p>
+<p>$$x_k = \bar{A}\,x_{k-1} + \bar{B}\,u_k, \qquad y_k = C\,x_k.$$</p>
+<p>This is the <em>recurrent view</em>: stateful, causal, ideal for deployment. But because the recurrence is linear with fixed coefficients, you can unroll it in closed form. With \(x_{-1}=0\), the output is a convolution of the input with a fixed kernel:</p>
+<p>$$y_k = \sum_{j=0}^{k} C\bar{A}^{\,j}\bar{B}\; u_{k-j} \;=\; (\bar{K} * u)_k, \qquad \bar{K} = \big(C\bar{B},\, C\bar{A}\bar{B},\, C\bar{A}^2\bar{B},\dots\big).$$</p>
+<p>That is the <em>convolutional view</em>. The vector \(\bar{K}\) is the SSM convolution kernel, a learned impulse response of length \(L\). Training convolves the whole window against \(\bar{K}\) in parallel; inference steps the recurrence one sample at a time. Nothing is approximated: the two views are the same operator, chosen for whichever cost profile the phase of work demands.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The kernel entries are \(C\bar{A}^{\,j}\bar{B}\), so the entire behavior of the layer, and its ability to remember, lives in the powers of \(\bar{A}\). If the eigenvalues of \(\bar{A}\) sit well inside the unit circle, \(\bar{A}^{\,j}\) decays fast and the model forgets within a few samples; a random \(A\) does exactly this and cannot see past a short horizon. Long memory is therefore not something the optimizer stumbles into. It has to be engineered into the <em>spectrum</em> of \(A\) at initialization. This one observation is what separates a toy linear RNN from S4.</p>
+</div>
+
+<h2>HiPPO: initializing a memory instead of hoping for one</h2>
+<p>The breakthrough that made these layers work was choosing \(A\) so the state \(x\) provably summarizes the entire past signal. The HiPPO framework (High-order Polynomial Projection Operators) derives a specific structured matrix \(A\) whose dynamics keep \(x\) as the coefficients of an optimal polynomial approximation of the history of \(u\) up to now. Concretely, the HiPPO-LegS matrix compresses the whole past onto a Legendre basis with uniform weighting, so each state dimension tracks a different time scale of the signal and old information degrades gracefully rather than being clipped by a fixed window. Initializing \(A\) with HiPPO, rather than randomly, is what let the original structured SSM jump from near-chance to state of the art on benchmarks that require reasoning over sequences tens of thousands of steps long. For a sensor engineer the analogy is exact: HiPPO is a fixed bank of leaky integrators at graded decay rates, a learned generalization of the multi-rate feature bank you might hand-build in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>.</p>
+
+<h2>S4: making the long kernel computable</h2>
+<p>HiPPO fixes memory, but a new cost appears. Building the length-\(L\) kernel \(\bar{K}\) naively means multiplying \(\bar{A}\) by itself \(L\) times, which is \(O(N^2L)\) work and numerically unstable for large \(L\). S4 (Structured State Space Sequence model) solves this by keeping \(A\) in a <strong>diagonal-plus-low-rank</strong> (DPLR) form, \(A = \Lambda - PP^{*}\), with \(\Lambda\) diagonal. Under this structure the kernel never needs to be formed by repeated powering. Its generating function becomes a rational function that S4 evaluates at the \(L\) roots of unity as a Cauchy kernel, then inverts with a single FFT, cutting kernel construction to \(O(N+L)\) memory and \(O((N+L)\log(N+L))\) time. The practical upshot is that S4 trains as fast as a convolution while retaining the HiPPO memory and the \(O(1)\) recurrent inference mode.</p>
+<p>A later simplification, <strong>S4D</strong>, drops the low-rank term entirely and keeps \(A\) purely diagonal. A diagonal complex \(A\) makes \(\bar{A}^{\,j}\) an elementwise power, so the kernel is a Vandermonde product that is trivial to write and nearly as accurate as full S4 when the diagonal is initialized from the HiPPO eigenvalues. Diagonal SSMs are the form most sensor practitioners actually deploy, because the entire layer reduces to a handful of complex exponentials per state dimension.</p>
+
+<p>The listing below builds a diagonal SSM, computes its output two ways, and checks that the parallel convolution and the streaming recurrence agree to numerical precision. This is the equivalence the whole section rests on.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+N, L = 16, 200                     # state size, sequence length
+rng  = np.random.default_rng(0)
+# Diagonal SSM: stable continuous poles (negative real part), HiPPO-style spread
+A = -np.exp(rng.normal(size=N)) + 1j*np.arange(N)      # continuous diagonal
+B = rng.normal(size=N) + 0j
+C = rng.normal(size=N) + 0j
+dt = 0.05
+
+# Bilinear discretization (elementwise, because A is diagonal)
+Abar = (1 + dt/2*A) / (1 - dt/2*A)
+Bbar = (dt*B)       / (1 - dt/2*A)
+
+u = rng.normal(size=L)             # one sensor channel
+
+# View 1: recurrent (streaming, O(1) state per step)
+x = np.zeros(N, dtype=complex); y_rec = np.zeros(L)
+for k in range(L):
+    x = Abar*x + Bbar*u[k]
+    y_rec[k] = (C*x).sum().real
+
+# View 2: convolution with the precomputed kernel K_j = C Abar^j Bbar
+powers = Abar[None, :] ** np.arange(L)[:, None]        # (L, N)
+K = (powers * (C*Bbar)[None, :]).sum(axis=1).real      # length-L impulse response
+y_conv = np.convolve(u, K)[:L]
+
+print("max |recurrent - convolution| =", np.abs(y_rec - y_conv).max())</code></pre>
+<div class="code-caption">A 16-state diagonal SSM evaluated two ways. The streaming recurrence and the parallel convolution against the precomputed kernel <code>K</code> match to about 1e-14, the numerical equivalence that lets S4 train as a convolution and deploy as an RNN from one set of weights.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: bearing vibration on a factory line</h3>
+<p>A condition-monitoring vendor streams 25.6 kHz accelerometer data from a gearbox to catch a developing bearing fault (the task of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>). The tell-tale is a slow amplitude modulation whose period spans thousands of samples, far beyond a transformer's affordable attention window and beyond a plain LSTM's usable memory. An S4D layer with \(N=32\) states, initialized from HiPPO, holds that multi-second envelope in 32 complex numbers. Training runs as an FFT convolution over 16k-sample windows on the GPU; the deployed model on the edge gateway switches to the recurrence and updates its 32-state vector once per incoming sample at fixed cost, never buffering the window. Same weights, two execution modes, one memory footprint that does not grow with recording length.</p>
+</div>
+
+<h2>S5: one shared MIMO system and a parallel scan</h2>
+<p>S4 and S4D treat each channel with its own scalar SSM and lean on the convolution to parallelize. S5 (Simplified State Space Sequence model) makes two clean changes. First, it goes <strong>multi-input multi-output</strong>: a single state \(x\in\mathbb{R}^{N}\) is driven by all input channels through a shared \(\bar{A},\bar{B},\bar{C}\), so cross-channel coupling lives inside the state rather than being deferred to a later mixing layer. Second, it abandons the convolutional view and parallelizes the recurrence directly with an <strong>associative parallel scan</strong>. Because the recurrence is linear, the operation "combine two consecutive steps" is associative, so a scan computes all \(L\) states in \(O(\log L)\) sequential depth on parallel hardware without ever forming a kernel. This matters because the parallel-scan formulation is exactly what <a class="cross-ref" href="section-16.3.html">Section 16.3</a> needs to make the recurrence <em>input-dependent</em> in Mamba, where a fixed convolution kernel no longer exists. S5 keeps a diagonal \(\bar{A}\) (initialized from HiPPO eigenvalues), so its per-step work stays cheap, and it typically matches or beats S4 on long-range benchmarks with a simpler, more uniform implementation.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the Cauchy kernel</h3>
+<p>The DPLR kernel math, HiPPO initialization, bidirectional variants, and mixed-precision FFT paths are subtle to get right and easy to make numerically unstable. The reference <code>s4</code> and <code>s5</code> repositories, and the <code>state-spaces</code> layer wrapped in libraries such as <code>safari</code> and Hugging Face Transformers, expose a ready S4/S4D/S5 block. Swapping a transformer encoder block for an S4D block is about 3 lines (import, instantiate <code>S4D(d_model, d_state=64)</code>, call it), versus roughly 200 lines to implement the generating-function kernel, discretization, and scan yourself. The library also ships the tuned HiPPO initialization, which is the part most likely to be silently wrong in a from-scratch build.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The lineage is fast-moving. S4 (Gu, Goel, and Re, 2022) established the DPLR kernel; DSS and S4D (2022) showed a diagonal \(A\) is nearly as good and far simpler; S5 (Smith, Warrington, and Linderman, 2023) unified the channels into one MIMO scan and set strong Long Range Arena results; and the same parallel-scan machinery became the backbone of Mamba's selective SSM (Gu and Dao, 2023), covered next. Current work pushes on stable long-context initialization beyond HiPPO, on bidirectional and 2D SSMs for images and video, and on hardware-aware kernels. The through-line for sensing is that these are the first sequence layers to make hundred-thousand-step context both trainable and streamable, which is precisely the regime raw high-rate sensor feeds live in.</p>
+</div>
+
+<h2>When the structure earns its keep</h2>
+<p>Reach for a structured SSM when the signal is long, the dependencies are long, and the deployment is streaming: high-rate vibration, continuous ECG or PPG, audio, or any feed where the informative structure spans thousands of samples and the device must run online at fixed cost. The linear-in-length training and constant-memory inference are the payoff. Where the SSM is weaker than attention is in doing sharp, content-dependent lookups (retrieving a specific earlier event by its content rather than by a fixed learned response); a plain S4/S5 kernel is fixed once trained and cannot re-weight itself per input. That limitation is exactly what the selection mechanism of <a class="cross-ref" href="section-16.3.html">Section 16.3</a> removes, and it is why hybrids in <a class="cross-ref" href="section-16.6.html">Section 16.6</a> pair an SSM's cheap long memory with a few attention layers for precise recall. As always, decide on a leakage-safe split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) so the long context does not quietly bleed test information into training.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the code listing and sweep the real part of the diagonal \(A\) from near zero (poles close to the unit circle) to strongly negative. For each setting, plot the kernel \(K\) and measure its effective memory length as the lag at which \(|K_j|\) falls below one percent of \(|K_0|\). Then corrupt one input sample far in the past and observe how long it influences the output. Confirm that poles near the unit circle give long memory and that the HiPPO-style spread of imaginary parts lets different state dimensions respond at different time scales.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>The recurrent and convolutional views of an SSM produce identical outputs. Why do we still keep both, and which one runs at training time versus deployment time?</li>
+<li>What goes wrong if you initialize \(A\) randomly instead of with HiPPO, and in which term of the kernel \(C\bar{A}^{\,j}\bar{B}\) does the failure show up?</li>
+<li>S5 replaces S4's convolution with a parallel scan. Name one capability this enables that a fixed convolution kernel cannot, and connect it to why Mamba needs the scan.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-16.3.html">Section 16.3</a>, we make the recurrence look at its input. Selective state spaces (Mamba) let \(\bar{A}\), \(\bar{B}\), and \(\Delta\) depend on the current sample, so the model can choose to remember or forget in a content-dependent way, recovering the sharp lookup that fixed S4/S5 kernels give up while keeping the linear-time, constant-memory streaming that makes SSMs so well suited to raw sensor feeds.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

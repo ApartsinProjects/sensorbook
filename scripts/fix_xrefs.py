@@ -25,26 +25,38 @@ for part in scaffold.parse_plan()["parts"]:
     for chap in part["chapters"]:
         CH_INDEX[chap["number"]] = f"{scaffold.part_dir(part)}/{scaffold.module_dir(chap)}/index.html"
 
-HREF_RE = re.compile(r'(href=")([^"]*?module-(\d+)-[^"]*?/(?:index\.html|section-[0-9.]+\.html))(")')
+from posixpath import relpath
+
+# any local href that targets a chapter's module dir or a section file
+HREF_RE = re.compile(r'(href=")([^"]*?(?:module-\d+-[^"]*?/(?:index\.html|section-[0-9.]+\.html)|section-\d+\.[0-9.]+\.html))(")')
+
+
+def _chapter_of(url: str) -> int | None:
+    m = re.search(r"module-(\d+)-", url)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"section-(\d+)\.[0-9.]+\.html$", url)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def fix_file(f: Path) -> int:
     text = f.read_text(encoding="utf-8")
     fixed = 0
+    here = str(f.parent.relative_to(ROOT)).replace("\\", "/")
 
     def repl(m):
         nonlocal fixed
-        pre, url, num, post = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        pre, url, post = m.group(1), m.group(2), m.group(3)
         if (f.parent / url).resolve().exists():
-            return m.group(0)  # already valid
-        target = CH_INDEX.get(num)
+            return m.group(0)  # already valid, leave it
+        num = _chapter_of(url)
+        target = CH_INDEX.get(num) if num else None
         if not target:
             return m.group(0)
-        # relative path from this file's dir to the authoritative target
-        from posixpath import relpath
-        rel = relpath(target, str(f.parent.relative_to(ROOT)).replace("\\", "/"))
         fixed += 1
-        return f"{pre}{rel}{post}"
+        return f"{pre}{relpath(target, here)}{post}"
 
     new = HREF_RE.sub(repl, text)
     if fixed:

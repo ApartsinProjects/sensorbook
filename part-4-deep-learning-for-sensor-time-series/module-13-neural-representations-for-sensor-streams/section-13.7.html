@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.7: Debugging and inspecting learned filters. Building Sensory AI." name="description"/>
+<title>Section 13.7: Debugging and inspecting learned filters | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Neural Representations for Sensor Streams</a></div>
+<h1>Debugging and inspecting learned filters</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The loss curve told me the model was fine. The dead filter told me the truth."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every previous section in this chapter <em>built</em> a representation: windows became tensors (Section <a class="cross-ref" href="section-13.1.html">13.1</a>), kernels learned local shape (Section <a class="cross-ref" href="section-13.2.html">13.2</a>), dilation stretched their reach (Section <a class="cross-ref" href="section-13.3.html">13.3</a>), and inductive biases nudged what they could express (Section <a class="cross-ref" href="section-13.6.html">13.6</a>). This section asks the uncomfortable question: <em>did any of it actually work?</em> A 1D CNN can reach a respectable validation accuracy while half its filters are dead, a quarter are duplicates, and the "gait" detector you imagined is really a clock that fires on a data-loader artifact. Because a learned filter is just a short weight vector, you can look straight at it, and the tools are cheap: plot the kernel, take its spectrum, visualize which inputs excite it, and watch its gradients. A trained sensor model that you have <em>inspected</em> is worth far more than one you merely trust, especially before it ships to a fleet where you cannot see the raw signal anymore.</p>
+</div>
+
+<p>This section assumes you have trained at least a small 1D convolutional network and are comfortable with the frequency-domain view of a filter from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. Everything below treats a learned kernel exactly as Chapter 7 treats any FIR filter: a short impulse response with a magnitude response you can read off with an FFT. The novelty is only that gradient descent, not you, chose the taps.</p>
+
+<h2>Read the kernel, then read its spectrum</h2>
+
+<p><strong>What.</strong> The first-layer weights of a 1D CNN are literally a bank of FIR filters, one per output channel per input axis. For a layer with tensor shape \((C_\text{out}, C_\text{in}, k)\), each row \(w[c,:,:]\) is a filter you can plot in the time domain and, more revealingly, transform to see its passband. A learned kernel \(w\) of length \(k\) has magnitude response</p>
+
+$$ |H(f)| = \left| \sum_{n=0}^{k-1} w[n]\, e^{-j 2\pi f n / f_s} \right|, $$
+
+<p>and the peak of \(|H(f)|\) tells you the frequency each filter is tuned to.</p>
+
+<p><strong>Why.</strong> A time-domain kernel is hard to interpret by eye, but its spectrum is not. On a wrist accelerometer you expect some filters to concentrate near 1 to 3 Hz (walking cadence and its harmonics) and others to spread across a broad band (impacts, noise). If instead every filter has a flat, feature-less spectrum, the layer has learned nothing structured and is probably acting as a random projection. Reading spectra also exposes redundancy: two filters with near-identical passbands are wasting capacity.</p>
+
+<p><strong>How.</strong> Pull the weights off the first layer, FFT each kernel (zero-padded for resolution), and sort by peak frequency. The snippet below does exactly this for a trained model and flags the two failure modes we care about most: dead filters and duplicated filters.</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def inspect_first_layer(conv, fs, pad=256):
+    W = conv.weight.detach()                     # (C_out, C_in, k)
+    W = W.mean(dim=1)                            # collapse input axes -> (C_out, k)
+    # Time-domain health: L2 norm per filter; near-zero == dead
+    norms = W.norm(dim=1)
+    dead = (norms &lt; 0.05 * norms.median()).nonzero().flatten()
+    # Frequency-domain view
+    H = torch.fft.rfft(W, n=pad, dim=1).abs()    # (C_out, pad//2+1)
+    freqs = torch.fft.rfftfreq(pad, 1.0/fs)
+    peak_hz = freqs[H.argmax(dim=1)]
+    # Duplicate detection via cosine similarity of spectra
+    Hn = F.normalize(H, dim=1)
+    sim = Hn @ Hn.t()
+    sim.fill_diagonal_(0.0)
+    dup_pairs = (sim &gt; 0.98).nonzero()
+    return dict(peak_hz=peak_hz, dead=dead, n_dup=len(dup_pairs)//2, norms=norms)
+
+# report = inspect_first_layer(model.conv1, fs=50.0)
+# print(report["peak_hz"].sort().values)   # where each filter is tuned
+# print("dead:", report["dead"].tolist(), "dup pairs:", report["n_dup"])
+</code></pre>
+<div class="code-caption">A one-pass audit of a trained first convolutional layer: it collapses the input-channel axis, measures each filter's energy (to catch dead units), computes each filter's magnitude spectrum with a single FFT, and flags near-duplicate passbands by cosine similarity. Run it after training and before deployment.</div>
+
+<p>The <code>inspect_first_layer</code> function is deliberately blunt: a healthy sensor front end should show peak frequencies spread across the physically meaningful band, a norm distribution with no cluster pinned at zero, and few near-duplicate spectra. If <code>peak_hz</code> collapses onto one value, or half the entries land in <code>dead</code>, the diagnosis is architectural, not cosmetic.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A first-layer convolution weight is not a black box; it is an FIR filter, and Chapter 7 already taught you to read one. The single most informative debugging plot for a sensor CNN is the sorted list of first-layer peak frequencies overlaid on the signal's own power spectrum. When the filters cluster where the physics lives, learning worked. When they scatter randomly or pile onto DC, the model is compensating for something upstream: unnormalized inputs, a leaked constant, or a learning rate that never let the front end specialize.</p>
+</div>
+
+<h2>Dead, saturated, and duplicate filters: the common pathologies</h2>
+
+<p><strong>Dead filters</strong> are units whose weights and gradients have collapsed toward zero, usually a ReLU that got pushed permanently negative early in training. They cost parameters and compute while contributing nothing. You catch them two ways: a near-zero weight norm (as above), and a near-zero <em>activation rate</em> measured over a validation batch (the fraction of windows for which the channel ever fires). A channel that activates on under one percent of windows is effectively dead.</p>
+
+<p><strong>Saturated filters</strong> are the opposite: they fire on almost everything, so they carry no discriminative information. On sensor data this frequently means the filter locked onto a DC offset or a slow drift that survived because the input was not standardized (a direct consequence of skipping the normalization discipline of Section <a class="cross-ref" href="section-13.5.html">13.5</a>).</p>
+
+<p><strong>Duplicate filters</strong> waste capacity: two channels that learned the same passband double the cost of that feature and halve the diversity of the bank. A light dose of weight decay, or an explicit orthogonality penalty, usually restores spread.</p>
+
+<p>The reason to hunt these before trusting accuracy is that all three can coexist with a good validation number. A model with 40 percent dead filters may still classify walking versus running because the task is easy; the dead capacity only bites when the deployment distribution shifts and you needed those unused features. This is the same story you will formalize under distribution shift in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: The Filter That Learned the Wall Clock</h3>
+<p>A team building a bearing-fault classifier for a factory conveyor (an industrial predictive-maintenance setting like <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) trained a 1D CNN on 25 kHz vibration windows and celebrated 96 percent accuracy. Filter inspection told a darker story. The single most important first-layer filter, ranked by gradient-times-activation, had a sharp passband at exactly the frequency of the data-acquisition system's line-sync tone, not any mechanical fault. The "fault detector" had learned that <em>healthy</em> recordings and <em>faulty</em> recordings came from two different acquisition sessions, and the sessions had slightly different mains interference. The spectrum plot took ten minutes to make and saved them from shipping a leakage artifact. They re-split the data by session (leakage-safe splitting, per <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>), retrained, and the honest accuracy was 81 percent: lower, real, and deployable.</p>
+</div>
+
+<h2>Which inputs excite a filter: activation maximization and saliency</h2>
+
+<p><strong>What.</strong> Reading a kernel's spectrum tells you the frequency it prefers; it does not tell you which real <em>signal shapes</em> drive it hardest, especially for filters in deeper layers where the FIR interpretation breaks down. Two complementary tools fill the gap. <em>Real-example maximization</em> ranks validation windows by how strongly they activate a chosen channel and shows you the top few, giving an honest, in-distribution picture of what the filter fires on. <em>Gradient saliency</em> computes \(\partial a_c / \partial x\), the sensitivity of a unit's activation to each input sample, highlighting which timesteps and axes matter.</p>
+
+<p><strong>Why.</strong> For a wearable model you want to confirm that a filter tagged "step detector" actually fires on heel-strike impulses and not on the moment the data loader zero-pads a short window. Real-example maximization is the most trustworthy check because it never leaves the data manifold, unlike synthetic activation maximization which can drift into adversarial nonsense on time series.</p>
+
+<p><strong>When.</strong> Use real-example maximization first for any per-channel sanity check; reach for saliency and integrated gradients when you need per-sample attribution for a specific prediction, which is the interpretability toolkit developed in full in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>. A useful ranking that combines both signals is filter importance by mean gradient-times-activation over a validation set:</p>
+
+$$ I_c = \frac{1}{N}\sum_{i=1}^{N} \Big| \, a_c(x_i)\, \frac{\partial \mathcal{L}}{\partial a_c}(x_i) \, \Big|, $$
+
+<p>which approximates how much each channel contributes to reducing the loss and cheaply orders filters from load-bearing to ignorable.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Hand-rolling gradient saliency, integrated gradients, and occlusion means registering forward and backward hooks, managing baselines, and accumulating gradients along an interpolation path: easily 60 to 80 lines with subtle sign and normalization bugs. Captum wraps each method behind one call, for example <code>IntegratedGradients(model).attribute(x, target=y)</code>, and handles the baseline path, batching, and convergence check for you. That is roughly a 70-line reduction per method, and the attributions come out in the same tensor layout as your input window so you can plot them directly over the signal.</p>
+</div>
+
+<h2>Watch training, not just the final model</h2>
+
+<p><strong>What.</strong> Many filter pathologies are born in the first few hundred steps, so the highest-leverage habit is to log filter health <em>during</em> training, not to autopsy it afterward. Cheap, decisive signals: the per-layer gradient norm (a layer whose gradients vanish is not learning), the fraction of dead ReLU channels per epoch, and the drift of first-layer peak frequencies over time (they should migrate toward the signal band and then stabilize).</p>
+
+<p><strong>Why.</strong> A vanishing first-layer gradient with a still-falling loss means the deeper layers are memorizing while the front end stays random: the network is not building the reusable low-level features you wanted, and it will transfer poorly to the self-supervised and foundation-model settings of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. Catching it at epoch two costs a rerun; catching it at deployment costs a recall.</p>
+
+<p><strong>How.</strong> A backward hook that records each layer's gradient norm, plus the dead-channel and peak-frequency reports from the earlier snippet logged once per epoch, gives you a three-line dashboard that turns silent representation failures into visible ones. When you see peak frequencies that never leave DC, revisit input normalization; when you see gradient norms that collapse, revisit initialization, learning rate, or the residual paths of Section <a class="cross-ref" href="section-13.6.html">13.6</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the 1D CNN you trained for Lab 13 on human activity recognition (see <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> for the task). (a) Run <code>inspect_first_layer</code> and plot the sorted peak frequencies over the signal's own power spectrum; identify how many filters are dead and how many are near-duplicates. (b) Add a small weight decay and retrain; report how the dead count and duplicate count change. (c) For the three highest-importance filters by \(I_c\), retrieve the top five activating validation windows and label, in one sentence each, what physical event each filter appears to detect. (d) Deliberately remove input standardization, retrain for one epoch, and describe what happens to the first-layer peak frequencies.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can a sensor CNN reach high validation accuracy while a large fraction of its filters are dead, and when does that dead capacity finally hurt you?</li>
+<li>You plot first-layer spectra and every filter peaks at 0 Hz. What upstream problem does this most strongly suggest, and which earlier section fixes it?</li>
+<li>Why is ranking real validation windows by activation a more trustworthy filter-inspection method than synthesizing an input that maximizes the activation?</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 13</h3>
+<p>train a 1D CNN for human activity recognition; visualize learned filters.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Attribution and saliency methods</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1703.01365">Sundararajan, Taly, and Yan (2017). Axiomatic Attribution for Deep Networks. ICML.</a></p>
+<p class="bib-annotation">Introduces integrated gradients, the baseline-path attribution method that underlies most principled per-sample saliency on time-series inputs; the axioms (sensitivity, implementation invariance) explain why naive gradients can mislead.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1409.1556">Simonyan, Vedaldi, and Zisserman (2014). Deep Inside Convolutional Networks: Visualising Image Classification Models and Saliency Maps. ICLR Workshop.</a></p>
+<p class="bib-annotation">The origin of gradient-based saliency and activation maximization; the same recipes port directly from images to 1D sensor windows.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2009.07896">Kokhlikyan et al. (2020). Captum: A Unified and Generic Model Interpretability Library for PyTorch. arXiv.</a></p>
+<p class="bib-annotation">The library behind this section's shortcut; one API for integrated gradients, occlusion, and layer attribution, with the tensor layout that makes plotting attributions over a signal trivial.</p>
+</div>
+
+<p class="bib-category">What learned filters represent</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://distill.pub/2017/feature-visualization/">Olah, Mordvintsev, and Schubert (2017). Feature Visualization. Distill.</a></p>
+<p class="bib-annotation">The clearest treatment of what activation maximization does and how it can lie; its cautions about off-manifold synthesis are exactly why real-example maximization is preferred for sensor data.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1810.09225">Ravanelli and Bengio (2018). Speaker Recognition from Raw Waveform with SincNet. IEEE SLT.</a></p>
+<p class="bib-annotation">Shows learned first-layer filters converging to interpretable band-pass shapes on raw 1D signals, the concrete evidence that reading a kernel's spectrum is meaningful.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1512.03385">He, Zhang, Ren, and Sun (2015). Deep Residual Learning for Image Recognition. CVPR.</a></p>
+<p class="bib-annotation">Residual connections are the standard remedy when first-layer gradients vanish during training; essential background for the "watch the gradient norm" diagnostic.</p>
+</div>
+
+<p class="bib-category">Failure modes and honest evaluation</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1811.12808">Raschka (2018). Model Evaluation, Model Selection, and Algorithm Selection in Machine Learning. arXiv.</a></p>
+<p class="bib-annotation">A careful reference on why a good validation number can hide leakage; pairs directly with the session-split lesson of the bearing-fault example.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1811.03378">Lu et al. (2019). Dying ReLU and Initialization: Theory and Numerical Examples. Communications in Computational Physics.</a></p>
+<p class="bib-annotation">Analyzes when ReLU units die and how initialization prevents it; the theory behind the dead-filter audit and its cure.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, we leave the purely convolutional view and give the network explicit memory. Recurrent cells and temporal convolutional networks carry state across a stream, which raises new inspection questions: instead of asking what a single filter detects, we will ask what a hidden state remembers, how far back its influence reaches, and how to keep that memory honest under streaming, stateful inference.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

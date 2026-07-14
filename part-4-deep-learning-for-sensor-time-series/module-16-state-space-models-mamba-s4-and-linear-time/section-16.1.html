@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.1: Why quadratic attention hurts on long sensor sequences. Building Sensory AI." name="description"/>
+<title>Section 16.1: Why quadratic attention hurts on long sensor sequences | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>Why quadratic attention hurts on long sensor sequences</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You gave me a full day of accelerometer data and asked for one number. I built a matrix with two hundred billion entries to get it, and the phone got warm."</p>
+        <cite>An Overextended AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you know how scaled dot-product attention works, its query, key, value machinery and its \(n \times n\) score matrix, all built in <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. It also assumes you can reason about sampling rate and sequence length from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and that you have met the linear-time recurrent and convolutional alternatives of <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. Big-O notation, FLOP counting, and the distinction between compute and memory are refreshed in Appendix B. You do not yet need any state-space theory; that arrives in the next section. This is the motivation chapter: it establishes precisely what breaks so the rest of Chapter 16 has a target to beat.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Attention's superpower and its curse are the same object: the score matrix that lets every sample see every other sample. For a window of \(n\) samples that matrix has \(n^2\) entries, so both the compute and the memory of a self-attention layer grow with the <em>square</em> of the sequence length. In language this is uncomfortable but survivable, because a paragraph is a few hundred tokens and text arrives in tidy documents. Sensor streams are different in kind. A single accelerometer at 200 Hz, an ECG at 500 Hz, a microphone at 16 kHz, or a vibration probe at 20 kHz produces tens of thousands to millions of samples per useful window, arrives continuously with no natural end, and often must be processed on a battery-powered edge device. Feed those lengths into a quadratic layer and the cost does not merely rise: it explodes past what the hardware, the memory, and the latency budget can hold. This section quantifies exactly where that explosion lands, why sensing feels it harder than any other domain, and why it is worth an entire chapter to escape it.</p>
+    </div>
+
+    <h2>The sensor sequences that break attention</h2>
+    <p>Sequence length is set by two numbers: how fast you sample and how long a window you need. Both push sensing toward the extreme. Modalities sample fast because the physics is fast, and windows are long because the phenomena of interest, a sleep stage, a machine's slow bearing wear, a driving maneuver, a seizure onset, unfold over seconds to hours. Multiply the two and the numbers dwarf a text prompt. Ten seconds of six-axis inertial data at 200 Hz is 2000 steps per channel. Thirty seconds of single-lead ECG at 500 Hz is 15,000 steps. One second of audio at 16 kHz is 16,000. A one-minute vibration snapshot at 20 kHz is 1.2 million. Where a large language model comfortably handles a 512-token context, a sensor model that wants to reason across a meaningful physical event routinely faces \(n\) in the tens of thousands, and the cost that matters, as the next subsection shows, scales as \(n^2\), not \(n\).</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The quadratic penalty is a length problem, not a data-volume problem. Doubling your dataset with more short windows costs a transformer twice as much, which is fine. Doubling the <em>length</em> of each window costs it four times as much, because the \(n \times n\) score matrix scales with the square of the window. Sensing is the domain where length, not count, is the axis that grows without bound: you can always ask for a longer horizon, a higher sampling rate, or continuous rather than windowed operation, and every one of those choices multiplies \(n\) directly into the quadratic term.</p>
+    </div>
+
+    <h2>Where the quadratic cost actually lands</h2>
+    <p>A self-attention layer over \(n\) tokens of width \(d\) spends its budget in two places. The projections that build queries, keys, and values are linear in length, costing \(\mathcal{O}(n d^2)\). The attention itself, forming \(QK^{\top}\), applying the softmax, and multiplying by \(V\), costs \(\mathcal{O}(n^2 d)\) in compute and, more painfully, materializes an \(\mathcal{O}(n^2)\) score matrix in memory. For short \(n\) the projection term dominates and nobody notices the square. Past a crossover length the \(n^2 d\) term takes over and then it is all you pay for. The memory wall usually bites first: the attention matrix for a single 15,000-step ECG window in 32-bit precision is</p>
+    <p>$$15000^2 \times 4 \text{ bytes} \approx 900 \text{ MB}$$</p>
+    <p>for one head of one layer of one example, before any activations, gradients, or the rest of the network. A modest batch of eight such windows on a multi-head, multi-layer model asks for tens of gigabytes of score matrices alone, which no phone and few GPUs will grant. Streaming makes it worse. To run causally in real time a transformer keeps a key-value cache of everything it has seen, so serving a continuously sampled sensor stream means the cache, and therefore the per-step cost, grows without bound as the device keeps running. FlashAttention and its kin trim the memory constant by never storing the full matrix, but they do not change the \(\mathcal{O}(n^2)\) compute; the fundamental scaling survives every clever kernel.</p>
+
+    <p>The listing below makes the crossover concrete: it estimates attention compute and the size of the score matrix across the sensor lengths above, alongside the linear-time cost that a recurrence would pay for the same work.</p>
+
+    <pre class="language-python"><code class="language-python">d = 64  # model width
+
+def costs(n, bytes_per=4):
+    attn_flops   = 2 * n * n * d        # QK^T and (weights @ V), the quadratic term
+    attn_mem_mb  = n * n * bytes_per / 1e6   # the n x n score matrix, one head
+    linear_flops = n * d * d            # what a linear-time recurrence pays instead
+    return attn_flops, attn_mem_mb, linear_flops
+
+print(f"{'sensor window':<28}{'n':>8}{'attn GFLOP':>12}{'score MB':>10}{'x vs linear':>12}")
+for name, n in [("512-token text prompt", 512),
+                ("10 s IMU @ 200 Hz", 2000),
+                ("30 s ECG @ 500 Hz", 15000),
+                ("1 s audio @ 16 kHz", 16000)]:
+    a, m, l = costs(n)
+    print(f"{name:<28}{n:>8}{a/1e9:>12.2f}{m:>10.1f}{a/l:>12.1f}")</code></pre>
+    <div class="code-caption"><strong>Listing 16.1.1.</strong> A back-of-the-envelope estimator for one attention head. The <code>attn_mem_mb</code> column is the raw score matrix, which is what runs a device out of RAM, and the final column is how many times more compute attention spends than a linear-time recurrence at the same length: it grows in lock-step with \(n\).</div>
+
+    <p>Run Listing 16.1.1 and the story is stark. The text prompt costs a fraction of a GFLOP and a 1 MB score matrix. The ECG window costs roughly 230 times more compute than a linear recurrence and asks for a 900 MB matrix per head, and the audio second is worse still. The ratio in the last column is not a constant overhead you can optimize away with a faster chip; it is \(n\) itself, so every step you take toward longer horizons or higher sampling rates widens the gap between attention and any linear-time model.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a wrist wearable that could not see the night</h3>
+        <p>A sleep-staging team built a transformer to score sleep from a wrist device carrying PPG and accelerometry. Their science demanded long context: sleep architecture only reveals itself across whole cycles of roughly ninety minutes, and the clinically useful unit is a full night. At the device's modest 64 Hz that is over 20 million samples per night, so they were forced to window into thirty-second epochs and score each in near isolation, exactly discarding the long-range structure their model existed to capture. Pushing the epoch longer blew the on-watch memory budget on the score matrix; running the whole night at once was not even discussable on the target microcontroller of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>. The quadratic layer had quietly capped the horizon at a length shorter than the phenomenon. Swapping the backbone for the linear-time state-space model of the next sections let them carry state across the entire night at bounded per-step cost, and staging accuracy across sleep-cycle transitions rose because the model could finally reason at the timescale of the biology. They kept subject-wise train and test splits throughout, so no sleeper appeared on both sides and the gain could not be a leakage artifact, a discipline enforced from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+    </div>
+
+    <h2>Why sensing feels this more than language</h2>
+    <p>Every domain that uses transformers pays the quadratic bill, so why does sensing complain loudest? Four reasons compound. First, <em>raw length</em>: as the numbers above show, physical sampling rates put sensor windows one to three orders of magnitude beyond a typical text context, and \(n^2\) is unforgiving of orders of magnitude. Second, <em>the streaming constraint</em>: text arrives as a finished document you can attend over once, but a sensor stream is open-ended and often must be answered in real time, which forces either the growing key-value cache above or a sliding window that throws away exactly the long-range dependencies you paid attention for. Third, <em>the deployment budget</em>: a language model can lean on a datacenter, while a great deal of sensing runs on a watch, an earbud, an implant, or an engine-control unit where memory is measured in kilobytes to megabytes and every joule shortens battery life, the constraints that <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> is built around. Fourth, <em>redundancy</em>: language is information-dense, but a signal sampled well above its Nyquist rate is highly correlated sample to sample, so paying \(n^2\) to let every sample query every other is spending quadratic compute to rediscover structure a linear-time model can track in a running state. Put together, these turn a manageable language-model tax into a hard wall for on-device, long-horizon, streaming sensing.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not have to hand-instrument FLOP and memory counters to find your crossover length. A profiler measures the real thing, kernel by kernel, in a few lines:</p>
+        <pre class="language-python"><code class="language-python">import torch
+from torch.profiler import profile, ProfilerActivity
+
+attn = torch.nn.MultiheadAttention(64, 8, batch_first=True).eval()
+x = torch.randn(1, 8000, 64)  # an 8000-step sensor window
+with profile(activities=[ProfilerActivity.CPU],
+             profile_memory=True, with_flops=True) as prof:
+    attn(x, x, x, need_weights=False)
+print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=5))</code></pre>
+        <div class="code-caption"><strong>Listing 16.1.2.</strong> The <code>torch.profiler</code> context reports measured FLOPs and peak memory per operator, replacing roughly forty lines of manual timing and allocation tracking and folding in kernel details the envelope estimate of Listing 16.1.1 ignores. Sweep the length and watch the attention rows scale quadratically while the projection rows scale linearly.</div>
+    </div>
+
+    <h2>The shape of the escape</h2>
+    <p>The way out is already visible in the last column of Listing 16.1.1. If a model can summarize the entire past into a fixed-size state and update that state with a constant amount of work per new sample, then processing a whole sequence costs \(\mathcal{O}(n)\), memory stays bounded no matter how long the stream runs, and streaming becomes a single running update rather than a growing cache. This is exactly the property the recurrent networks of <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> had, and the reason we did not simply keep using them is that classic recurrences were slow to train, being inherently sequential, and struggled to carry information across the very long ranges sensing demands. The structured state-space models of this chapter thread the needle: they keep the linear-time, bounded-memory recurrence for inference, yet also admit an equivalent convolutional form that trains in parallel like a transformer, and they are engineered specifically to preserve long-range dependencies rather than let them decay. That combination, the accuracy and parallel training of attention with the linear cost of recurrence, is what makes them the natural fit for long sensor sequences, and building it up carefully is the work of the rest of Chapter 16.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The modern linear-time lineage begins with S4 (Gu, Goel, and Ré, 2022), which set records on the Long Range Arena benchmark for sequences up to 16,000 steps where standard transformers ran out of memory, and continues through S5 (Smith, Warrington, and Linderman, 2023) and Mamba (Gu and Dao, 2023), whose selective state spaces match or beat transformers of similar size while scaling linearly. In parallel, efficient-attention research keeps attacking the quadratic term directly, from Performer and Longformer to the memory-aware exact kernel of FlashAttention (Dao et al., 2022); note that FlashAttention removes the memory bottleneck but leaves the \(\mathcal{O}(n^2)\) compute intact. The live question the field has not fully settled is which sensing regimes truly need content-based attention and which are served better and far more cheaply by a state-space recurrence, precisely the comparison you will run in <a class="cross-ref" href="section-16.5.html">Section 16.5</a> and in Lab 16.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using Listing 16.1.1 as a starting point, sweep \(n\) from 256 to 32,768 by powers of two and plot, on log-log axes, the measured wall-clock time and peak memory of <code>nn.MultiheadAttention</code> against those of a single-layer <code>nn.GRU</code> at the same width. (1) Identify the crossover length at which attention first exceeds a memory budget you pick to represent a small edge device, say 256 MB. (2) Fit the slope of each curve on the log-log plot and confirm attention's slope is near 2 while the GRU's is near 1. (3) Repeat the memory measurement with a FlashAttention-style implementation if available and report which slope changes and which does not. (4) Convert your chosen edge budget into a maximum admissible sampling rate for a ten-second window and state the modality it rules out.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A team doubles both their dataset size and their per-window length. By what factor does each change multiply the cost of the attention term, and why are the two factors different?</p>
+        <p class="quiz-question">2. FlashAttention lets a model handle far longer windows without running out of memory. Does it change the asymptotic <em>compute</em> cost of attention, and what does your answer imply for a device that is compute-bound rather than memory-bound?</p>
+        <p class="quiz-question">3. Explain, in terms of state size and per-step work, why a linear-time recurrence handles an open-ended streaming sensor with bounded memory while a causal transformer's cost grows as the stream continues.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-16.2.html">Section 16.2</a>, we build the first model that keeps the linear-time recurrence without sacrificing long-range memory: the structured state-space models S4 and S5. You will see how a carefully parameterized linear recurrence can be unrolled into a convolution for parallel training, then run as a constant-cost update at inference, turning the quadratic wall of this section into a straight line.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

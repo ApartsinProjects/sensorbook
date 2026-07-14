@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.6: Masked sensor modeling. Building Sensory AI." name="description"/>
+<title>Section 15.6: Masked sensor modeling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Transformers for Sensor Data</a></div>
+<h1>Masked sensor modeling</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You hid a third of the accelerometer window and asked me to guess it back. After a million windows, I stopped guessing and started understanding walking."</p>
+        <cite>A Self-Supervised AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the patch tokens of <a class="cross-ref" href="section-15.2.html">Section 15.2</a> and the encoder mechanics of <a class="cross-ref" href="section-15.1.html">Section 15.1</a>, because a masked model masks and reconstructs patches with an attention encoder. It assumes the channel-layout choices of <a class="cross-ref" href="section-15.5.html">Section 15.5</a>, since where you mask (in time or across sensors) interacts with whether the model mixes channels. You should be comfortable with the idea of a pretext task and with the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, which decides whether your unlabeled pretraining data secretly contains your test subjects. No familiarity with contrastive learning is needed; that alternative is the subject of <a class="cross-ref" href="../module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Labeled sensor data is expensive and rare. A wearable fleet streams billions of accelerometer windows a day, but almost none carry a clinician-verified activity label. Masked sensor modeling turns that flood of unlabeled signal into supervision for free. You hide part of each window, ask a transformer to reconstruct the hidden part from what remains, and in doing so force the network to learn how a sensor stream is put together: how a gait cycle continues, how three accelerometer axes co-move, how a vibration harmonic repeats. The reconstruction target is the data itself, so no human ever labels anything. Once pretrained, the encoder is a reusable feature extractor: freeze it and fit a small head with the few hundred labels you actually have. This is the sensor-domain descendant of masked language modeling and the masked autoencoder for images, and it is the engine behind most sensor and time-series foundation models in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+    </div>
+
+    <h2>Why reconstruct what you already have?</h2>
+    <p>The pretext looks circular: hide data you possess, predict it back. The value is not the prediction but the representation the network must build to make that prediction possible. To fill a masked gap in an ECG trace, a model has to encode the QRS morphology and the rhythm well enough to extrapolate the missing beat. To recover a masked axis of an inertial window, it must have learned the geometric coupling between axes that a real motion imposes. These are exactly the features a downstream classifier wants, and they were learned without a single label. Formally, masked modeling minimizes a reconstruction loss over only the masked positions,</p>
+    <p>$$\mathcal{L}_{\text{mask}} = \frac{1}{|\mathcal{M}|}\sum_{i \in \mathcal{M}} \big\lVert \hat{x}_i - x_i \big\rVert_2^2,$$</p>
+    <p>where \(\mathcal{M}\) is the set of masked patch indices and \(\hat{x}_i\) is the model's estimate of masked patch \(x_i\). Computing the loss only on \(\mathcal{M}\), not on the visible patches, is deliberate: it stops the network from taking the lazy shortcut of copying visible input through and forces every gradient to reward genuine inference about hidden content.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Masking is a solvable-difficulty knob. Mask too little and the task is trivial: neighboring samples in an oversampled signal are so correlated that linear interpolation wins, and the network learns nothing. Mask too much and the task is impossible: there is not enough context to reconstruct anything, and the model regresses to the mean. The sweet spot is high because sensor signals are smooth and redundant. Images tolerate around 75 percent masking; sensor patch models commonly sit in the 40 to 75 percent range, far above the 15 percent that masked language modeling uses on discrete, information-dense text. The right ratio is the one that makes the pretext just barely solvable from long-range structure rather than local smoothness.</p>
+    </div>
+
+    <h2>The geometry of the mask: time, channels, and blocks</h2>
+    <p>What you hide decides what the model learns. Three masking geometries dominate, and they are not interchangeable. <em>Random patch masking in time</em> hides scattered temporal patches within each channel; the model learns temporal continuation and is the default for univariate or channel-independent designs. <em>Block (span) masking</em> hides one long contiguous stretch, which is harder than the same fraction scattered, because the model cannot lean on immediate neighbors and must reason over the full window; this better matches the real failure mode of a dropout or a sensor going dark for a second. <em>Channel masking</em> hides entire sensors for the window and asks the model to impute them from the surviving channels, which is only meaningful in a channel-mixing architecture (<a class="cross-ref" href="section-15.5.html">Section 15.5</a>) and directly rehearses the missing-modality robustness that <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a> depends on. Many strong recipes combine them: mask random time patches most of the time and occasionally black out a whole channel, so the encoder becomes fluent in both temporal continuation and cross-sensor imputation.</p>
+
+    <p>There is also an efficiency prize specific to the autoencoder design. In the masked autoencoder (MAE) recipe, the heavy encoder sees <em>only the visible patches</em>; the mask tokens are inserted just before a lightweight decoder. With 75 percent of patches dropped, the encoder processes a quarter of the sequence, and because attention cost grows with the square of sequence length (<a class="cross-ref" href="section-15.4.html">Section 15.4</a>), pretraining runs several times faster and cheaper than a model that must attend over the full window.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+
+def mask_patches(x, mask_ratio=0.5):
+    # x: (batch, num_patches, patch_dim), a patchified sensor window
+    B, N, D = x.shape
+    keep = int(N * (1 - mask_ratio))
+    # per-sample random order; smallest-noise patches are kept
+    order = torch.argsort(torch.rand(B, N, device=x.device), dim=1)
+    keep_idx, mask_idx = order[:, :keep], order[:, keep:]
+    visible = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(-1, -1, D))
+    # boolean mask marks which of the N patches were hidden (loss computed here only)
+    is_masked = torch.ones(B, N, dtype=torch.bool, device=x.device)
+    is_masked.scatter_(1, keep_idx, False)
+    return visible, keep_idx, mask_idx, is_masked
+
+x = torch.randn(4, 16, 32)          # 4 windows, 16 patches, 32-dim each
+visible, keep_idx, mask_idx, is_masked = mask_patches(x, mask_ratio=0.5)
+print(visible.shape, int(is_masked[0].sum()))   # (4, 8, 32)  8</code></pre>
+    <div class="code-caption">Random patch masking for a patchified sensor window. Only the <code>visible</code> patches enter the MAE encoder; <code>keep_idx</code> lets the decoder scatter reconstructions back into place, and <code>is_masked</code> selects the positions the reconstruction loss is averaged over. Swapping the per-sample random order for a contiguous span turns this into block masking.</div>
+
+    <p>The listing above shows why the bookkeeping matters: you must remember the original position of every kept patch so the decoder can re-slot it and add positional encoding, and you must carry <code>is_masked</code> so the loss is scored only where it should be.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: pretraining a wrist IMU encoder</h3>
+        <p>A wearables team has 50,000 hours of raw 50 Hz wrist accelerometer and gyroscope from a consumer band, and only 900 hours labeled with activity types by a lab study. Training a supervised transformer on 900 hours overfits the study's twelve participants and collapses on new wrists. Instead they patchify each 10-second window, mask half the patches, and pretrain a channel-mixing encoder to reconstruct them across all 50,000 hours, occasionally masking the entire gyroscope so the model learns to infer rotation from linear acceleration. This is essentially the LIMU-BERT recipe for inertial data. They then freeze the encoder and fit a linear activity head on the 900 labeled hours. Macro-F1 on held-out wrists rises sharply versus the from-scratch supervised baseline, and the biggest gains appear on the rare classes (stair climbing, cycling) where labels were thinnest, because the encoder already understood the motion before it ever saw a label. Crucially, subjects in the labeled test set were excluded from pretraining too, or the leakage rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> would inflate the whole result.</p>
+    </div>
+
+    <h2>Reconstruction targets and the smooth-signal trap</h2>
+    <p>Predicting raw amplitude with a mean-squared loss is the simplest target and often enough, but it has a known weakness: because sensor signals are dominated by low frequencies, an \(L_2\) loss lets the model win by matching the slow envelope while smearing the transients that carry the diagnostic information (a foot strike, a valve knock, an arrhythmic beat). Three fixes recur. Normalize each patch to zero mean and unit variance before scoring, so the loss cannot be dominated by DC offset and gain, a trick that also stabilizes across sensors with different sensitivities (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>). Reconstruct in a time-frequency representation rather than raw amplitude, so the loss weights spectral content the way <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> does; this is the approach that works well for vibration and audio-like signals. Or add a masked <em>frequency</em> objective alongside the time one, which is the idea behind SimMTM and related series-modeling methods. The lesson: choose the target so that reconstructing it well is impossible without capturing the structure your downstream task cares about.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: skip the plumbing</h3>
+        <p>Writing masked pretraining from scratch means the masking sampler, the visible-only encoder, positional re-slotting, mask tokens, the masked-only loss, and a train loop, roughly 150 to 200 lines before you can pretrain anything. Libraries collapse this. <code>tsai</code> exposes a <code>MVP</code> (masked value prediction) callback that wraps any of its time-series transformers, so masked self-supervised pretraining on a multivariate array is about 5 lines: build the learner, attach the callback with a mask ratio, and call <code>fit</code>. The library handles the masking geometry, the loss restriction to masked positions, and the checkpoint you later fine-tune. Reach for the from-scratch version only when you need a custom masking geometry (say, physically correlated channel dropouts) the callback does not expose.</p>
+    </div>
+
+    <h2>When masked modeling is the right choice</h2>
+    <p>Prefer masked modeling when unlabeled sensor data vastly outnumbers labeled, when the downstream tasks are diverse enough that one reusable encoder amortizes the pretraining cost, and when your signals are continuous and locally redundant so reconstruction is a meaningful pretext. It is the natural pretraining route for the foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>. It is a weaker choice when labels are plentiful (train supervised and skip the detour), when the signal is so noisy that reconstructing it rewards memorizing noise, or when you care about invariances that reconstruction does not capture: if you want an encoder that ignores sensor placement or device, a contrastive objective that explicitly pulls augmented views together (<a class="cross-ref" href="../module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) may transfer better. In practice the two are complementary, and several strong systems combine a masked reconstruction loss with a contrastive one.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Masked reconstruction is now the dominant pretraining objective for open time-series foundation models. MOMENT (2024) pretrains a family of transformers by masked patch reconstruction across a large multi-domain corpus and releases a general-purpose encoder for forecasting, classification, and anomaly detection. Ti-MAE and PatchTST established that patch-level masked pretraining beats point-level masking and improves both forecasting and transfer. SimMTM reframes the pretext as reconstructing a masked series from its neighbors in a learned series manifold, adding a frequency-aware objective. On the sensor side, LIMU-BERT brought masked reconstruction to inertial data on constrained wearables. The open questions are the masking geometry that best matches physical sensor dropout, how to mask across heterogeneous multi-rate channels (<a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> discusses irregular sampling), and how much masked pretraining still helps once state-space backbones (<a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) replace attention.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a 50 Hz triaxial accelerometer dataset with an activity label. Patchify 10-second windows and pretrain a small transformer encoder with random patch masking at ratios of 15, 50, and 75 percent, then freeze each encoder and fit a linear probe on 5 percent of the labels. Plot linear-probe accuracy against masking ratio. Then repeat the 50 percent run with contiguous block masking instead of scattered masking and compare. Which geometry gives the better frozen features, and does the best masking ratio match the redundancy of your signal?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why is the reconstruction loss computed only over the masked patches and not over the visible ones?</li>
+            <li>Sensor patch models mask 40 to 75 percent, but masked language modeling masks about 15 percent. What property of sensor signals explains the difference?</li>
+            <li>You want an encoder that can impute a failed gyroscope from the surviving accelerometer. Which masking geometry rehearses that ability, and why does it require a channel-mixing architecture?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-15.7.html">Section 15.7</a>, we turn from how to pretrain these transformers to how to run them cheaply once trained: quantization, patch and token reduction, distillation, and the deployment tradeoffs that decide whether a masked-pretrained encoder can actually live on a wearable or an edge gateway rather than a server.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

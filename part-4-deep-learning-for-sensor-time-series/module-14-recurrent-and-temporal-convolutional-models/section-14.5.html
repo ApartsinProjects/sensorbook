@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.5: Streaming/stateful inference. Building Sensory AI." name="description"/>
+<title>Section 14.5: Streaming/stateful inference | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>Streaming/stateful inference</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They trained me on the whole recording at once, then deployed me to watch the sensor one sample at a time, forever, with no rewind button. I would like a word with whoever thought those were the same job."</p>
+        <cite>A Streaming AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>The models of this chapter are usually trained offline on fixed windows: you hand the network a \(C \times T\) tensor, it sees the whole span, and it returns an answer. Deployment on a live sensor is a different machine entirely. Samples arrive one at a time, the stream never ends, and the device has a fixed per-sample time budget and a few kilobytes of RAM. The naive bridge, buffer the last \(T\) samples and re-run the full model on every new sample, produces correct answers and wastes almost all of the compute, because it recomputes activations that did not change. <em>Streaming inference</em> is the art of turning a window model into an incremental one that emits the same output per sample while doing \(O(1)\) work per sample and holding only a small, explicit <em>state</em> between steps. Getting this right is the difference between a model that runs on a microcontroller and one that only runs in a notebook.</p>
+    </div>
+
+    <p>This section assumes the recurrent cells of <a class="cross-ref" href="section-14.1.html">Section 14.1</a> and the causal dilated convolutions of <a class="cross-ref" href="section-14.3.html">Section 14.3</a>, and it inherits the streaming-safe conditioning rules from <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. The timing vocabulary (sample period, latency, jitter) is the one established in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Here we care about one question: given a model that was trained to consume a whole window, how do we run it on an endless stream without either recomputing everything or changing the answer?</p>
+
+    <h2>Two machines: offline windows versus an endless stream</h2>
+    <p>Offline, you control the tensor. You pad it, you see both edges, you can even look ahead. Online, the future does not exist yet, so any layer that peeks forward is unusable and the model must be <em>causal</em>: the output at time \(t\) depends only on samples up to \(t\). Both architectures in this chapter can be made causal (RNNs are causal by construction; a TCN becomes causal with left-only padding), which is exactly why they stream and a bidirectional model does not. The second difference is memory. An offline forward pass allocates the full \(T\)-length activation maps; a streaming pass may keep only what the next step needs. The whole discipline reduces to identifying that minimal carried quantity, the <strong>state</strong>, and updating it in constant time.</p>
+
+    <h2>Streaming an RNN: the state was there all along</h2>
+    <p>Recurrent networks are the easy case, because recurrence <em>is</em> streaming. An LSTM or GRU already computes its answer through a per-step update</p>
+    \[ h_t = f_\theta(h_{t-1},\, x_t), \qquad \hat{y}_t = g_\theta(h_t), \]
+    <p>where \(h_t\) (for an LSTM, the hidden and cell pair \((h_t, c_t)\)) is a fixed-size vector independent of how long the stream has run. To go from batch training to streaming inference you do not touch the weights; you simply <em>persist</em> \(h_t\) across calls instead of re-initializing it to zero for each window. The per-sample cost is one cell update, \(O(d^2)\) in the hidden size \(d\) and, crucially, constant in stream length. The only new decisions are administrative: when does a session start (reset \(h\) to zero), and what happens when the stream has a gap.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Streaming must reproduce the offline output, bit for bit</h3>
+        <p>A streaming implementation is only correct if, fed the same samples, it emits the same sequence of outputs as the offline model. This is a testable property, not a hope: run the batch model on a length-\(N\) window, run the streaming model sample by sample on the same \(N\) values, and assert the two output sequences agree to floating-point tolerance. If they diverge, you have a real bug, almost always a non-causal layer, a mishandled padding edge, or a normalization statistic computed over the window instead of carried in the state. Write this parity test before you optimize anything; it is the guardrail that lets you refactor for speed without silently changing predictions.</p>
+    </div>
+
+    <h2>Streaming a TCN: cache the receptive field, do not recompute it</h2>
+    <p>Temporal convolutional networks are the case where naive streaming quietly wastes almost everything. A TCN's output at time \(t\) depends on the last \(R\) samples, where \(R\) is the receptive field set by the dilation schedule of <a class="cross-ref" href="section-14.3.html">Section 14.3</a>. The tempting deployment is: keep a buffer of the last \(R\) samples, and on every new sample re-run the full stack over that buffer. That works and costs</p>
+    \[ \text{naive per sample} \;=\; O\!\Big(R \sum_{\ell} K_\ell C_\ell\Big), \]
+    <p>summed over layers \(\ell\) with kernel size \(K_\ell\) and channel count \(C_\ell\). But the convolution at layer \(\ell\) for all but the newest position was already computed on the previous sample and has not changed. The fix is a per-layer ring buffer that caches exactly the dilated taps each layer needs. Each layer then performs a single kernel evaluation per new sample, and the cost drops to</p>
+    \[ \text{cached per sample} \;=\; O\!\Big(\sum_{\ell} K_\ell C_\ell\Big), \]
+    <p>a factor of \(R\) less work, with \(R\) often in the hundreds. The state you carry is one small first-in-first-out buffer per layer, sized to that layer's dilation times its kernel, and the total memory is proportional to the receptive field rather than to the (infinite) stream. The parallel with a Kalman filter's carried state (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) is not a coincidence: both replace an unbounded history with a fixed-size sufficient summary.</p>
+
+    <pre><code class="language-python">import torch, torch.nn.functional as F
+
+class StreamingCausalConv1d:
+    """Causal dilated conv that consumes ONE sample per call, O(1) in stream length."""
+    def __init__(self, conv):                       # conv: a trained nn.Conv1d
+        self.conv = conv.eval()
+        self.k, self.d = conv.kernel_size[0], conv.dilation[0]
+        span = (self.k - 1) * self.d + 1            # samples the kernel spans
+        self.buf = torch.zeros(1, conv.in_channels, span)  # ring of the receptive span
+
+    def step(self, x_t):                            # x_t: (1, in_channels)
+        self.buf = torch.roll(self.buf, -1, dims=2)
+        self.buf[:, :, -1] = x_t                    # newest sample at the right edge
+        taps = self.buf[:, :, ::self.d]             # pick the dilated taps only
+        with torch.no_grad():
+            return self.conv(taps)[:, :, -1]        # (1, out_channels): output for THIS t
+</code></pre>
+    <div class="code-caption">A single streaming causal convolution layer. The ring buffer <code>buf</code> holds only the receptive span of this layer; each <code>step</code> shifts in one new sample, gathers the dilated taps, and returns the one output column for the current timestep. Stack these (feeding each layer's output into the next) to stream a full TCN with per-sample cost independent of how long the stream has run.</div>
+
+    <p>The code above is the whole idea in miniature: state is the buffer, the update is a shift-and-fill, and the output is a single column rather than a recomputed window. Chain one <code>StreamingCausalConv1d</code> per TCN layer and the stack streams end to end. One subtlety survives from <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>: any BatchNorm must run on frozen inference statistics, never on a per-window batch mean, or your streaming output will not match the offline one and your parity test will (correctly) fail.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">A bearing monitor that missed its deadline</h3>
+        <p>An industrial team deployed a causal TCN for online bearing-fault detection (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) on a vibration channel sampled at 20 kHz, running on a small edge gateway. Their first version buffered the receptive field, about 500 samples, and re-ran the entire eight-layer stack on every new sample. It was correct and hopelessly late: per-sample compute blew straight past the 50-microsecond budget, the input queue backed up, and samples were dropped, which the model then read as spurious transients. Rewriting the eight layers as cached streaming convolutions cut per-sample work by roughly the 500x receptive-field factor, the queue drained, and the same weights that failed in the notebook now held real-time on the gateway. Nothing about the model changed; only the arithmetic that was allowed to repeat.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Let the framework own the buffers</h3>
+        <p>Hand-rolling a ring buffer per layer, wiring the dilations, and keeping the parity test green is easily 60 to 100 lines for a real multi-layer TCN, and every off-by-one in a dilation index is a silent accuracy bug. Libraries that ship a streaming inference mode collapse it to a flag. With <code>pytorch-tcn</code>, a model built with <code>TCN(..., causal=True)</code> exposes an <code>inference(x_t, in_buffer=...)</code> path that maintains the internal per-layer buffers for you:</p>
+        <pre><code class="language-python">from pytorch_tcn import TCN
+net = TCN(num_inputs=1, num_channels=[16]*8, kernel_size=3, causal=True)
+net.eval(); net.reset_buffers()          # zero the streaming state at session start
+for x_t in stream:                       # x_t: (1, 1, 1), one sample at a time
+    y_t = net.inference(x_t)             # buffers updated in place, O(1) per step</code></pre>
+        <div class="code-caption">Streaming a causal TCN with <code>pytorch-tcn</code>: <code>reset_buffers()</code> starts a session and <code>inference()</code> advances the internal per-layer ring buffers, replacing roughly 60 to 100 lines of hand-managed buffering while preserving offline parity by construction.</div>
+        <p>The library owns the buffer plumbing and the causal padding math; you own the two decisions it cannot make, when to call <code>reset_buffers()</code> and how large a chunk to feed per call.</p>
+    </div>
+
+    <h2>Warm-up, resets, and chunking: the operational details</h2>
+    <p>Three practical questions decide whether a streaming model behaves in the field. First, <strong>warm-up</strong>: at session start the state is zero and the buffers are empty, so the first \(R\) samples (or, for an RNN, the first several dozen steps) run on partial context and are less reliable. Either mark those outputs as low-confidence or prime the model with a short lead-in before you trust it. Second, <strong>reset semantics</strong>: state carried across a genuine discontinuity is worse than useless. When a new recording begins, a wearer removes the device, or a data gap breaks temporal continuity (<a class="cross-ref" href="section-14.6.html">Section 14.6</a> treats irregular timing in depth), reset the state so stale history does not bleed into a fresh context. Third, <strong>chunking</strong>: strict one-sample-at-a-time streaming minimizes latency but maximizes per-call overhead. Processing short blocks of, say, 16 or 64 samples amortizes Python and kernel-launch overhead and often improves throughput on an accelerator, at the cost of adding one block of latency. The right chunk size is a latency-versus-throughput dial set by your deployment target, a tradeoff that the edge-deployment treatment of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> makes central.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: prove parity, then break it on purpose</h3>
+        <p>Take a trained three-layer causal TCN with dilations \(1, 2, 4\) and kernel size 3. (1) Compute the receptive field \(R\) and state the exact buffer size each layer must hold. (2) Run the offline model on a random length-256 window and the streaming version sample by sample on the same values; assert the output sequences match to \(10^{-5}\). (3) Now introduce three faults one at a time and confirm each breaks parity: replace the causal (left) padding with symmetric padding, let a BatchNorm layer use the current window's batch statistics, and forget to reset the buffers between two independent sessions. For each, explain in one sentence why the streaming and offline outputs diverge.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why does an RNN require essentially no extra machinery to stream, while a TCN needs an explicit per-layer buffer? What is being carried in each case?</li>
+            <li>Naive TCN streaming re-runs the stack over the buffered receptive field on every sample. By what factor does cached streaming reduce per-sample compute, and what quantity sets that factor?</li>
+            <li>You must never let streaming change the prediction relative to the offline model. Name two implementation choices that silently violate this and say how a parity test would catch each.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-14.6.html">Section 14.6</a>, we drop the comfortable assumption that samples arrive on a fixed clock. Real sensor streams are irregular and asynchronous: channels report at different rates, packets are late or missing, and the gap between samples carries information. We will see how to make recurrent and convolutional models consume time itself as an input rather than pretending every step is evenly spaced, which is exactly the discontinuity that forced the state resets above.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

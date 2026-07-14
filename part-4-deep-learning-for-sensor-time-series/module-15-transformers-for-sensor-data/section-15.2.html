@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.2: Patchification of sensor streams. Building Sensory AI." name="description"/>
+<title>Section 15.2: Patchification of sensor streams | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Transformers for Sensor Data</a></div>
+<h1>Patchification of sensor streams</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You handed me ten thousand samples and asked what they meant. I chopped them into eighty little stories and read those instead."</p>
+        <cite>A Well-Segmented AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you know why a transformer's self-attention cost grows with the square of the sequence length, covered in <a class="cross-ref" href="section-15.1.html">Section 15.1</a>, and that you are comfortable with sampling rate, windowing, and the multivariate sensor tensor shape \((\text{channels} \times \text{time})\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. It helps to have seen learned windowed representations of raw streams in <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, since patchification is a disciplined way of choosing those windows. No prior exposure to Vision Transformers is required; the patch idea is developed here from the signal up.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A transformer does not want ten thousand raw samples; it wants a modest sequence of meaningful tokens. Feeding one token per timestep is the naive default, and it is almost always wrong for sensor data: attention cost explodes quadratically, and a single 100 Hz sample carries almost no standalone meaning. Patchification is the fix. You slice the stream into short contiguous segments, a patch of perhaps 16 or 64 samples, and turn each segment into one token by a linear projection. This collapses the sequence length by the patch size, cutting attention cost by that factor squared, and it hands each token a locally coherent chunk of signal, a fragment of a stride, a heartbeat, or a vibration burst, which is a far better unit of meaning than an isolated reading. Patchification is the single design decision that made transformers practical for long sensor streams, and the patch length and stride you choose shape everything downstream.</p>
+    </div>
+
+    <h2>From samples to tokens: why one-sample-per-token fails</h2>
+    <p>Self-attention compares every token to every other token, so its compute and memory scale as \(O(L^2)\) in the sequence length \(L\). If you tokenize a stream at one token per sample, a ten-second window at 200 Hz is \(L = 2000\) tokens, and the attention matrix alone is four million entries per head per layer. Double the window and the cost quadruples. This is the wall that <a class="cross-ref" href="section-15.4.html">Section 15.4</a> attacks with efficient-attention tricks, but patchification attacks it first and more cheaply: reduce \(L\) at the input. Grouping \(P\) samples into one token divides the sequence length by \(P\) and therefore divides attention cost by \(P^2\). A patch length of 16 turns that 2000-token sequence into 125 tokens and shrinks the attention matrix by a factor of 256.</p>
+    <p>The second reason is semantic, and it matters just as much. A transformer token should be a unit that carries meaning on its own, the way a word does in language. A single accelerometer sample at one instant is almost meaningless; the information lives in the local <em>shape</em> of the signal over tens of milliseconds. A patch of 32 samples spanning a fraction of a stride, a QRS complex, or one revolution of a bearing is a coherent local pattern that a linear projection can encode into a rich token. Patchification thus does two jobs at once: it makes long streams computationally tractable and it raises each token from a bare number to a small, informative subseries. This is the same move the Vision Transformer made when it cut an image into 16-by-16 pixel patches instead of treating every pixel as a token, and it is the reason patch-based transformers, not sample-level ones, dominate sensor benchmarks today.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Patchification trades temporal resolution for sequence length, and the trade is almost always favorable. You give up the ability to attend to individual samples (which rarely carry standalone meaning) and gain a quadratic reduction in attention cost plus tokens that encode local shape. The patch length \(P\) is therefore not a tuning nuisance but the central knob of a sensor transformer: it sets both the model's compute budget and the finest temporal event the attention layers can reason about as a distinct token.</p>
+    </div>
+
+    <h2>Constructing patches: length, stride, and projection</h2>
+    <p>Formally, take one channel of a stream as a vector \(x \in \mathbb{R}^{L}\). Choose a patch length \(P\) and a stride \(S\). Slide a window of width \(P\) along the stream, advancing by \(S\) each time, to produce \(N = \lfloor (L - P)/S \rfloor + 1\) patches, each a vector in \(\mathbb{R}^{P}\). Stack them into a matrix of shape \((N \times P)\). Then apply a single learned linear map \(W \in \mathbb{R}^{P \times D}\) to lift every patch into the model's embedding dimension \(D\):</p>
+    <p>$$z_i = W^\top p_i + b, \qquad p_i \in \mathbb{R}^{P},\; z_i \in \mathbb{R}^{D}$$</p>
+    <p>The result is a sequence of \(N\) tokens ready for the attention stack of <a class="cross-ref" href="section-15.1.html">Section 15.1</a>. Two choices define the operation. When the stride equals the patch length, \(S = P\), the patches tile the stream without overlap: every sample appears in exactly one token, and \(N \approx L/P\) is as small as possible. When \(S < P\), consecutive patches overlap, which softens the hard boundaries between tokens and can help when an event of interest straddles a tile edge, at the cost of more tokens and therefore more compute. Non-overlapping patching is the common default for efficiency; overlap is a deliberate choice you make when boundary events are known to matter. The listing below performs the whole operation with one tensor primitive.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+import torch.nn as nn
+
+# One 6-channel IMU window: 10 s at 100 Hz -> 1000 samples per channel.
+B, C, L = 4, 6, 1000                       # batch, channels, time
+x = torch.randn(B, C, L)
+
+P, S, D = 50, 50, 128                      # patch len, stride, embed dim (non-overlapping)
+
+# unfold slides a length-P window with step S along the time axis.
+patches = x.unfold(dimension=-1, size=P, step=S)   # (B, C, N, P)
+N = patches.shape[2]
+print("num patches per channel:", N)               # -> 20  (1000 / 50)
+
+# One shared linear projection lifts each length-P patch to a D-dim token.
+proj = nn.Linear(P, D)
+tokens = proj(patches)                             # (B, C, N, D)
+print("token sequence shape:", tokens.shape)       # -> (4, 6, 20, 128)</code></pre>
+    <div class="code-caption"><strong>Listing 15.2.1.</strong> Patchifying a six-channel IMU window with <code>torch.unfold</code>. A 1000-sample stream becomes 20 tokens per channel, a 50x reduction in sequence length and therefore a 2500x reduction in the size of the attention matrix. The same linear projection is shared across all patches and channels, so patchification adds only \(P \times D\) parameters.</div>
+
+    <p>Notice in Listing 15.2.1 that patches are formed <em>per channel</em>: each of the six IMU axes yields its own sequence of tokens. Whether those per-channel sequences are then processed independently or mixed together is the channel-independence question that <a class="cross-ref" href="section-15.5.html">Section 15.5</a> is devoted to; patchification itself is agnostic and simply produces the tokens. Note also what is missing: the tokens carry no information about <em>where</em> in the stream each patch came from. Restoring that order is the job of positional encoding in <a class="cross-ref" href="section-15.3.html">Section 15.3</a>, because a bag of patches with no position is as ambiguous as a shuffled sentence.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: bearing vibration on a factory transformer model</h3>
+        <p>A pump manufacturer streamed accelerometer data at 25.6 kHz from bearing housings to detect early spalling. A per-sample transformer was hopeless: a one-second window is 25,600 tokens, and the attention matrix would not fit in memory. The team patchified with \(P = 256\), \(S = 256\), collapsing each second to 100 tokens, small enough to attend over minutes of history. The patch length was not arbitrary: a bearing turning at 1500 rpm completes one revolution every 40 ms, about 1024 samples, so a 256-sample patch captures roughly a quarter turn, enough to encode the impulsive signature of a defect striking the race once per revolution. Shrinking the patch to 64 samples quadrupled the token count and the training cost while adding no accuracy, because a quarter-revolution patch already isolated the fault transient. As always, the patch model was evaluated with machine-disjoint splits (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) so overlapping windows from the same bearing could not leak between train and test and inflate the detection lead time.</p>
+    </div>
+
+    <h2>Design choices that make or break a patch model</h2>
+    <p>Three decisions surround the raw patch operation. The first is <em>instance normalization</em>. Sensor windows drift in baseline and scale (a warm engine, a tighter watch strap, a different subject), so most patch transformers normalize each instance to zero mean and unit variance before patching and add the statistics back at the output. This reversible per-window standardization, popularized as RevIN, is what lets a single model generalize across sensors with different offsets, and it consistently matters more than any attention hyperparameter. The second is <em>padding</em>: when \(L\) is not a multiple of \(S\), the final partial patch is either dropped or the stream is padded, and for causal streaming you must pad on the left so that no future sample bleeds into a token, a constraint that connects to the streaming-inference discipline of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>. The third is the choice between a <em>linear</em> patch projection and a small <em>convolutional</em> stem: replacing the single linear map with a short 1D convolution before flattening lets the token embed a mild nonlinearity and softens patch-boundary artifacts, a cheap upgrade that often buys a point or two of accuracy.</p>
+    <p>How do you set the patch length in the first place? Anchor it to the physics, as the bearing example did. Pick \(P\) so that one patch spans roughly one period of the fastest event you need each token to represent: one cardiac cycle for ECG, one stride for gait, one revolution for rotating machinery. Then let sequence length and compute budget nudge it: if the resulting token count is too large to attend over, grow \(P\); if the finest event is being blurred across a token boundary, shrink \(P\) or add overlap. This physics-first sizing is the same feature-scale reasoning that guided classical windowing in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, now expressed as a tokenization choice.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A correct patch embedding from scratch means writing the unfold, handling the ragged final patch, wiring the linear or convolutional projection, adding reversible instance normalization, and getting the causal left-padding right for streaming, roughly sixty lines with several easy-to-miss edge cases. A patch-transformer library gives you the whole front end in one call:</p>
+        <pre class="language-python"><code class="language-python">from tsai.models.PatchTST import PatchTST
+
+# c_in channels, forecast horizon c_out, seq_len context; patching is built in.
+model = PatchTST(c_in=6, c_out=24, seq_len=1000, patch_len=50, stride=50)</code></pre>
+        <div class="code-caption"><strong>Listing 15.2.2.</strong> The <code>tsai</code> implementation of PatchTST replaces about sixty lines of patch-embedding plumbing (unfold, projection, RevIN, padding) with one constructor and exposes <code>patch_len</code> and <code>stride</code> as the two knobs you actually tune. Sweeping patch length to reproduce the bearing experiment becomes a one-argument change.</div>
+    </div>
+
+    <h2>When patchification gets hard: multi-rate and asynchronous streams</h2>
+    <p>Fixed-length patching assumes a single, uniform sampling rate, which is exactly what real multimodal rigs violate. A wearable may log accelerometer at 100 Hz, PPG at 25 Hz, and skin temperature at 1 Hz; a vehicle fuses lidar at 10 Hz with IMU at 200 Hz. A single patch length in samples then corresponds to wildly different physical durations per stream, so patches no longer align in time. The standard remedies are to patch each modality on its own physical-time grid (equal duration, unequal sample counts) and let attention align them, or to resample the slow channels up to a common rate before patching, accepting the interpolation cost. Genuinely event-driven sensors, where samples arrive at irregular instants, break the sliding window entirely and are better tokenized by time-binning or by treating each event as a token, the irregular-sampling problem raised for recurrent models in <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> and revisited for event cameras in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>. Patchification is powerful precisely because it presumes regularity; know when that presumption holds.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>PatchTST (Nie et al., 2023) established that channel-independent patching beats far more elaborate architectures on long-horizon forecasting, and it remains a strong, simple baseline. The open question for sensing foundation models is what a token should be: patch-and-project versus discrete value tokenization. Time-series foundation models split on this, with some (the patch line traced in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>) embedding continuous patches and others quantizing values into a vocabulary the way language models do. Adaptive and learned patch boundaries, where the model decides patch length per region of signal rather than fixing it, are an active and still-unsettled research direction.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a public human-activity IMU dataset sampled at 50 Hz. (1) Patchify a 10-second window at patch lengths \(P \in \{5, 10, 25, 50, 100\}\) with non-overlapping stride, and for each report the resulting token count and the relative size of the self-attention matrix. (2) Train the same small transformer at each \(P\) and plot accuracy and training time against \(P\); identify the physical event duration where accuracy peaks. (3) Repeat \(P = 25\) with stride \(S = 12\) (50% overlap) and state whether the extra tokens buy accuracy, and explain the result in terms of boundary events.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A stream has \(L = 4000\) samples. You patchify with \(P = 40, S = 40\). By what factor does the self-attention matrix shrink compared to one-token-per-sample, and why is it the square of the sequence-length reduction?</p>
+        <p class="quiz-question">2. Give the two distinct reasons patchification helps a sensor transformer, one computational and one semantic, and name one thing each token loses that a later component must restore.</p>
+        <p class="quiz-question">3. You must run a patch transformer as a live streaming detector. Which patching choices (stride, padding side, overlap) are constrained by causality, and how?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-15.3.html">Section 15.3</a>, we confront what patchification threw away: order. A sequence of patch tokens is an unordered set until we tell the model where each patch sits in time and, for multivariate rigs, which sensor it came from. We build positional encodings for both the time axis and sensor identity, so the attention layers can reason about temporal distance and channel provenance rather than a shuffled bag of fragments.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

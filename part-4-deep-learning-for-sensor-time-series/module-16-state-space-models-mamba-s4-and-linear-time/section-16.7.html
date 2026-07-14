@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.7: When to reach for an SSM. Building Sensory AI." name="description"/>
+<title>Section 16.7: When to reach for an SSM | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>When to reach for an SSM</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I benchmarked six architectures. The state-space model won on the sensor that never stops streaming, and lost on the one that fits in a single glance."</p><cite>A Pragmatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous six sections gave you the machinery: the quadratic wall attention hits on long sequences (16.1), the recurrence-plus-convolution duality of S4 and S5 (16.2), the input-dependent selectivity of Mamba (16.3), the time-series variants (16.4), the head-to-head numbers (16.5), and hybrids that mix both (16.6). This section is the decision itself. When you stand in front of a real sensor problem, with a real sampling rate, a real latency budget, and a real deployment target, which of these do you actually build? An SSM is not a default and not a fad. It is a tool with a sharp profile: linear-time streaming, a bounded recurrent state, and a graceful appetite for very long context. Knowing that profile tells you exactly when to reach for it and, just as usefully, when to leave it on the shelf.</p>
+</div>
+
+<p>This is an [A][R] chapter, so we assume you are comfortable with the transformer baseline from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> and the recurrent and convolutional families from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. The goal here is a repeatable decision procedure, not another architecture. Read this section as the checklist you run before committing engineering time.</p>
+
+<h2>The three questions that pick the architecture</h2>
+
+<p>Nearly every sensor modeling choice collapses onto three axes. Answer them honestly for your problem and the architecture usually falls out.</p>
+
+<p><strong>1. How long is the effective context, and how does it grow?</strong> Attention costs \(O(L^2)\) time and memory in sequence length \(L\); an SSM costs \(O(L)\) to scan and, crucially, \(O(1)\) memory per emitted step when run as a recurrence. If your window is 128 samples of accelerometer data for a gesture, \(L^2\) is nothing and the SSM advantage is invisible. If your window is a 24-hour photoplethysmography (PPG) trace at 25 Hz, that is over two million samples, and the quadratic term is fatal. The SSM's linear scan is not a nice-to-have there; it is the difference between training and not training.</p>
+
+<p><strong>2. Does the signal stream, and must inference be causal and stateful?</strong> An SSM carries a fixed-size hidden state \(h_t\) forward through the recurrence</p>
+
+$$h_t = \bar{A}\, h_{t-1} + \bar{B}\, x_t, \qquad y_t = C\, h_t,$$
+
+<p>so at deployment you keep one small state vector and update it per sample in constant time and constant memory, forever. A transformer, by contrast, either recomputes over a growing cache or slides a fixed window and forgets. For an always-on wearable or an industrial monitor that must run for weeks between resets, that bounded state is the whole argument. See <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> for the streaming-inference machinery this enables.</p>
+
+<p><strong>3. What is the compute and memory envelope of the deployment target?</strong> A cloud GPU forgives a lot; a microcontroller forgives nothing. The SSM's constant per-step cost and small parameter footprint make it a natural fit for the edge (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), but the selective scan needs a hardware-aware kernel to hit its theoretical speed, and that kernel is not free on every accelerator.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>SSMs win where two conditions hold together: the sequence is <em>long</em> and the inference is <em>streaming</em>. Long-but-batched problems (offline forecasting on a big GPU) often go to transformers or foundation models; short-but-streaming problems (a 1-second window classifier) often go to a temporal CNN. The SSM's home turf is the intersection: a signal that is both long and never stops.</p>
+</div>
+
+<h2>A decision matrix you can actually use</h2>
+
+<p>Map your problem onto the table below. It is deliberately opinionated; treat it as a strong prior you then confirm with the Lab 16 benchmark, not as gospel.</p>
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Reach for</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Very long context (10k to millions of steps), streaming, on-device</td><td><strong>SSM (Mamba/S5)</strong></td><td>Linear scan, \(O(1)\) state, small footprint</td></tr>
+<tr><td>Long context but offline, big GPU, need max accuracy and rich cross-channel attention</td><td>Transformer or time-series foundation model</td><td>Attention captures arbitrary pairwise structure; batch compute hides the \(L^2\) cost</td></tr>
+<tr><td>Short fixed window (&lt; ~1k steps), latency-critical classification</td><td>Temporal CNN / TCN (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Ch 14</a>)</td><td>Fully parallel, tiny, no scan kernel needed</td></tr>
+<tr><td>Long context, need both long memory and sharp local content-based retrieval</td><td>Hybrid SSM-attention (<a href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">16.6</a>)</td><td>SSM backbone for context, sparse attention for recall</td></tr>
+<tr><td>Linear-Gaussian dynamics with a known model and calibrated uncertainty</td><td>Kalman family (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Ch 9</a>)</td><td>Optimal, interpretable, no training data needed</td></tr>
+</tbody>
+</table>
+
+<p>The last row deserves emphasis. An SSM <em>is</em> a learned linear state-space recurrence, structurally cousin to the Kalman filter you met in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. If you already know the physics, if the dynamics are linear-Gaussian and you need calibrated covariance, a Kalman filter gives you optimality and uncertainty for free and needs zero labels. Reach for the neural SSM when the dynamics are unknown, nonlinear in the mapping, or high-dimensional enough that hand-specifying \(A\), \(B\), \(C\) is hopeless, and when you have data to learn them.</p>
+
+<h2>The costs that do not show up in the accuracy column</h2>
+
+<p>Three failure modes catch teams who adopt SSMs on hype rather than on fit.</p>
+
+<p><strong>Kernel dependence.</strong> Mamba's speed comes from a fused selective-scan CUDA kernel. On a platform without it (some edge NPUs, older toolchains, WebGPU), you fall back to a slower path and the latency advantage over a well-tuned TCN can evaporate. Confirm the kernel exists for your target before you commit.</p>
+
+<p><strong>Retrieval weakness.</strong> A fixed-size hidden state is a lossy summary. When the task needs exact recall of a specific earlier event (find the one heartbeat that looked like this), pure SSMs underperform attention, which is exactly why the hybrids of 16.6 exist. If your task is recall-heavy, budget for attention somewhere in the stack.</p>
+
+<p><strong>Short sequences give nothing.</strong> On windows of a few hundred steps, the \(L^2\) term is cheap and a transformer or TCN is simpler to train, easier to debug, and often just as fast. Do not pay the SSM's complexity tax for context you do not have.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a patch-pump insulin monitor</h3>
+<p>A clinical wearable team builds a hypoglycemia early-warning model on a body-worn patch. The device samples glucose, motion, and skin temperature and must run for 14 days on a coin cell, emitting a risk score every minute from a stream that never resets. They start with a sliding-window transformer: it hits the accuracy target in the cloud, but on-device the growing key-value cache blows the RAM budget and the fixed window keeps forgetting the slow overnight drift that precedes morning lows. Switching the backbone to a Bi-Mamba encoder (16.4) collapses per-step inference to a constant-size 64-dimensional state update, holds a full multi-day context implicitly, and drops steady-state RAM by roughly an order of magnitude. The score-per-minute latency becomes flat and predictable, which is what the safety case in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> actually requires. The SSM did not win on raw accuracy; it won on the streaming envelope.</p>
+</div>
+
+<h2>A quick screening test before you build</h2>
+
+<p>Before committing to any architecture, run the cheap screen below. It computes the two ratios that most reliably predict whether an SSM pays off, so you learn the answer in seconds rather than after a week of training.</p>
+
+<pre><code class="language-python">def ssm_fit_score(seq_len, streaming, ram_kb, needs_exact_recall):
+    """Heuristic screen: is a selective SSM the right first bet?"""
+    reasons = []
+    score = 0
+    if seq_len &gt;= 2000:                 # quadratic attention starts to hurt
+        score += 2; reasons.append("long context favors O(L) scan")
+    if streaming:                       # always-on, causal, per-sample emit
+        score += 2; reasons.append("O(1) recurrent state fits streaming")
+    if ram_kb &lt; 512:                    # tight edge budget
+        score += 1; reasons.append("bounded state fits small RAM")
+    if needs_exact_recall:              # SSMs summarize, they do not index
+        score -= 2; reasons.append("recall-heavy: add attention (16.6)")
+    verdict = ("reach for an SSM" if score &gt;= 3
+               else "consider a hybrid" if score &gt;= 1
+               else "SSM unlikely to help")
+    return verdict, reasons
+
+print(ssm_fit_score(seq_len=2_160_000, streaming=True,
+                    ram_kb=256, needs_exact_recall=False))
+# ('reach for an SSM', ['long context favors O(L) scan',
+#  'O(1) recurrent state fits streaming', 'bounded state fits small RAM'])
+</code></pre>
+<div class="code-caption">A ten-line screening heuristic that turns the three decision questions into a score. It is a conversation starter, not a substitute for the Lab 16 benchmark, but it reliably flags the two clear cases: the long-plus-streaming win and the recall-heavy caution.</div>
+
+<p>The <code>ssm_fit_score</code> function above encodes exactly the three-question logic: it rewards long context and streaming, gives a small bonus for tight RAM, and penalizes tasks that need exact retrieval. When it returns "reach for an SSM," you still verify empirically, but you start with a strong prior instead of a blank page.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: swap the backbone in a few lines</h3>
+<p>You do not implement the selective scan yourself. With the <code>mamba-ssm</code> package the entire long-context backbone is a drop-in block:</p>
+<pre><code class="language-python">from mamba_ssm import Mamba
+block = Mamba(d_model=64, d_state=16, d_conv=4, expand=2)  # 1 line
+y = block(x)   # x: (batch, seq_len, 64) -> same shape, linear-time scan
+</code></pre>
+<p>That single constructor replaces roughly 150 lines of hand-written discretization, parallel-scan, and CUDA-kernel plumbing, and it ships the hardware-aware kernel that makes the linear-time claim real. Your job shrinks to choosing <code>d_state</code> and confirming the kernel exists on your target.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier</h3>
+<p>As of 2026 the practical default for long sensor streams is trending toward <em>hybrids</em> rather than pure SSMs: architectures in the Jamba and Zamba lineage interleave Mamba-2 blocks with a thin layer of attention, capturing the SSM's linear streaming cost while restoring exact recall. On the time-series side, SSM backbones increasingly appear inside foundation models rather than as standalone task models. The open question for sensing is calibration under distribution shift: a bounded recurrent state can silently drift when the input statistics move, which ties directly into the conformal and adaptive methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take three sensor tasks you have seen in earlier chapters: a 1-second inertial gesture classifier (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>), a multi-day continuous ECG arrhythmia monitor (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>), and an offline vibration-based remaining-useful-life forecast on a server. For each, fill in the three decision questions (context length and growth, streaming and causality, compute envelope), then predict the winning architecture and justify it in two sentences. Where would a hybrid change your answer?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Give the two conditions that must hold <em>together</em> for a pure SSM to be the clear choice, and name one situation where each holds alone but the SSM still is not the pick.</li>
+<li>Why does a fixed-size hidden state hurt on retrieval-heavy tasks, and what does 16.6 add to fix it?</li>
+<li>Your target is an edge NPU with no selective-scan kernel. How does that change the SSM-versus-TCN comparison, and what would you measure to decide?</li>
+</ol>
+</div>
+
+<div class="callout lab"><h3 class="callout-title">Lab 16</h3><p>benchmark a Mamba-style model vs a transformer on long-horizon sensor sequences (accuracy vs latency vs memory).</p></div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Foundational state-space models</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2111.00396">Gu, Goel, and Ré (2022). Efficiently Modeling Long Sequences with Structured State Spaces (S4). ICLR.</a></p>
+<p class="bib-annotation">The paper that made long-range SSMs practical; the reference point for why linear-time recurrence competes with attention on long context.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2312.00752">Gu and Dao (2023). Mamba: Linear-Time Sequence Modeling with Selective State Spaces.</a></p>
+<p class="bib-annotation">Introduces input-dependent selectivity and the hardware-aware scan kernel; the model this section's decision matrix is built around.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2208.04933">Smith, Warrington, and Linderman (2023). Simplified State Space Layers for Sequence Modeling (S5). ICLR.</a></p>
+<p class="bib-annotation">The parallel-scan MIMO simplification that clarifies the recurrence-versus-convolution duality behind the streaming argument.</p>
+</div>
+
+<p class="bib-category">Hybrids and the recall tradeoff</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2403.19887">Lieber et al. (2024). Jamba: A Hybrid Transformer-Mamba Language Model.</a></p>
+<p class="bib-annotation">Concrete evidence that interleaving attention with SSM blocks restores exact recall while keeping most of the linear-time benefit; grounds the "consider a hybrid" branch.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2405.21060">Dao and Gu (2024). Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality (Mamba-2).</a></p>
+<p class="bib-annotation">Formalizes the duality between attention and state-space models, explaining why the choice is a spectrum rather than a binary.</p>
+</div>
+
+<p class="bib-category">Time-series and sensor SSMs</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2403.15360">Patro and Agneeswaran (2024). SiMBA: Simplified Mamba-Based Architecture for Vision and Multivariate Time Series.</a></p>
+<p class="bib-annotation">Shows an SSM backbone competitive on multivariate forecasting benchmarks; a concrete data point for the offline-versus-streaming tradeoff.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2403.09898">Ahamed and Cheng (2024). TimeMachine: A Time Series is Worth 4 Mambas for Long-Term Forecasting.</a></p>
+<p class="bib-annotation">A multi-scale Mamba design for long-horizon forecasting; useful when weighing SSMs against transformers on very long windows.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Liang et al. (2024). Bi-Mamba+: Bidirectional Mamba for Time Series Forecasting.</a></p>
+<p class="bib-annotation">The bidirectional variant referenced in the clinical example; relevant when non-causal encoding of a bounded history is acceptable.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, we tackle the problem that quietly undermines every architecture in this part: labels are scarce and expensive in sensing. Whether your backbone is a transformer, a TCN, or the SSM you just learned to choose, a strong self-supervised pretraining objective is often what turns a mediocre model into a deployable one. We turn to contrastive and masked-reconstruction learning that squeezes signal out of the mountains of unlabeled sensor streams you already have.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

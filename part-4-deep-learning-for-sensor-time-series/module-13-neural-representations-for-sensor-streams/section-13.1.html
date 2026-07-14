@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.1: Sensor windows as tensors; channel and axis structure. Building Sensory AI." name="description"/>
+<title>Section 13.1: Sensor windows as tensors; channel and axis structure | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Neural Representations for Sensor Streams</a></div>
+<h1>Sensor windows as tensors; channel and axis structure</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They handed me a tensor and forgot to say which axis was time. I convolved across my sensors and learned the shape of a wiring harness."</p>
+<cite>A Disoriented AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This chapter assumes you can sample and window a signal (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>) and that you have built at least one leakage-safe dataset split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). It also assumes the tensor and autograd basics of a deep-learning framework; if <code>shape</code>, <code>dtype</code>, and broadcasting are hazy, read Appendix B (Deep Learning Refresher) alongside this section. No prior convolutional-network experience is required: this section defines only the data container, and <a class="cross-ref" href="section-13.2.html">Section 13.2</a> puts a network on top of it.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A neural network never sees a "sensor stream." It sees a rectangular array of numbers with named axes, and it will faithfully learn whatever structure those axes happen to encode, including structure you did not intend. Before a single filter is trained, you make three quiet decisions: how long a window is, which axis carries time, and which axis carries the sensor channels. Get them right and the convolutions in the rest of this chapter slide along time the way physics intended. Get them wrong and the model mixes accelerometer axes as if they were video frames, learns nonsense fast, and hides the bug behind a plausible loss curve. This section is about making those three decisions on purpose.</p>
+</div>
+
+<h2>From a continuous stream to a fixed-shape window</h2>
+<p>A raw sensor produces an unbounded, ragged thing: samples arriving over time, possibly at different rates per modality, with gaps and jitter. A neural network wants the opposite: a batch of fixed-shape tensors it can stack and matrix-multiply. Bridging the two is <strong>windowing</strong>, and it is the first modeling act of the chapter. You slice the stream into segments of length \(L\) samples, advancing by a stride \(S\) between segments, and treat each segment as one training example. <em>What</em> you produce is a tensor; <em>why</em> you window is that convolutions and recurrences need a bounded, aligned tensor to operate on; <em>how</em> you choose \(L\) and \(S\) is a physics-and-labels decision, not a default.</p>
+<p>Window length \(L\) sets the receptive horizon: it must be long enough to contain the phenomenon you want to detect. A gait cycle at \(50\ \mathrm{Hz}\) runs about one second, so a window shorter than \(L=50\) samples cannot contain a full stride and no filter downstream can recover what the window threw away. Stride \(S\) sets overlap: \(S=L\) gives disjoint windows, \(S<L\) gives overlapping ones that multiply your example count and smooth label boundaries. The number of windows extracted from a stream of \(T\) samples is</p>
+\[ N = \left\lfloor \frac{T - L}{S} \right\rfloor + 1. \]
+<p>Overlap is tempting because it inflates the dataset for free, but that free lunch is exactly where leakage hides: if adjacent overlapping windows land on opposite sides of a train/test split, the test set contains samples the model already saw. The window is the atomic unit that must respect subject-level and time-level splits, a rule <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> makes non-negotiable.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A window is not a neutral packaging step; it is a bandwidth decision baked into the data before learning starts. The window length caps the longest pattern the model can ever see in one forward pass, and the stride silently sets how correlated your "independent" training examples are. Two teams with the same architecture and the same sensor can report wildly different accuracy purely because one chose \(L=128\) with \(50\%\) overlap and the other chose \(L=64\) disjoint. Log \(L\) and \(S\) next to your learning rate; they are hyperparameters of equal weight.</p>
+</div>
+
+<h2>The three axes: batch, channel, time</h2>
+<p>Once windowed, a batch of sensor examples is a rank-3 tensor. Its three axes are <strong>batch</strong> \(N\) (independent windows stacked for parallel processing), <strong>channel</strong> \(C\) (the simultaneous scalar streams the device emits), and <strong>time</strong> \(L\) (samples within one window). For a nine-axis inertial measurement unit, \(C=9\): three accelerometer axes, three gyroscope axes, three magnetometer axes, each a separate row that shares the same clock. The channel axis is where a multivariate sensor differs from a grayscale image: an image has one intensity channel over two spatial axes, while a sensor window has many physical channels over one temporal axis.</p>
+<p>Why does the channel axis deserve its own name rather than being flattened into time? Because a convolution treats the two axes with opposite symmetry. Along <em>time</em> a 1D convolution is translation-equivariant: a pattern shifted later in the window produces the same response shifted later, which is exactly the invariance you want for a gait event that can occur anywhere in the window. Along <em>channels</em> there is no such symmetry: axis \(x\) of the accelerometer is not a shifted copy of axis \(y\), and a filter is free to weight the nine channels differently at every time step. Convolution slides over time and mixes over channels. Flatten the channel axis into time and you destroy that distinction, inviting the network to convolve one accelerometer axis into the next as though they were consecutive instants. The <em>when to worry</em> is any moment your tensor's axis order is ambiguous, which is most of the time, because frameworks disagree.</p>
+
+<div class="callout warning">
+<h4>Common Misconception</h4>
+<p>The misconception is that a \((N, C, L)\) tensor and a \((N, L, C)\) tensor are "the same data, just transposed, so the model will sort it out." They hold the same numbers, but a 1D convolution reads the second-to-last axis as channels and the last axis as the sliding dimension. Feed PyTorch's <code>Conv1d</code> a \((N, L, C)\) tensor and it will happily convolve across your sensor channels and treat time steps as independent features. The shapes are compatible, the code runs, the loss decreases, and the model is learning the wrong geometry. This class of bug does not raise an exception; it raises your validation error quietly.</p>
+</div>
+
+<p>The framework conventions are worth memorizing because they are inconsistent by design. PyTorch's <code>nn.Conv1d</code> expects <strong>channels-first</strong>, \((N, C, L)\), so the sensor-channel axis sits in the middle. Keras and TensorFlow's <code>Conv1D</code> default to <strong>channels-last</strong>, \((N, L, C)\), so time sits in the middle. NumPy loaders and pandas frames usually hand you \((L, C)\) per window, matching how a CSV reads (rows are time, columns are channels), which happens to align with Keras and needs a transpose for PyTorch. None of these is more correct; they are different contracts, and the entire job here is knowing which contract the next layer expects and transposing exactly once, deliberately, with a comment.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a wearable activity-recognition pipeline</h3>
+<p>A team building a fall-detection wearable logs a six-axis IMU on the wrist at \(50\ \mathrm{Hz}\). Their loader reads each recording into a pandas frame of shape \((T, 6)\), windows it at \(L=128\) (about \(2.5\) seconds, long enough to span a stumble and the impact) with stride \(S=64\), and stacks the result into \((N, 128, 6)\). Training in PyTorch, the first author drops that array straight into a <code>Conv1d(in_channels=6, ...)</code> layer. It runs. Accuracy plateaus at an embarrassing level and the confusion matrix looks random within the "active" classes. The bug is one missing transpose: the tensor was \((N, L, C)\) but <code>Conv1d</code> read \(C=128\) time steps as channels and slid a filter across the six axes. Adding <code>x = x.transpose(1, 2)</code> to reshape to \((N, 6, 128)\) before the first layer recovers double-digit accuracy points overnight. The lesson generalizes to every inertial pipeline in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>: the axis order is a contract, and the contract is enforced by shape, not by intent.</p>
+</div>
+
+<h2>Building the tensor in code</h2>
+<p>Windowing is the kind of loop everyone writes once, gets subtly wrong at the edges, and then never trusts again. The code below builds windows two ways: an explicit loop that makes the arithmetic visible, and a strided view that a library computes without copying. The explicit version documents intent; the strided version is what you ship.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def window_stream(stream, L, S):
+    """stream: (T, C) array from a CSV loader. Returns (N, C, L), PyTorch channels-first."""
+    T, C = stream.shape
+    N = (T - L) // S + 1
+    out = np.empty((N, C, L), dtype=stream.dtype)
+    for i in range(N):
+        seg = stream[i * S : i * S + L]      # (L, C): time-major, as CSV reads
+        out[i] = seg.T                        # -> (C, L): channels-first for Conv1d
+    return out
+
+# A 10-second, 3-axis accelerometer recording at 50 Hz
+rng = np.random.default_rng(0)
+stream = rng.standard_normal((500, 3)).astype(np.float32)   # (T=500, C=3)
+X = window_stream(stream, L=128, S=64)
+print(X.shape)                    # (6, 3, 128) = (N, C, L)
+
+# The zero-copy library equivalent (NumPy >= 1.20)
+from numpy.lib.stride_tricks import sliding_window_view
+V = sliding_window_view(stream, window_shape=128, axis=0)[::64]  # (6, 3, 128)
+print(V.shape, np.allclose(V, X)) # (6, 3, 128) True</code></pre>
+<div class="code-caption"><strong>Listing 13.1.</strong> The explicit <code>window_stream</code> loop makes the two decisions visible: <code>N = (T - L) // S + 1</code> counts windows, and the <code>seg.T</code> transpose converts CSV-native \((L, C)\) into PyTorch-native \((C, L)\). The <code>sliding_window_view</code> call produces the identical result as a strided view over the same memory (no copy), which is why the assertion passes.</div>
+
+<p>As Listing 13.1 shows, the strided view returns the same \((N, C, L)\) tensor the loop builds, but it does so without allocating \(N \times C \times L\) fresh floats: overlapping windows share their underlying bytes. That matters at scale, where a \(50\%\)-overlap dataset would otherwise double your memory footprint for numbers that are literally the same samples viewed twice.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>The hand-written windower is roughly a dozen lines once you add dtype handling, ragged-tail padding, and a per-window label vote. <code>sliding_window_view</code> collapses the windowing itself to a single line and removes the two classic off-by-one bugs (dropping or duplicating the final partial window) by construction. PyTorch offers the same as <code>tensor.unfold(dimension, size, step)</code>, and torchaudio's <code>Spectrogram</code> or a framing utility handles the streaming case. The library does not choose \(L\), \(S\), or the axis order for you; it guarantees only that once you have chosen them, the tensor it returns is exactly the shape and stride you asked for. About a dozen lines become one, and the edge cases stop being yours to own.</p>
+</div>
+
+<h2>Channels are not interchangeable: physical structure on the channel axis</h2>
+<p>The channel axis carries more than a count; it carries physical grouping the model can exploit or ignore. Nine IMU channels are really three modalities of three axes each, and those groupings are not arbitrary permutations. The three accelerometer axes form an orthonormal frame, so rotating the device permutes and mixes them in a structured way, which is why augmentation in <a class="cross-ref" href="section-13.5.html">Section 13.5</a> can rotate the accelerometer triple as a rigid body but must never shuffle an accelerometer axis with a magnetometer axis. Channels can also differ in units, scale, and noise floor: an accelerometer in \(\mathrm{m/s^2}\), a gyroscope in \(\mathrm{rad/s}\), a barometer in \(\mathrm{hPa}\). A convolution that mixes them with shared-scale weights will be dominated by whichever channel has the largest raw magnitude until per-channel normalization fixes it, another <a class="cross-ref" href="section-13.5.html">Section 13.5</a> topic.</p>
+<p>This is also where the two dominant design philosophies of the rest of Part IV first appear. A <strong>channel-mixing</strong> model lets the first layer combine all \(C\) channels at every time step, learning cross-sensor interactions (accelerometer and gyroscope together disambiguate rotation from translation). A <strong>channel-independent</strong> model processes each channel with its own filters and fuses them only later, which is more robust when channels can drop out or arrive at different rates. Both are legitimate; the choice is an inductive bias you set through the tensor's grouping, revisited for transformers in <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. What you cannot do is pretend the channel axis is featureless. Where a feature vector from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> discards temporal order to summarize a window, the tensor here preserves both order along time and identity along channels, and that preserved structure is the entire reason a convolutional network can outperform a bag of hand-crafted features.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public human-activity dataset (for example UCI HAR, a nine-channel IMU logged at \(50\ \mathrm{Hz}\)). Load one subject's recording as a \((T, 9)\) array. (1) Window it at \(L=128\), \(S=64\), and report \(N\) from the formula, then confirm it against the array's first dimension. (2) Produce both a \((N, 9, 128)\) and a \((N, 128, 9)\) version and write one sentence stating which layer each is the correct input for. (3) Deliberately feed the wrong-axis tensor to a <code>Conv1d(in_channels=9, ...)</code> and record the exact error message (or the silent shape it accepts) so you recognize the failure signature in your own future code.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. A stream has \(T=1000\) samples. With \(L=200\) and \(S=50\), how many windows do you extract, and how many raw samples are shared between two consecutive windows?</p>
+<p class="quiz-question">2. PyTorch <code>Conv1d</code> receives a tensor of shape \((32, 128, 6)\) from a Keras-style loader. What does it interpret as channels, what as the sliding axis, and what single operation fixes it?</p>
+<p class="quiz-question">3. Why is overlapping windowing a leakage hazard, and what unit must a train/test split be defined over to prevent it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-13.2.html">Section 13.2</a>, we put the first learnable layer on top of the \((N, C, L)\) tensor: the 1D convolution that slides along the time axis, mixes across the channel axis exactly as this section anticipated, and the temporal pooling that shrinks the time dimension into a decision. The axis discipline you just fixed is what makes those filters mean anything.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

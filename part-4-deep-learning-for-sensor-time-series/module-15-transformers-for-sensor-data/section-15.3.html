@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.3: Positional encoding for time and sensor identity. Building Sensory AI." name="description"/>
+<title>Section 15.3: Positional encoding for time and sensor identity | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Transformers for Sensor Data</a></div>
+<h1>Positional encoding for time and sensor identity</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Shuffle my tokens and I compute the same answer. That is elegant, until you remember the accelerometer spike came before the airbag fired, not after."</p>
+<cite>A Permutation-Invariant AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>Attention, as built in <a class="cross-ref" href="section-15.1.html">Section 15.1</a>, is a set operation. Feed it the same tokens in a different order and every output is identical, because the softmax over key-query scores has no idea which token came first. That is fatal for sensor data, where order <em>is</em> the signal: a heartbeat is defined by the spacing of its peaks, a fault by a transient that arrives before a shutdown, a gesture by a trajectory through time. It is doubly fatal once you patchify (<a class="cross-ref" href="section-15.2.html">Section 15.2</a>) a multi-channel stream, because now every token carries two coordinates the model must recover: <em>when</em> it happened and <em>which sensor</em> it came from. Positional encoding is how you hand those coordinates back to a permutation-invariant network. Get it wrong and the transformer treats a 100 Hz IMU burst as an unordered bag of numbers; get it right and it reads time like a clock and channels like a wiring diagram. Sensor streams add a twist the language world rarely faces: samples are often irregularly spaced in real time, so the "position" you must encode is a physical timestamp, not an integer index.</p>
+</div>
+
+<p>This section assumes the attention mechanism and tokenization of the two preceding sections, the sampling-and-timestamp vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (regular versus event-driven sampling, clock skew, jitter), and the notion of a per-channel embedding from <a class="cross-ref" href="index.html">Chapter 13</a>. Notation stays consistent with the chapter: a patchified window is a sequence of \(N\) tokens, each an embedding in \(\mathbb{R}^{D}\), and token \(i\) carries a real timestamp \(t_i\) and a sensor (channel) identity \(c_i\).</p>
+
+<h2>The permutation-invariance problem, stated precisely</h2>
+<p>Let \(Z \in \mathbb{R}^{N \times D}\) be the token matrix and \(P\) any permutation matrix. Self-attention satisfies \(\text{Attn}(PZ) = P\,\text{Attn}(Z)\): it is equivariant to reordering, so the set of outputs is unchanged and only their arrangement follows the input. A recurrent or convolutional model (<a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>) never had this problem, because recurrence walks the sequence in order and a causal convolution reads a fixed local window; order is baked into the computation. A transformer throws that structure away in exchange for global, parallel mixing, and must be told position explicitly. The standard remedy is to add (or otherwise inject) a <em>positional encoding</em> \(p_i\) to each token so that \(z_i \leftarrow z_i + p_i\) before the first attention layer. The design question this section answers is what \(p_i\) should be when the index \(i\) is a poor proxy for physical time and when tokens also differ in sensor identity.</p>
+
+<h2>Encoding time: absolute, relative, and continuous</h2>
+<p>The original sinusoidal encoding assigns dimension \(2k\) and \(2k+1\) of \(p_i\) the values \(\sin(i/\omega_k)\) and \(\cos(i/\omega_k)\) with geometrically spaced frequencies \(\omega_k = 10000^{2k/D}\). Its <em>what</em> is a smooth, bounded, multi-scale fingerprint of position; its <em>why</em> is that a linear map of \(p_i\) can express any fixed offset, so the model can learn to attend "twelve steps back" as a rotation in encoding space; its <em>how</em> is a fixed lookup requiring no parameters. A learned alternative simply makes \(p_i\) a trainable vector per index, which fits training data better but does not extrapolate past the longest window seen in training, a real limit for variable-length sensor segments.</p>
+<p>Two refinements dominate modern practice. <em>Relative</em> encodings inject a function of \(i-j\) directly into the attention score, so the model reasons about gaps rather than absolute clock positions, which matches the fact that a heartbeat interval means the same thing at minute one and minute sixty. <em>Rotary</em> position embedding (RoPE) implements this by rotating the query and key vectors by an angle proportional to position, so the dot product \(q_i^\top k_j\) depends only on \(i-j\); it is now the default in most sequence transformers because it is relative, parameter-free, and length-extrapolates gracefully.</p>
+<p>The sensor-specific complication is irregular sampling. If your tokens arrive at real times \(t_i\) that are not evenly spaced (asynchronous channels, event cameras, duty-cycled radios, dropped packets), then encoding the integer index \(i\) tells the model a lie about elapsed time. The fix is <em>continuous-time</em> encoding: feed the real timestamp into the sinusoidal formula, replacing \(i\) with \(t_i\) (in seconds) so that two tokens 40 ms apart get an encoding distance proportional to 40 ms regardless of how many packets fell in between. This is the same idea that lets state-space models and neural ODEs handle irregular streams, and it is the honest way to represent the jittery clocks discussed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Encode elapsed time, not token index</h3>
+<p>For regularly sampled data the index and the timestamp are interchangeable up to a constant, so index-based encoding is fine. The moment sampling becomes irregular, the two diverge, and index-based encoding silently compresses long gaps and stretches short ones. Encoding the physical timestamp \(t_i\) makes the geometry of your attention match the geometry of real time. It also lets a single trained model run at a different sample rate at deployment, because "half a second ago" is expressed in seconds, not in a count of tokens that changes with the rate.</p>
+</div>
+
+<h2>Encoding sensor identity</h2>
+<p>Once you patchify a multi-channel stream, a token no longer means "the whole system at time \(t\)"; it means "sensor \(c\), around time \(t\)." The model must know \(c\) to interpret the numbers, because a value of 9.8 means gravity on an accelerometer axis and something entirely different on a magnetometer or a skin-temperature probe. The clean solution mirrors time encoding: maintain a learned <em>identity embedding</em> table with one vector per channel and add it to every token from that channel. This is exactly the "variate token" idea that channel-as-token designs exploit, and it is what lets one transformer ingest heterogeneous sensor suites whose channels have no natural ordering. Because identity is categorical (there is no sense in which the gyroscope is "between" the barometer and the thermometer), you use a learned lookup, not a sinusoid. Identity embeddings also give you graceful degradation: if a sensor drops out, you simply omit its tokens, and the surviving tokens still carry correct identity, a property we lean on heavily for missing-modality robustness in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. The design choice of whether channels even see each other in attention is the subject of <a class="cross-ref" href="section-15.5.html">Section 15.5</a>; here we only ensure that when they do, each token knows who it is.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A driver-monitoring unit fusing IMU, CAN speed, and a cabin thermopile</h3>
+<p>An automotive team builds an in-cabin event classifier from three asynchronous streams: a 200 Hz six-axis IMU, vehicle speed decoded from the CAN bus at roughly 50 Hz, and a slow thermopile array at 8 Hz. They patchify each channel independently and pool all patches into one token sequence. Two encodings are added to every token: a continuous-time sinusoid computed from the token's real timestamp (aligned to a common vehicle clock), and a learned 6-way identity embedding tagging which stream it came from. When a hard-braking event fires, the model must line up the IMU deceleration transient with the CAN speed drop that follows tens of milliseconds later; index-based encoding would have scrambled that lag because the three streams emit wildly different token counts per second. With timestamp encoding the lag is represented in milliseconds, and the identity embedding keeps the slow thermopile from being mistaken for a low-frequency accelerometer axis. The same model later runs unchanged when a firmware update raises the thermopile to 16 Hz, because nothing in the encoding was tied to a fixed rate.</p>
+</div>
+
+<p>The snippet below builds both encodings for a mixed-rate batch: a continuous-time sinusoid from real timestamps and a learned identity table, then adds them to the token embeddings. It is the arithmetic of this section made executable, and it is deliberately rate-agnostic.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class TimeAndIdentityEncoding(nn.Module):
+    def __init__(self, d_model, n_sensors, max_period=10000.0):
+        super().__init__()
+        assert d_model % 2 == 0
+        k = torch.arange(0, d_model, 2).float() / d_model
+        self.register_buffer("inv_freq", 1.0 / (max_period ** k))  # (d_model/2,)
+        self.identity = nn.Embedding(n_sensors, d_model)           # learned per channel
+
+    def forward(self, z, t, c):
+        # z: (B, N, D) tokens; t: (B, N) real timestamps in seconds; c: (B, N) sensor ids
+        ang = t.unsqueeze(-1) * self.inv_freq                      # (B, N, D/2)
+        time_pe = torch.cat([ang.sin(), ang.cos()], dim=-1)        # (B, N, D)
+        return z + time_pe + self.identity(c)
+
+enc = TimeAndIdentityEncoding(d_model=64, n_sensors=6)
+z  = torch.randn(2, 10, 64)
+t  = torch.rand(2, 10).cumsum(-1)          # irregular, strictly increasing seconds
+c  = torch.randint(0, 6, (2, 10))          # which sensor each token came from
+out = enc(z, t, c)
+print(out.shape)                           # torch.Size([2, 10, 64])
+</code></pre>
+<div class="code-caption">A rate-agnostic encoder that adds a continuous-time sinusoid (driven by real timestamps <code>t</code>, not indices) and a learned per-sensor identity embedding to each token. Swapping <code>t</code> for <code>torch.arange</code> would recover the classic index-based encoding.</div>
+
+<h2>Putting it together: factorized encodings for the patch grid</h2>
+<p>After patchification a batch is naturally a grid indexed by (channel, time-patch), much like an image is indexed by (row, column). The proven recipe is a <em>factorized</em> encoding: build a time encoding that depends only on \(t_i\) and an identity encoding that depends only on \(c_i\), and sum them. This keeps the parameter count linear in (sensors + patches) rather than multiplicative, lets the two axes generalize independently (a new sample rate reuses the identity table; a new sensor reuses the time encoding), and mirrors how 2D vision transformers factor row and column encodings. You add both to the token before layer one; from there attention is free to build any cross-term it needs. Resist the temptation to concatenate rather than add unless you have spare width, because addition preserves the model dimension the rest of the stack expects.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">RoPE and encoding tables in a few lines</h3>
+<p>You rarely hand-roll rotary embeddings in production. <code>torchtune.modules.RotaryPositionalEmbeddings</code> or <code>rotary-embedding-torch</code> apply RoPE to your query and key tensors in one call, replacing roughly 30 to 40 lines of index-juggling sin and cos rotation with two lines and handling the interleave-versus-split convention correctly. For learned identity embeddings, <code>nn.Embedding(n_sensors, d_model)</code> is already the one-line primitive; the library value here is RoPE's fiddly rotation math, not the lookup. When you do need continuous timestamps, keep the sinusoid from the snippet above, because most RoPE utilities assume integer positions and will not accept real seconds without adaptation.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is moving</h3>
+<p>Time-series-specific position encoding is an active research target. Rotary position embedding (RoPE), introduced for language, is now standard in sensor and time-series transformers because it is relative and extrapolates. Recent work argues that generic encodings underserve time series and proposes dedicated schemes: ConvTran's <em>tAPE</em> (a time-aware absolute encoding whose frequencies are scaled to series length) paired with <em>eRPE</em> (an efficient relative encoding), and irregular-time approaches that feed continuous timestamps directly, as mPLASTIC and time-embedding layers do for asynchronous clinical streams. The through-line is the same lesson as this section: encode physical elapsed time and categorical sensor identity, not raw token index. The state-space models of <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a> sidestep positional encoding entirely by being sequential again, a tradeoff worth weighing.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a 3-channel IMU window sampled at a nominal 100 Hz but with 5% of samples randomly dropped, and patchify it. (1) Build two versions of the token sequence: one with index-based sinusoidal encoding and one with timestamp-based encoding from the true (gap-aware) times. (2) Construct a synthetic label that depends on the real elapsed gap between two events (for example, "the second peak arrives within 120 ms of the first"). (3) Train a small transformer on each and compare accuracy. Explain, with reference to the key-insight callout, why the timestamp version should win as the drop rate rises.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does adding <em>any</em> fixed \(p_i\) break the permutation equivariance of attention, and why is that the goal rather than a bug?</p>
+<p>2. A colleague encodes token index on a stream with heavy packet loss and reports that the model ignores timing. What single change fixes this, and why?</p>
+<p>3. Why is sensor identity encoded with a learned lookup table rather than a sinusoid, when time is encoded with a sinusoid?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-15.4.html">Section 15.4</a>, we confront the cost that makes all of this hard to scale: self-attention is quadratic in the number of tokens, and sensor windows can be very long. We will look at long-context and efficient-attention techniques (sparse, linear, and windowed attention) that let a transformer keep the positional grounding built here while reading minutes of high-rate signal without the memory bill exploding.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

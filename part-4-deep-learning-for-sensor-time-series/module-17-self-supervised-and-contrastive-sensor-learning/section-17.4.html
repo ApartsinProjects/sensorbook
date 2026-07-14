@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.4: Temporal predictive coding and TS2Vec. Building Sensory AI." name="description"/>
+<title>Section 17.4: Temporal predictive coding and TS2Vec | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Self-Supervised and Contrastive Sensor Learning</a></div>
+<h1>Temporal predictive coding and TS2Vec</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The future is the only label a sensor stream hands you for free, and it always arrives on time."</p><cite>A Forward-Looking AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Sections 17.2 and 17.3 taught two pretext objectives: pull augmented views together, and reconstruct what you masked. This section teaches a third that is native to time itself. A sensor stream is an ordered arrow, so the most natural free supervision is <em>the next slice of the stream</em>. Temporal predictive coding turns "what comes next" into a training signal without ever forecasting raw values, and TS2Vec turns "the same timestamp seen in two overlapping contexts should agree" into a representation that is useful at every resolution from a single sample to a whole recording. These two ideas produce embeddings that shine on classification, forecasting, and anomaly detection alike, which is why they became default pretrainers for unlabeled sensor windows.</p>
+</div>
+
+<p>This section assumes you are comfortable with the contrastive machinery of <a class="cross-ref" href="section-17.2.html">Section 17.2</a> (the InfoNCE loss, positive and negative pairs) and with the dilated temporal convolutional encoders of <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. If sampling rate and alignment are hazy, revisit <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because both methods slice the same stream twice and must line up timestamps exactly.</p>
+
+<h2>Contrastive predictive coding: predict the latent, not the value</h2>
+
+<p><strong>What.</strong> Contrastive Predictive Coding (CPC, van den Oord et al., 2018) trains an encoder by predicting future latent representations from past context. An encoder \(g_{enc}\) maps each input window to a latent \(z_t\). An autoregressive summarizer \(g_{ar}\) (a GRU or causal convolution) compresses the past into a context vector \(c_t = g_{ar}(z_{\le t})\). From \(c_t\) the model predicts the latent \(k\) steps ahead, and the objective asks it to score the true future latent higher than a bag of distractors sampled from elsewhere.</p>
+
+<p><strong>Why not just forecast the raw signal?</strong> Predicting raw accelerometer or ECG values forces the network to spend capacity on high-frequency noise, quantization, and unpredictable detail that carries no semantics. By contrasting in latent space the model only has to capture what makes the true future <em>distinguishable</em> from random negatives, which is precisely the slow, shared structure (gait phase, cardiac rhythm, machine regime) you want a representation to hold. This is mutual-information maximization between context and future, formalized by the InfoNCE bound:</p>
+
+$$\mathcal{L}_{\text{InfoNCE}} = -\,\mathbb{E}\!\left[\log \frac{\exp\!\big(z_{t+k}^{\top} W_k\, c_t\big)}{\sum_{z_j \in \mathcal{N}}\exp\!\big(z_{j}^{\top} W_k\, c_t\big)}\right]$$
+
+<p>where \(W_k\) is a learned prediction head for horizon \(k\) and \(\mathcal{N}\) contains the positive future latent plus negatives drawn from other timesteps and other sequences in the batch. Minimizing this loss maximizes a lower bound on \(I(c_t; z_{t+k})\).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Predictive coding and masked reconstruction (<a class="cross-ref" href="section-17.3.html">Section 17.3</a>) are the same wish expressed in two grammars: both ask the model to fill in signal it cannot see. Reconstruction fills a masked <em>interior</em> in value space with an \(L_2\) target; predictive coding fills the <em>future</em> in latent space with a contrastive target. The contrastive form is deliberately blind to un-predictable detail, so it tends to win when the useful structure is low-dimensional and slow relative to the sampling rate, which describes most physiological and mechanical signals.</p>
+</div>
+
+<h2>TS2Vec: hierarchical contextual consistency</h2>
+
+<p><strong>What.</strong> TS2Vec (Yue et al., AAAI 2022) is a universal representation framework that produces a vector <em>for every timestamp</em> of a series, at every temporal scale, from one contrastive pretraining run. Its central idea is <em>contextual consistency</em>: the representation of a given timestamp should be stable across two different surrounding contexts of the same series. If timestamp \(t\) means the same thing whether you saw it inside window A or window B, then its embedding has captured the timestamp, not the accident of framing.</p>
+
+<p><strong>How it builds the two contexts.</strong> TS2Vec takes one input series and generates two overlapping views by (1) sampling two random crops that share an overlapping region, and (2) applying independent <em>timestamp masking</em> (randomly zeroing input positions before the encoder). A dilated-convolution encoder maps each view to a per-timestamp latent sequence. On the overlap, the same timestamp appears in both views; those paired latents are the positives.</p>
+
+<p><strong>The two-axis loss.</strong> TS2Vec contrasts along two axes at once, which is what makes the representation multipurpose:</p>
+<ul>
+<li><strong>Temporal contrast:</strong> for a fixed series, the two views of the <em>same</em> timestamp are a positive pair; other timestamps of the same series are negatives. This teaches within-series discriminability, which powers forecasting and anomaly detection.</li>
+<li><strong>Instance-wise contrast:</strong> at a fixed timestamp, the two views of the <em>same</em> series are positive; the same timestamp in <em>other</em> series in the batch are negatives. This teaches across-series identity, which powers classification and clustering.</li>
+</ul>
+
+<p><strong>Why hierarchical.</strong> After computing the loss at full resolution, TS2Vec max-pools the latent sequence along time by a factor of two and recomputes both losses, repeating until a single vector remains. The same objective therefore shapes the representation at second-scale, minute-scale, and whole-recording scale. To get an instance embedding you max-pool the final timestamp vectors; to get a per-sample embedding for a change detector you read the bottom level directly. One pretraining, every granularity.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: bearing regimes on a factory line</h3>
+<p>A packaging plant streams tri-axial vibration from 40 gearbox bearings at 25.6 kHz but has labeled only a handful of confirmed failures. An engineer pretrains TS2Vec on three months of unlabeled windows. Because the temporal-contrast axis sharpens per-timestamp embeddings, the bottom-level vectors flag the exact second a spall begins to modulate the vibration envelope, which a plain instance classifier would smear across a whole window. Because the instance-contrast axis groups whole windows by operating regime, the pooled embeddings cluster into idle, ramp, and full-load without a single label. Fine-tuning a linear head on 20 labeled failure windows then reaches accuracy that a from-scratch model needs thousands of labels to match, the label-efficiency win that motivates <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Implementing the contextual-consistency loss</h2>
+
+<p>The core of TS2Vec is short: encode two masked crops, align them on their overlap, and sum a temporal and an instance-wise InfoNCE term over a hierarchy of pooled scales. The snippet below shows the dual loss at a single scale so the two axes are explicit; the full method wraps it in a max-pool loop.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def dual_contrastive_loss(z1, z2):
+    # z1, z2: (batch B, time T, dim C) latents for the two views,
+    # already aligned on the shared overlap region.
+    B, T, C = z1.shape
+    loss = 0.0
+
+    # --- Instance-wise contrast: fix a timestamp, contrast across series ---
+    zi = torch.cat([z1, z2], dim=0)            # (2B, T, C)
+    zi = zi.transpose(0, 1)                     # (T, 2B, C)
+    sim = torch.matmul(zi, zi.transpose(1, 2))  # (T, 2B, 2B)
+    logits = -F.log_softmax(sim, dim=-1)
+    # positive of row i is its counterpart view at offset B
+    idx = torch.arange(B, device=z1.device)
+    inst = (logits[:, idx, idx + B].mean() + logits[:, idx + B, idx].mean()) / 2
+    loss += inst
+
+    # --- Temporal contrast: fix a series, contrast across timestamps ---
+    zt = torch.cat([z1, z2], dim=1)            # (B, 2T, C)
+    sim = torch.matmul(zt, zt.transpose(1, 2))  # (B, 2T, 2T)
+    logits = -F.log_softmax(sim, dim=-1)
+    t = torch.arange(T, device=z1.device)
+    temp = (logits[:, t, t + T].mean() + logits[:, t + T, t].mean()) / 2
+    loss += temp
+    return loss / 2
+</code></pre>
+<div class="code-caption">The two InfoNCE terms of TS2Vec at one scale: instance-wise contrast slices by timestamp and compares series, temporal contrast slices by series and compares timestamps. The published method calls this on max-pooled copies of <code>z1, z2</code> down a factor-of-two hierarchy and sums the results. Note that both views must be cropped so that only the shared-overlap timestamps enter the loss.</div>
+
+<p>As always with self-supervised pretraining, the split that guards against optimistic numbers lives outside this loss. Pretrain and evaluate on <em>disjoint recordings, subjects, and devices</em>, never on shuffled windows from the same trace, or timestamp-level leakage will inflate every downstream score. The leakage-safe partitioning discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applies here in full.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the hierarchy</h3>
+<p>The reference <code>ts2vec</code> package exposes <code>model.fit(train_data)</code> and <code>model.encode(x, encoding_window='full_series')</code>, collapsing the crop sampling, timestamp masking, dilated encoder, hierarchical pooling loop, and both loss axes into roughly 3 lines of caller code versus about 200 lines to reproduce faithfully. It handles variable-length series and missing values internally. Reach for the from-scratch version only when you need to modify the objective itself; otherwise let the library own the plumbing so you spend your effort on the evaluation protocol.</p>
+</div>
+
+<h2>When to choose predictive coding versus TS2Vec</h2>
+
+<p><strong>When.</strong> Reach for CPC-style predictive coding when your downstream task is intrinsically about the future or about long-range temporal order: forecasting, next-event prediction, or streaming inference where a causal context vector \(c_t\) is exactly the online state you want to carry forward (see <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>). Reach for TS2Vec when you need one embedding that serves many downstream tasks at many granularities, especially when you cannot predict in advance whether you will do classification, retrieval, or point-level anomaly scoring. In practice TS2Vec is the stronger default for mixed sensor workloads because its instance axis and its per-timestamp output cover both ends of the granularity range that a single CPC context vector does not.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The lineage from CPC to TS2Vec continues. TF-C (Time-Frequency Consistency, NeurIPS 2022) adds a frequency-domain view so the positives must agree across time and spectrum, pairing naturally with the spectral tools of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. SoftCLT (ICLR 2024) replaces the hard positive/negative split with soft assignments weighted by inter-series distance and timestamp gap, which relaxes the harsh assumption that every other timestamp is a true negative. These consistency-based objectives are now the backbone pretrainers underneath several sensor and wearable foundation models covered in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take an unlabeled human-activity dataset (for example a wrist accelerometer at 50 Hz). (a) Pretrain TS2Vec on a subject-disjoint training split. (b) Freeze the encoder and fit a logistic-regression probe on the pooled instance embeddings using only 5 labeled windows per class; plot accuracy as you raise the label budget to 500. (c) Now export the <em>bottom-level</em> per-timestamp embeddings for one long recording and compute the norm of the timestamp-to-timestamp difference; mark where it spikes and check whether the spikes coincide with true activity transitions. Report both the label-efficiency curve and the transition-detection quality from the same frozen encoder.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ul>
+<li>Why does CPC contrast in latent space instead of forecasting raw sensor values, and what property of physiological or mechanical signals makes that choice pay off?</li>
+<li>TS2Vec computes two contrastive losses. State what the positive and negative pairs are for each, and which downstream capability each axis mainly serves.</li>
+<li>What is the purpose of the max-pooling hierarchy, and how would you extract (i) a whole-recording embedding and (ii) a per-sample embedding from the same trained model?</li>
+</ul>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-17.5.html">Section 17.5</a>, we move from "these two views should agree" to a subtler question: how should representations encode the <em>relative</em> distance between samples rather than a binary same-or-different verdict? We meet relative and relational objectives, and RelCon, which learn a graded notion of similarity that softens the hard-negative assumption these consistency methods rely on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

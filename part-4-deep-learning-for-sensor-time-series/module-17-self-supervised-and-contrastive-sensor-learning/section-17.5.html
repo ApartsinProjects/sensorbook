@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.5: Relative and relational objectives (RelCon). Building Sensory AI." name="description"/>
+<title>Section 17.5: Relative and relational objectives (RelCon) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Self-Supervised and Contrastive Sensor Learning</a></div>
+<h1>Relative and relational objectives (RelCon)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Two joggers are not identical and not strangers. Most of the world lives in that gap, and a binary label refuses to see it."</p><cite>A Graded AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Standard contrastive learning (<a class="cross-ref" href="section-17.2.html">Section 17.2</a>) is built on a hard binary: the augmented copy of a window is a <em>positive</em>, every other window in the batch is a <em>negative</em>. For sensor streams that lie is expensive. Two accelerometer windows from two people walking are not the same sample, yet they are far more alike than a walking window and a keyboard-typing window. Treating both as equally "negative" pushes genuinely similar motion apart and wastes the structure that makes sensor data learnable. Relative and relational objectives replace the binary with a <strong>graded</strong> target: learn an embedding whose distances respect a ranking of how similar samples actually are. This section develops that idea and its cleanest instance, <strong>RelCon</strong>, a relative-contrastive recipe that trained one of the largest motion foundation models to date. It assumes you are comfortable with the InfoNCE loss and cosine-similarity embeddings from <a class="cross-ref" href="section-17.2.html">Section 17.2</a> and the temporal representation ideas of <a class="cross-ref" href="section-17.4.html">Section 17.4</a>; time alignment concepts trace back to <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+</div>
+
+<h2>Why binary positives break on sensor data</h2>
+<p>The augmentation-based positive works when a single semantic class dominates a window and augmentations are label-preserving. Vision inherited this from crops of one object. Sensor streams violate both assumptions. A ten-second inertial window can contain a gait cycle plus a stumble; jitter or scaling augmentations sometimes cross a semantic boundary (a small time-warp can turn a slow walk into something the downstream head reads as a shuffle). Worse, the <em>negative</em> set is polluted: in any reasonably sized batch of wearable data, several "negatives" are other subjects doing the same activity. InfoNCE will dutifully repel them, injecting label noise that no amount of data cleans up.</p>
+<p>The fix is to stop pretending similarity is binary. If we had, for each anchor, a trustworthy ordering of candidates from most to least similar, we could ask the embedding to reproduce that ordering rather than a 0/1 verdict. This turns pretraining into a <em>ranking</em> problem over relationships between distinct real samples, hence "relative" and "relational." The two engineering questions become: (1) where does a reliable similarity ranking come from without labels, and (2) what loss turns a ranking into gradients.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Binary contrastive learning encodes one bit per pair ("same or not"). A relative objective encodes an <em>ordering</em> over many pairs, which is far more information per anchor and, critically, information that survives class-collision noise. You are no longer betting that a random batch has no false negatives; you are only betting that your similarity measure ranks candidates approximately correctly.</p>
+</div>
+
+<h2>A learnable, label-free similarity measure</h2>
+<p>RelCon answers question (1) with a <strong>learnable distance measure</strong> trained before the main encoder. The measure judges how well one motion segment can explain another: given a candidate segment, can it reconstruct the masked portions of the anchor after an alignment that tolerates speed differences? Dynamic time warping supplies the alignment so that two walks at different cadences are recognized as close, and a reconstruction objective supplies the graded score. The result is a function \(d(x, c)\) that is small when \(c\) is a good motif-level match for anchor \(x\) and large otherwise, learned entirely from unlabeled signals. This is the sensor-native analogue of the intuition in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> that similar signals share time-frequency structure, but here the notion of "similar" is fit to the data rather than fixed by hand.</p>
+<p>For each anchor we sample \(K\) candidates from the corpus and score them with \(d\), yielding an ordering \(d_{(1)} \le d_{(2)} \le \dots \le d_{(K)}\). Nearest candidates are soft positives; farthest are clear negatives; the middle is exactly the graded region binary methods throw away.</p>
+
+<h2>The relative contrastive loss</h2>
+<p>Question (2) is answered by a nested InfoNCE. Order the candidates by learned distance. Then, for every rank \(j\), treat candidate \(j\) as the positive and <em>all candidates at least as far as \(j\)</em> as its negatives. Summing these nested terms gives</p>
+$$ \mathcal{L}_{\text{rel}}(x) = -\frac{1}{K-1}\sum_{j=1}^{K-1} \log \frac{\exp\!\big(s(z, z_{(j)})/\tau\big)}{\sum_{k \ge j} \exp\!\big(s(z, z_{(k)})/\tau\big)}, $$
+<p>where \(z\) is the anchor embedding, \(z_{(k)}\) is the embedding of the \(k\)-th nearest candidate, \(s\) is cosine similarity, and \(\tau\) is the temperature. Each term is an ordinary contrastive loss; stacking them forces \(s(z, z_{(1)}) > s(z, z_{(2)}) > \dots\), so the embedding geometry mirrors the similarity ranking. A single candidate is simultaneously a positive (against those farther) and a negative (against those nearer), which is precisely the relational bookkeeping a binary loss cannot express.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def relative_contrastive_loss(z_anchor, z_cands, dist, tau=0.1):
+    # z_anchor: (D,)  z_cands: (K, D)  dist: (K,) learned distances to anchor
+    z_anchor = F.normalize(z_anchor, dim=-1)
+    z_cands  = F.normalize(z_cands, dim=-1)
+    sim = (z_cands @ z_anchor) / tau            # (K,) cosine sim, scaled
+    order = torch.argsort(dist)                 # nearest (smallest dist) first
+    sim = sim[order]
+    losses = []
+    for j in range(sim.shape[0] - 1):
+        # candidate j is positive; all farther candidates (k >= j) are negatives
+        denom = torch.logsumexp(sim[j:], dim=0)
+        losses.append(denom - sim[j])
+    return torch.stack(losses).mean()
+
+# toy check: distances that agree with embedding sims give a lower loss
+z  = torch.randn(64)
+zc = torch.randn(8, 64)
+d  = torch.arange(8.0)                          # candidate 0 is "closest"
+print(float(relative_contrastive_loss(z, zc, d)))
+</code></pre>
+<div class="code-caption">A minimal relative contrastive loss: candidates are sorted by the learned distance <code>dist</code>, then a nested InfoNCE enforces that embedding similarity decreases monotonically with distance. In practice <code>dist</code> comes from the pretrained similarity measure, not the raw signal, and the loop is vectorized over a batch of anchors.</div>
+<p>The loop above is written for clarity; the reference implementation batches anchors and computes all nested denominators with a cumulative <code>logsumexp</code> from the far end, so the whole loss is a handful of tensor ops. The temperature and the candidate count \(K\) are the two knobs that matter: too small a \(K\) and the ranking is noisy, too large and most candidates are trivially far and contribute nothing.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>You do not have to hand-roll the ranking machinery. <code>pytorch-metric-learning</code> ships ranked-list and multi-similarity losses plus distance-weighted miners that select and order candidates for you. Feeding it your learned distances as the pairing signal replaces roughly 40 lines of nested-loop loss and miner code with about 5, and the library handles numerically stable log-sum-exp, hard-pair mining, and cross-batch memory banks. The one piece it cannot supply is the sensor-specific <em>distance measure</em> itself; that stays bespoke because it encodes what "similar motion" means for your modality.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a wearable motion foundation model</h3>
+<p>An Apple team applied exactly this recipe in RelCon, pretraining on roughly one billion accelerometer segments from about 87,000 participants in the Apple Heart and Movement Study, with no activity labels at all. The learnable DTW-based measure ranked candidate motions per anchor, and the relative contrastive loss shaped a single encoder. Frozen, that encoder transferred across independent human-activity benchmarks (gait, activity classification, energy expenditure) and beat prior self-supervised wearable encoders on the majority of downstream tasks. The lesson for a product team is concrete: the graded objective let one model absorb messy, multi-subject, unlabeled motion that binary contrastive learning would have poisoned with false negatives, and the payoff showed up as label efficiency on every activity head built on top of it (see <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). Cross-user transfer like this is the whole promise of sensor foundation models in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+</div>
+
+<h2>When relational objectives are the right tool</h2>
+<p>Reach for a relative or relational loss when three conditions hold: labels are absent, the corpus has heavy class overlap (many subjects or devices repeating the same motions, so false negatives are rife), and you can define a cheap, trustworthy similarity between distinct samples. Inertial and physiological streams (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>) fit perfectly. Nearest-neighbor variants such as NNCLR are a lighter-weight cousin: they promote the batch's nearest neighbor to a positive instead of ranking a whole candidate set, which captures relational structure without a learned distance measure but gives up the graded ordering. When the corpus is genuinely single-class per window and augmentations are safe, the extra machinery buys little and plain SimCLR-style contrastive learning is simpler and just as good. And as always in this book, evaluate on a leakage-safe split: because relational objectives explicitly pull same-activity samples together, a subject leaking across the train/test boundary can inflate scores dramatically, so hold out whole subjects and devices per <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>RelCon (Xu et al., 2024, arXiv:2411.18822, ICLR 2025) is the current reference point for relative contrastive pretraining on wearable motion, notable for pairing a <em>learnable</em> DTW-reconstruction distance with the nested relative loss at billion-segment scale. Active directions include making the similarity measure multimodal (ranking motion by co-recorded PPG or audio rather than motion alone), replacing per-anchor candidate sampling with a maintained ranked memory to cut compute, and extending the graded target beyond one modality toward the cross-device, cross-user objectives of the next section. The open question is whether a learned similarity can be trusted enough to define ranks without occasionally encoding its own biases into the foundation model.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a small labeled HAR dataset (PAMAP2 or UCI-HAR). Build a per-anchor candidate set of size \(K = 16\) and define the "distance" \(d\) two ways: (a) Euclidean distance in raw signal space, and (b) DTW distance. Train two encoders with the relative contrastive loss above, then freeze each and fit a linear probe. Report the label-efficiency curve (accuracy vs number of labeled examples). Does the alignment-aware distance in (b) transfer better, and by how much at 1% of labels?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Explain in one sentence why a batch of walking windows from many subjects is a failure mode for binary InfoNCE but an advantage for a relative objective.</li>
+<li>In the nested loss \(\mathcal{L}_{\text{rel}}\), what role does a single candidate at rank \(j\) play with respect to candidates at ranks \(< j\) versus \(> j\)?</li>
+<li>Why must the learned distance measure be trained <em>before</em> the encoder rather than jointly, and what would go wrong if the two were optimized against each other from scratch?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-17.6.html">Section 17.6</a>, we scale the relational idea across boundaries: pretraining that spans different devices, different users, and different modalities at once, where the notion of "similar" must survive a change of sensor, sampling rate, and body location.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

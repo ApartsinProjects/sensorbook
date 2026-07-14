@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.3: Deep ensembles, MC-dropout, Bayesian and evidential DL. Building Sensory AI." name="description"/>
+<title>Section 18.3: Deep ensembles, MC-dropout, Bayesian and evidential DL | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Uncertainty, Calibration, and Conformal Prediction</a></div>
+<h1>Deep ensembles, MC-dropout, Bayesian and evidential DL</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A single network will happily tell you the pressure is 3.2 bar with total conviction, even when it has never seen a valve like this one. The cure is to ask several networks and notice when they start to argue."</p><cite>An Appropriately Doubtful AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p><a class="cross-ref" href="section-18.1.html">Section 18.1</a> drew the line between aleatoric uncertainty (irreducible sensor noise) and epistemic uncertainty (what the model does not know because it lacks data or capacity). A softmax score or a single predicted variance captures the first kind at best; it says nothing about the second. That gap is dangerous for sensor systems, because the moment that matters most, a novel fault, a spoofed signal, an out-of-distribution operating regime, is exactly when the model has left its training support and its lone point estimate becomes least trustworthy. This section covers four practical ways to make a deep network report epistemic uncertainty: deep ensembles, Monte Carlo dropout, Bayesian deep learning, and evidential deep learning. Each answers the same question, "how much would my prediction change if I had trained on different data?", at a different point on the accuracy-versus-compute curve.</p>
+</div>
+
+<p>This section assumes the variance decomposition and Bayesian posterior notation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and it inherits the calibration vocabulary of <a class="cross-ref" href="section-18.2.html">Section 18.2</a>: an uncertainty estimate is only useful once it is calibrated, so everything here is measured on a held-out set, never on training windows. The through-line is the law of total variance, which lets us split any distribution over predictions into the two components we care about:</p>
+
+$$\underbrace{\operatorname{Var}\!\big[y \mid x\big]}_{\text{predictive}} \;=\; \underbrace{\mathbb{E}_{\theta}\!\big[\sigma^2_\theta(x)\big]}_{\text{aleatoric}} \;+\; \underbrace{\operatorname{Var}_{\theta}\!\big[\mu_\theta(x)\big]}_{\text{epistemic}}$$
+
+<p>Here \(\theta\) is the network weights, \(\mu_\theta(x)\) and \(\sigma^2_\theta(x)\) are a heteroscedastic head's predicted mean and variance, and the outer expectation and variance run over a distribution of plausible weights. Every method below is a different recipe for that weight distribution.</p>
+
+<h2>Deep ensembles: the strong, embarrassingly parallel baseline</h2>
+
+<p><strong>What.</strong> A deep ensemble (Lakshminarayanan et al., NeurIPS 2017) is \(M\) copies of the same architecture, each trained from an independent random initialization on the same data, their predictions averaged at inference. Nothing more exotic. The random seeds send stochastic gradient descent into different basins of the loss surface, so the members disagree most where the data did not pin them down.</p>
+
+<p><strong>Why it works.</strong> The disagreement <em>is</em> the epistemic term. On an in-distribution window every member has seen similar data and they concur, so \(\operatorname{Var}_\theta[\mu_\theta(x)]\) is small. On a novel window the members extrapolate differently and the spread explodes. Despite being theoretically the least "Bayesian" of the four, deep ensembles remain the most reliable in practice: across the large-scale shift benchmarks they consistently give the best calibration under distribution shift, which is precisely the regime a deployed sensor model lives in. For regression, pair each member with a heteroscedastic head that predicts \(\mu\) and \(\sigma^2\) via the Gaussian negative-log-likelihood; the ensemble then supplies both terms of the variance decomposition in one shot.</p>
+
+<p><strong>When.</strong> Choose ensembles when accuracy and honest uncertainty matter more than training cost and you can afford \(M\) times the parameters (typically \(M = 5\) captures most of the benefit). The cost is real but embarrassingly parallel: members train independently, and at inference on the edge you can distill them or use the memory-sharing tricks below.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Ensemble disagreement and a Bayesian posterior are answering the same question by different means. A posterior over weights asks "which weights are consistent with the data?"; independent retraining <em>samples</em> from the modes of the loss surface, which are the high-probability regions of exactly that posterior. This is why a plain ensemble often out-calibrates a mathematically "correct" single-mode variational approximation: it captures the multi-modal structure that a unimodal Gaussian over weights cannot.</p>
+</div>
+
+<h2>Monte Carlo dropout: one network, many masks</h2>
+
+<p><strong>What.</strong> MC-dropout (Gal &amp; Ghahramani, ICML 2016) keeps dropout <em>active at inference</em> and runs \(T\) stochastic forward passes, each with a different random mask, then treats the \(T\) outputs as samples from an approximate predictive distribution. The mean is your prediction; the spread is your epistemic estimate.</p>
+
+<p><strong>Why it is (approximately) Bayesian.</strong> Gal and Ghahramani showed that training a network with dropout and \(L_2\) weight decay is equivalent to variational inference with a specific Bernoulli approximate posterior over the weights. Each dropout mask is therefore a cheap sample \(\theta_t \sim q(\theta)\), and averaging over masks approximates the predictive integral \(\int p(y\mid x,\theta)\,q(\theta)\,d\theta\). The appeal is that you get uncertainty from a model you probably already trained, with no architectural change and one hyperparameter (the dropout rate).</p>
+
+<p><strong>When, and the caveats.</strong> Use MC-dropout when compute or memory forbids an ensemble and the network already contains dropout layers. Know its limits: the uncertainty quality is highly sensitive to the dropout rate and where the layers sit, it tends to <em>underestimate</em> epistemic uncertainty far from the data compared to an ensemble, and it does nothing if your architecture uses batch normalization instead of dropout. For sequence models covered in <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>, apply the same mask across timesteps (variational RNN dropout) rather than resampling per step, or the recurrent state's uncertainty will be nonsense.</p>
+
+<pre><code class="language-python">import torch
+
+def mc_dropout_predict(model, x, T=30):
+    """Heteroscedastic net returning (mu, log_var). Keep dropout ON."""
+    model.train()                        # forces dropout active; freeze BN separately if present
+    mus, var_a = [], []
+    with torch.no_grad():
+        for _ in range(T):
+            mu, log_var = model(x)       # (B, D) each
+            mus.append(mu)
+            var_a.append(log_var.exp())
+    mus = torch.stack(mus)               # (T, B, D)
+    var_a = torch.stack(var_a)           # (T, B, D)
+
+    pred_mean = mus.mean(0)              # predictive mean
+    aleatoric = var_a.mean(0)            # E_theta[ sigma^2 ]  -> irreducible noise
+    epistemic = mus.var(0)              # Var_theta[ mu ]     -> model ignorance
+    return pred_mean, aleatoric, epistemic
+</code></pre>
+<div class="code-caption">Monte Carlo dropout with an explicit split into the two terms of the variance decomposition. The <code>aleatoric</code> tensor is the average predicted noise; the <code>epistemic</code> tensor is the disagreement across dropout masks and is the quantity that should spike on out-of-distribution windows. Swapping this function's loop for a loop over ensemble members yields a deep ensemble with no other change to the calling code.</div>
+
+<p>The snippet above makes the practical point concrete: whether the samples come from dropout masks or from ensemble members, the downstream bookkeeping is identical, and only the <code>epistemic</code> term should react to novelty.</p>
+
+<h2>Bayesian deep learning: posteriors without full retraining</h2>
+
+<p><strong>What.</strong> Bayesian deep learning aims for the real object, a posterior \(p(\theta \mid \mathcal{D})\) over weights, rather than a point estimate. Full Hamiltonian Monte Carlo over millions of weights is intractable, so practice uses scalable approximations. Three matter for sensor work. <em>Mean-field variational inference</em> (Bayes by Backprop) replaces each weight with a learned Gaussian, doubling the parameter count and adding training noise. <em>SWAG</em> (Maddox et al., NeurIPS 2019) fits a Gaussian to the trajectory of SGD iterates in the final epochs, turning ordinary training into a cheap posterior for free. <em>Laplace approximation</em> (revived at scale by Daxberger et al., NeurIPS 2021, "Laplace Redux") fits a Gaussian around an already-trained maximum-a-posteriori solution using the loss curvature, so it is fully <em>post-hoc</em>: train normally, then add uncertainty in a few lines.</p>
+
+<p><strong>Why and when.</strong> Reach for these when you want a principled posterior and its downstream benefits (marginal likelihood for model selection, coherent propagation into a fusion stage as in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>) without paying for \(M\) full trainings. The Laplace approximation is the pragmatic sweet spot for deployed models: it leaves your trained weights and accuracy untouched, needs no retraining, and only the last layer is often enough to get well-calibrated uncertainty at a fraction of an ensemble's cost.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: post-hoc Bayes in five lines</h3>
+<p>Implementing a Kronecker-factored last-layer Laplace approximation by hand, computing the Fisher information, storing its factors, and doing the linearized predictive integral, is roughly 250 lines of careful linear algebra. The <code>laplace-torch</code> library collapses it to about five: <code>la = Laplace(model, 'classification', subset_of_weights='last_layer', hessian_structure='kron')</code>, then <code>la.fit(train_loader)</code>, <code>la.optimize_prior_precision()</code>, and <code>la(x)</code> returns the predictive distribution. It handles the Hessian factorization, the prior-precision tuning, and the linearized prediction internally. For the ensemble and MC-dropout families, <code>torch-uncertainty</code> wraps members, packed-ensembles, and dropout evaluation behind one interface.</p>
+</div>
+
+<h2>Evidential deep learning: uncertainty in a single forward pass</h2>
+
+<p><strong>What.</strong> Evidential deep learning removes the need for sampling entirely by having the network output the parameters of a <em>distribution over the predictive distribution</em>. For classification (Sensoy et al., NeurIPS 2018) the model emits the concentration parameters of a Dirichlet, whose total \(S=\sum_k \alpha_k\) acts as accumulated evidence: high total means confidence, low total means "I have seen little like this." For regression (Deep Evidential Regression, Amini et al., NeurIPS 2020) the model emits the four parameters of a Normal-Inverse-Gamma prior, from which aleatoric and epistemic terms read off in closed form. One forward pass, both uncertainties, no ensemble, no dropout loop, which is decisive on the microcontrollers of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a> where a 30-pass MC loop or five networks simply will not fit.</p>
+
+<p><strong>When, with eyes open.</strong> Evidential methods are the cheapest route to per-sample uncertainty at inference, so they are attractive for edge and streaming deployment. But their epistemic signal is a learned regressor, not a sample-based estimate, and it can be poorly calibrated or arbitrary far from the training data. Treat evidential uncertainty as a fast first-line screen and validate it hard on true out-of-distribution data before trusting it in a safety loop; where a guarantee is required, the distribution-free machinery of <a class="cross-ref" href="section-18.4.html">Section 18.4</a> is the safer floor.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a deep ensemble catches an unseen bearing fault</h3>
+<p>A wind-turbine operator runs a temporal-convolutional model that estimates remaining useful life (RUL) from gearbox vibration, the prognostics task of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>. Trained only on outer-race and gear-tooth faults, a single network confidently predicts 400 hours of life for a turbine whose planet-bearing spalling it has never seen, and the plant nearly skips a service window. Swapping in a five-member deep ensemble changes the outcome: the members still each predict a number, but they scatter from 120 to 620 hours, and the epistemic variance jumps ninefold above its in-distribution baseline. The maintenance dashboard is wired to escalate to a human whenever epistemic variance crosses a calibrated threshold, so the novel fault is flagged as "model out of its depth" rather than silently mis-predicted. The aleatoric term, meanwhile, stays flat, correctly reporting that the sensor noise did not change; only the model's ignorance did.</p>
+</div>
+
+<h2>Choosing among the four</h2>
+
+<p>The choice is a budget decision. If you can afford the compute and want the best calibration under shift, use a <strong>deep ensemble</strong>; it is the default that research keeps failing to beat. If you cannot, and the model already has dropout, <strong>MC-dropout</strong> is the cheapest add-on, accepting that it under-reports far-from-data uncertainty. If you have a trained model you must not disturb, a <strong>post-hoc Laplace</strong> approximation adds a calibrated posterior with no retraining. If you are on a microcontroller where even a second forward pass is a luxury, <strong>evidential</strong> methods give single-pass uncertainty, validated carefully. Whatever you pick, the epistemic estimate is your trigger for the abstention and fallback logic of <a class="cross-ref" href="section-18.6.html">Section 18.6</a> and for any functional-safety argument in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The frontier is closing the ensemble's cost gap and questioning the cheap methods' honesty. <em>Packed-Ensembles</em> (Laurent et al., ICLR 2023) pack \(M\) members into a single grouped-convolution network at roughly the cost of one, recovering most of the calibration benefit with a fraction of the memory, and ship in the <code>torch-uncertainty</code> library. On the skeptical side, "Pitfalls of Deep Evidential Regression" (Meinert et al., AAAI 2023) shows that the popular evidential regression loss does not actually learn a well-defined epistemic quantity and can be tuned to arbitrary uncertainty, a caution that has pushed practitioners back toward ensembles and Laplace for anything safety-relevant. Single-forward-pass deterministic methods (DUQ, DDU, spectral-normalized distance awareness) are a third strand, estimating epistemic uncertainty from feature-space distance to the training set in one pass.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a human-activity or vibration dataset and a heteroscedastic temporal-CNN. (a) Train a 5-member deep ensemble and, separately, enable MC-dropout on one member with \(T=30\). (b) Construct a genuine out-of-distribution test split (a subject, device, or fault class absent from training, using the leakage-safe partitioning of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). (c) For both methods, plot the distribution of epistemic variance on in-distribution versus OOD windows and report the AUROC of using epistemic variance alone to separate the two. (d) State which method separates them better and by how much, and explain the gap in terms of how each samples the weight distribution.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ul>
+<li>In the variance decomposition, which term should react when a sensor enters an operating regime absent from training, and why does a single network fail to expose it?</li>
+<li>MC-dropout and deep ensembles both produce a set of predictions to average. What is the concrete source of disagreement in each, and why does the ensemble usually give larger, more reliable epistemic estimates far from the data?</li>
+<li>You must add uncertainty to an already-trained, accuracy-critical model without retraining it. Which method fits, and what does it use to build its posterior?</li>
+</ul>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-18.4.html">Section 18.4</a>, we stop approximating posteriors and start demanding guarantees. Conformal prediction turns any of these point predictors or uncertainty scores into prediction sets with a finite-sample coverage guarantee that holds regardless of the model, provided the data are exchangeable, and we confront what happens to that guarantee when a drifting sensor stream breaks exchangeability.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.3: Dilations and receptive fields. Building Sensory AI." name="description"/>
+<title>Section 14.3: Dilations and receptive fields | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>Dilations and receptive fields</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You asked me to hear the arrhythmia and the arrhythmic minute it hides in. Same ears, two time scales. So I learned to skip."</p>
+<cite>A Multi-Scale AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The temporal convolutional network of <a class="cross-ref" href="section-14.2.html">Section 14.2</a> gave us a causal, parallelizable alternative to recurrence, but it left one problem unsolved: a plain stack of convolutions reaches back into the past only linearly with depth, so seeing several seconds of a 100 Hz stream would demand a tower dozens of layers tall. Dilation is the trick that breaks that ceiling. By spacing a kernel's taps apart and doubling the spacing each layer, a modest stack grows its <em>receptive field</em> (the span of past samples one output can actually see) exponentially rather than linearly. This is the single most important design lever in a TCN, because it is what lets a compact network watch a single heartbeat and the rhythm it belongs to at the same time. Getting the receptive field to match the physics of your task, no shorter and not wastefully longer, is most of the practical craft in this chapter. This section teaches you to compute it exactly, tune it deliberately, and budget it against latency and memory.</p>
+</div>
+
+<p>This section builds directly on the causal, weight-shared convolution and the receptive-field formula introduced for single layers in <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and on the residual TCN block of <a class="cross-ref" href="section-14.2.html">Section 14.2</a>. It also assumes you can convert samples to seconds using the sampling relationships from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. We keep the book's notation: a window is \(x \in \mathbb{R}^{C \times T}\) with \(C\) channels and \(T\) time steps, kernel size is \(K\), and the dilation of a layer is \(d\).</p>
+
+<h2>What dilation does to a kernel</h2>
+<p>A dilated convolution is an ordinary convolution whose kernel taps are spread out by inserting \(d-1\) gaps between them. For a causal layer with dilation \(d\), one output channel computes</p>
+$$z_o[t] = b_o + \sum_{c=1}^{C} \sum_{k=0}^{K-1} w_{o,c}[k]\, x_c\big[t - d\,(K-1-k)\big].$$
+<p>When \(d=1\) this is the familiar dense causal convolution; each output reads \(K\) consecutive past samples. When \(d=2\), the kernel skips every other sample, so a size-3 kernel spans 5 input samples while still touching only 3 of them. The <em>what</em> is a kernel that covers a wider span at fixed parameter cost. The <em>why</em> is that the span, not the number of taps, sets how far back the layer can look, and the parameter count and multiply-accumulate cost depend only on \(K\), not on \(d\). Dilation buys reach for free in parameters and nearly free in compute. The <em>how</em> in every framework is one argument: PyTorch's <code>nn.Conv1d</code> takes <code>dilation=d</code>, and you keep the layer causal by left-padding with \(d\,(K-1)\) zeros so \(z[t]\) never reaches a future sample, exactly the online constraint a streaming model must honor (<a class="cross-ref" href="section-14.5.html">Section 14.5</a>).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Double the dilation, double the reach, keep the cost</h3>
+<p>Stack \(L\) causal layers with the same kernel \(K\) and geometrically increasing dilations \(d_\ell = 2^{\ell-1}\) (that is, 1, 2, 4, 8, ...). The receptive field is</p>
+$$R = 1 + (K-1)\sum_{\ell=1}^{L} d_\ell = 1 + (K-1)\big(2^{L}-1\big).$$
+<p>The receptive field grows <em>exponentially</em> in depth while parameters and FLOPs grow only linearly. A plain stack (\(d_\ell=1\)) gives \(R = 1 + L(K-1)\), linear in depth. That gap is the whole reason TCNs reach multi-second context in a handful of layers: with \(K=3\), eight dilated layers see \(1 + 2(2^{8}-1) = 511\) samples, whereas eight dense layers see only 17.</p>
+</div>
+
+<h2>Budgeting the receptive field to the physics</h2>
+<p>The exponential formula is a design tool, not just an observation. Work backward from the task. First decide the longest phenomenon a single prediction must integrate: for cardiac rhythm you might need eight to ten beats, roughly 8 seconds; for a gait transition, about 2 seconds; for detecting a bearing fault signature riding on shaft rotation, several revolutions. Convert that duration to samples with the sample rate, giving a target \(R^{\star}\). Then choose \(K\) and \(L\) so that \(R \ge R^{\star}\). Because \(R\) is dominated by the largest dilation \(2^{L-1}\), each added layer roughly doubles your temporal horizon, so the number of layers you need scales with the <em>logarithm</em> of the required history. A subtle failure mode lurks here: if you make \(K=2\) with aggressive dilation, consecutive taps at a deep layer are \(2^{L-1}\) samples apart, and information at intermediate positions can fall between the cracks (a gridding or aliasing effect). The standard defenses are to use \(K=3\) or larger so taps overlap between layers, to repeat the dilation cycle in several stacked blocks rather than dilating once to a huge value, and to cap the maximum dilation near the sample spacing of the feature you care about. Dilation is a coverage argument, not only a reach argument.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">An ambulatory ECG detector that must span ten beats</h3>
+<p>A clinical wearables team is building an atrial-fibrillation screener from single-lead ECG at 250 Hz (the cardiac modeling this feeds into is <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). AF is a rhythm irregularity, not a single-beat morphology, so one decision must see the spacing of roughly ten consecutive R-peaks: about 8 seconds, or \(R^{\star}\approx 2000\) samples. A dense stack would need hundreds of layers. Instead they use residual TCN blocks with \(K=7\) and dilations 1, 2, 4, 8, 16, 32, 64, giving \(R = 1 + 6\,(2^{7}-1) = 763\) samples per block; two stacked cycles push the effective field past 2000 samples, comfortably covering ten beats, in fourteen convolutional layers. The model runs causally so it can later stream on the patient's monitor, and because the receptive field is computed rather than guessed, the team can prove to their regulatory reviewers (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>) exactly how much history each alarm depends on.</p>
+</div>
+
+<p>The helper below computes the receptive field of a dilation schedule and inverts the question a practitioner actually asks: given a sample rate and a required history in seconds, how deep must the stack be? It is the arithmetic of this section made executable, and the printed numbers match the ECG example above.</p>
+
+<pre><code class="language-python">import math
+
+def receptive_field(kernel, dilations):
+    """Samples one output can see for a causal dilated stack."""
+    return 1 + (kernel - 1) * sum(dilations)
+
+def layers_needed(kernel, target_samples, blocks=1):
+    """Smallest L with dilations 1,2,4,...,2^(L-1), repeated `blocks` times,
+    whose receptive field covers target_samples."""
+    L = 1
+    while True:
+        dils = [2 ** i for i in range(L)] * blocks
+        if receptive_field(kernel, dils) >= target_samples:
+            return L, receptive_field(kernel, dils)
+        L += 1
+
+fs = 250                       # ECG sample rate, Hz
+history_s = 8.0                # need ~10 beats
+target = int(fs * history_s)   # 2000 samples
+L, R = layers_needed(kernel=7, target_samples=target, blocks=2)
+print(f"layers per block: {L}, receptive field: {R} samples "
+      f"= {R / fs:.1f} s")     # layers per block: 7, receptive field: 2033 samples = 8.1 s</code></pre>
+<div class="code-caption">Sizing a dilated TCN from physics: <code>layers_needed</code> inverts the exponential receptive-field formula so you pick depth from a required history in seconds rather than by trial and error, here confirming that seven dilated layers (kernel 7) repeated over two blocks span 8.1 s of 250 Hz ECG.</div>
+
+<h2>Reach is not the whole story: cost, latency, and effective field</h2>
+<p>A large receptive field is necessary but not sufficient. Three practical costs travel with it. <strong>Latency and buffering</strong>: a causal model with receptive field \(R\) needs \(R-1\) past samples buffered to produce the current output, so the memory a streaming deployment must hold, and the warm-up before the first valid prediction, both scale with \(R\) (this is the state we make explicit in <a class="cross-ref" href="section-14.5.html">Section 14.5</a>). <strong>Compute</strong>: dilation leaves per-layer FLOPs unchanged, but you still pay for every layer at every time step, so doubling the horizon by adding a layer adds one layer's worth of work across the whole sequence. <strong>Effective versus theoretical field</strong>: the formula gives the span a layer <em>can</em> reach, but gradients and learned weights decide the span it <em>does</em> use. In practice the effective receptive field is often smaller and roughly bell-shaped, concentrated on the recent past, so provisioning a theoretical field two to three times your target buys headroom against this shrinkage. When even a generous dilated stack cannot hold the horizon you need, that is the signal to reach for the recurrent state of <a class="cross-ref" href="section-14.1.html">Section 14.1</a>, the global attention of <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, or the linear-time long-range models of <a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Dilation is one keyword, not a loop</h3>
+<p>Implementing a dilated causal convolution by hand means building the gapped index pattern, computing the left pad \(d(K-1)\), slicing off the extra right-side samples the pad introduces, and threading it through autograd, roughly 20 to 30 lines that are easy to get subtly wrong on the causal boundary. In PyTorch it is <code>nn.Conv1d(c_in, c_out, kernel_size=K, dilation=d, padding=d*(K-1))</code> followed by trimming the final \(d(K-1)\) outputs, and the framework handles the strided memory access, the gradient, and GPU kernels. The one-word <code>dilation=d</code> argument replaces the entire hand-rolled index scheme.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: design a stack for a vibration monitor</h3>
+<p>You are monitoring a motor with an accelerometer at 2 kHz. The bearing fault signature you must detect repeats once per shaft revolution, and the shaft turns at 1800 rpm, so you want each prediction to integrate at least five revolutions. (1) Convert five revolutions to a target receptive field in samples. (2) With kernel \(K=3\) and geometric dilations starting at 1, how many layers does a single dilation cycle need to cover it, using \(R = 1 + (K-1)(2^{L}-1)\)? (3) Recompute with \(K=5\) and comment on the parameter-versus-depth tradeoff. (4) Your target field is large enough that a single cycle reaches a dilation of hundreds of samples between adjacent taps. Explain the gridding risk and how repeating the cycle across two blocks mitigates it. Show every number.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Two stacks use kernel \(K=3\). Stack A has ten dense layers (\(d=1\)); stack B has ten layers with \(d=2^{\ell-1}\). Compute each receptive field and state the ratio, then explain in one sentence why B costs no more parameters than A.</li>
+<li>A colleague sets \(K=2\) and dilations 1, 4, 16, 64 to save compute, and finds the model misses events that sit at odd sample offsets. Name the failure and give two concrete changes that fix it without shrinking the receptive field much.</li>
+<li>Your theoretical receptive field is 4 seconds but validation shows the model ignores anything older than about 1.5 seconds. What is this phenomenon called, and what does it imply for how much theoretical field you should provision relative to the history you truly need?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-14.4.html">Section 14.4</a>, we turn from how far a model can see to what it emits: the distinction between collapsing a whole window into a single label and producing an aligned output at every time step. The receptive-field budgeting you just learned decides which of those framings a given dilated stack can support, and how much context each per-step prediction is allowed to draw on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

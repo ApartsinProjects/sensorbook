@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.5: Normalization and augmentation for sensors. Building Sensory AI." name="description"/>
+<title>Section 13.5: Normalization and augmentation for sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Neural Representations for Sensor Streams</a></div>
+<h1>Normalization and augmentation for sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They told me to memorize what a squat looks like. Instead I memorized what this one phone, taped to this one thigh, records when this one person squats."</p>
+        <cite>An Overfit AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>A 1D convolutional stack does not care about volts, milligravities, or degrees Celsius; it cares about numbers, and it will happily learn that one wearer's resting baseline is 0.02 and another's is 0.31 as if that offset were a class label. Two data-side decisions stand between a filterbank that learns physiology and one that memorizes a device. The first is <em>normalization</em>: how you rescale each channel so that gradients are well behaved and a model trained on one unit transfers to the next. The second is <em>augmentation</em>: how you manufacture plausible variations of a sensor window so a small labeled dataset teaches invariance instead of coincidence. Both are cheap, both are where most of the field's silent accuracy is won or lost, and both have sensor-specific twists that the image and text playbooks get wrong.</p>
+    </div>
+
+    <p>This section assumes the tensor layout of <a class="cross-ref" href="section-13.1.html">Section 13.1</a> (a window is a \(C \times T\) array of \(C\) channels over \(T\) timesteps) and the convolutional features of <a class="cross-ref" href="section-13.2.html">Section 13.2</a>. It leans hard on the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because normalization statistics are the single most common back door through which the test set leaks into training. We write a raw window as \(x \in \mathbb{R}^{C \times T}\), its channel \(c\) as \(x_c\), and the model input after conditioning as \(\tilde{x}\).</p>
+
+    <h2>Normalizing the input: what statistic, fit where</h2>
+    <p>The default recipe is per-channel standardization. For channel \(c\) you compute a mean \(\mu_c\) and standard deviation \(\sigma_c\) and map \(\tilde{x}_c = (x_c - \mu_c)/\sigma_c\). Doing it <em>per channel</em> rather than over the whole tensor is the first sensor-specific point: an accelerometer axis in \(g\) and a barometer channel in hectopascals differ by orders of magnitude, and a single global scale would let the loud channel drown the quiet one before the first convolution ever runs. The question that actually decides whether your reported number is real is not the formula but the scope: <strong>over what data are \(\mu_c\) and \(\sigma_c\) computed?</strong></p>
+    <p>There are three honest choices and one dishonest one. <em>Dataset statistics</em> fit \(\mu_c, \sigma_c\) once on the training split and freeze them; this is standard and safe as long as the fit never sees validation or test data. <em>Per-recording statistics</em> normalize each session by its own mean and variance, which removes slow per-device offset and is often the strongest transfer trick for wearables, but it needs a full recording and so is offline-only unless you make it causal. <em>Per-window (instance) statistics</em> standardize each window by its own \(T\) samples, which is fully streaming-safe and kills baseline drift, at the cost of throwing away absolute amplitude that some tasks need. The dishonest choice is to fit \(\mu_c, \sigma_c\) on the entire dataset before splitting, which leaks the test distribution's scale into training and inflates every metric you will later fail to reproduce.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Normalization is a fit, and a fit can leak</h3>
+        <p>Standardization has parameters, so it is a model, and like any model it must be fit on training data only and then applied unchanged to validation, test, and deployment. A pipeline that calls <code>fit_transform</code> on the concatenation of all splits is not doing preprocessing; it is doing leakage with a respectable name. The rule is mechanical: fit \(\mu_c, \sigma_c\) on train, store them, transform everything else with the stored values.</p>
+    </div>
+
+    <h2>Normalization layers inside the network</h2>
+    <p>Input standardization tames the data going in; normalization <em>layers</em> tame the activations flowing through. BatchNorm over a 1D feature map (<code>BatchNorm1d</code>) normalizes each learned channel across the batch and time axis, which speeds convergence but couples every sample in a batch to its neighbors, an awkward property for the tiny batch sizes and streaming inference common on edge devices (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>). LayerNorm and GroupNorm sidestep the batch dependency and are the safer default for sequence models. There is also a sensor-flavored layer worth knowing: reversible instance normalization strips each instance's mean and variance before the network and adds them back at the output, which directly attacks the non-stationary baseline drift that plagues long deployments and reappears as a first-class hazard in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Choose the layer by deployment constraint first: if inference is one window at a time, never let a BatchNorm running-statistic mismatch decide your accuracy.</p>
+
+    <h2>Augmentation that respects physics</h2>
+    <p>Augmentation invents new training examples by transforming existing ones with label-preserving perturbations, so the model learns which variations to ignore. The whole game is <em>plausibility</em>: a good augmentation produces a window the sensor could actually have recorded for the same label. Image tricks do not transplant cleanly, because flipping an accelerometer's time axis makes a rise look like a fall and can invert the very label you are trying to teach. The sensor-native transforms are these:</p>
+    <ul>
+        <li><strong>Jitter</strong>: add Gaussian noise, simulating a noisier sensor or session.</li>
+        <li><strong>Scaling</strong>: multiply a whole window by a random factor near 1, simulating gain differences between units.</li>
+        <li><strong>Magnitude and time warping</strong>: smoothly stretch amplitude or the time axis with a random spline, simulating cadence and intensity variation.</li>
+        <li><strong>Rotation</strong>: for a tri-axial IMU, apply a random 3D rotation to the \((x,y,z)\) axes together, simulating a different on-body mounting orientation (see the inertial treatment in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>).</li>
+        <li><strong>Channel permutation and dropout</strong>: swap or zero channels to build robustness to sensor placement and dropout.</li>
+        <li><strong>Window masking</strong>: blank a contiguous span, the time-series analogue of cutout, which also seeds the masked-reconstruction objectives of <a class="cross-ref" href="../module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>.</li>
+    </ul>
+    <p>The load-bearing subtlety is that plausibility depends on the label. Rotation is a gift for activity recognition (walking is walking regardless of how the phone sits in the pocket) but poison for orientation estimation, where the mounting angle <em>is</em> the target. Time warping helps gait classification but corrupts any task where absolute timing or sampling rate carries meaning (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>). There is no universal augmentation set; there is only the set whose invariances match your task.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def augment_imu_window(x, rng, sigma=0.03, scale_sd=0.1):
+    # x: (3, T) tri-axial accelerometer window, axes = rows
+    x = x + rng.normal(0, sigma, size=x.shape)          # jitter
+    x = x * rng.normal(1.0, scale_sd)                     # per-window gain
+    # random small 3D rotation of the axis triple (mounting invariance)
+    axis = rng.normal(size=3); axis /= np.linalg.norm(axis)
+    theta = rng.uniform(-0.3, 0.3)                        # radians, gentle
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]])
+    R = np.eye(3) + np.sin(theta)*K + (1 - np.cos(theta))*(K @ K)  # Rodrigues
+    return R @ x                                          # (3, T), label unchanged</code></pre>
+    <div class="code-caption">A label-preserving augmentation for a tri-axial accelerometer window: jitter and per-window gain model sensor and unit variation, while the Rodrigues rotation <code>R</code> simulates a different on-body mounting so an activity classifier learns orientation invariance rather than one phone's pocket angle. It is called only on the training split.</div>
+
+    <p>The code above rotates the axis triple as a rigid body, which is what makes it physically valid: the three axes are not independent channels but a coordinate frame, so they must rotate together. Applying an independent random gain per axis would instead teach the model that gravity can point in inconsistent directions, an event no real IMU produces.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">A wearable HAR model that only knew one wrist</h3>
+        <p>A team building human activity recognition (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) trained a 1D CNN on watch accelerometry collected from right-handed volunteers wearing the device on the left wrist. Offline accuracy was excellent. In the field, left-handed users and anyone who wore the watch face-in saw "brushing teeth" and "clapping" collapse into noise. The dataset had a hidden orientation prior, and the network had learned it. Adding the rotation augmentation above, plus per-recording standardization to remove each wrist's resting baseline, recovered most of the lost accuracy without collecting a single new subject. The fix was entirely on the data side; the architecture never changed.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Let an augmentation library compose the policy</h3>
+        <p>Chaining jitter, scaling, warping, and masking by hand, each with its own random-parameter bookkeeping and probability gate, is easily 40 to 60 lines and a magnet for off-by-one axis bugs. A time-series augmentation library collapses a composed, probabilistically gated policy to a few lines:</p>
+        <pre><code class="language-python">import tsaug
+aug = (tsaug.AddNoise(scale=0.03)
+       + tsaug.Convolve(window="flattop", size=8) @ 0.5   # @ = apply with prob 0.5
+       + tsaug.TimeWarp(n_speed_change=3) @ 0.5)
+x_aug = aug.augment(x)   # x: (N, T, C)</code></pre>
+        <div class="code-caption">A composed augmentation pipeline in <code>tsaug</code>: the library handles per-transform random sampling, the probabilistic <code>@</code> gate, and correct broadcasting over the batch and channel axes, replacing roughly 40 to 60 lines of hand-rolled transform code.</div>
+        <p>The library owns the random-state plumbing and shape handling; you own the one decision it cannot make for you, which transforms preserve your label.</p>
+    </div>
+
+    <h2>Putting the two together: an honest recipe</h2>
+    <p>Order matters, and the two operations sit on opposite sides of the leakage boundary. Fit the standardization statistics on the training split only, freeze them, and apply them everywhere. Apply augmentation <em>only</em> to training windows, on the fly, after standardization, and never to validation or test, because augmenting the evaluation set measures the wrong distribution. Log the augmentation policy alongside the model checkpoint the way you log a learning rate; an unrecorded augmentation set is an unreproducible result. When you later evaluate under the leakage-safe protocol of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>, this discipline is what lets the field number match the notebook number.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: find the leak and the label-breaking transform</h3>
+        <p>You inherit a gait-classification pipeline over 50 Hz tri-axial accelerometry. It (1) fits a single <code>StandardScaler</code> on the concatenation of train and test before splitting; (2) augments both train and test with jitter to "make evaluation robust"; (3) time-warps every window by up to 40 percent for a task whose labels include cadence bins; (4) flips the time axis of half the windows as a cheap doubling of data.</p>
+        <p>Identify each defect, say whether it leaks, breaks a label, or both, and give the minimal fix. For each transform, state which invariance it assumes and whether that invariance holds for cadence classification.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Why is per-channel standardization preferable to a single global scale when your window mixes an accelerometer axis in \(g\) with a barometer channel in hectopascals?</li>
+            <li>Per-window instance normalization is streaming-safe but discards absolute amplitude. Name one task where that trade helps and one where it destroys the signal you need.</li>
+            <li>Rotation augmentation improves activity recognition but ruins orientation estimation. State the general principle that predicts this from the definition of each task's label.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-13.6.html">Section 13.6</a>, we step back from data-side conditioning to the model itself and ask what <em>inductive biases</em> a sensor architecture should carry: translation equivariance, multi-scale receptive fields, permutation structure across channels, and the causal constraint. Augmentation teaches invariance from the outside; inductive bias builds it into the wiring, and the two are most powerful when they agree.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

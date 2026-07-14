@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.2: 1D convolutions and temporal pooling. Building Sensory AI." name="description"/>
+<title>Section 13.2: 1D convolutions and temporal pooling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Neural Representations for Sensor Streams</a></div>
+<h1>1D convolutions and temporal pooling</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me a bank of tiny filters and told me to find whatever repeats. Turns out a footstep repeats. So does a failing bearing. So does an atrial flutter."</p>
+<cite>A Pattern-Matching AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>A sensor window is a long, redundant array of numbers where the useful information lives in <em>local, repeating shapes</em>: the double bounce of a heel strike, the ring-down after a gearbox tooth meshes, the QRS complex of a heartbeat. The 1D convolution is the neural primitive that hunts for such shapes efficiently, sharing one small filter across every time step so the same detector fires wherever the pattern occurs. Temporal pooling is its partner: it collapses a long stream of detector responses into a compact, position-tolerant summary a classifier can use. Together they are the workhorse of sensor deep learning, and almost every architecture later in this part (temporal convolutional networks, the stem of a transformer, the encoder of a self-supervised model) begins with exactly this pair. This section is where you learn to read, size, and reason about them.</p>
+</div>
+
+<p>This section assumes you can already picture a sensor window as a tensor of shape (channels, time), which <a class="cross-ref" href="section-13.1.html">Section 13.1</a> laid out. It leans on the convolution and filterbank intuition from classical signal processing in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, and it treats sampling rate and the causal constraint as given from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. We keep the book's notation: a window is \(x \in \mathbb{R}^{C \times T}\) with \(C\) channels and \(T\) time steps, and a layer produces feature maps \(z \in \mathbb{R}^{C' \times T'}\).</p>
+
+<h2>The 1D convolution as a learned, sliding matched filter</h2>
+<p>A 1D convolution slides a small weight kernel along the time axis and, at each position, takes an inner product between the kernel and the window of input beneath it. For an input with \(C\) channels, a single output channel \(o\) computes</p>
+$$z_o[t] = b_o + \sum_{c=1}^{C} \sum_{k=0}^{K-1} w_{o,c}[k]\, x_c[t + k],$$
+<p>where \(K\) is the kernel size (its length in samples), \(w_{o,c}\) are the learnable weights, and \(b_o\) is a bias. The <em>what</em> is a bank of \(C'\) such kernels, each learning to respond to a different local shape. The <em>why</em> is three properties the sensor setting rewards heavily. First, <strong>weight sharing</strong>: the same kernel is applied at every \(t\), so a heel-strike detector trained on one stride generalizes to every stride in the recording, and the parameter count depends on \(K\), not on \(T\). Second, <strong>locality</strong>: each output looks only at a short span, matching the fact that discriminative sensor events are short relative to the window. Third, <strong>translation equivariance</strong>: shift the input in time and the output shifts identically, so the network does not have to relearn a pattern for every possible arrival time. This is precisely the matched-filter idea from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, except the filter coefficients are learned from labels rather than designed by hand (the tradeoff between the two is the subject of <a class="cross-ref" href="section-13.4.html">Section 13.4</a>).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Sensors convolve across time, not space</h3>
+<p>The 2D convolutions that dominate vision slide a kernel across a spatial grid where <em>up</em> and <em>left</em> are interchangeable axes. A sensor stream has one privileged axis, time, and it runs one way. So the natural primitive is <code>Conv1d</code>: the kernel slides along time while spanning <em>all</em> input channels at once. A depth of accelerometer axes or EEG electrodes is not a spatial dimension to convolve over; it is a channel stack the first layer mixes in full, exactly as color channels are mixed at the input of a 2D network.</p>
+</div>
+
+<h2>Sizing the layer: kernels, stride, padding, and receptive field</h2>
+<p>Three hyperparameters set the geometry, and getting them right is most of the practical skill. <strong>Kernel size</strong> \(K\) is a duration once you multiply by the sample period: at 50 Hz a \(K=15\) kernel spans 0.3 seconds, roughly one footstep, which is why you size kernels in <em>milliseconds of physics</em> rather than in abstract taps. <strong>Stride</strong> \(S\) is how many samples the kernel hops between evaluations; \(S=1\) keeps full temporal resolution, while \(S=2\) halves the output length and cheaply downsamples. <strong>Padding</strong> \(P\) adds zeros at the ends so the output length is controllable; the output length is</p>
+$$T' = \left\lfloor \frac{T + 2P - K}{S} \right\rfloor + 1.$$
+<p>The quantity that ultimately decides <em>what the network can see</em> is the <strong>receptive field</strong>: the span of input samples that influence one output value. Stacking \(L\) convolutions of kernel \(K\) and stride 1 grows the receptive field to \(1 + L(K-1)\), which is linear in depth and often too slow to reach the seconds-long context a sensor task needs. That limitation is exactly what motivates dilation and multiresolution stacks, taken up in <a class="cross-ref" href="section-13.3.html">Section 13.3</a>, and the long-context temporal convolutional networks of <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. One more choice matters for deployment: a <em>causal</em> convolution pads only on the left so \(z[t]\) never reads \(x[t{+}1]\), preserving the online constraint that a streaming model must obey.</p>
+
+<h2>Temporal pooling: from a stream of responses to a decision</h2>
+<p>A convolution turns one stream into many streams of detector responses, but a classifier usually needs a fixed-size vector, and it should not care <em>where</em> in the window a gesture happened. Temporal pooling supplies both. <strong>Max pooling</strong> over a length-\(m\) region reports the strongest response, answering "did this pattern appear at all?" and granting tolerance to small time shifts. <strong>Average pooling</strong> reports the mean, preserving how <em>sustained</em> a pattern was, which suits energy-like features. The most useful variant for windowed sensor classification is <strong>global pooling</strong>, which collapses the entire time axis to a single value per channel, so a variable-length or long window becomes a fixed \(C'\)-vector regardless of \(T\). Global max asks whether a transient ever fired; global average asks how prevalent it was. This is the neural echo of the summary statistics you computed by hand in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, now learned end to end. <em>When</em> to use which: max for sparse, transient events (a fall, an arrhythmic beat); average for diffuse, ongoing states (walking versus standing); and strided convolutions when you want the network, not a fixed rule, to decide how to downsample.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wrist-worn activity recognizer that fits on a coin cell</h3>
+<p>A wearables team building human activity recognition (see <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) feeds 2.56-second windows of 3-axis accelerometer data at 50 Hz, a tensor of shape (3, 128). The first <code>Conv1d</code> uses \(K=15\) (0.3 s, about one step) with 32 filters and stride 2, so the model learns 32 short gait-shape detectors and halves the length to 64 in one move. Two more conv-plus-pool blocks widen the receptive field to just over a second, enough to span a full stride cycle. A global average pool then crushes the time axis to a 128-vector fed to a small linear head. The whole network is well under 50k parameters, small enough to run on the watch's microcontroller (the quantization that gets it there is <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), and it beats the team's hand-crafted feature baseline because the filters adapt to how <em>their</em> users actually walk.</p>
+</div>
+
+<p>The code below builds exactly that stem in PyTorch and confirms how the tensor shape marches from (3, 128) down to a single vector per window. The shapes it prints are the receptive-field and pooling arithmetic above, made concrete.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class HARStem(nn.Module):
+    def __init__(self, in_ch=3, width=32, n_classes=6):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(in_ch, width, kernel_size=15, stride=2, padding=7),  # 0.3 s kernels
+            nn.BatchNorm1d(width), nn.ReLU(),
+            nn.Conv1d(width, width, kernel_size=9, stride=2, padding=4),
+            nn.BatchNorm1d(width), nn.ReLU(),
+            nn.Conv1d(width, 2 * width, kernel_size=5, padding=2),
+            nn.BatchNorm1d(2 * width), nn.ReLU(),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)          # global temporal pooling
+        self.head = nn.Linear(2 * width, n_classes)
+
+    def forward(self, x):                            # x: (batch, 3, 128)
+        z = self.features(x)                         # -> (batch, 64, 32)
+        z = self.pool(z).squeeze(-1)                 # -> (batch, 64)
+        return self.head(z)                          # -> (batch, 6)
+
+x = torch.randn(8, 3, 128)
+print(HARStem()(x).shape)                            # torch.Size([8, 6])</code></pre>
+<div class="code-caption">A three-block 1D convolutional stem for human activity recognition: strided <code>Conv1d</code> layers downsample time while widening the receptive field, and <code>AdaptiveAvgPool1d(1)</code> performs global temporal pooling so any window length collapses to one vector per channel before the linear head.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Global pooling in one line</h3>
+<p>Writing your own global temporal pool means reshaping, masking any padding, reducing over the time axis, and handling variable lengths, which is easily 15 to 20 lines of index-juggling that quietly breaks on the edge cases. PyTorch's <code>nn.AdaptiveAvgPool1d(1)</code> (or <code>AdaptiveMaxPool1d(1)</code>) does it in one line for any input length, and the library handles the reduction, the output-size bookkeeping, and the autograd path. Swapping average for max is a one-word change, which makes it trivial to A/B the two pooling semantics on your task.</p>
+</div>
+
+<h2>What the filters learn, and how to keep it honest</h2>
+<p>Because the first-layer kernels operate directly on the raw signal, they are interpretable: trained on periodic motion they tend to converge to band-limited, oscillatory shapes that behave like a learned filterbank, a phenomenon we return to in <a class="cross-ref" href="section-13.7.html">Section 13.7</a> on inspecting learned filters. That interpretability is a gift and a trap. A convolution shares weights across time but <em>not</em> across channels or amplitude, so if one accelerometer axis is scaled differently or a channel drifts, the learned filters bake in that idiosyncrasy. This is why normalization and augmentation (<a class="cross-ref" href="section-13.5.html">Section 13.5</a>) are not optional garnish but part of making convolutional features transfer across units. It is also why evaluation must respect the arrow of time: pooling and striding do not excuse you from subject-wise, chronological splits, or the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> will hand you an accuracy the field never reproduces.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: size the receptive field to the physics</h3>
+<p>You are classifying gait from a shin-mounted gyroscope sampled at 100 Hz, and domain knowledge says a full stride cycle lasts about 1.1 seconds. (1) Using only stride-1 convolutions with kernel \(K=7\), how many stacked layers do you need before one output can see a whole stride? (2) Now allow a stride-2 downsample after every conv. Recompute the depth needed to cover 1.1 s, and state the output length starting from a 256-sample window. (3) Which design would you ship to a battery-powered device, and why? Justify each step with the receptive-field and output-length formulas from this section.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Weight sharing gives translation equivariance. Explain why that property is worth more for a footstep detector than for a fixed-position feature, and name the pooling operation that converts equivariance into the translation <em>invariance</em> a window classifier wants.</li>
+<li>A colleague sets kernel size \(K=3\) at 200 Hz and cannot understand why the network misses a 40 ms transient. What does \(K=3\) span in milliseconds here, and what two knobs would you change to let a single output see the whole transient?</li>
+<li>Why does a causal convolution pad only on the left, and what breaks in a deployed streaming model if you use symmetric padding instead?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-13.3.html">Section 13.3</a>, we confront the receptive-field bottleneck head on: stacking plain convolutions to reach seconds of context is slow and parameter-hungry, so we introduce dilated convolutions and multiresolution stacks that grow the receptive field exponentially with depth, letting a compact network see both a single heartbeat and the rhythm it belongs to at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

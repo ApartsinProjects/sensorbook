@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.4: Conformal prediction: split, weighted, and the exchangeability problem. Building Sensory AI." name="description"/>
+<title>Section 18.4: Conformal prediction: split, weighted, and the exchangeability problem | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Uncertainty, Calibration, and Conformal Prediction</a></div>
+<h1>Conformal prediction: split, weighted, and the exchangeability problem</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked for a promise, not a hunch. I can give you a set that catches the truth ninety percent of the time, but only if you swear the future looks like the calibration data. It rarely does."</p>
+        <cite>A Contractually Cautious AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on quantiles, coverage, and the frequentist meaning of a confidence statement from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and on the strict train, calibrate, test discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because a leaked calibration split silently voids every guarantee below. It assumes you have a trained point predictor or classifier from the earlier chapters of this part; conformal prediction wraps any such model without retraining it. Calibration in the temperature-scaling sense appeared in <a class="cross-ref" href="section-18.2.html">Section 18.2</a>; here we want a stronger, distribution-free promise. The drift-tracking variants that repair what this section cannot are deferred to <a class="cross-ref" href="section-18.5.html">Section 18.5</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every method so far has produced a number with an implied confidence: a softmax probability, an ensemble variance, a Bayesian credible interval. None of them come with a guarantee that the number means what it says on your data. Conformal prediction does. Given any pretrained model, a held-out calibration set, and a target miscoverage rate \(\alpha\), split conformal prediction returns a prediction set that is guaranteed to contain the true label with probability at least \(1 - \alpha\), with no assumption on the model, the data distribution, or the sample size. That guarantee is almost free: a single quantile of held-out scores. The catch is one assumption doing all the work, exchangeability, and sensor time series is precisely the setting that breaks it. This section teaches the split recipe, shows exactly where exchangeability fails on streams, and introduces weighted conformal prediction, the first repair for the most common failure mode.</p>
+    </div>
+
+    <h2>Split conformal in one pass</h2>
+    <p>Split (or inductive) conformal prediction is disarmingly simple. Partition your data into a training fold and a calibration fold that the model never sees during fitting. Train any model \(\hat{f}\) on the training fold. Then define a <em>nonconformity score</em> \(s(x, y)\) that is large when the pair \((x,y)\) looks surprising to the model. For regression the natural choice is the absolute residual \(s = |y - \hat{f}(x)|\); for classification a common choice is \(s = 1 - \hat{p}(y \mid x)\), the model's assigned improbability of the true class. Compute the scores \(s_1, \dots, s_n\) on the \(n\) calibration points, then take the quantile</p>
+    <p>$$\hat{q} = \text{the } \lceil (n+1)(1-\alpha) \rceil \text{-th smallest of } \{s_1, \dots, s_n\}.$$</p>
+    <p>At test time, output every label whose score falls at or below the threshold: \(\mathcal{C}(x) = \{\, y : s(x,y) \le \hat{q}\,\}\). For regression this is the fixed-width band \(\hat{f}(x) \pm \hat{q}\); for classification it is a set of plausible classes, sometimes one, sometimes several when the model is unsure. The theorem is that, if the calibration and test points are exchangeable, the set covers the truth with probability at least \(1-\alpha\), and at most \(1-\alpha+1/(n+1)\). Notice the finite-sample correction \((n+1)\) in the quantile rank: it is what turns an asymptotic promise into an exact one, and it is why conformal coverage holds even for a calibration set of a few hundred points.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The coverage guarantee is a statement about <em>ranks</em>, not about the model. A future test score is, under exchangeability, equally likely to land in any position among the calibration scores. Asking "is the test score below the \((1-\alpha)\) empirical quantile?" is then just asking "does a uniformly random rank fall in the bottom \(1-\alpha\) fraction?", which by construction happens with probability \(1-\alpha\). The model's accuracy affects only how <em>wide</em> the resulting sets are, never whether they cover. A useless model still yields valid sets; they are simply enormous. This decoupling, validity from any model and informativeness from a good one, is the whole reason conformal prediction is worth teaching.</p>
+    </div>
+
+    <p>The code below runs the entire split conformal procedure for a regression predictor on a sensor target and empirically checks the coverage, the number you must always verify rather than trust.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def split_conformal_band(cal_pred, cal_true, alpha=0.1):
+    scores = np.abs(cal_true - cal_pred)          # nonconformity: absolute residual
+    n = len(scores)
+    rank = int(np.ceil((n + 1) * (1 - alpha)))    # finite-sample corrected rank
+    rank = min(rank, n)                           # guard when (n+1)(1-a) > n
+    return np.sort(scores)[rank - 1]              # the conformal quantile q_hat
+
+# cal_* is the calibration fold, test_* is a disjoint test fold
+q = split_conformal_band(cal_pred, cal_true, alpha=0.1)
+lo, hi = test_pred - q, test_pred + q
+covered = (test_true >= lo) & (test_true <= hi)
+print(f"target coverage 0.90 | empirical {covered.mean():.3f} | half-width {q:.3f}")</code></pre>
+    <div class="code-caption"><strong>Listing 18.4.1.</strong> Split conformal regression in a dozen lines. The band half-width <code>q</code> is a single scalar shared by every test point, and the printed empirical coverage should sit near 0.90 when calibration and test data are exchangeable. Watch what that number does when they are not.</div>
+
+    <h2>The exchangeability assumption, and why streams break it</h2>
+    <p>A sequence of random variables is exchangeable if its joint distribution is invariant to reordering: any permutation of the samples is equally probable. This is weaker than independent and identically distributed, but it is still a symmetry assumption, and it is the single hinge the coverage proof hangs on. Sensor time series violates it in at least three structural ways. First, <em>temporal dependence</em>: consecutive samples from an accelerometer, an ECG, or a vibration probe are strongly autocorrelated, so a window and its neighbor are not swappable with a distant window. Second, <em>distribution shift</em>: the test stream is collected later than, and often on different hardware or a different subject from, the calibration stream, so the marginal distribution of inputs drifts, a problem taken up in full in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Third, <em>non-stationarity</em>: sensor baselines wander with temperature, battery, wear, and calibration age, as the measurement models of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> make explicit. When exchangeability fails, split conformal does not merely lose a little coverage; its empirical coverage can collapse well below \(1-\alpha\) exactly when you needed the guarantee most, during the drift.</p>
+
+    <div class="callout warning">
+        <h3 class="callout-title">Splitting by time, not at random</h3>
+        <p>The most seductive mistake is to build the calibration fold by randomly sampling windows from the same recording as the test data. Adjacent windows overlap and share context, so a random split leaks near-duplicate neighbors across the calibration and test folds. The empirical coverage then looks perfect in your notebook and fails in deployment, because your validation quietly restored an exchangeability the real stream never had. Calibrate on data that is separated from the test data the same way deployment will separate them: by time, by session, by subject, or by device, following the leakage-safe protocol of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+    </div>
+
+    <h2>Weighted conformal prediction under covariate shift</h2>
+    <p>One failure mode is repairable in closed form. Suppose only the input distribution changes, from \(P_{\text{cal}}(x)\) to \(P_{\text{test}}(x)\), while the conditional \(P(y \mid x)\) stays fixed. This is <em>covariate shift</em>, and it describes much of sensor deployment: the same physical relationship between signal and label, measured on a new population of inputs. Weighted conformal prediction (Tibshirani and colleagues, 2019) restores validity by reweighting each calibration score by the likelihood ratio \(w(x) = P_{\text{test}}(x) / P_{\text{cal}}(x)\). Instead of an unweighted quantile, you take the quantile of the calibration scores under the normalized weights</p>
+    <p>$$p_i = \frac{w(x_i)}{\sum_{j=1}^{n} w(x_j) + w(x_{\text{test}})},$$</p>
+    <p>where the test point itself contributes a term because its own weight enters the tie-broken rank. Calibration points that resemble the test distribution count more; those from stale regions count less. The insight is that exchangeability is not gone, it is only tilted, and a known tilt can be undone by a known weight. The practical difficulty moves entirely into estimating \(w(x)\), typically with a probabilistic classifier trained to discriminate calibration inputs from test inputs, which is itself an imperfect model whose error erodes the guarantee. Weighted conformal buys back coverage under covariate shift at the price of a density-ratio estimate, and it says nothing about a shift in \(P(y \mid x)\), which needs the adaptive machinery of the next section.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a bearing-wear regressor that lost its nerve on a hotter line</h3>
+        <p>An industrial team wrapped a vibration-based remaining-useful-life regressor in split conformal prediction, calibrated on months of data from one production line, and shipped 90 percent intervals to the maintenance scheduler. On a second line running warmer, empirical coverage fell to 74 percent: the warmer bearings pushed the spectral features into a region the calibration set barely sampled, so the fixed half-width was too narrow exactly where wear was hardest to read. The physics of vibration-to-wear had not changed, only the distribution of operating temperatures had, a textbook covariate shift. They trained a small logistic classifier to separate old-line from new-line feature vectors, used its odds as the likelihood-ratio weights \(w(x)\), and recomputed the weighted quantile. Coverage returned to 0.89, and the intervals widened only where the density ratio flagged extrapolation, staying tight on the familiar cool-running machines. Calibration and test lines were held strictly separate, so the recovered coverage reflected genuine transfer, not leakage.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You rarely hand-roll the quantile bookkeeping, the mondrian grouping, or the weighting scheme. The <code>MAPIE</code> library wraps a fitted scikit-learn or PyTorch predictor and returns conformal intervals or sets with one estimator call:</p>
+        <pre class="language-python"><code class="language-python">from mapie.regression import MapieRegressor
+mapie = MapieRegressor(estimator=my_fitted_model, cv="prefit")
+mapie.fit(X_cal, y_cal)                       # calibration fold only
+y_pred, y_pis = mapie.predict(X_test, alpha=0.1)   # 90% intervals</code></pre>
+        <div class="code-caption"><strong>Listing 18.4.2.</strong> The <code>cv="prefit"</code> path reproduces Listing 18.4.1 plus classification sets, weighted and cross-conformal variants, and coverage diagnostics, replacing roughly forty lines of quantile and score plumbing with four. It handles the finite-sample rank correction and edge cases so you calibrate, not debug.</div>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The distribution-free framework traces to Vovk, Gammerman, and Shafer, with the split form popularized for machine learning by Lei and colleagues (2018). Weighted conformal under covariate shift is Tibshirani and colleagues (2019). Two threads dominate current work relevant to sensing. Adaptive conformal inference (Gibbs and Cand&egrave;s, 2021) abandons exchangeability entirely and instead adjusts \(\alpha\) online to hold long-run coverage under arbitrary drift, the subject of <a class="cross-ref" href="section-18.5.html">Section 18.5</a>. Conditional and adaptive-width methods such as Conformalized Quantile Regression (Romano, Patterson, and Cand&egrave;s, 2019) replace the fixed band of Listing 18.4.1 with input-dependent widths, so a noisy sensor regime gets a wider interval than a quiet one. The open problem the field has not closed is valid, tight, <em>conditional</em> coverage on dependent time series: guaranteeing \(1-\alpha\) not just on average but for each operating condition, which pure exchangeability arguments cannot deliver.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take any regressor from <a class="cross-ref" href="../module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> trained on a sensor stream. (1) Build calibration and test folds by a strict temporal split and reproduce Listing 18.4.1, confirming empirical coverage near 0.90. (2) Now rebuild the folds by random window sampling from a single overlapping recording and re-measure coverage; explain the inflated result in terms of exchangeability leakage. (3) Inject a covariate shift by scaling test inputs to a warmer regime, show coverage drops, then estimate likelihood-ratio weights with a logistic discriminator and apply weighted conformal to recover it. (4) Report how much the weighted intervals widened and where, and argue whether that widening is warranted.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A colleague reports that their conformal intervals cover only 70 percent of test points despite targeting 90 percent. Name three structural properties of sensor streams that could break the exchangeability assumption and produce this gap.</p>
+        <p class="quiz-question">2. Why does the split conformal coverage guarantee hold for <em>any</em> model, even a badly fit one, and what quantity does model quality actually control?</p>
+        <p class="quiz-question">3. Weighted conformal prediction repairs coverage under covariate shift but not under a change in \(P(y \mid x)\). Explain why the likelihood-ratio reweighting cannot fix the latter.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-18.5.html">Section 18.5</a>, we drop the exchangeability assumption altogether. Adaptive conformal inference and its conformal-PID refinement treat coverage as a control problem, nudging the threshold up or down after every observation so that a drifting, non-stationary sensor stream still hits its long-run coverage target without any weight estimate or stationarity promise.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

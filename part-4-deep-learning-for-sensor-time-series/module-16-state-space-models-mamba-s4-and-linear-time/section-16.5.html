@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.5: SSMs vs transformers: accuracy, latency, memory, on-device fit. Building Sensory AI." name="description"/>
+<title>Section 16.5: SSMs vs transformers: accuracy, latency, memory, on-device fit | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: State-Space Models: Mamba, S4, and Linear-Time Sequences</a></div>
+<h1>SSMs vs transformers: accuracy, latency, memory, on-device fit</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The transformer read the entire recording again for every new sample. I kept a small vector and answered before it finished re-reading the first second."</p>
+<cite>A Frugal AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section compares two families you have already met: the attention mechanism and its quadratic cost from <a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and the linear-time recurrences of <a class="cross-ref" href="section-16.2.html">Section 16.2</a> (S4/S5) and <a class="cross-ref" href="section-16.3.html">Section 16.3</a> (Mamba). It assumes you understand asymptotic cost in sequence length \(L\) from <a class="cross-ref" href="section-16.1.html">Section 16.1</a>, and it leans on the streaming and quantization ideas developed in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. No new mathematics is introduced here; the goal is to turn the mechanisms into a defensible engineering decision.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>By now you can build both an attention layer and a selective SSM. The practical question is which one to ship, and the honest answer is that the tradeoff is not "SSMs win." Transformers still hold an edge on tasks that demand sharp, content-addressable recall over a modest window, and their tooling is more mature. SSMs win decisively on the axis that sensing actually stresses: cost that grows with sequence length. Attention is \(O(L^2)\) time and \(O(L)\) memory for the key-value cache; a selective SSM is \(O(L)\) time and \(O(1)\) state at inference. For a wearable sampling an IMU at 100 Hz all day, or a vibration probe at 25.6 kHz, that asymptotic gap is the difference between a model that fits in a microcontroller's SRAM and one that cannot run at all. This section makes the comparison concrete on four axes (accuracy, latency, memory, on-device fit), tells you where each family genuinely wins, and gives you a measurement harness so you never have to argue the tradeoff from a table you half-trust.</p>
+</div>
+
+<h2>The four axes, side by side</h2>
+<p>Start with the asymptotics, because they drive everything else. For a length-\(L\) sequence, model width \(d\), and SSM state size \(N\), the dominant costs are as follows. The table entries are per-layer; multiply by depth for the full model.</p>
+
+<div style="overflow-x:auto">
+<table>
+<thead>
+<tr><th>Axis</th><th>Transformer (full attention)</th><th>Selective SSM (Mamba-style)</th></tr>
+</thead>
+<tbody>
+<tr><td>Training time</td><td>\(O(L^2 d)\)</td><td>\(O(L\,d\,N)\), parallel scan</td></tr>
+<tr><td>Autoregressive step (inference)</td><td>\(O(L d)\) with a growing KV cache</td><td>\(O(d\,N)\), constant in \(L\)</td></tr>
+<tr><td>Inference memory</td><td>\(O(L d)\) KV cache, grows with context</td><td>\(O(d\,N)\) state, fixed</td></tr>
+<tr><td>Long-range dependency</td><td>Direct, any-to-any lookup</td><td>Compressed into state, decays gracefully</td></tr>
+<tr><td>Content-based recall</td><td>Strong (this is what attention is)</td><td>Weaker; the selection gate helps but does not match it</td></tr>
+</tbody>
+</table>
+</div>
+<div class="code-caption">Per-layer cost comparison. The decisive rows for sensing are the two middle ones: an SSM's inference step and memory are independent of how long the stream has been running, while a transformer pays for every past token on every new sample.</div>
+
+<p>Read the table as a decision tool, not a scoreboard. The \(O(L^2)\) training cost is often tolerable because you train once, offline, on windowed data. The rows that bite in production are the inference step and the memory footprint, because those are paid on the device, forever, once per incoming sample. A transformer serving a continuous stream must either cap its context (throwing away old information) or carry a key-value cache that grows linearly with how long it has been running; neither is acceptable on a coin-cell wearable. The SSM simply keeps its fixed-size state and steps forward.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Accuracy comparisons at a fixed, short context length flatter the transformer, because that is the regime attention was designed for and the regime most benchmarks use. The moment you extend the context to the lengths raw sensor feeds actually produce (tens of thousands of samples), the transformer's quadratic cost forces you to subsample, chunk, or truncate, and its <em>effective</em> accuracy on the real task collapses even though its accuracy-per-token looks fine. The SSM's advantage is often less "better math on the same window" and more "it can afford to look at the whole window at all." Always compare at the context length your deployment demands, not the one the leaderboard chose.</p>
+</div>
+
+<h2>Accuracy: who actually wins, and on what</h2>
+<p>On long-sequence classification and forecasting for sensor data, well-tuned SSMs and transformers land within a point or two of each other, and which one leads depends on the task structure rather than on raw capacity. Selective SSMs (Mamba, and the time-series variants of <a class="cross-ref" href="section-16.4.html">Section 16.4</a>) tend to lead when the signal is long and its informative structure is smooth or periodic: gait cycles, respiration envelopes, slow machine degradation. Transformers tend to lead when the task hinges on retrieving a specific earlier event by its content (find the one prior beat that looked like this one), because any-to-any attention is a literal content-addressable lookup and a compressed state is not. The selection gate in Mamba narrows this gap by letting the recurrence copy or ignore inputs on demand, but it does not fully close it. The pragmatic reading is that for most streaming sensor classification you lose little or no accuracy moving to an SSM, and for the recall-heavy minority you either keep attention or use the hybrids of <a class="cross-ref" href="section-16.6.html">Section 16.6</a>. Whichever you pick, evaluate on a leakage-safe split (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>); with long contexts it is easy to let a window straddle the train/test boundary and inflate both models equally.</p>
+
+<h2>Latency and memory: the axis sensing actually cares about</h2>
+<p>Latency splits into two very different questions. <em>Throughput</em> (samples per second during a parallel forward pass) favors whichever kernel is better tuned for your hardware; on a modern GPU with FlashAttention a transformer at short \(L\) can be extremely fast, and an SSM's advantage only appears once \(L\) is large enough for \(O(L^2)\) to dominate. <em>Streaming step latency</em> (time to emit one output for one new sample, with the model already caught up) is where the families diverge structurally. The SSM step is a fixed-size state update, constant in \(L\); the transformer step must attend over a cache that grows with elapsed time. For an always-on device the second number is the one that sets your battery life, and it is the one an SSM wins by construction. Memory follows the same logic: the SSM carries \(O(dN)\) numbers regardless of stream length, while the transformer's KV cache is \(O(Ld)\) and grows without bound until you evict.</p>
+
+<p>The listing below measures this directly. It times a single autoregressive step for a growing context and reports how each family scales.</p>
+
+<pre class="language-python"><code class="language-python">import time, numpy as np
+
+d, N = 256, 16                      # model width, SSM state size
+
+def ssm_step(state, u, Abar, Bbar, C):
+    # O(d*N): fixed-size state update, independent of how long we have streamed
+    state = Abar * state + Bbar * u[:, None]      # (d, N)
+    return state, (state * C).sum(axis=1)         # (d,)
+
+def attn_step(kv_cache, q):
+    # O(L*d): must attend over every cached key/value seen so far
+    scores = kv_cache["k"] @ q / np.sqrt(d)       # (L,)
+    w = np.exp(scores - scores.max()); w /= w.sum()
+    return w @ kv_cache["v"]                       # (d,)
+
+rng = np.random.default_rng(0)
+Abar, Bbar, C = rng.normal(size=(d, N)), rng.normal(size=(d, N)), rng.normal(size=(d, N))
+
+for L in [256, 4096, 65536]:
+    # SSM: state size never changes with L
+    state = np.zeros((d, N)); u = rng.normal(size=(1, d))
+    t0 = time.perf_counter()
+    for _ in range(200): state, _ = ssm_step(state, u, Abar, Bbar, C)
+    t_ssm = (time.perf_counter() - t0) / 200
+
+    # Transformer: cache holds L past tokens
+    kv = {"k": rng.normal(size=(L, d)), "v": rng.normal(size=(L, d))}
+    q = rng.normal(size=d)
+    t0 = time.perf_counter()
+    for _ in range(200): _ = attn_step(kv, q)
+    t_attn = (time.perf_counter() - t0) / 200
+
+    print(f"L={L:6d}  SSM step={t_ssm*1e6:7.1f} us   "
+          f"attn step={t_attn*1e6:8.1f} us   "
+          f"cache={kv['k'].nbytes/1e6:6.1f} MB")</code></pre>
+<div class="code-caption">A per-step latency probe. The SSM step time and state size are flat across three orders of magnitude of context, while the attention step time and cache size grow with \(L\). Run it and the constant-versus-linear split is unmistakable; this is the whole argument in one experiment.</div>
+
+<p>Run this and you see the SSM step time hold flat while the attention step time and cache size climb with \(L\). That flat line is why the same Mamba weights that trained on a workstation can step on a microcontroller: nothing about the runtime cost depends on how long the sensor has been streaming.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: an always-on hearable doing continuous activity context</h3>
+<p>A wearables team ships earbuds that infer coarse activity and head motion from an onboard IMU to steer noise cancellation, the kind of always-on inference of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>. Their first prototype used a small transformer with a 512-sample window; to keep context they either slid the window (losing the slow drift that distinguished walking from a moving vehicle) or grew a KV cache that blew the 512 KB SRAM budget within seconds. Switching the encoder to a Mamba-style block fixed the state at a few kilobytes regardless of how long the earbud had been worn, cut the per-sample energy enough to matter on a coin cell, and let the model retain minutes of context for free. Accuracy on their internal activity set moved by under a point. The win was not accuracy; it was that the constant-memory model was the only one that fit the device at all.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: benchmark both families without writing two runtimes</h3>
+<p>You do not need to hand-build the kernels to compare them fairly. With the <code>mamba-ssm</code> package and Hugging Face <code>transformers</code>, an apples-to-apples latency and memory sweep is about 8 lines: instantiate <code>MambaForCausalLM</code> and a size-matched <code>AutoModel</code>, wrap each in <code>torch.utils.benchmark.Timer</code>, and sweep the sequence length. That replaces roughly 150 lines of custom timing, cache management, and CUDA-sync bookkeeping, and it gives you the tuned fused kernels (FlashAttention on one side, the hardware-aware selective scan on the other) so neither family is unfairly hobbled by a naive implementation.</p>
+</div>
+
+<h2>On-device fit: quantization, tooling, and the honest caveats</h2>
+<p>Constant memory is necessary but not sufficient for edge deployment; the model also has to quantize cleanly and run on the runtime you actually have. Here the picture is mixed and worth stating plainly. In the model's favor: the SSM's fixed state and elementwise recurrence map naturally onto streaming, fixed-point hardware, and the absence of a growing cache removes the memory-management headache that dominates transformer edge serving. Against it: the selective SSM's internal dynamics span a wide dynamic range (the state can hold information across thousands of steps), so aggressive 8-bit quantization of the recurrence needs care, and the tooling is younger. Transformer quantization and edge runtimes (the toolchain of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> and TinyML of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>) are far more mature, with off-the-shelf converters and vendor kernels. The practical verdict: for a long-context, streaming, tightly memory-bound target, an SSM is usually the right architecture and the extra quantization effort pays for itself; for a short-context task on a platform with a polished transformer runtime, the transformer's tooling maturity can win on time-to-ship even where the SSM would be theoretically leaner.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The comparison is still moving. On the SSM side, Mamba-2 (Dao and Gu, 2024) reframes the selective scan as a structured matrix multiply to reuse the same fused, hardware-efficient kernels that made attention fast, narrowing the throughput gap on GPUs. On the evaluation side, work on associative-recall benchmarks has sharpened exactly where pure SSMs trail attention, motivating the hybrids of <a class="cross-ref" href="section-16.6.html">Section 16.6</a> that interleave a few attention layers into an SSM backbone to buy content recall at near-linear cost. For sensing specifically, the open questions are quantization-robust selective scans for microcontrollers and honest long-context benchmarks that report accuracy <em>at the deployment context length</em> rather than at a short leaderboard window. Treat any single-number claim of superiority skeptically until you see the axis and the context length it was measured at.</p>
+</div>
+
+<h2>A decision recipe</h2>
+<p>Fold the four axes into one procedure. First, fix the context length your task truly needs, not the one a benchmark used. Second, if that length is short (hundreds of samples) and the task is recall-heavy, default to a transformer and lean on its mature tooling. Third, if the length is long (thousands and up) or the target is memory-bound and always-on, default to a selective SSM and budget a little extra time for quantization. Fourth, if you need both long cheap context and sharp recall, reach for a hybrid. In every case, measure latency and memory at the real context length with the harness above, and validate accuracy on a leakage-safe split so a long window does not smuggle test information into training. The tradeoff is a measurement, not an opinion; make it one.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the latency listing to also record peak memory (state size for the SSM, cache bytes for the transformer) and plot both step time and memory against \(L\) on log-log axes for \(L\) from \(256\) to \(262144\). Fit slopes to each curve and confirm the SSM lines are flat (slope near 0) while the attention lines have slope near 1. Then pick a memory budget (say 256 KB of SRAM) and read off the maximum context each family can serve within it. Report the crossover context length where the transformer can no longer fit but the SSM still can.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can an accuracy comparison at a short, fixed context length mislead you about which family to deploy on a long streaming feed?</li>
+<li>Distinguish throughput latency from streaming step latency. Which one does an SSM win by construction, and why does that one set battery life for an always-on device?</li>
+<li>Name one axis on which a transformer genuinely still wins, and one deployment-side reason (not accuracy) you might pick a transformer even when an SSM is theoretically leaner.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-16.6.html">Section 16.6</a>, we stop choosing sides. Hybrid SSM-attention architectures interleave a majority of cheap linear-time SSM layers with a few attention layers, buying the SSM's constant-memory streaming and long context together with the transformer's sharp content-based recall, and we look at how to place those attention layers so the hybrid keeps almost all of the SSM's on-device thrift.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

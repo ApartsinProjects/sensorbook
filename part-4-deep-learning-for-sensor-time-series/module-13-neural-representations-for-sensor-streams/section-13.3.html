@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.3: Multiresolution and dilated features. Building Sensory AI." name="description"/>
+<title>Section 13.3: Multiresolution and dilated features | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Neural Representations for Sensor Streams</a></div>
+<h1>Multiresolution and dilated features</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A footstep is milliseconds, a walk is seconds, a workout is minutes. Give me one kernel and I will miss two of them."</p><cite>A Multi-Scale AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Physical processes rarely live at a single time scale. An accelerometer sees the sharp impulse of a heel strike, the roughly one-second cadence of a stride, and the slow drift of posture across a minute, all superimposed in one channel. A small convolution kernel (Section <a class="cross-ref" href="section-13.2.html">13.2</a>) sees only a narrow window of samples, so a naive stack must go very deep before any neuron can relate a fast event to its slow context. This section is about seeing many scales at once, cheaply. Two ideas do most of the work: <em>dilation</em>, which spreads a fixed-size kernel over a wide span so the receptive field grows exponentially with depth, and <em>parallel multiresolution branches</em>, which run several kernel widths side by side and let the network fuse them. Together they are the deep-learning answer to the classical multiresolution idea you met with wavelets in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>.</p>
+</div>
+
+<p>This section assumes you are comfortable with the 1D convolution and pooling machinery of Section <a class="cross-ref" href="section-13.2.html">13.2</a> and the window-as-tensor layout of Section <a class="cross-ref" href="section-13.1.html">13.1</a>. If the phrase "receptive field" is unfamiliar, it simply means the span of input samples that can influence one output value; enlarging it efficiently is the whole game here.</p>
+
+<h2>Why a single scale is never enough</h2>
+
+<p>Consider a window of \(L\) samples from a wrist accelerometer at 50 Hz. A kernel of width \(k=5\) touches 100 ms of signal. That is plenty to detect the shape of one impact but far too little to know whether the wearer is jogging or climbing stairs, distinctions that only appear over one or two full gait cycles (a second or more, roughly 50 to 100 samples). Stacking plain convolutions does grow the receptive field, but only <em>linearly</em>: with \(D\) layers of stride-1 kernels of width \(k\), the receptive field is</p>
+
+$$ R = 1 + D\,(k-1). $$
+
+<p>To cover 128 samples with \(k=3\) you would need 64 layers. That is expensive, hard to train, and wasteful, because most of those layers add resolution the task does not need. The multiresolution question is: how do we reach far-apart samples with few layers while keeping fine detail available where it matters?</p>
+
+<h2>Dilated convolutions: exponential reach for free</h2>
+
+<p><strong>What.</strong> A dilated (or atrous) convolution inserts gaps of \(d-1\) zeros between the kernel taps, so a width-\(k\) kernel with dilation \(d\) spans \((k-1)d + 1\) input samples while still using only \(k\) weights and \(k\) multiply-adds. Formally, for input \(x\) and kernel \(w\),</p>
+
+$$ y[t] = \sum_{i=0}^{k-1} w[i]\, x\big[t - i\,d\big]. $$
+
+<p><strong>Why.</strong> Stack layers whose dilation doubles, \(d = 1, 2, 4, 8, \dots\), and the receptive field grows exponentially rather than linearly:</p>
+
+$$ R = 1 + (k-1)\sum_{\ell=0}^{D-1} 2^{\ell} = 1 + (k-1)\,(2^{D}-1). $$
+
+<p>With \(k=3\), just seven stacked layers reach \(R = 255\) samples, over five seconds of that 50 Hz stream, using seven layers instead of 127. This is the WaveNet construction, and it is why dilation became the default for long-context sensor and audio models.</p>
+
+<p><strong>How.</strong> In every mainstream framework dilation is a single argument on the convolution layer; you do not build the zero-stuffed kernel yourself. The one subtlety is padding: to keep the length \(L\) fixed you pad each layer by \((k-1)d/2\) on each side (symmetric), or pad only on the left when the model must be causal (no peeking into the future), which matters for the streaming inference you will meet in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Dilation buys <em>reach</em>, not <em>resolution</em>. A single deep dilated stack can see far, but a pure doubling schedule leaves gridding artifacts: some output positions never attend to certain input phases, because the sampled taps interleave badly. The fix is to combine scales rather than rely on one ladder. Either interleave dilation cycles (1, 2, 4, 1, 2, 4) or run several widths in parallel and fuse them, which is the multiresolution-branch idea below. Reach and resolution are different resources; a good design spends on both.</p>
+</div>
+
+<h2>Parallel multiresolution branches</h2>
+
+<p>The complementary strategy runs several kernel sizes on the <em>same</em> input in parallel, then concatenates their outputs along the channel axis. A branch with \(k=3\) captures sharp transients; a branch with \(k=39\) captures slow envelope shape; the concatenation hands the next layer a feature vector that already mixes scales. This is the InceptionTime pattern for time series, itself borrowed from Inception in vision. A common trick keeps it cheap: a \(1\times1\) "bottleneck" convolution reduces the channel count before the wide kernels run, so the wide branches cost far less than their width suggests.</p>
+
+<p>Why prefer parallel branches over a deeper dilated stack? Because the network chooses, per feature, which scale is informative, instead of committing to one growth schedule. Two-second bearing vibration and 100 ms fault clicks can coexist as separate learned channels rather than fighting for the same kernel. The cost is more parameters and memory at each layer, so branches suit richer models while dilation suits long, thin, streaming ones.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: catching a bearing fault before it screams</h3>
+<p>A wind-turbine gearbox is monitored by a 20 kHz accelerometer. An incipient outer-race bearing fault shows up as short impulse trains (each impact lasts under a millisecond) that repeat at the bearing's characteristic frequency (tens of hertz), all riding on the turbine's slow one-per-revolution modulation (about 0.3 Hz). A single-scale CNN tuned to the impulses missed the periodic structure and fired on isolated electrical spikes. Swapping the first block for three parallel branches (widths 3, 11, 31) plus a dilated tail reaching about 0.5 s let one set of channels lock onto the impulse shape while others tracked the repetition envelope. False alarms on the validation fleet dropped noticeably, and the model flagged two units days before the vibration RMS crossed the classical threshold used in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Designing and reasoning about the receptive field</h2>
+
+<p>Before training anything, compute the receptive field and confirm it covers the shortest task-relevant pattern <em>and</em> its context. Under-reaching silently caps accuracy; over-reaching wastes compute and invites overfitting to window edges. The snippet below builds a small dilated stack and reports both the receptive field and the parameter count, so you can size the model on paper.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+def dilated_block(ch, k=3):
+    layers, rf, d = [], 1, 1
+    for _ in range(6):                      # dilations 1,2,4,8,16,32
+        pad = (k - 1) * d // 2              # keep length fixed
+        layers += [nn.Conv1d(ch, ch, k, padding=pad, dilation=d),
+                   nn.BatchNorm1d(ch), nn.ReLU()]
+        rf += (k - 1) * d                   # linear per layer, d doubles
+        d *= 2
+    return nn.Sequential(*layers), rf
+
+net, rf = dilated_block(ch=16, k=3)
+x = torch.randn(8, 16, 256)                 # batch, channels, time
+print("receptive field:", rf, "samples")   # -> 127
+print("output shape:", tuple(net(x).shape)) # -> (8, 16, 256), length preserved
+print("params:", sum(p.numel() for p in net.parameters()))
+</code></pre>
+<div class="code-caption">A six-layer dilation-doubling stack over a 16-channel, 256-sample window. The loop accumulates the receptive field analytically (reaching 127 samples) while symmetric padding preserves length, so you can verify coverage before spending a single training step.</div>
+
+<p>Notice that the receptive field is a property of the architecture, computed without data, whereas the <em>effective</em> receptive field (how much each input actually influences the output) is usually smaller and concentrated near the center; you inspect it empirically with the filter-visualization tools of Section <a class="cross-ref" href="section-13.7.html">13.7</a>. Sizing on paper first, then verifying, is the disciplined order.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Zero-stuffing a kernel and re-deriving the convolution by hand is dozens of lines and an easy source of off-by-one bugs. In PyTorch the entire mechanism is one keyword: <code>nn.Conv1d(ch, ch, kernel_size=3, dilation=8, padding=8)</code>. The framework handles the sparse tap placement, the padding arithmetic, and a fused CUDA kernel that never materializes the zeros. That replaces roughly 30 lines of manual striding and indexing with one, and it stays correct when you switch to causal padding for streaming.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have a 100 Hz IMU stream and must classify gestures whose longest meaningful pattern is about 1.5 seconds. (a) Using \(k=3\), find the smallest number of dilation-doubling layers whose receptive field covers 150 samples. (b) Compare the layer count and total multiply-adds against a plain (dilation-1) stack reaching the same span. (c) Redesign the first block as three parallel branches and state, in one sentence each, what physical scale each branch is meant to capture for a "wrist flick" versus a "slow circle" gesture (see <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>).</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does a pure dilation-doubling stack grow its receptive field exponentially while a plain convolution stack grows it only linearly, and what does dilation <em>not</em> improve?</li>
+<li>What are "gridding" artifacts in a dilated stack, and name one design change that mitigates them?</li>
+<li>When would you choose parallel multiresolution branches over a single deeper dilated stack, given a fixed compute and memory budget?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-13.4.html">Section 13.4</a>, we ask where the filters themselves should come from. Dilation and multiresolution decide <em>which spans</em> a kernel sees; the next section weighs learned filterbanks against fixed ones (Mel banks, wavelets, gammatone filters) and shows when handing the network a physics-informed front end beats letting it discover everything from scratch.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

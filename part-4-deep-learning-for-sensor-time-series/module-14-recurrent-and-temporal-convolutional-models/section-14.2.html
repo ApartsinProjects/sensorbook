@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.2: Temporal convolutional networks. Building Sensory AI." name="description"/>
+<title>Section 14.2: Temporal convolutional networks | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>Temporal convolutional networks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The recurrent net made me read the recording one sample at a time, like a ledger. The convolution let me read the whole page at once and still promise I never peeked at tomorrow."</p>
+<cite>A Newly Parallelized AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The recurrent models of <a class="cross-ref" href="section-14.1.html">Section 14.1</a> carry a hidden state forward one time step at a time, which is elegant but forces every training step to unroll the sequence sequentially and makes long-range gradients fragile. The temporal convolutional network (TCN) is the convolutional answer to the same problem: it stacks <em>causal</em>, <em>dilated</em>, <em>residual</em> 1D convolutions into a deep model that reads a whole window in parallel, sees seconds of context, and still guarantees it never looks into the future. On many sensor tasks a TCN matches or beats an LSTM while training several times faster and deploying with a fixed, predictable memory footprint. This section assembles the TCN as a complete architecture: what its three ingredients are, why each one earns its place, and when a TCN is the right first model to reach for on a sensor stream.</p>
+</div>
+
+<p>This section builds directly on the 1D convolution, receptive field, and causal-padding ideas from <a class="cross-ref" href="../module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, and it treats the sample-rate and arrow-of-time constraints as given from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. We keep the book's notation: a window is \(x \in \mathbb{R}^{C \times T}\) with \(C\) channels and \(T\) time steps. The detailed arithmetic of how dilation grows the receptive field is the whole subject of the next section, so here we introduce dilation only far enough to explain the architecture and defer the sizing math to <a class="cross-ref" href="section-14.3.html">Section 14.3</a>.</p>
+
+<h2>Three ingredients: causal, dilated, residual</h2>
+<p>A TCN is defined by combining three properties, each fixing a specific weakness of a naive convolutional stack. <strong>Causal</strong> convolutions pad only on the left, so the output at time \(t\) depends on inputs at or before \(t\) and never after. This is not decoration: a streaming fall detector or a live arrhythmia monitor must produce \(z[t]\) from the past alone, and a symmetric-padding model that trained on future samples will silently leak the answer (the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applies to architecture, not just to splits). <strong>Dilated</strong> convolutions insert gaps of \(d\) samples between the kernel taps, so a length-\(K\) kernel spans \(d(K-1)+1\) input samples while still touching only \(K\) weights. Stacking layers with dilation doubling as \(d = 1, 2, 4, 8, \dots\) makes the receptive field grow exponentially with depth, which is how a compact TCN reaches the seconds-long context a sensor task needs without the linear, parameter-hungry depth a plain stack would demand. <strong>Residual</strong> connections wrap each pair of dilated convolutions in a skip path, so the block learns a correction rather than a full transform; this keeps gradients healthy through the deep stack that the exponential dilation schedule requires.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">A TCN trades sequential depth for parallel depth</h3>
+<p>An LSTM's path length between an input at time \(0\) and an output at time \(T\) is \(T\) sequential steps, which is exactly why its gradients struggle and its training cannot parallelize over time. A TCN's path length to the same output is the number of <em>layers</em>, typically a dozen or so, regardless of \(T\). Every output for the whole window is computed at once as a batched convolution, so the GPU stays saturated and training wall-clock drops. You pay for this with a <em>fixed</em> receptive field: an LSTM can in principle remember arbitrarily far back, while a TCN sees exactly as far as its dilation schedule was built to reach and not one sample further.</p>
+</div>
+
+<h2>The residual block, concretely</h2>
+<p>The canonical TCN block, from Bai, Kolter, and Koltun's 2018 sequence-modeling study, chains two dilated causal convolutions, each followed by a nonlinearity and a regularizer, then adds the block input back through a skip connection. Written for one block at dilation \(d\),</p>
+$$y = \mathrm{ReLU}\!\big(x + \mathcal{F}_d(x)\big), \qquad \mathcal{F}_d = \mathrm{Drop}\circ\mathrm{ReLU}\circ\mathrm{WN\text{-}Conv}_d \circ \mathrm{Drop}\circ\mathrm{ReLU}\circ\mathrm{WN\text{-}Conv}_d,$$
+<p>where \(\mathrm{WN\text{-}Conv}_d\) is a weight-normalized dilated causal convolution and \(\mathrm{Drop}\) is dropout. When the block changes channel count, the skip path uses a \(1\times1\) convolution so the addition is shape-compatible. The <em>why</em> of each piece is worth stating: weight normalization stabilizes the deep stack, dropout on the temporal features guards against a model that memorizes one subject's idiosyncrasy, and the residual add is what lets you keep stacking blocks until the receptive field covers your physics. A full TCN is simply \(B\) of these blocks with dilations \(1, 2, 4, \dots, 2^{B-1}\), optionally repeated for extra capacity, then a task head. That head is a global pool plus a linear layer for sequence-to-label, or a per-step \(1\times1\) convolution for sequence-to-sequence, the distinction we develop in <a class="cross-ref" href="section-14.4.html">Section 14.4</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Bearing fault detection on a factory motor</h3>
+<p>A condition-monitoring team (the setting of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) streams a single accelerometer on a pump motor at 12 kHz. An incipient bearing fault shows up as a faint impulse train whose spacing corresponds to the ball-pass frequency, but the impulses are buried in broadband vibration and separated by tens of milliseconds, hundreds of samples apart. Their first attempt with an LSTM trained for two days and still smeared the impulse timing. A 8-block TCN with kernel \(K=7\) and doubling dilation reaches a receptive field of over 1,500 samples (about 0.13 s), wide enough to span several inter-impulse gaps, and it trains in a few hours because every window convolves in parallel. Because the impulses are periodic, the dilated filters effectively learn the matched, comb-like detector the classical spectral analysis of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> would have hand-designed, but tuned to this motor's actual signature.</p>
+</div>
+
+<p>The code below builds one residual block and a small TCN, then prints how the receptive field and tensor shape behave. It makes the causal padding explicit by chopping off the extra left-pad samples so the output stays exactly length \(T\), the detail most from-scratch implementations get wrong.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class Chomp1d(nn.Module):
+    def __init__(self, s): super().__init__(); self.s = s
+    def forward(self, x): return x[:, :, :-self.s].contiguous() if self.s else x
+
+class TCNBlock(nn.Module):
+    def __init__(self, c_in, c_out, k, d, p=0.1):
+        super().__init__()
+        pad = (k - 1) * d                      # left-pad, then chomp -> causal
+        def conv(ci): return nn.Sequential(
+            nn.utils.weight_norm(nn.Conv1d(ci, c_out, k, padding=pad, dilation=d)),
+            Chomp1d(pad), nn.ReLU(), nn.Dropout(p))
+        self.net = nn.Sequential(conv(c_in), conv(c_out))
+        self.down = nn.Conv1d(c_in, c_out, 1) if c_in != c_out else None
+    def forward(self, x):
+        res = x if self.down is None else self.down(x)
+        return torch.relu(self.net(x) + res)
+
+class TCN(nn.Module):
+    def __init__(self, c_in=1, width=32, blocks=8, k=7, n_classes=4):
+        super().__init__()
+        layers, ci = [], c_in
+        for b in range(blocks):
+            layers.append(TCNBlock(ci, width, k, d=2 ** b)); ci = width
+        self.tcn = nn.Sequential(*layers)
+        self.head = nn.Linear(width, n_classes)
+    def forward(self, x):                       # x: (batch, 1, T)
+        z = self.tcn(x)                         # -> (batch, width, T), causal
+        return self.head(z[:, :, -1])           # last-step readout for a label
+
+x = torch.randn(8, 1, 2048)
+rf = 1 + 2 * (7 - 1) * (2 ** 8 - 1)             # kernel 7, 8 doubling dilations
+print(TCN()(x).shape, "receptive field:", rf)   # torch.Size([8, 4]) 3061</code></pre>
+<div class="code-caption">A from-scratch TCN: each <code>TCNBlock</code> applies two weight-normalized dilated causal convolutions with a residual skip, <code>Chomp1d</code> trims the left padding to keep outputs causal and length-preserving, and doubling dilation across 8 blocks yields a 3,061-sample receptive field from kernel size 7.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The whole stack in a few lines</h3>
+<p>The block above, the chomp bookkeeping, the dilation schedule, and the residual downsampling add up to roughly 40 lines that are easy to get subtly wrong (an off-by-one in the chomp leaks the future). The <code>pytorch-tcn</code> package exposes the same architecture as a single <code>TCN(num_inputs, num_channels, kernel_size, dilations)</code> module with a documented <code>causal=True</code> flag and built-in streaming-inference support, replacing the ~40 lines with about 3 and handling the causal padding, weight norm, and residual wiring for you. Reach for it once you have understood the block; write it by hand once so you know what the flag is protecting you from.</p>
+</div>
+
+<h2>When to reach for a TCN</h2>
+<p>A TCN is the strong default when three conditions hold: the discriminative context is bounded and you can name it in milliseconds, you have a GPU and want fast training, and you need the deployment-time predictability of a fixed compute and memory cost per window. It shines on periodic or impulsive sensor signals (gait, vibration, ECG) where the receptive field can be sized to the physics. It is the wrong tool when the relevant context is genuinely unbounded or its length varies wildly, because a TCN can only see as far as it was built to; there an attention model (<a class="cross-ref" href="../module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) or a linear-time state-space model (<a class="cross-ref" href="../module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) will serve better. Whichever you pick, evaluate it with subject-wise, chronological splits: a TCN's causal design earns an honest streaming number only if the split does not hand it future data through the back door.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: size a TCN to the signal</h3>
+<p>You must classify sleep stages from a single-channel EEG sampled at 100 Hz, and a sleep spindle, the event you care about, lasts up to 3 seconds. (1) Using kernel size \(K=5\) and doubling dilation \(d = 1, 2, 4, \dots\), how many residual blocks do you need before one output can see a whole 3-second spindle? Use the receptive-field expression \(1 + 2(K-1)(2^{B}-1)\) for \(B\) blocks. (2) State the parameter count's dependence on \(B\) versus on the window length \(T\), and explain why that dependence is the TCN's headline advantage over a plain stack. (3) Would you change \(K\) or the number of blocks if you moved to 200 Hz, and why?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Name the three defining ingredients of a TCN and state the specific failure each one prevents.</li>
+<li>An LSTM and a TCN have the same accuracy on your task, yet the TCN trains four times faster. Explain the mechanism in terms of path length and parallelism over the time axis.</li>
+<li>A teammate removes the <code>Chomp1d</code> step to "save a line." What property of the model breaks, and how would it inflate the offline validation score relative to live streaming performance?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-14.3.html">Section 14.3</a>, we open up the dilation machinery we used here only as a black box: we derive exactly how kernel size, dilation schedule, and depth combine into a receptive field, show how to size that field to a target duration of physics, and expose the coverage gaps a careless dilation schedule leaves inside its own window.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.6: Irregular and asynchronous sampling. Building Sensory AI." name="description"/>
+<title>Section 14.6: Irregular and asynchronous sampling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Deep Learning for Sensor Time Series</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Recurrent and Temporal Convolutional Models</a></div>
+<h1>Irregular and asynchronous sampling</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I was trained on a metronome and deployed at a jazz club. Nobody told the samples to arrive on the beat."</p><cite>A Rhythmically Challenged AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The clock is a modeling assumption, and sensors break it</h3>
+<p>Every architecture so far in this chapter, the LSTM of <a class="cross-ref" href="section-14.1.html">Section 14.1</a>, the temporal convolution of <a class="cross-ref" href="section-14.2.html">Section 14.2</a>, and the dilation stacks of <a class="cross-ref" href="section-14.3.html">Section 14.3</a>, silently assumes that the step from index \(t\) to \(t+1\) is a fixed slice of wall-clock time. Real sensor streams violate this constantly: a duty-cycled accelerometer sleeps to save battery, a BLE packet is dropped, an ICU nurse charts a lab value only when it is ordered, and three sensors on the same bus each run their own free clock. When the gap between samples carries information, treating the index as time throws that information away and, worse, forces you to interpolate data you never measured. This section is about making the elapsed time \(\Delta t\) a first-class input rather than an ignored assumption.</p>
+</div>
+
+<p>This section assumes you understand sampling, jitter, and clock synchronization at the physical level from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and that you can build the recurrent and convolutional encoders from the earlier sections of this chapter. It also leans on the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because irregular data offers new and creative ways to leak the future into the past.</p>
+
+<h2>Where irregularity comes from, and why you cannot ignore it</h2>
+<p>Irregular sampling is not one problem; it is a family. <strong>Event-driven</strong> sensors emit a reading only when something crosses a threshold, so quiet periods produce no samples at all, the extreme case being the event cameras of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-46-event-based-and-neuromorphic-sensing/index.html">Chapter 46</a>. <strong>Power-managed</strong> sensors duty-cycle: the device sleeps for a variable interval, so the gap itself encodes a scheduling decision. <strong>Lossy transport</strong>, typical of Bluetooth Low Energy wearables, drops packets under radio contention, leaving ragged holes in an otherwise uniform stream. <strong>Asynchronous multi-rate fusion</strong> combines a 100 Hz IMU, a 1 Hz GPS fix, and an event-triggered barometer, each on its own clock, so there is no single grid onto which all channels naturally fall. And <strong>human-triggered</strong> records, most clinical data, appear when a measurement was clinically warranted, which means the sampling pattern is itself a signal about patient state.</p>
+<p>The tempting fix, resample everything to a uniform grid and pretend, is dangerous for two reasons. First, upsampling by interpolation fabricates measurements: a linear fill between two blood-pressure readings twelve hours apart invents a smooth trend the patient may never have had, and a forward-fill can carry a stale value across a state change. Second, the interpolation kernel can straddle the split boundary and leak future information backward, exactly the trap flagged in the forecasting discussion of <a class="cross-ref" href="section-14.4.html">Section 14.4</a>. The gap length is often the most predictive feature you own, and resampling deletes it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Missingness is a measurement, not a hole to be filled</h3>
+<p>In human-triggered and event-driven streams, <em>the decision to sample</em> is correlated with the latent state. A lab drawn every hour signals a sicker patient than one drawn daily. So the informative representation is not just the imputed value; it is the triple of value, elapsed time since the last observation of that channel, and a binary mask marking whether this timestep is a real reading or a placeholder. Feed all three. Models that see the mask and \(\Delta t\) routinely beat models handed a cleanly interpolated series, because the imputation destroyed the signal that the gap pattern carried.</p>
+</div>
+
+<h2>Three ways to make a model time-aware</h2>
+<p>The cheapest intervention is <strong>time as a feature</strong>: append the elapsed interval \(\Delta t_i = s_i - s_{i-1}\) (where \(s_i\) is the timestamp of sample \(i\)) as an extra input channel, and often the observation mask alongside it. A vanilla GRU or TCN can then learn to modulate its update on the gap. This is a one-line change and a strong baseline, though the model must discover the right functional form of the gap on its own.</p>
+<p>The principled recurrent answer is a <strong>time-decayed state</strong>. The GRU-D and T-LSTM families make the hidden state <em>forget as a function of elapsed time</em>: between two observations the memory decays toward a learned baseline, fast for channels that go stale quickly (heart rate) and slow for those that persist (a chronic diagnosis). A common decay is</p>
+$$\gamma_i = \exp\!\big(-\max(0,\; w\,\Delta t_i + b)\big), \qquad h_i^{-} = \gamma_i \odot h_{i-1},$$
+<p>with the decayed state \(h_i^{-}\) fed into the usual gated update. When \(\Delta t_i\) is small, \(\gamma_i \approx 1\) and nothing changes; when the gap is long, the state relaxes toward its prior, which is exactly the behavior a Kalman prediction step exhibits between measurements in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>.</p>
+<p>The most expressive answer models the hidden state as a <strong>continuous-time trajectory</strong>. ODE-RNNs and latent-ODE models evolve \(h(t)\) by a learned ordinary differential equation \(\mathrm{d}h/\mathrm{d}t = f_\theta(h)\) between observations, then jump the state at each arrival with a standard recurrent update. Because the dynamics are defined for every real \(t\), the model is genuinely grid-free: you can query it at any timestamp, interpolate and extrapolate within one framework, and handle wildly uneven spacing without a single imputed value. This continuous-time viewpoint connects directly to the linear-time state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>, several of which are discretizations of exactly this kind of continuous system.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class GRUDecayCell(nn.Module):
+    """Minimal GRU-D-style cell: hidden state decays with the elapsed gap."""
+    def __init__(self, in_dim, hid):
+        super().__init__()
+        self.gru = nn.GRUCell(in_dim, hid)
+        self.w = nn.Parameter(torch.zeros(hid))   # per-unit decay rate
+        self.b = nn.Parameter(torch.zeros(hid))
+
+    def forward(self, x_t, dt_t, h):
+        # dt_t: (batch, 1) elapsed time since previous sample, in seconds
+        gamma = torch.exp(-torch.relu(self.w * dt_t + self.b))  # (batch, hid)
+        h_decayed = gamma * h                                   # forget by gap
+        return self.gru(x_t, h_decayed)
+
+cell = GRUDecayCell(in_dim=4, hid=16)
+h = torch.zeros(2, 16)
+# two irregular samples: a 0.1 s gap, then a 30 s gap
+for x, dt in [(torch.randn(2, 4), torch.full((2, 1), 0.1)),
+              (torch.randn(2, 4), torch.full((2, 1), 30.0))]:
+    h = cell(x, dt, h)
+print(h.shape)  # torch.Size([2, 16])</code></pre>
+<div class="code-caption">A GRU-D-style decay cell. The load-bearing line is <code>gamma = exp(-relu(w*dt + b))</code>: it shrinks the retained state as the gap grows, per hidden unit, so channels that go stale fast decay fast. Passing the raw index instead of <code>dt_t</code> would recover the ordinary GRU and discard all timing information.</div>
+
+<p>The code above shows the decay applied to two samples spaced 0.1 s and 30 s apart; the second update starts from a heavily faded memory, which is the whole point.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Continuous-time RNNs without hand-writing the solver</h3>
+<p>Implementing an ODE-RNN from scratch means writing an adaptive-step solver and its adjoint for backpropagation, easily 200-plus lines of careful numerics. The <code>torchdiffeq</code> library reduces the state evolution to a single call, <code>odeint(f, h0, t)</code>, which integrates the learned dynamics between your observation timestamps and returns gradients through the solver automatically. You supply the ~15-line dynamics module \(f_\theta\) and the arrival times; the library owns step-size control, stiffness handling, and the adjoint. What was a numerics project becomes a modeling choice.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The duty-cycled fall detector that woke up confused</h3>
+<p>A wearable team built a fall detector on a 50 Hz accelerometer and, to stretch battery life, added an aggressive sleep mode: after ten seconds of stillness the sensor dropped to 5 Hz until motion resumed. Their TCN, trained on continuous 50 Hz windows, treated the post-sleep samples as if they were 20 ms apart when they were 200 ms apart, so a genuine stumble looked like an implausibly violent spike and tripped false alarms every morning as users got out of bed. The fix was not a bigger model. They fed \(\Delta t\) per sample and switched the recurrent core to a time-decayed GRU, so the network learned that a large gap means "I have been asleep, expect a rate change" rather than "the world just accelerated." False positives fell by more than half with no change to the sensor firmware, and the design generalized to the human-activity pipelines of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+</div>
+
+<h2>Asynchronous multi-sensor streams, and the leakage traps</h2>
+<p>When several channels each fire on their own clock, you have two structural choices. <strong>Union-of-timestamps</strong> builds one merged sequence over every arrival time across all sensors; at each row, exactly one channel (or a few) is real and the rest are masked, and per-channel \(\Delta t\) tells the model how stale each masked entry is. This preserves the true event order and is the natural input for a decay or ODE model. <strong>Set-based</strong> encoders drop the grid entirely and treat the record as an unordered set of (time, channel, value) tuples, which is the door into the attention-based sensor models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, where a learned positional encoding of the timestamp replaces the grid outright.</p>
+<p>Two evaluation traps deserve a warning label. First, any statistic computed for imputation, a channel mean, a decay baseline, a normalization scale, must be estimated on the training split only, or the test set's future bleeds into training exactly as it would for the continuous-health monitors of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-33-continuous-and-contactless-health-monitoring/index.html">Chapter 33</a>. Second, and subtler: if the sampling times themselves are correlated with the label (a lab ordered <em>because</em> the clinician already suspected the outcome), then the timestamp pattern can be a shortcut feature that will not exist at prediction time. Audit whether \(\Delta t\) is a legitimate predictor or a leak of the very decision you are trying to anticipate.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: prove the gap carries signal</h3>
+<p>Take any duty-cycled or packet-dropped sensor stream (or simulate one by randomly deleting 40% of a uniform series). Train three models on a downstream label: (a) linear-interpolated to a uniform grid with no gap feature, (b) the same grid plus a per-timestep observation mask and \(\Delta t\) channel, and (c) a GRU-D-style decay cell like the one above. Report the metric gap between (a) and (b), then between (b) and (c). Then deliberately shuffle the \(\Delta t\) values across timesteps and retrain (c); if performance collapses, you have empirically shown the timing pattern, not just the values, drove the model.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why can forward-filling a slowly-sampled clinical variable actively hurt a model rather than merely add noise?</li>
+<li>In the decay \(\gamma_i = \exp(-\max(0, w\,\Delta t_i + b))\), what does the network's behavior reduce to as \(\Delta t_i \to 0\), and why is that the desired limit?</li>
+<li>Give one scenario where the sampling timestamps are a leakage shortcut rather than a legitimate feature.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-14.7.html">Section 14.7</a>, we assemble everything from this chapter, the recurrent and convolutional cores, the streaming state, and the irregular-time inputs, into practical training recipes: how to window, normalize, batch ragged sequences, schedule learning rates, and regularize sensor models so they actually train stably and survive contact with a live deployment.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
