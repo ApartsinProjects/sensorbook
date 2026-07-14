@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 65.1: Task metrics vs operational metrics. Building Sensory AI." name="description"/>
+<title>Section 65.1: Task metrics vs operational metrics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 65: Evaluation Protocols and Leakage-Safe Benchmarking</a></div>
+<h1>Task metrics vs operational metrics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My F1 score was 0.97. The night shift still turned me off. Nobody in the report explained why those two facts were allowed to coexist."</p>
+<cite>A Decommissioned AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the confusion-matrix vocabulary (precision, recall, ROC, PR curves) and the notion of a decision threshold from the probability primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, plus the leakage-safe dataset discipline introduced in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The full catalogue of metric definitions lives in Appendix F (Evaluation Metrics); we do not re-derive them here. We build directly on those, so this section is about which numbers to report and why, not how to compute a ROC curve from scratch.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A model has two audiences and they ask different questions. The machine-learning audience asks "how well does the classifier separate the labels?" and is answered by <strong>task metrics</strong>: accuracy, F1, AUROC, mean absolute error. The operations audience, the on-call engineer, the clinician, the plant manager, asks "if I deploy this, what will it cost me per shift?" and is answered by <strong>operational metrics</strong>: alerts per day, mean time between false alarms, missed-event rate at a fixed staffing budget, latency, and the dollar or risk value of each outcome. A model can be excellent on the first scoreboard and unusable on the second. This section teaches you to always report both, aligned, so the gap between them becomes visible before deployment instead of after.</p>
+</div>
+
+<h2>Why a task metric can lie about the field</h2>
+<p>A task metric summarizes label separation on a held-out set under an implicit set of assumptions: the test distribution matches deployment, every error costs the same, and the operating threshold is whatever maximized the metric. Sensor systems violate all three routinely. The consequence is a number that is true about the test file and false about the running product.</p>
+<p>Consider the arithmetic that a threshold-free score hides. Fall detection on a wrist wearable might report an AUROC of \(0.98\), which sounds like a solved problem. But falls are rare. Suppose a genuine fall occurs about once per user-month while the device evaluates a candidate window every few seconds, so the negative class outnumbers the positive by something like \(10^{6}\) to one. Even a very good operating point with a false-positive rate of \(0.1\%\) then produces roughly \(10^{6} \times 0.001 = 1000\) false alarms for each real fall. The AUROC did not lie about ranking; it simply never mentioned that the base rate turns a small error rate into a wall of nuisance alerts. The operational metric that exposes this is the <em>precision at the deployed threshold</em>, or equivalently the false-alarm count per user per week, and it is the number the product team actually lives with. This base-rate trap returns in force in <a class="cross-ref" href="section-65.4.html">Section 65.4</a>.</p>
+<p>The general move is to compute the metric the user experiences, not the one the loss function optimized. That almost always means fixing a real operating point (a threshold, a staffing budget, a latency ceiling) and reading off the consequence in the units the operator counts.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Task metrics are threshold-agnostic and cost-agnostic by design, which is exactly why they travel poorly to the field. The moment you deploy, you pick one threshold and every error acquires a specific cost. An operational metric is just a task metric evaluated at the real operating point and re-expressed in the operator's currency: alerts per shift, missed events per year, milliseconds of latency, dollars per false dispatch. Reporting AUROC without the deployed operating point is reporting the average of a decision you have not yet made.</p>
+</div>
+
+<h2>Building the bridge: operating points and cost curves</h2>
+<p>The bridge from task to operations has three planks. First, <strong>fix the operating point the way the deployment will</strong>. If the on-call team can absorb five alerts per shift, then the threshold is whatever yields five alerts per shift on representative data, and you report recall <em>at that budget</em>, not the recall that maximizes F1. Second, <strong>attach a cost to each cell of the confusion matrix</strong>. Let \(c_{\text{FP}}\) be the cost of a false alarm (a wasted truck roll, an unnecessary clinical review) and \(c_{\text{FN}}\) the cost of a miss (an unplanned outage, a missed arrhythmia). The expected operational cost per window at threshold \(\tau\) is</p>
+$$ \mathbb{E}[\text{cost}](\tau) = c_{\text{FP}}\,(1-\pi)\,\text{FPR}(\tau) + c_{\text{FN}}\,\pi\,\bigl(1-\text{TPR}(\tau)\bigr), $$
+<p>where \(\pi\) is the event base rate. The optimal threshold minimizes this quantity, and it is generally nowhere near the F1-maximizing point when \(c_{\text{FN}} \gg c_{\text{FP}}\) or when \(\pi\) is tiny. Third, <strong>express latency and throughput as first-class metrics</strong>. A predictive-maintenance model that flags a bearing failure two hours before it happens is worthless if the crew needs a two-day lead time to source the part; the operational metric is not "did it detect the fault" but "did it detect the fault with enough lead time to act," a horizon that connects directly to the prognostics work in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: an ICU arrhythmia monitor that passed the benchmark and failed the ward</h4>
+<p>A cardiac team validates a PPG-based atrial-fibrillation detector (the modeling side is developed in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>). On the retrospective test set it reports sensitivity \(0.95\) and specificity \(0.95\), and the paper is accepted. On the ward, each monitored bed produces a reading every few seconds. With AF genuinely present in only about \(2\%\) of windows, the \(5\%\) false-positive rate dominates: for every true AF window flagged, the nurses see roughly \(\tfrac{0.95 \times 2}{0.05 \times 98} \approx\) two-to-one <em>against</em> the alarm being real, so more than half of all alarms are false. Across forty beds this is hundreds of false alarms per shift. The operational metric that mattered, positive predictive value at the deployed prevalence and its consequence, alarm fatigue, was invisible in sensitivity and specificity. The fix was not a better model but a re-report: the team fixed an alarms-per-bed-per-hour budget, tuned the threshold and a temporal persistence rule to meet it, and only then measured the sensitivity that survived. The number dropped from \(0.95\) to \(0.88\), and the deployment became viable precisely because the honest operating point was now on the table.</p>
+</div>
+
+<h2>What to report: paired task and operational metrics</h2>
+<p>The discipline is simple to state and easy to skip: never report a task metric alone. Report it paired with the operational metric that shares its operating point, computed in one pass on one configuration so the two numbers are genuinely about the same decision. A leaderboard row for a sensor model should read like a small table, not a single headline. AUROC pairs with "false alarms per device per week at the chosen threshold." Mean absolute error on a regression pairs with "fraction of predictions inside the tolerance band the controller can act on." Detection latency pairs with "lead time relative to the action deadline." The pairing is what makes the row actionable and what makes leakage-inflated numbers, the subject of the rest of this chapter, harder to hide behind.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def operational_report(scores, labels, cost_fp, cost_fn, base_rate,
+                       alerts_budget_per_day, windows_per_day):
+    """Pick the threshold that meets an alert budget, then report
+    the task metric AND the operational consequence at that point."""
+    order = np.argsort(-scores)                 # rank by score, high first
+    s, y = scores[order], labels[order]
+    # Threshold that yields the allowed number of alerts per day
+    frac_allowed = alerts_budget_per_day / windows_per_day
+    k = max(1, int(frac_allowed * len(s)))
+    tau = s[k - 1]
+    pred = scores >= tau
+    tp = np.sum(pred & (labels == 1)); fp = np.sum(pred & (labels == 0))
+    fn = np.sum(~pred & (labels == 1))
+    recall = tp / max(tp + fn, 1)               # task metric at this point
+    precision = tp / max(tp + fp, 1)
+    fpr = fp / max(np.sum(labels == 0), 1)
+    exp_cost = (cost_fp * (1 - base_rate) * fpr
+                + cost_fn * base_rate * (1 - recall))   # operational metric
+    return dict(threshold=float(tau), recall=round(recall, 3),
+                precision=round(precision, 3),
+                alerts_per_day=round(fpr * (1 - base_rate) * windows_per_day, 1),
+                expected_cost=round(float(exp_cost), 4))
+
+rng = np.random.default_rng(0)
+labels = (rng.random(200_000) < 0.01).astype(int)        # 1% base rate
+scores = np.clip(rng.normal(labels * 1.6, 1.0), -5, 6)   # noisy detector
+print(operational_report(scores, labels, cost_fp=1, cost_fn=200,
+                         base_rate=0.01, alerts_budget_per_day=20,
+                         windows_per_day=200_000))
+</code></pre>
+<div class="code-caption">Code 65.1.1: A minimal paired report. Rather than maximizing F1, it fixes the threshold to the operator's alert budget (20 alerts/day), then returns the task metric (recall, precision) and the operational metrics (alerts per day, expected cost) at that single operating point. The high <code>cost_fn</code> reflects that a miss here costs 200x a false alarm, so the reported recall is the number that actually governs the deployment decision.</div>
+
+<p>Code 65.1.1 makes the pairing mechanical: the threshold is chosen by the budget, and every returned number is read at that threshold. Swapping in the true \(c_{\text{FP}}\), \(c_{\text{FN}}\), and base rate for your domain turns the last field into a decision-grade quantity rather than a benchmark trophy.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let a library sweep the operating points</h3>
+<p>Computing precision, recall, and cost across a full threshold sweep by hand is a dozen lines of index-juggling per metric. <code>scikit-learn</code>'s <code>precision_recall_curve</code>, <code>roc_curve</code>, and <code>make_scorer</code> collapse the sweep and the cost-weighting into two or three calls, and <code>average_precision_score</code> gives the base-rate-aware summary the ICU example needed. That is roughly a 30-line reduction to about 3 lines, with the vectorized threshold sweep, tie handling, and interpolation all handled for you. Write the paired-report wrapper once (as in Code 65.1.1); let the library do the curve arithmetic underneath it.</p>
+</div>
+
+<h2>When the two metrics diverge, trust the operational one</h2>
+<p>A healthy divergence between task and operational metrics is diagnostic, not embarrassing. When AUROC is high but alerts-per-shift is intolerable, the model ranks well and the base rate is punishing: the answer is a persistence rule, a higher threshold, or a two-stage cascade, not a bigger network. When mean absolute error is low but the controller still oscillates, the errors are concentrated exactly where the tolerance band is tight: report error <em>conditioned on the operating region</em>. When latency is the binding constraint, no accuracy gain matters until the model fits the deadline, which is why the edge-deployment chapters (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>) treat latency budgets as a first-class evaluation axis. In every case the operational metric is closer to the money and the risk, so when the two disagree, it is the operational number that decides whether to ship.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a gesture-recognition wearable that emits a classification every 200 ms and triggers a device command on a positive. The true gesture occurs about 30 times per day; a false trigger annoys the user, and three false triggers in a session cause them to disable the feature. (a) Estimate the windows per day and the base rate. (b) Using Code 65.1.1 as a template, find the alert budget that keeps expected false triggers under one per two-hour session, and report the recall that survives it. (c) Argue in two sentences why the F1-maximizing threshold would be the wrong one to ship, and name the operational metric you would put on the datasheet instead.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>A detector reports AUROC \(0.99\) but the ops team refuses to deploy it. Give two distinct operational reasons this is consistent, and name the metric that would have surfaced each one before deployment.</li>
+<li>Why does a low base rate make precision, not recall, the metric most likely to collapse in the field, even when the ROC curve looks excellent?</li>
+<li>You are handed a single F1 score for a fault detector. What three additional facts do you need before you can predict the cost of running it for a month?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-65.2.html">Section 65.2</a>, we turn from <em>which</em> metrics to report to <em>how</em> to split the data so those metrics are honest. A beautiful paired report is still a fiction if the same user, site, device, or session leaks across the train and test folds, and we will see why the naive random split silently inflates every number this section taught you to compute.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

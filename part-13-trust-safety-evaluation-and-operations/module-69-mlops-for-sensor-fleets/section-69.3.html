@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.3: Monitoring drift and data quality. Building Sensory AI." name="description"/>
+<title>Section 69.3: Monitoring drift and data quality | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Monitoring drift and data quality</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The dashboard was all green. Every gauge read healthy, every pipeline was fresh, no batch was ever rejected. The model had been wrong for six weeks. Nobody was watching the shape of the numbers, only their presence."</p>
+<cite>A Vigilant AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the distribution-shift taxonomy (covariate, label, and concept shift) developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, the classical change-detection machinery (CUSUM, sliding windows) of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and the divergence and hypothesis-testing vocabulary from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. It assumes the data contract of <a class="cross-ref" href="section-69.1.html">Section 69.1</a> already catches gross schema and unit violations; here we watch for the subtler shifts that pass the contract but still move the input distribution away from what the model was trained on.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A model deployed on a sensor fleet decays not because its weights change but because the world changes underneath them. Seasons shift the ambient temperature a gas sensor bakes in; a phone OS update resamples the accelerometer; a new cohort of users wears the watch tighter; a factory retools a line. None of these trip a contract check, because the data is still well-formed, in-range, and on time. Monitoring for drift and data quality is the practice of watching the <em>statistical shape</em> of the inputs and predictions, not just their presence, so you learn that the operating distribution has moved before your users learn it through wrong answers. This section is about the detectors that turn "the numbers look different this week" into a quantified, thresholded, alertable signal, and about the discipline of running those detectors across thousands of devices without drowning in false alarms.</p>
+</div>
+
+<h2>Three kinds of drift, and why you monitor each differently</h2>
+<p>"Drift" is a bucket word for three distinct phenomena, and conflating them is the most common monitoring mistake. <strong>Input drift</strong> (covariate shift) is a change in the distribution of the features, \(P(x)\): the accelerometer now sees a population that walks slower, or the microphone sits in a noisier room. <strong>Prediction drift</strong> (label shift, seen through the model) is a change in the distribution of the model's outputs, \(P(\hat{y})\): the fall-detector suddenly fires twice as often. <strong>Concept drift</strong> is a change in the relationship itself, \(P(y \mid x)\): the same vibration signature that meant "healthy bearing" last year now means "early wear" because the lubricant was reformulated. These are ordered by how easily you can see them. Input and prediction drift are computable from data you already have at inference time, with no labels at all. Concept drift is invisible to any input-only monitor: the inputs can look identical while the correct answer has silently changed, which is exactly why it is dangerous and why the proxy-and-delayed-label machinery of the next section exists.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Drift detection is not the same as detecting a performance drop, and treating them as interchangeable will burn you in both directions. Inputs can drift substantially with no accuracy loss (the model generalizes fine to the new distribution), producing false alarms; and accuracy can collapse under concept drift with the input distribution completely unchanged, producing false calm. An input-drift monitor is therefore an <em>early-warning</em> and <em>attribution</em> tool, not a substitute for measuring performance. You run it because it needs no labels and fires in minutes, while a true accuracy measurement may need ground truth that arrives days later or never. Read every drift alert as "the assumptions behind the last validated accuracy number may no longer hold," not as "the model is now wrong."</p>
+</div>
+
+<h2>Data quality is a separate axis from drift</h2>
+<p>Before you measure whether a distribution moved, confirm the data describing it is trustworthy, because a broken pipeline mimics drift perfectly. Data-quality monitors are cheap, unglamorous, and catch most real incidents. <strong>Freshness</strong>: what is the lag between a reading's timestamp and its arrival, and is any device silent past its expected cadence? <strong>Completeness</strong>: what fraction of expected samples actually arrived per window, and is the missingness pattern random or structured (one firmware version, one geography, one time of day)? <strong>Plausibility beyond the contract</strong>: flat-line runs, impossible slew rates, a channel that has not changed a bit in an hour. <strong>Duplication and reordering</strong>: repeated batches from a retrying uploader inflate counts and skew every downstream statistic. The reason to separate these from drift is causal attribution: a "distribution shift" that is really a gateway dropping every third packet demands a networking fix, not a retrain. Always rule out a data-quality cause before you trust a drift number, because a drift detector run on corrupted data reports drift with total confidence.</p>
+
+<h2>Measuring distributional drift</h2>
+<p>To detect input or prediction drift you compare a fixed <strong>reference distribution</strong> (typically the training set, or a blessed recent window that matches training performance) against a rolling <strong>detection window</strong> of live data. For a single channel, three tools dominate. The <strong>Population Stability Index</strong> bins both distributions and sums a symmetric divergence over bins,
+$$\text{PSI} = \sum_{i=1}^{B} (p_i - q_i)\,\ln\!\frac{p_i}{q_i},$$
+where \(p_i\) and \(q_i\) are the reference and current fractions in bin \(i\); the field conventions are \(\text{PSI} < 0.1\) stable, \(0.1\!-\!0.25\) moderate, \(> 0.25\) significant. The <strong>two-sample Kolmogorov-Smirnov</strong> statistic takes the maximum gap between the empirical CDFs and gives a p-value, so it is threshold-free but sensitive to sample size. The <strong>Jensen-Shannon divergence</strong>, a bounded symmetric cousin of the KL divergence from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, behaves well when a bin empties out. Raw sensor channels are rarely the right unit to monitor, though: a \(100\,\text{Hz}\) waveform is high-dimensional and autocorrelated. Monitor the same low-dimensional features the model consumes, spectral band powers, statistical moments, or the model's own embedding (Chapters <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">8</a> and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">13</a>), and for genuinely multivariate drift reach for a kernel <strong>Maximum Mean Discrepancy</strong> test, which compares distributions in a reproducing-kernel space without binning.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import ks_2samp
+
+def psi(ref, cur, bins=10, eps=1e-6):
+    """Population Stability Index between a reference and current sample."""
+    edges = np.quantile(ref, np.linspace(0, 1, bins + 1))   # equal-frequency bins on ref
+    edges[0], edges[-1] = -np.inf, np.inf                   # catch out-of-range live values
+    p, _ = np.histogram(ref, edges); q, _ = np.histogram(cur, edges)
+    p = p / p.sum() + eps; q = q / q.sum() + eps            # smooth empty bins
+    return float(np.sum((p - q) * np.log(p / q)))
+
+def drift_report(ref, cur):
+    ks_stat, ks_p = ks_2samp(ref, cur)
+    score = psi(ref, cur)
+    level = "stable" if score < 0.1 else "moderate" if score < 0.25 else "significant"
+    return {"psi": round(score, 3), "level": level,
+            "ks_stat": round(ks_stat, 3), "ks_p": round(ks_p, 4)}
+
+rng = np.random.default_rng(0)
+reference = rng.normal(0.0, 1.0, 5000)          # training-time feature (e.g. gait cadence)
+same      = rng.normal(0.0, 1.0, 800)           # a fresh in-distribution window
+shifted   = rng.normal(0.4, 1.2, 800)           # slower, more variable cohort
+print("no drift:", drift_report(reference, same))
+print("drift   :", drift_report(reference, shifted))
+</code></pre>
+<div class="code-caption">Code 69.3.1: A minimal per-feature drift monitor. PSI is bucketed on reference quantiles (so the bins reflect training-time density) with open outer edges to catch out-of-range live values, and a KS test supplies a p-value cross-check. The <code>shifted</code> window models a new user cohort with a slower, more variable gait cadence and lands in the "significant" band.</div>
+
+<p>Code 69.3.1 makes the two-window comparison concrete: freeze the reference at model-blessing time, recompute the report each detection window, and alert when PSI crosses your band or the KS p-value falls below a corrected threshold. Bucketing PSI on the reference quantiles matters, it puts equal training-time mass in each bin so the score reflects where the model actually had support, and the open outer edges ensure a live value beyond anything seen in training is counted rather than silently dropped.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the warehouse robot that met winter</h4>
+<p>A fleet of autonomous floor robots classifies floor surface from wheel-encoder and IMU vibration to tune traction (the inertial features come from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>). The model ships in summer. In November, three coastal warehouses install anti-slip mats near loading doors and run heaters that change the concrete's thermal expansion; the vibration spectrum's low band shifts. Accuracy is fine at first: the model generalizes. But the input-drift monitor on the band-power feature climbs from \(\text{PSI}=0.06\) to \(0.31\) over two weeks, and, crucially, the alert is scoped per site, so it fires on exactly the three affected warehouses and stays quiet on the forty that saw no change. That scoping turns a vague "something drifted in the fleet" into "these three sites, this feature, starting this date," which points the on-call engineer straight at the facilities change. No labels were needed, and the early warning bought time to gather a labeled sample before any measurable accuracy loss appeared.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: declare the detectors, let the library run the fleet sweep</h3>
+<p>The hand-rolled monitor in Code 69.3.1 covers one feature with one test. A production fleet monitors dozens of features across thousands of devices, each needing univariate tests, multivariate MMD, multiple-testing correction, and a rendered report. Libraries such as <code>alibi-detect</code> and <code>evidently</code> supply KS, Chi-squared, MMD, and learned-classifier drift detectors behind one interface: you fit a detector on the reference once and call <code>predict</code> on each window, and the library handles binning, the Bonferroni or false-discovery-rate correction across features, and an HTML drift report. That collapses roughly a hundred lines of per-feature statistics and correction bookkeeping into a detector object plus one call per window, and the serialized detector lives in the model registry beside the weights so the reference cannot drift away from the model it guards.</p>
+</div>
+
+<h2>Making it work at fleet scale without alert fatigue</h2>
+<p>Two devices are easy; ten thousand devices with thirty features each is a hundred thousand hypothesis tests per window, and at any fixed p-value threshold a flood of them fire by pure chance. Three disciplines keep the signal usable. First, <strong>correct for multiple comparisons</strong>: control the false-discovery rate across the features-times-devices grid (Benjamini-Hochberg) rather than testing each in isolation, or the on-call rota will mute the whole system by the second week. Second, choose the <strong>right aggregation grain</strong>: fleet-wide drift, per-cohort drift (firmware, geography, hardware revision), and per-device drift answer different questions, and a shift confined to one firmware version is invisible in the fleet average but obvious in a per-cohort split, which is also your first attribution clue. Third, <strong>tune windows and reference deliberately</strong>: too short a detection window is dominated by noise and diurnal cycles; a stale reference makes normal seasonal variation look like drift. Compare a window against both the fixed training reference (has the world moved since training?) and a trailing recent window (is this change abrupt or gradual?). The output of all this is not "retrain now", it is a scoped, attributed, deduplicated alert; converting that signal into a retraining decision is the job of <a class="cross-ref" href="section-69.5.html">Section 69.5</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You monitor a wearable that estimates respiratory rate from a chest IMU across \(8{,}000\) users, tracking six features per user. (a) At a naive per-test threshold of \(p < 0.05\), roughly how many of the \(48{,}000\) tests per window will fire under the null even with zero real drift, and what does that imply for an unaggregated alert? (b) A firmware update rolls to \(5\%\) of the fleet and shifts one feature's mean; explain why a fleet-wide PSI on that feature might stay under \(0.1\) while a per-cohort split flags it clearly. (c) Give one concrete failure mode where prediction drift (\(P(\hat{y})\)) spikes but input drift is flat, and say what you would check first.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Distinguish input drift, prediction drift, and concept drift by the probability each changes, and say which one no input-only monitor can ever detect.</li>
+<li>Why must you rule out a data-quality cause (freshness, completeness, duplication) before trusting a drift score, and what does a drift detector report when run on data with a structured missingness pattern?</li>
+<li>Why is PSI binned on the reference quantiles rather than on equal-width bins, and why are the outer bin edges left open at \(\pm\infty\)?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-69.4.html">Section 69.4</a>, we confront the hardest case a drift monitor cannot solve on its own: concept drift under delayed or absent ground truth. When the true labels for today's sensor readings arrive weeks later, or never, you cannot measure accuracy in real time, so we build proxy signals, confidence and calibration trends (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), agreement between redundant models, and physics-consistency checks, that stand in for the accuracy you cannot yet see.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 68.1: Sensor failure and degradation modes. Building Sensory AI." name="description"/>
+<title>Section 68.1: Sensor failure and degradation modes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 68: Robustness, Sensor Spoofing, and Functional Safety</a></div>
+<h1>Sensor failure and degradation modes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The sensor did not lie to me. It simply kept reporting the last true thing it ever knew, and I believed it for six more hours."</p>
+<cite>A Trusting AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the sensor measurement model \(z = h(x) + b + \varepsilon\), noise, bias, and transduction, from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, the sampling, timestamping, and synchronization vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the residual and change-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. We treat a working perception model as given. This section is not about the environment shifting under a healthy sensor (that is <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>); it is about the sensor itself becoming an unreliable narrator, and about naming the failure precisely enough that a monitor can catch it before the model does something irreversible.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A perception stack is only as trustworthy as its worst input, and inputs fail in structured, nameable ways. The dangerous failures are not the loud ones. A sensor that returns zeros or NaNs is easy to catch; a sensor that returns <em>plausible</em> values that are quietly wrong is the one that propagates into a control action. This section builds a taxonomy of sensor fault modes, separates <strong>abrupt failures</strong> (dropout, stuck-at, saturation) from <strong>slow degradation</strong> (bias drift, gain loss, noise inflation), and ties each to the term of the measurement equation it corrupts. That mapping is what makes a fault detectable: once you know a stuck accelerometer freezes the innovation of your filter and a drifting gyro biases it, you know exactly which statistic to monitor. Everything later in this chapter, redundancy, runtime monitors, safety cases, presupposes this vocabulary.</p>
+</div>
+
+<h2>A taxonomy grounded in the measurement equation</h2>
+<p>Start from the Chapter 2 model: a sensor reports \(z_t = g \cdot h(x_t) + b_t + \varepsilon_t\), where \(h\) is the transduction of the true state \(x_t\), \(g\) is a gain, \(b_t\) a bias, and \(\varepsilon_t\) zero-mean noise. Every fault mode is a specific corruption of one of these terms, and organizing faults this way is not pedantry: it tells you which residual will move.</p>
+<ul>
+<li><strong>Dropout / erasure</strong>: \(z_t\) is missing or a sentinel (NaN, zero, last-value-held). The transduction \(h\) is severed. Cause: cable fault, packet loss on a CAN or MIPI bus, a MEMS die crack, power brown-out.</li>
+<li><strong>Stuck-at (frozen)</strong>: \(z_t = z_{t^\*}\) for all \(t &gt; t^\*\), the value is constant regardless of \(x_t\). This is the treacherous one, because a frozen value inside the normal range passes every range check. Cause: a hung sensor microcontroller that keeps re-serving its last register, a firmware deadlock, an ADC latch.</li>
+<li><strong>Bias / offset fault</strong>: \(b_t\) jumps or ramps away from zero. A step bias is a calibration loss; a ramp is <em>drift</em>. Cause: thermal expansion, MEMS charge accumulation, aging of a reference voltage.</li>
+<li><strong>Gain / scale fault</strong>: \(g\) departs from unity, so the sensor under- or over-reports proportionally. Cause: aging photodiode responsivity, lens transmission loss, membrane fatigue in a pressure sensor.</li>
+<li><strong>Noise inflation</strong>: \(\mathrm{Var}(\varepsilon_t)\) grows. The mean is right but precision collapses. Cause: loose connector, EMI, a failing pre-amp, thermal noise near end-of-life.</li>
+<li><strong>Saturation / clipping</strong>: \(z_t\) is pinned at a rail because \(h(x_t)\) exceeded the dynamic range. Cause: an accelerometer set to \(\pm 2g\) during an \(8g\) impact, an over-exposed pixel well.</li>
+<li><strong>Quantization and timing faults</strong>: dropped bits, or timestamps that are late, jittered, or duplicated, corrupting the \(t\) index itself. These break the synchronization assumptions of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and are invisible to any check that looks only at \(z\), never at when \(z\) arrived.</li>
+</ul>
+<p>The single most useful axis across this list is <em>abrupt versus incipient</em>. Abrupt faults (dropout, stuck-at, saturation) arrive between one sample and the next and are, once you know to look, statistically obvious. Incipient faults (bias drift, gain loss, noise inflation) develop over hours to months and hide inside the noise band until they don't. Different detectors catch each: a per-sample residual gate catches the abrupt, a slow cumulative statistic catches the incipient.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A stuck sensor is more dangerous than a dead one. A dead sensor announces itself, zeros, NaNs, a lost heartbeat, and your fault logic fires immediately. A stuck sensor keeps serving a value that is in-range, self-consistent, and low-variance, which is exactly what a naive health check calls "healthy." The tell is not the value, it is the <em>absence of variation where variation is expected</em>: the innovation of a Kalman filter fed a frozen measurement collapses toward a constant, and the signal's short-window variance drops to the noise floor even when the platform is clearly moving. Monitor for a sensor that is too quiet, not only for one that is out of range.</p>
+</div>
+
+<h2>Modeling degradation over time</h2>
+<p>Incipient faults deserve a model, because their whole hazard is that they are gradual. A useful and standard first-order picture treats a slowly corrupting parameter, say the bias \(b_t\), as a drift-plus-diffusion process:</p>
+$$ b_t = b_0 + r\,t + \sigma_w W_t, $$
+<p>where \(r\) is a deterministic drift rate (units per hour), \(W_t\) is a random walk capturing the stochastic wander of the fault, and \(\sigma_w\) its volatility. This is exactly the "bias instability" you find on a MEMS gyro datasheet, and it is why an uncorrected inertial sensor's dead-reckoned position error grows super-linearly (the orientation and dead-reckoning error budget of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>). Two summary numbers govern how long a sensor stays usable: the drift rate \(r\), which sets when the bias exceeds a tolerance \(\tau\) in the mean (at time \(t \approx \tau / r\)), and the signal-to-noise trend. A convenient health scalar is the ratio of fault magnitude to noise scale,</p>
+$$ \mathrm{SNR}_{\text{fault}}(t) = \frac{|b_t|}{\sigma_\varepsilon}, $$
+<p>which starts below one (the fault is buried in noise, undetectable and, usefully, still harmless) and crosses a detection threshold and then a safety threshold as the fault grows. The gap between those two crossings is your warning budget. Prognostics, estimating the remaining time before a sensor crosses the safety threshold, is the subject of predictive maintenance in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>; here we care that the model exists and tells us which statistic to watch.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the automotive radar that faded before it failed</h4>
+<p>An automated-driving stack fuses camera, lidar, and a front radar for adaptive cruise. Over one winter, road grime and a hairline crack in the radome slowly attenuate the radar's return: a <em>gain fault</em>, \(g\) drifting downward. Nothing trips a range alarm, the radar still returns targets, just weaker, so its detections thin out at the edges of range first. The fusion layer, trusting each modality equally, begins dropping distant vehicles that only the radar had been confirming. The failure is invisible per-frame; it shows up only as a slow rise in the disagreement between radar range and lidar range on shared targets, a cross-modal residual. The team's fix was not a better radar model but a degradation monitor: track the running median ratio of radar-confirmed to lidar-confirmed detections, and when it falls below a learned band, downweight radar in the fuser and raise a maintenance flag. That cross-sensor consistency check is the natural detector for gain and bias faults, and it is why missing-modality robustness (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>) and this section are two halves of the same discipline.</p>
+</div>
+
+<h2>Detecting and injecting faults</h2>
+<p>Detection follows directly from the taxonomy: pick the statistic the fault is guaranteed to move. Range and rate-of-change gates catch saturation and impossible jumps. A short-window variance floor catches stuck-at and, inverted, catches noise inflation. A cross-sensor or model-residual test catches bias and gain, because those leave the single sensor self-consistent and only reveal themselves against a second opinion. The code below implements the three cheapest, highest-value gates as a single reusable checker, the kind of guard that belongs at the very front of any sensor pipeline.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def sensor_health(window, lo, hi, max_step, stuck_var, sat_frac=0.02):
+    """Fault flags for one channel over a recent sample window.
+    window: 1-D array of recent samples (oldest to newest).
+    Returns a dict of boolean fault indicators. Each maps to one
+    corruption of z = g*h(x) + b + eps."""
+    w = np.asarray(window, dtype=float)
+    flags = {}
+    flags["dropout"]   = bool(np.isnan(w).any())          # erasure / missing h
+    finite = w[np.isfinite(w)]
+    if finite.size &lt; 2:
+        flags["stuck"] = flags["saturated"] = flags["out_of_range"] = True
+        flags["jump"] = False
+        return flags
+    flags["out_of_range"] = bool((finite &lt; lo).any() or (finite &gt; hi).any())
+    flags["jump"]         = bool(np.abs(np.diff(finite)).max() &gt; max_step)  # impossible slew
+    flags["stuck"]        = bool(np.var(finite) &lt; stuck_var)               # too quiet -> frozen
+    rail_hits = (np.abs(finite - lo) &lt; 1e-6) | (np.abs(finite - hi) &lt; 1e-6)
+    flags["saturated"]    = bool(rail_hits.mean() &gt; sat_frac)              # pinned at a rail
+    return flags
+
+# A gyro channel that has silently frozen at a plausible in-range value.
+frozen = np.full(64, 0.031) + 1e-9 * np.random.randn(64)
+print(sensor_health(frozen, lo=-4.0, hi=4.0, max_step=0.5, stuck_var=1e-4))
+# -> {'dropout': False, 'out_of_range': False, 'jump': False,
+#     'stuck': True, 'saturated': False}
+</code></pre>
+<div class="code-caption">Code 68.1.1: A front-of-pipeline sensor health gate. Each flag targets one term of the measurement equation: <code>dropout</code> and <code>out_of_range</code> are range checks, <code>jump</code> is a rate-of-change (slew) gate for impossible transitions, <code>stuck</code> is the "too quiet" test that catches a frozen sensor a range check misses, and <code>saturated</code> counts rail hits. The example shows the case the introduction warned about: an in-range, self-consistent, frozen gyro that only the variance-floor test catches.</div>
+
+<p>Code 68.1.1 makes the key insight operational: the <code>stuck</code> flag is the only one that fires on the frozen gyro, precisely because its value is in-range and its jumps are zero. But you cannot trust a detector you have never seen trip, which is why the other half of this discipline is <strong>fault injection</strong>: deliberately corrupting healthy recordings with each mode, dropout, bias ramps, stuck-at, saturation, timing jitter, and confirming both that the monitor fires and that the downstream model degrades gracefully. This is exactly what Lab 68 builds. Fault injection turns the taxonomy from a checklist into a test suite, and it is the only honest way to know your safety envelope before the field finds the hole for you (leakage-safe evaluation discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applies: inject on held-out recordings, never on training data).</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: fault streams without the plumbing</h3>
+<p>Hand-rolling a full fault-injection harness, per-mode corruptions, configurable onset times and rates, reproducible seeding, and a logger that records which fault was injected when, is roughly 150 lines of careful, easy-to-get-subtly-wrong code. Robustness-testing libraries such as <code>imagecorruptions</code> (the ImageNet-C corruption set) for vision, and time-series toolkits like <code>tsaug</code> or the perturbation utilities in <code>aeon</code> and <code>river</code> for streams, provide parameterized corruptions and drift injectors out of the box, collapsing the harness to about 15 lines: choose a corruption, set severity, map over the stream. That is a roughly 150-to-15 reduction, with reproducible severity levels and standard corruption names you can cite in a safety case (Section 68.6). Keep the from-scratch injector only for domain-specific faults, a MIPI line stall, a CAN timestamp reorder, that no general library models.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Two frontiers are active. First, <strong>learned degradation detection</strong>: instead of hand-set thresholds, self-supervised models learn a sensor's healthy signature and flag deviations as incipient faults, extending the anomaly-detection methods of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a> to the sensor itself rather than the machine it watches. The hard part is separating a degrading sensor from a changing world, which is the concept-shift problem of Chapter 66 wearing a different hat. Second, <strong>standardized robustness benchmarks</strong>: ImageNet-C and its 3D and lidar successors (Robo3D, and corruption suites for point clouds and radar) let researchers report accuracy under a fixed grid of corruption types and severities, turning "robust to sensor faults" from a claim into a measured number. The open question is a benchmark that scores <em>graceful degradation and timely detection jointly</em>, rewarding a system that notices it is failing over one that merely fails a little less.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You own a wrist-worn PPG heart-rate sensor. Consider four field faults: (a) the optical window fogs with sweat, slowly attenuating the signal; (b) the ADC latches and returns a constant 0.42 for minutes at a time; (c) a loose band lets motion inject high-frequency noise; (d) firmware occasionally stamps two samples with the same timestamp. For each, name the fault mode, write which term of \(z = g\,h(x) + b + \varepsilon\) (or the time index) it corrupts, and state which flag in Code 68.1.1 would catch it, or explain why none would and what statistic you would add. Then extend the checker with a timing-consistency flag that catches case (d).</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Explain why a stuck-at fault at an in-range value defeats a range check but not a variance-floor check, and write the one-line statistic each uses.</li>
+<li>Given a bias drift \(b_t = r t\) with rate \(r\) and noise scale \(\sigma_\varepsilon\), at roughly what time does the fault become detectable versus dangerous, and why is the gap between those times the quantity you actually care about?</li>
+<li>Why is a cross-sensor residual the natural detector for a gain fault, when no single-channel gate fires on it? Tie your answer to the automotive radar step-through.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-68.2.html">Section 68.2</a>, we turn from faults that <em>happen</em> to faults that are <em>made to happen</em>: an adversary who spoofs lidar returns, injects phantom radar targets (MadRadar), forges GPS, or slips inaudible commands into a microphone. The taxonomy here is the foundation, because a good attack is engineered to look exactly like a benign degradation and slip past the very health gates we just built.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

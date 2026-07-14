@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 68.3: Redundancy, voting, and safety envelopes. Building Sensory AI." name="description"/>
+<title>Section 68.3: Redundancy, voting, and safety envelopes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 68: Robustness, Sensor Spoofing, and Functional Safety</a></div>
+<h1>Redundancy, voting, and safety envelopes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me three eyes so that no single lie could blind me. Then they wired all three to the same power rail, and were surprised when the dark arrived all at once."</p>
+<cite>A Triply Redundant AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">You cannot certify a perceptron; you can box it in</h3>
+<p>The failure modes of <a class="cross-ref" href="section-68.1.html">Section 68.1</a> and the deliberate spoofs of <a class="cross-ref" href="section-68.2.html">Section 68.2</a> share an uncomfortable conclusion: any single sensor, and any single learned perception model, will eventually output a confident wrong answer, and you will not know when. Robustness at the system level does not come from making that one component perfect. It comes from architecture: putting <em>more than one</em> independent path to the same answer, comparing them, and wrapping the whole thing in a simple, checkable bound that a safety engineer can actually reason about. This section covers the three moves that turn unreliable parts into a dependable system: <strong>redundancy</strong> (build several independent estimates), <strong>voting</strong> (reconcile them and detect disagreement), and <strong>safety envelopes</strong> (constrain the fused output to a region you have argued is safe). These are the patterns that let a car ship with a neural network in the perception loop and still pass a functional-safety audit.</p>
+</div>
+
+<p>This section assumes you know how probabilistic sensor fusion combines measurements for <em>accuracy</em> (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>) and how a model reports calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>). Redundancy and voting reuse that machinery but chase a different goal: fault <em>masking</em> and fault <em>detection</em> rather than precision. Keep the distinction sharp, because a fusion filter that silently averages a spoofed channel into the estimate is doing exactly the wrong thing when safety is the objective.</p>
+
+<h2>Redundancy: replication, diversity, and analytical channels</h2>
+<p>Redundancy means the system has more independent ways to know a quantity than it strictly needs. Three flavors matter, and they defend against different threats. <strong>Replication</strong> runs several identical sensors or identical model instances; it masks random hardware faults (a dead pixel column, a stuck IMU axis) cheaply, but it is defenceless against a <em>common-cause failure</em>, the single event that takes down every copy at once. Three identical cameras behind one windshield are all blinded by the same low sun; three copies of the same network share the same adversarial blind spot from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. <strong>Diversity</strong> (also called dissimilar or N-version redundancy) instead uses <em>different physics or different algorithms</em> for each channel: camera plus radar plus lidar, or a deep detector plus a classical geometric one. Diversity is the only redundancy that survives a common-cause event, because fog that defeats the camera does not defeat the radar, and a texture that fools the network does not fool the range gate. <strong>Analytical redundancy</strong> is the subtle one: a physical model predicts what a sensor <em>should</em> read from the other sensors, so a Kalman-style innovation (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) becomes a virtual extra vote without any extra hardware.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Independence is a claim you must defend, not a wiring diagram</h3>
+<p>Redundancy only multiplies reliability when the channels fail <em>independently</em>. If two "independent" channels share a clock, a power rail, a calibration dataset, a ground-truth pipeline, or a single upstream timestamp, their failures are correlated and your probability arithmetic is fiction. For a triple-modular system the residual failure rate scales like \(p^2\) <em>only</em> under independence; with a common-cause fraction \(\beta\), the true rate is closer to \(\beta p\), and a \(\beta\) of even a few percent dominates everything the redundancy bought you. The engineering work is not adding a third sensor; it is arguing, and documenting, that the three do not fail together. Physically separate the fault-containment regions, diversify the modality, and audit every shared dependency.</p>
+</div>
+
+<h2>Voting: reconciling channels and surfacing disagreement</h2>
+<p>Given several channels, a <em>voter</em> produces one output and, just as importantly, a health verdict. The classic pattern is <strong>M-out-of-N</strong>: with three channels, <em>two-out-of-three</em> (2oo3) accepts a value if at least two channels agree within a tolerance, masks the odd one out, and flags a fault. For continuous quantities (a distance, a heading), the robust choice is the <strong>median</strong>, which rejects a single arbitrarily-wrong channel by construction, unlike the mean which a spoofer can drag anywhere. When channels carry calibrated variances you can escalate to a <strong>weighted</strong> or plausibility-gated vote, but never let the weight of a channel that has already failed its agreement check leak back into the fused value. The decisive output of a voter is not the number, it is the <em>spread</em>: when the channels disagree beyond tolerance, that is a detected fault, and a safe system reacts to it (degrade, hand back to the driver, stop) rather than picking a winner and driving on. Voting for safety is disagreement <em>detection</em> first and value selection second, which is the opposite emphasis from the accuracy-seeking fusion of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def voter_2oo3(readings, sigmas, tol):
+    """Median-select 2oo3 voter with disagreement detection.
+    readings, sigmas: length-3 arrays (value and 1-sigma per channel).
+    Returns (value, healthy_mask, agreed) for a safety monitor to act on."""
+    r = np.asarray(readings, float)
+    med = np.median(r)                      # robust to one wild channel
+    # A channel agrees if it is within tol combined sigmas of the median.
+    resid = np.abs(r - med)
+    healthy = resid <= tol * np.asarray(sigmas, float)
+    n_ok = int(healthy.sum())
+    if n_ok >= 2:
+        value = r[healthy].mean()           # fuse only the agreeing channels
+        return value, healthy, True
+    # Fewer than two channels agree: no trustworthy value exists.
+    return med, healthy, False              # caller MUST enter a safe state
+
+# Nominal: three channels agree -> healthy, fused value returned.
+print(voter_2oo3([10.1, 9.9, 10.0], [0.2, 0.2, 0.2], tol=3))
+# Spoofed channel 2 pushed to 40 m: median masks it, fault still flagged healthy=2/3.
+print(voter_2oo3([10.1, 9.9, 40.0], [0.2, 0.2, 0.2], tol=3))
+# Two-way split: no majority -> agreed=False, system must degrade.
+print(voter_2oo3([10.0, 25.0, 40.0], [0.2, 0.2, 0.2], tol=3))
+</code></pre>
+<div class="code-caption">Code 68.3.1: A median-select two-out-of-three voter. The median masks a single spoofed or failed channel (line 2 of the tests), while the agreement mask surfaces the fault to a monitor. When no two channels agree (third test) the voter refuses to invent a value and signals that the caller must enter a safe state. Compare this refusal-first behavior with the always-produce-an-estimate stance of a fusion filter.</div>
+
+<p>Code 68.3.1 makes the safety asymmetry explicit: the interesting return value is <code>agreed</code>, not the number. A spoofed lidar return that reads 40 m against two channels at 10 m is masked by the median and never reaches the planner, yet the health flag still records that one channel was outvoted, feeding the runtime monitor of <a class="cross-ref" href="section-68.4.html">Section 68.4</a>.</p>
+
+<h2>Safety envelopes: bounding the learned component</h2>
+<p>Voting reconciles redundant channels, but perception still ends in a neural network you cannot exhaustively verify. The dominant pattern for shipping such a component is the <strong>doer/checker</strong> architecture (also called Simplex or run-time assurance, RTA): a high-performance but unverified controller or perception model (the <em>doer</em>) proposes an action, and a simple, formally analysable <em>checker</em> either passes it through or, if it would leave a proven-safe region, switches to a conservative fallback. The <em>safety envelope</em> is that proven-safe region, expressed in variables a human can audit: a following distance that respects braking dynamics, a joint velocity under a torque limit, a detected-obstacle range that must be physically consistent with the vehicle's own speed. The learned model is free to be brilliant inside the envelope and is simply overruled at its boundary. This is what lets a safety case (<a class="cross-ref" href="section-68.6.html">Section 68.6</a>) rest its top-level argument on the checker, whose logic is a few hundred lines, rather than on the uninspectable weights of the doer.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A warehouse AMR that trusts the network but obeys the bumper</h3>
+<p>An autonomous mobile robot (AMR) on a logistics floor runs a learned 3D detector for people and pallets. The team does not certify the detector; they wrap it. A diverse channel, a fixed-geometry depth check on the same stereo pair plus a hardware safety-rated lidar scanner, feeds a 2oo3 voter for "is the 2 m stop-zone clear?" On top sits a speed envelope: the commanded velocity may never exceed what the <em>current</em> agreed clear-range permits under the robot's measured deceleration, \(v_{\max}=\sqrt{2\,a_{\text{brake}}\,(d_{\text{clear}}-d_{\text{margin}})}\). When a worker steps out from behind a rack and the network is a frame late, the lidar channel disagrees, the voter reports <code>agreed=False</code>, and the envelope collapses \(v_{\max}\) to zero, stopping the robot before the slow network ever updates. The clever detector improves throughput on the 99% of clear aisles; the dumb envelope is what the auditor signs.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is pushing</h3>
+<p>Classical envelopes are hand-derived kinematic bounds. The research frontier is making them tighter and learnable while staying certifiable. <strong>Responsibility-Sensitive Safety</strong> (RSS, from Mobileye) formalises the driving envelope as closed-form distance constraints that a checker enforces; <strong>control barrier functions</strong> (CBFs) generalise this to smooth safety filters that minimally correct an unsafe action; and reachability tools such as the Hamilton-Jacobi-based analyses behind libraries like <em>hj_reachability</em> compute provably safe backward-reachable sets for a dynamics model. The 2024-era open question is co-designing the doer and the checker so the fallback is invoked rarely without ever being unsound, and doing so for high-dimensional learned perception rather than just low-dimensional control. The safety-of-the-intended-function standard <em>ISO 21448 (SOTIF)</em>, revisited in <a class="cross-ref" href="section-68.5.html">Section 68.5</a>, is the regulatory backdrop that makes these envelopes mandatory rather than optional.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: a barrier-function safety filter in a few lines</h3>
+<p>Hand-rolling a provably safe fallback, its invariant set, and the quadratic program that projects an unsafe action back onto the safe boundary is a few hundred lines of dynamics and optimisation code, plus the proof. Control-barrier-function libraries such as <code>cbfpy</code> reduce the online safety filter to declaring the barrier \(h(x)\ge 0\) and the system dynamics, then calling <code>filter(u_desired, x)</code>: the library builds and solves the QP that returns the closest safe action each step. That is roughly a 200-line hand-implementation down to about 15 lines, with the library handling the QP assembly, feasibility, and the barrier-constraint algebra. You still owe the argument that your barrier encodes the real hazard; the library only guarantees you stay inside whatever set you declared.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the AMR scenario above. (a) Extend Code 68.3.1 so that each channel carries a timestamp and the voter rejects any channel older than a staleness bound \(\tau\) <em>before</em> voting, then show that a frozen (stuck-value) lidar channel is now caught even when its value happens to agree. (b) Implement the speed envelope \(v_{\max}=\sqrt{2\,a_{\text{brake}}(d_{\text{clear}}-d_{\text{margin}})}\) and drive it from the voter's <code>agreed</code> flag and fused range, returning \(v_{\max}=0\) whenever <code>agreed</code> is false. (c) Argue in three sentences why replacing the three sensors with three identical cameras would pass your unit tests yet fail a common-cause analysis.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Distinguish replication, diversity, and analytical redundancy, and name the single threat that only diversity defends against.</li>
+<li>Why is the median a safer voter than the weighted mean when one channel may be spoofed, and what does the voter's disagreement flag let the system do that the fused value alone cannot?</li>
+<li>In a doer/checker architecture, on which component does the safety case place its top-level claim, and why is that possible even when the doer is an uninspectable neural network?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-68.4.html">Section 68.4</a>, we turn the health flags and envelope violations produced here into a first-class <em>runtime monitor</em>: an always-on observer that watches the live system against its assumptions, decides when a fault has crossed from detected to actionable, and coordinates the transition into a safe state. Voting tells you the channels disagree; monitoring and assurance decide what the system does about it, and how you prove that the deciding logic is itself trustworthy.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

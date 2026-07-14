@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.4: Proxy monitoring under delayed ground truth. Building Sensory AI." name="description"/>
+<title>Section 69.4: Proxy monitoring under delayed ground truth | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Proxy monitoring under delayed ground truth</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me for my accuracy. The labels that would tell me my accuracy arrive in three weeks, for one batch in ten, and only when a human bothered to look. So I told them about my confidence instead, and I told them how much I trusted my confidence, and that turned out to be the honest answer."</p>
+<cite>A Provisionally Correct AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section leans on calibration and confidence as measurable quantities, the reliability diagram, and conformal scores, from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and on the distribution-shift vocabulary, covariate shift, label shift, and importance weighting, from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. It is the companion to <a class="cross-ref" href="section-69.3.html">Section 69.3</a>, which monitored the <em>inputs</em> for drift and data quality; here we monitor the <em>outputs and outcomes</em> when the labels that would score them are late, biased, or missing. We assume the leakage-safe evaluation discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>In a lab you compute accuracy the instant a prediction is made, because the label is sitting next to it. In a deployed sensor fleet the label almost never sits next to the prediction. Did the turbine that the model flagged actually fail? You find out at the next teardown, months later, if ever. Was that flagged heart rhythm truly atrial fibrillation? A cardiologist confirms it two weeks after the patch is mailed back. Was the pedestrian really there? You only learn when there was <em>not</em> one and someone complains. Ground truth is <strong>delayed</strong> (it comes late), <strong>censored</strong> (it comes for only some cases), and <strong>biased</strong> (the cases it comes for are exactly the ones a human decided to check). You cannot wait for it to run a monitor. <strong>Proxy monitoring</strong> is the discipline of tracking label-free signals that move <em>before</em> the true metric moves, then validating those proxies against ground truth as it slowly backfills. This section teaches you which proxies to trust, how to calibrate a proxy into an estimate of the real metric, and how to keep the trickle of late labels from lying to you.</p>
+</div>
+
+<h2>The three ways ground truth fails to show up on time</h2>
+<p>It is worth being precise, because each failure mode calls for a different remedy. <strong>Latency</strong> is the gap between a prediction at time \(t\) and the label at time \(t + \Delta\). For a maintenance model \(\Delta\) can be months; for a clinical over-read, weeks; for a click on a recommended action, minutes. A monitor that reports accuracy is always reporting the accuracy of predictions made \(\Delta\) ago, which is useless for catching a regression that started yesterday. <strong>Censoring</strong> means labels arrive for only a subset of predictions: a device is retired before its failure is observed, a patient never returns, a flagged event is never adjudicated. The label is not late; it is absent, and treating absent as negative silently corrupts every rate you compute. <strong>Verification bias</strong> is the sharpest trap: the labels that <em>do</em> arrive are not a random sample. A human investigates the alarms the model raised, so you learn the true state of positives far more often than negatives. Compute precision on that trickle and it looks plausible; compute recall and it is a fantasy, because the false negatives were never looked at. A proxy-monitoring system has to be designed around all three at once.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A proxy is only useful if it is a <em>leading</em> indicator: it must move before the true metric, and its movement must be predictive of the true metric's movement. Average prediction confidence, output-class balance, and ensemble disagreement all satisfy this when the model is well calibrated, because a model that is losing accuracy under shift almost always becomes less confident, more evenly split, or more internally inconsistent first. The discipline is not "watch some numbers"; it is "watch numbers whose relationship to accuracy you have measured on backfilled labels, and re-measure that relationship as the world drifts." An uncalibrated confidence is a proxy you have not earned the right to trust yet.</p>
+</div>
+
+<h2>A taxonomy of proxy signals</h2>
+<p>Proxies fall into four families, ordered from cheapest to most trustworthy. <strong>Confidence-based</strong> proxies read the model's own output distribution: mean maximum-softmax probability, predictive entropy, or conformal set size (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>). If the model is calibrated, average confidence is a direct, if noisy, estimate of average accuracy. <strong>Distributional</strong> proxies watch the <em>prediction</em> distribution rather than the input: the flagged-anomaly rate, the class mix, the score histogram. A silent doubling of the positive rate is a five-alarm signal even with zero labels, because the base rate of real failures did not double overnight. <strong>Consistency</strong> proxies exploit redundancy: agreement between an ensemble's members, between two sensors that should see the same event (the fusion redundancy of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>), or between the current model and the previous version run in shadow. Disagreement needs no ground truth and rises sharply under shift. <strong>Behavioral and downstream-outcome</strong> proxies are the most trustworthy because they touch reality: the human-override rate (how often an operator dismisses the model's alarm), the intervention outcome (did the dispatched crew find a real fault), the complaint rate. These carry real signal about correctness but arrive with their own latency, so they close the loop slowly. A mature fleet monitor tracks one or two proxies from each family and cross-checks them, because any single proxy can be fooled.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the ambulatory ECG patch that could not wait for the cardiologist</h4>
+<p>A cardiac-monitoring company ships adhesive ECG patches that record for fourteen days; an on-device model flags suspected atrial fibrillation in real time (the clinical modeling is the subject of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). The definitive label is a cardiologist's over-read, which happens only after the patch is mailed back, uploaded, and queued: a median of nineteen days after the prediction, and only for the roughly one recording in eight that gets escalated. Waiting nineteen days to notice a bad deploy is not acceptable when a firmware change to the patch's analog front end can shift the signal baseline overnight. So the team runs proxy monitoring. They track mean confidence on flagged beats, the AF-flag rate per patient-day, and the disagreement between the deployed model and a heavier reference model run in the cloud on the same uploaded strips. When a lead-adhesive supplier change subtly raised baseline wander, the confidence proxy sagged and the deployed-versus-reference disagreement jumped within a day, on <em>every</em> patch, long before a single over-read confirmed the accuracy drop. The proxies triggered a rollback nineteen days before ground truth would have. When the over-reads finally arrived, they confirmed a real six-point sensitivity loss on the affected batch, validating the alarm after the fact and calibrating exactly how much confidence-sag maps to how much sensitivity loss.</p>
+</div>
+
+<h2>Turning a proxy into an estimate of the real metric</h2>
+<p>Watching a proxy wiggle is monitoring; turning it into a number you can put a threshold on is estimation. The workhorse for classification is <strong>Average Thresholded Confidence</strong> (ATC). The idea: on a labeled reference set, find a threshold \(t\) on a confidence score \(s(x)\) (for example the maximum softmax probability, or negative entropy) such that the fraction of reference points scoring below \(t\) equals the reference <em>error</em> rate. Formally, choose \(t\) so that</p>
+$$ \Pr_{\text{ref}}\big[\, s(x) < t \,\big] \;=\; \Pr_{\text{ref}}\big[\, \hat{y}(x) \neq y \,\big]. $$
+<p>Then, on a fresh unlabeled batch from the fleet, estimate the error as simply the fraction of points scoring below that same \(t\). This works because a calibrated score orders points by correctness the same way in the reference and target distributions under a broad shift assumption; it converts a whole confidence histogram into one accuracy number without a single target label. Direct-loss-estimation and importance-weighted variants extend the same trick to AUC and to regression. Critically, ATC must be <em>re-validated</em> whenever backfilled labels arrive: each time a batch of ground truth lands, you compare the estimate the proxy produced weeks ago against the truth, and if the residual is growing you re-fit \(t\) or retire the proxy. That backfill loop is what keeps the estimate honest as the fleet drifts.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def fit_atc_threshold(conf_ref, correct_ref):
+    """Pick threshold t so P(conf < t) equals the reference error rate."""
+    err_rate = 1.0 - correct_ref.mean()          # measured on labeled reference
+    t = np.quantile(conf_ref, err_rate)          # the err_rate-quantile of confidence
+    return t
+
+def estimate_error(conf_target, t):
+    """Label-free error estimate on an unlabeled fleet batch."""
+    return float(np.mean(conf_target < t))
+
+rng = np.random.default_rng(0)
+# Reference: calibrated model, ~12% error. Confidence higher when correct.
+correct_ref = rng.random(5000) > 0.12
+conf_ref = np.clip(rng.normal(np.where(correct_ref, 0.85, 0.55), 0.12), 0, 1)
+t = fit_atc_threshold(conf_ref, correct_ref)
+
+# Fleet batch after a drift that pushed true error to ~22% (labels unavailable).
+correct_true = rng.random(5000) > 0.22
+conf_tgt = np.clip(rng.normal(np.where(correct_true, 0.80, 0.50), 0.14), 0, 1)
+print(f"threshold t          = {t:.3f}")
+print(f"estimated error      = {estimate_error(conf_tgt, t):.3f}")
+print(f"true error (oracle)  = {1 - correct_true.mean():.3f}")
+</code></pre>
+<div class="code-caption">Average Thresholded Confidence in twelve lines: <code>fit_atc_threshold</code> calibrates one number on a labeled reference set, and <code>estimate_error</code> then predicts the fleet's error rate on an unlabeled batch. The printed estimate tracks the oracle error (which the monitor never actually sees) to within a couple of points, catching the drift from 12% to 22% with no target labels.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The hand-rolled ATC above is the teaching version. Production libraries do label-free performance estimation with drift-aware confidence bands and multiple metrics out of the box. <code>nannyml</code>'s <code>CBPE</code> (Confidence-Based Performance Estimation) and <code>DLE</code> (Direct Loss Estimation) estimators fit on a labeled reference and then predict ROC AUC, F1, or accuracy on unlabeled production data in about five lines: <code>estimator = nannyml.CBPE(...); estimator.fit(reference_df); estimator.estimate(production_df)</code>. That replaces roughly 150 to 250 lines of your own thresholding, per-chunk aggregation, calibration checks, and confidence-interval bookkeeping, and it handles the re-calibration and alerting hooks you would otherwise have to write and test yourself.</p>
+</div>
+
+<h2>Correcting the labels you do get</h2>
+<p>Eventually some ground truth backfills, and it is tempting to just score against it. Do not, before you correct for how it was selected. If humans only adjudicate model-flagged positives, the labeled set is a biased sample and naive recall is uncomputable, since the false negatives are invisible. Three practices help. First, <strong>deliberate label sampling</strong>: budget for a small random audit of <em>un</em>flagged cases so you can estimate the false-negative rate, not just the false-positive rate; a stratified draw of a few hundred negatives per month often costs less than one missed failure. Second, <strong>importance weighting</strong>: when the probability of a case being labeled depends on measurable features, weight each label by the inverse of its selection probability to recover an unbiased metric (the same reweighting machinery as label shift in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>). Third, <strong>delayed and prequential evaluation</strong>: report metrics on a lagged window whose labels are now mature, sliding forward as more arrive, and always show the fraction of a window's predictions that are still unlabeled so a reader knows how provisional the number is. A metric on 12% resolved labels is a rumor; the dashboard should say so.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You run a fleet of leak detectors on a gas network. The model raises 400 alarms per week; field crews investigate every alarm (so every positive gets a true label after about three days) but almost never inspect a non-alarm site. (a) Which standard metrics can you compute reliably from this feedback, and which cannot be computed at all? (b) Design a minimal labeling budget that makes recall estimable, and write the formula that turns your audit sample into a fleet-wide false-negative-rate estimate. (c) Propose two label-free proxies from different families in the taxonomy that would flag a sudden drop in recall days before the audit could, and state what could fool each one.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Explain why average model confidence is a usable accuracy proxy only after calibration, and what goes wrong if you skip the calibration step.<br/>
+2. Give a concrete scenario in which the flagged-positive rate stays flat while true accuracy collapses, defeating a distributional proxy. Which other proxy family would still catch it?<br/>
+3. Verification bias inflates one of precision or recall and hides the other. Which is which when only model-flagged positives get adjudicated, and why?</p>
+</div>
+
+<h2>Wiring it into the fleet monitor</h2>
+<p>Operationally, proxy monitoring is a second track running alongside the input-drift monitor of <a class="cross-ref" href="section-69.3.html">Section 69.3</a>. Each batch emits its proxy vector (mean confidence, entropy, positive rate, ensemble disagreement, override rate) and an ATC-style error estimate with a confidence band. A regression fires when the estimate crosses a threshold <em>and</em> at least one independent proxy family agrees, which suppresses the false alarms that any single noisy proxy throws. Separately, a slow reconciliation job ingests backfilled labels, recomputes bias-corrected true metrics on now-mature windows, and audits every past proxy estimate against the truth; when the proxy-to-truth residual drifts, it schedules a re-fit or opens a ticket. That reconciliation is precisely the evidence a retraining trigger needs, which is where we turn next.</p>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-69.5.html">Section 69.5</a>, we turn these proxy estimates and backfilled metrics into <em>decisions</em>: the retraining triggers that decide when a drift signal or a confirmed accuracy drop justifies retraining, and the fleet-management machinery that rolls a new model out across thousands of heterogeneous devices without taking the whole fleet down at once.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

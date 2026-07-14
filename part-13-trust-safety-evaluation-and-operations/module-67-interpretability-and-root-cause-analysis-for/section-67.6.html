@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 67.6: Human-review tooling (TSInterpret, Captum). Building Sensory AI." name="description"/>
+<title>Section 67.6: Human-review tooling (TSInterpret, Captum) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 67: Interpretability and Root-Cause Analysis for Time Series</a></div>
+<h1>Human-review tooling (TSInterpret, Captum)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"An explanation that lives only in a notebook is a private opinion. An explanation a tired technician can accept or overrule at 3 a.m. is a control."</p><cite>A Well-Tooled AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous five sections built explanation <em>methods</em>: attribution (67.1), saliency and its traps (67.2), counterfactuals (67.3), prototypes and concepts (67.4), root-cause graphs (67.5). Each is a different research paper with a different call signature, a different tensor shape, and a different way of quietly breaking on multivariate sensor windows. This section is about the <strong>layer between those methods and a human</strong>: the libraries that give every explainer one interface, and the review loop that turns a saved attribution into a decision an operator actually makes. Two libraries anchor it. <strong>Captum</strong> is the PyTorch attribution engine (gradients, Integrated Gradients, occlusion, SHAP variants) that computes the raw signal. <strong>TSInterpret</strong> is the time-series-specific wrapper that adapts those methods to \((\text{time} \times \text{channel})\) inputs, hides the reshaping, and standardizes the plot a reviewer sees. Getting this layer right is the difference between interpretability as a paper figure and interpretability as an operational safeguard.</p>
+</div>
+
+<p>This section assumes you can already produce the attributions and prototypes of Sections 67.1 through 67.5, and that you understand the model-monitoring context in which review queues live (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>). Because reviewers act on flagged windows, you also need the anomaly-scoring backbone that produces the flags (<a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) and the calibrated confidence that decides which flags reach a person at all (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>).</p>
+
+<h2>Why a tooling layer, not another method</h2>
+
+<p>A production sensor model rarely commits to one explainer. You want gradient-based attribution for speed on every alert, occlusion for a slower but model-agnostic second opinion, and a counterfactual when the reviewer asks "what would have made this normal?" Wiring three research repos together by hand means three tensor conventions, three normalization schemes, and three subtly different notions of what the "baseline" is. <strong>TSInterpret</strong> (Höllig, Kulbach, and Thoma, 2022) exists to remove that friction: it presents feature-attribution methods (Integrated Gradients, GradCAM, LEFTIST, TSR) and instance-based methods (counterfactuals, Native-Guide) behind one <code>explain()</code> call that always takes a window shaped \((\text{samples}, \text{channels}, \text{time})\) and always returns something plottable. The value is not a new algorithm; it is that every explainer becomes swappable, so a reviewer's dashboard shows the same layout whether the number underneath came from a gradient or an occlusion sweep.</p>
+
+<p><strong>Captum</strong> (Kokhlikyan et al., 2020) sits one level below as the differentiable attribution library for any PyTorch model. It supplies the mathematics: <code>IntegratedGradients</code>, <code>DeepLift</code>, <code>GradientShap</code>, <code>Occlusion</code>, and the <code>captum.concept</code> TCAV machinery used in Section 67.4. For a 1D sensor CNN it works out of the box because a window is just a tensor; the only care needed is choosing a physically meaningful baseline (a zeroed window implies "silence," which is wrong for a sensor with a nonzero DC bias). The division of labor is clean: Captum computes, TSInterpret adapts and standardizes, and your review UI consumes a uniform result object.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The reviewer is a classifier too, and a slow, expensive, distractible one. Every design choice in the tooling layer should be read as "does this reduce the reviewer's error rate or their time per case?" A consistent layout across explainers cuts their error, because they learn to read one chart instead of five. A triage order that puts the most decision-changing cases first cuts wasted time. Interpretability tooling is a human-factors problem wearing a machine-learning costume; the attribution math is necessary but it is not the product.</p>
+</div>
+
+<h2>From attribution tensor to a review loop</h2>
+
+<p>A raw attribution is a tensor the same shape as the window. A <em>review case</em> is that tensor plus everything the human needs to rule on it: the input window, the model's prediction and calibrated confidence, the top attributed channels and time spans, one nearest historical prototype (67.4), and a field for the reviewer's verdict. The loop has four stages. <strong>Triage</strong> orders the queue, usually by a mix of predicted severity and low confidence, so scarce attention lands where a human is most likely to change the outcome. <strong>Presentation</strong> renders the case with the attribution overlaid on the signal, not as a separate heatmap the eye has to align by hand. <strong>Adjudication</strong> captures a structured verdict (confirm, override, escalate) plus a free-text reason. <strong>Feedback</strong> writes the verdict back as a label, closing the loop with the retraining triggers of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>. Skipping the feedback stage is the most common failure: teams ship a beautiful dashboard, collect thousands of expert verdicts, and throw them away.</p>
+
+<p>The code below builds one review case for a sensor-window classifier using Captum's Integrated Gradients, then reduces the full attribution to the compact summary a reviewer reads first. It is the exact bridge between the method and the UI.</p>
+
+<pre><code class="language-python">import torch
+from captum.attr import IntegratedGradients
+
+def build_review_case(model, window, channel_names, baseline=None):
+    model.eval()
+    window = window.unsqueeze(0)                     # (1, channels, time)
+    logits = model(window)
+    prob, pred = torch.softmax(logits, dim=1).max(dim=1)
+
+    if baseline is None:                             # per-channel mean, not zeros
+        baseline = window.mean(dim=2, keepdim=True).expand_as(window)
+
+    ig = IntegratedGradients(model)
+    attr = ig.attribute(window, baselines=baseline, target=pred, n_steps=64)
+    attr = attr.squeeze(0)                           # (channels, time)
+
+    per_channel = attr.abs().sum(dim=1)              # which sensor mattered
+    peak_time   = attr.abs().sum(dim=0).argmax()     # which instant mattered
+    top_ch      = per_channel.argmax()
+
+    return {
+        "prediction":  pred.item(),
+        "confidence":  round(prob.item(), 3),        # gate triage on this
+        "top_channel": channel_names[top_ch],
+        "peak_time":   int(peak_time),
+        "attribution": attr,                         # full map for the overlay plot
+    }
+
+# usage: one call per flagged window feeds one card in the review queue
+case = build_review_case(model, flagged_window, ["ax", "ay", "az", "gx", "gy", "gz"])
+</code></pre>
+<div class="code-caption">Turning a Captum attribution into a review case. The full <code>attribution</code> map drives the signal overlay; <code>confidence</code> orders the triage queue; <code>top_channel</code> and <code>peak_time</code> are the one-line summary a reviewer reads before deciding whether to open the full plot. Note the per-channel mean baseline, which respects each sensor's DC bias instead of implying silence.</div>
+
+<p>The summary fields matter as much as the tensor. A reviewer scanning a queue reads "IMU alert, driven by <code>az</code> at t=190" and triages in a second; only on the ambiguous cases do they open the overlay. That two-tier presentation, one-line summary then full plot on demand, is what keeps a human review loop fast enough to run on a real fleet.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Implementing Integrated Gradients correctly from scratch (path integral, Riemann approximation, completeness check) is roughly 40 lines you will get subtly wrong on the baseline convergence; Captum gives it in three, with the completeness delta returned for free. Adapting five different explainers to a common \((\text{samples}, \text{channels}, \text{time})\) interface and a shared plotting call is another 200-plus lines of reshaping and normalization glue; TSInterpret's uniform <code>explain()</code> plus its built-in visualizers collapse that to one wrapper per method. Reach for Captum for the attribution mathematics and for TSInterpret whenever you need more than one explainer to share a dashboard.</p>
+</div>
+
+<h2>What a reviewer actually needs on screen</h2>
+
+<p>A usable review card shows five things in a fixed layout: the raw signal for the driving channels, the attribution overlaid as color or shading directly on that signal, the prediction with its calibrated confidence, one nearest historical case for context, and a compact verdict control. Three rules earn their place. First, <strong>overlay, do not juxtapose</strong>: a heatmap drawn beside the signal forces the reviewer to align two x-axes by eye, and Section 67.2 already showed how easily temporal saliency misleads even when correctly aligned. Second, <strong>show confidence honestly</strong>: an uncalibrated 0.99 invites rubber-stamping, so pipe the conformal or temperature-scaled score from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, not the raw softmax. Third, <strong>make disagreement cheap</strong>: a one-click override with a required reason produces the highest-value training labels you will ever collect, because they mark exactly where the model and an expert diverge.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the ICU rhythm queue</h3>
+<p>A hospital deployed an ECG arrhythmia classifier (the cardiac modeling comes from <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>) with a cardiology-fellow review queue for anything flagged above a severity threshold. The first build showed a bare label and a separate saliency strip; fellows confirmed nearly everything, because verifying meant mentally aligning two plots under time pressure. The team rebuilt the card with TSInterpret: Integrated Gradients from Captum, overlaid in red directly on the lead-II trace, calibrated confidence in place of raw softmax, and one nearest confirmed prior episode beside it. Override rate on false alarms tripled, and the free-text reasons clustered into two themes, motion artifact misread as ectopy and lead-reversal, that became the next two training-data fixes. The attribution method never changed. The <em>tooling</em> around it turned a rubber stamp into a genuine second reader, and the review layer, not the model, is what the clinical-validation file (<a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>) had to document.</p>
+</div>
+
+<h2>Wiring review into operations</h2>
+
+<p>The review loop is not a standalone app; it is a stage in the fleet pipeline. Alerts arrive from the monitoring layer (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>), the tooling attaches an explanation and a triage score, a human adjudicates, and the verdict flows back as a label and as an audit record. Two practices keep it honest. Cache the explanation with the alert, because recomputing an attribution days later against a since-updated model yields a different picture than the reviewer saw, and your audit trail must show what was actually on screen. And always draw the prototypes and baselines used in the tooling from the training split only, using the leakage-safe partitions of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>; a "nearest historical case" pulled from the test set has quietly leaked evaluation data into the operator's judgment.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>TSInterpret (Höllig et al., JMLR MLOSS 2023) and Captum (Kokhlikyan et al., 2020) remain the reference open-source stack, with Alibi and InterpretML covering adjacent model-agnostic methods. The active frontier is the review interface itself. Language-model agents (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>) are being wired to read a Captum attribution plus the top prototype and draft a natural-language rationale for the human to check, shifting the reviewer from reading heatmaps to auditing a written argument. The open risk is automation bias: a fluent LLM rationale can make a wrong attribution more persuasive, not less, so the emerging benchmarks (Section 67.7, XTSC-Bench) are beginning to score whether tooling helps a human reach the <em>correct</em> verdict, not merely a faster one. Human-grounded evaluation of the whole review loop, not the attribution in isolation, is the direction the field is moving.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a wrist-IMU human-activity classifier and stand up a minimal review queue. (1) Use the <code>build_review_case</code> function to generate cases for 200 flagged windows, and order the queue by ascending calibrated confidence; report how many cases a reviewer would open at a two-tier "summary then plot" cutoff of 0.6 confidence. (2) Swap the Integrated Gradients call for Captum's <code>Occlusion</code> and compare the <code>top_channel</code> agreement rate across the two methods; where they disagree, which would you show the reviewer and why? (3) Add a required "reason" field to the override control and describe how you would route those free-text reasons into the retraining trigger of Chapter 69.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is a per-channel mean a better Integrated Gradients baseline than an all-zeros window for most sensor signals, and what would the zero baseline silently claim?</li>
+<li>The tooling layer is described as reducing the reviewer's error rate or time per case. Give one concrete UI choice that targets error and one that targets time.</li>
+<li>A team recomputes each alert's attribution on demand instead of caching it with the alert. What audit and reproducibility problem does this create once the model is updated?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-67.7.html">Section 67.7</a>, we ask the question this whole chapter has deferred: is any of it faithful? Explanation-faithfulness benchmarks such as XTSC-Bench give a principled way to score whether an attribution reflects the model's real reasoning or just tells a plausible story, so you can choose the explainer your review tooling should trust.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

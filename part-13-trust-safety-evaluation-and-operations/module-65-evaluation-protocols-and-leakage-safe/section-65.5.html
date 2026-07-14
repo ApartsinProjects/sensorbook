@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 65.5: Robustness to missing and faulty sensors. Building Sensory AI." name="description"/>
+<title>Section 65.5: Robustness to missing and faulty sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 65: Evaluation Protocols and Leakage-Safe Benchmarking</a></div>
+<h1>Robustness to missing and faulty sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The demo scored 94. Then a $2 accelerometer came loose in the field and the model, never having been asked, confidently kept scoring 94 on a flat line."</p>
+        <cite>An Unpleasantly Surprised AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the leakage-safe splitting discipline of <a class="cross-ref" href="section-65.2.html">Section 65.2</a> and the operational-metric framing of <a class="cross-ref" href="section-65.1.html">Section 65.1</a>. It draws on the physical fault mechanisms (bias, drift, saturation, quantization) catalogued in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and it evaluates the missing-modality architectures built in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a> without re-deriving them. The concern here is strictly evaluation: how to <em>measure</em> degradation under sensor failure, not how to engineer the redundancy that resists it (that is <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>).</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A model trained and tested on pristine, fully-populated sensor frames is being graded on an exam it will never sit in production. Real fleets lose channels: a connector corrodes, a Bluetooth link drops a packet, an IMU saturates during impact, a thermistor freezes at its last reading. A clean-data leaderboard number tells you nothing about what happens then, and the failure is usually silent: the model still emits a confident prediction over garbage. This section makes robustness a <em>first-class evaluated quantity</em>. You will define a fault taxonomy, inject faults only at test time under a leakage-safe protocol, and summarize the result not as one accuracy but as a degradation curve with a worst-case floor. The goal is to know, before deployment, exactly how gracefully your system fails.</p>
+    </div>
+
+    <h2>A taxonomy of sensor faults worth injecting</h2>
+    <p>"Missing sensor" is only the simplest failure. A robustness evaluation that tests dropout alone will bless a model that then collapses on a stuck thermistor. The point of a taxonomy is coverage: you inject a representative fault from each family and report each separately, because the failure modes are mechanistically distinct and a model can be immune to one while catastrophically brittle to another. Six families cover the overwhelming majority of field incidents.</p>
+    <p><strong>Dropout (missing)</strong> is a channel going absent: no samples, or a sentinel like NaN. <strong>Stuck-at (frozen)</strong> is the sensor repeating its last value, a flat line that a mean-imputer will happily accept as real. <strong>Bias and drift</strong> shift the signal by a constant or a slow ramp, the calibration failure of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>; the values stay in-range and plausible, which is what makes drift so dangerous to detect. <strong>Saturation and clipping</strong> pin the signal at a rail when the true value exceeds the sensor's range. <strong>Noise inflation</strong> multiplies the sensor's variance, modeling a failing amplifier or loose ground. <strong>Latency and desynchronization</strong> delay one stream relative to the others, breaking the temporal alignment that fusion depends on (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>). Table 65.5.1 pairs each family with its field cause and, critically, the imputation strategy it defeats, since a robustness gain that only survives your favorite imputer is not a gain.</p>
+
+    <div class="table-container">
+    <table>
+      <caption><strong>Table 65.5.1.</strong> A minimal fault taxonomy for evaluation. Each family is injected independently at test time; the last column names a naive defense it is designed to expose.</caption>
+      <thead>
+        <tr><th>Fault family</th><th>Signal effect</th><th>Typical field cause</th><th>Defeats</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Dropout</td><td>absent / NaN</td><td>connector loss, packet drop</td><td>models with no missing-mask input</td></tr>
+        <tr><td>Stuck-at</td><td>flat repeat of last value</td><td>frozen firmware, dead ADC</td><td>mean / forward-fill imputation</td></tr>
+        <tr><td>Bias / drift</td><td>in-range constant or ramp shift</td><td>decalibration, thermal drift</td><td>range and NaN checks</td></tr>
+        <tr><td>Saturation</td><td>clipped at rail</td><td>true value exceeds range</td><td>normalization by fixed scale</td></tr>
+        <tr><td>Noise inflation</td><td>variance &#215; k</td><td>failing amp, loose ground</td><td>low-pass smoothing alone</td></tr>
+        <tr><td>Latency / desync</td><td>time-shifted stream</td><td>clock skew, buffering</td><td>early-fusion concatenation</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The most dangerous faults are the ones that stay in-range. A dropped channel announces itself as NaN and any competent pipeline can branch on it. A drifting bias or a stuck-at line produces perfectly plausible numbers, so the model has no structural signal that anything is wrong and neither does a naive range check. Consequently a robustness evaluation must weight the <em>silent</em> faults (stuck-at, drift, saturation) at least as heavily as the loud one (dropout). Reporting only dropout robustness is the single most common way a benchmark overstates field resilience.</p>
+    </div>
+
+    <h2>The leakage-safe fault-injection protocol</h2>
+    <p>Where you inject the fault decides whether you are measuring robustness or fooling yourself. The rule is that <strong>faults are a property of the test-time input, never of the labels, and never leaked into tuning</strong>. Three protocol choices make this rigorous. First, keep the evaluation set's ground truth exactly as it was on clean data: the correct activity, heart rate, or object is unchanged by the fact that one sensor broke, so the label must not move. What degrades is the input, and therefore the score. Second, if you train with fault augmentation (a legitimate and usually effective defense), the augmentation distribution and its random seeds must be disjoint from the evaluation faults. Tuning the dropout rate on the same seed you report against is the temporal cousin of the leakage sins in <a class="cross-ref" href="section-65.2.html">Section 65.2</a>: it manufactures a robustness number the field will not honor. Third, hold the fault seed fixed <em>across models</em> so that model A and model B face byte-identical corrupted inputs; otherwise you are comparing luck, not robustness.</p>
+    <p>With the protocol fixed, the summary statistic is a <strong>degradation curve</strong>, not a single number. For a fault parameterized by severity \(s\) (dropout probability, drift magnitude, noise multiplier), sweep \(s\) from clean to catastrophic and plot the operational metric \(M(s)\). Two scalars condense the curve. The <em>retained performance</em> at a chosen operating severity is
+    \[ R(s) = \frac{M(s)}{M(0)}, \]
+    and the <em>area under the degradation curve</em> integrates resilience across the whole sweep,
+    $$ \mathrm{AUDC} = \frac{1}{M(0)}\int_0^{s_{\max}} M(s)\,\mathrm{d}s. $$
+    Report both, plus the <strong>worst-case single-channel ablation</strong>: drop each sensor in turn and record the largest drop. That worst-case floor is what a safety case (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) actually cares about, because the field will find your weakest channel whether or not your average looks healthy.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a wrist wearable that leaned on one sensor</h3>
+        <p>A sleep-staging wearable fused PPG, accelerometer, and skin-temperature streams and reported 0.81 macro-F1 on a subject-disjoint test set. Robustness evaluation told a different story. Under the taxonomy of Table 65.5.1, dropping the accelerometer cost only 3 F1 points, but a <em>stuck-at</em> fault on the PPG channel (the optical sensor losing skin contact and repeating its last sample, a nightly occurrence when the band loosens) cost 22 points, and the model never flagged low confidence, since a flat PPG line is a valid-looking input. Mean imputation had trained the model to trust the PPG channel implicitly. The worst-case single-channel ablation, not the average, exposed the fragility. The team added PPG-contact masking and stuck-at augmentation during training; the stuck-at penalty fell to 6 points and, as importantly, the model's abstention rate (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) now rose when contact was lost instead of emitting a confident wrong stage.</p>
+    </div>
+
+    <h2>Building the harness</h2>
+    <p>A robustness harness is a fault-injection layer wrapped around your existing evaluation loop plus a curve summarizer. Listing 65.5.1 shows the core: a dictionary of fault functions keyed by family, a sweep over severities that re-scores the clean-label test set on corrupted inputs, and the two scalars from above. The design point is that the labels object is passed through untouched; only <code>X</code> is corrupted, which is what keeps the protocol honest.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def dropout(X, s, rng):        # s = fraction of channels zeroed per frame
+    M = rng.random(X.shape[:2]) &lt; s
+    Xc = X.copy(); Xc[M] = 0.0
+    return Xc, (~M).astype(np.float32)          # also emit the missing-mask
+
+def stuck_at(X, s, rng):       # s = fraction of channels frozen
+    Xc = X.copy()
+    for c in np.where(rng.random(X.shape[1]) &lt; s)[0]:
+        Xc[:, c, :] = Xc[:, c, :1]              # repeat first sample forever
+    return Xc, np.ones(X.shape[:2], np.float32)
+
+def drift(X, s, rng):          # s = bias in signal std units
+    return X + s * X.std(), np.ones(X.shape[:2], np.float32)
+
+FAULTS = {"dropout": dropout, "stuck_at": stuck_at, "drift": drift}
+
+def degradation_curve(model, X, y, fault, sevs, seed=0):
+    rng = np.random.default_rng(seed)           # fixed seed: same across models
+    scores = []
+    for s in sevs:
+        Xc, mask = FAULTS[fault](X, s, rng)
+        scores.append(model.score(Xc, mask, y)) # labels y never corrupted
+    scores = np.array(scores)
+    audc = np.trapz(scores, sevs) / (scores[0] * (sevs[-1] - sevs[0]))
+    return scores, scores / scores[0], audc     # M(s), retained R(s), AUDC</code></pre>
+    <div class="code-caption"><strong>Listing 65.5.1.</strong> A leakage-safe robustness harness. Each fault corrupts only the input tensor <code>X</code> and emits a missing-mask; the labels <code>y</code> pass through unchanged. A fixed seed guarantees every model faces identical corruption, and the returned triple gives the raw curve, retained performance, and area under the degradation curve.</div>
+
+    <p>As Listing 65.5.1 emphasizes, <code>dropout</code> returns a missing-mask alongside the corrupted tensor. Whether a model can consume that mask is itself part of what you are evaluating: a fusion model built for missing-modality inputs (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>) reads it and reweights; a naive early-fusion concatenator ignores it and drifts. Running the same sweep on both, with the fixed seed, is exactly the apples-to-apples comparison the protocol demands.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling a full corruption suite (a dozen fault functions, severity sweeps, per-severity reseeding, curve integration, and worst-case ablation over every channel) runs to a few hundred lines. Established perturbation-benchmark libraries collapse the boilerplate to a compose-and-run:</p>
+        <pre class="language-python"><code class="language-python">from robustness_suite import CorruptionSuite   # e.g. an audiomentations /
+suite = CorruptionSuite(                        # imagecorruptions-style API
+    faults=["dropout", "stuck_at", "drift", "gain", "desync"],
+    severities=5, seed=0)
+report = suite.evaluate(model, test_loader)     # curves + AUDC + worst-case
+</code></pre>
+        <div class="code-caption"><strong>Listing 65.5.2.</strong> A perturbation-suite library replaces roughly 300 lines of fault plumbing with about 4, and standardizes the severity levels so results are comparable across teams. What no library decides for you is <em>which</em> faults reflect your deployment; that judgment stays yours.</div>
+        <p>Listing 65.5.2 cuts the harness to four lines, but the taxonomy in Table 65.5.1 is still your responsibility: a suite that omits stuck-at because your camera-centric library never needed it will silently under-test a wearable.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a multi-channel model you have trained (HAR, biosignal, or a small fusion model). Using the harness in Listing 65.5.1, produce a degradation curve for dropout, stuck-at, and drift, and compute AUDC for each. Then run the worst-case single-channel ablation and identify your most load-bearing sensor. Retrain with augmentation on <em>only</em> that fault family, using a seed disjoint from evaluation, and re-measure. Report which fault improved, which regressed, and whether the model's confidence tracked the degradation or stayed flatly overconfident.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why must the ground-truth labels stay unchanged when you inject a sensor fault into the test input?</p>
+        <p class="quiz-question">2. A team reports strong dropout robustness. Name two fault families from Table 65.5.1 that this number tells you nothing about, and explain why they are more dangerous to miss.</p>
+        <p class="quiz-question">3. What specifically goes wrong if you tune your training-time augmentation severity on the same random seed you later evaluate against?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-65.6.html">Section 65.6</a>, we turn to the other half of the sleep-wearable story: even a robust model is untrustworthy if its confidence lies. We will measure calibration and uncertainty directly, so that when a sensor fails the reported probability drops truthfully instead of staying pinned at a confident, wrong value.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

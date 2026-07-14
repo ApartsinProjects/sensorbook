@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.4: Test-time training and adaptation (TENT, CoTTA). Building Sensory AI." name="description"/>
+<title>Section 66.4: Test-time training and adaptation (TENT, CoTTA) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>Test-time training and adaptation (TENT, CoTTA)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They shipped me trained on ten subjects and expected me to meet the eleventh with grace. So I learned to adjust my own knobs between heartbeats, quietly, without asking anyone for a label."</p>
+<cite>A Self-Tuning AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you know what a batch-normalization layer stores and computes (running mean and variance plus affine scale and shift), which is developed alongside neural encoders for sensor streams in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. It leans on prediction entropy and calibration as a proxy for confidence, from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and on the self-supervised auxiliary tasks of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. Distribution shift itself was formalized in <a class="cross-ref" href="section-66.1.html">Section 66.1</a>; domain generalization, the train-time cousin of this section, was <a class="cross-ref" href="section-66.3.html">Section 66.3</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Domain generalization tries to bake robustness in before shipping, then freezes the model forever. Test-time adaptation (TTA) takes the opposite bet: ship a normal model, and let it adjust itself to each new deployment using the unlabeled sensor stream it is already seeing. No target labels, no round trip to a server, often just a few thousand parameters updated on the fly. This is unusually well suited to sensing, where the shift is real and predictable (a new wrist, a different phone, a colder motor bearing) but the labels never arrive. This section covers the three ideas that define the field: <strong>test-time training (TTT)</strong>, which adapts through a self-supervised loss; <strong>TENT</strong>, which minimizes prediction entropy over batch-norm parameters; and <strong>CoTTA</strong>, which keeps TENT from destroying itself when the domain keeps changing.</p>
+</div>
+
+<h2>Why adapt at test time at all</h2>
+<p>A sensor model fails in the field for a concrete reason: the feature statistics it saw in training no longer match what the deployed sensor produces. A human-activity model trained on ten subjects meets an eleventh whose gait, wrist placement, and phone model shift the accelerometer distribution; a bearing-fault detector meets a motor running five degrees hotter. The decision boundary is often still roughly correct, but the <em>activations feeding it</em> have drifted, and in a network with batch normalization that drift is exactly what the normalization statistics were supposed to remove. That observation is the seed of the whole field. If the only thing that broke is the input statistics, you may be able to repair the model without a single label, just by re-estimating those statistics and gently re-tuning the layers that consume them. TTA is attractive for sensing precisely because the alternative, collecting labels for every new subject or device and retraining, does not scale to a fleet, and because the target data streams in for free.</p>
+
+<h2>Test-time training: adapt through a self-supervised proxy</h2>
+<p>Test-time training (TTT, Sun et al., 2020) is the founding idea. At training time you attach a self-supervised auxiliary head to a shared feature extractor and train two losses jointly: the real task and a proxy that needs no labels. For images the classic proxy is predicting a rotation; for sensor time series the natural analogues from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> are predicting an applied transformation (time reversal, channel permutation, a jitter magnitude) or a masked-reconstruction loss. At test time you are handed an unlabeled window, you cannot compute the task loss, but you <em>can</em> compute the proxy loss, so you take one or a few gradient steps on it to update the shared features, and only then read off the task prediction. The bet is that a feature extractor forced to solve the proxy well on the target sample is also a better substrate for the real task. TTT works, but it commits you to a specific auxiliary head chosen before deployment, and it modifies the whole backbone, which is heavy for an edge device.</p>
+
+<h2>TENT: minimize the entropy of your own predictions</h2>
+<p>TENT (Test-time ENTropy minimization, Wang et al., 2021) is the idea that made TTA practical, and it is disarmingly simple. It needs no auxiliary head and no change to how you trained. The insight: on data a model handles well, its softmax predictions are confident (low entropy); on shifted data they are mushy (high entropy). So drive the entropy down. For a prediction \(\hat{y}\) with class probabilities \(p_c\), TENT minimizes the Shannon entropy</p>
+$$ H(\hat{y}) = -\sum_{c} p_c \log p_c $$
+<p>averaged over the current test batch. Two design choices make it safe and cheap. First, it updates <em>only</em> the batch-norm affine parameters (the per-channel scale \(\gamma\) and shift \(\beta\)), a few thousand numbers, freezing every convolution and linear weight; this keeps the learned decision structure intact and cannot overfit the way a full backbone update can. Second, it recomputes the batch-norm normalization statistics from the test batch itself rather than reusing the stale training running averages, which alone recovers a surprising fraction of the lost accuracy. Entropy is minimized by making predictions both confident and, as a side effect of sharpening, more separated. Because the update touches so little, TENT runs online: one forward pass, one entropy backward pass over \(\gamma,\beta\), predict, repeat on the next batch. It is the reason TTA moved from a research curiosity to something you can put on a phone.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>TENT works because entropy is a label-free stand-in for error that you can differentiate. You never learn the true class of a test window, but you assume a well-adapted model should be decisive about it, and you push the model toward decisiveness on the target distribution. The danger is the flip side of the same coin: entropy is minimized just as happily by a <em>wrong</em> confident prediction, so if the model starts drifting toward one class, entropy minimization can reward the drift. That failure mode, quiet collapse toward confident nonsense, is why the batch-norm-only restriction matters and why the next method exists.</p>
+</div>
+
+<h2>CoTTA: surviving a domain that never stops changing</h2>
+<p>TENT assumes a single fixed target domain. Real sensor deployments are <em>continual</em>: a wearable crosses from walking to a car to a cold morning run, a factory line changes product every hour. Under this stream, plain TENT accumulates error, because each adaptation step is trained on the last step's possibly-wrong predictions, and it suffers catastrophic forgetting of the source knowledge. CoTTA (Continual Test-Time Adaptation, Wang et al., 2022) adds three guards. (1) A <strong>weight-averaged teacher</strong>: a slowly moving exponential average of the student supplies the target pseudo-labels, so the supervision signal is smoother and less noisy than the student's own instantaneous output. (2) <strong>Augmentation averaging</strong>: when the teacher is uncertain, it averages predictions over several augmentations of the input to produce a more reliable pseudo-label. (3) <strong>Stochastic restore</strong>: after each update a small random fraction of weights is reset to their original source values, which continually reinjects source knowledge and provably bounds forgetting. The net effect is an adapter that can ride a shifting stream for a long time without collapsing, at the cost of running a teacher and augmentations, which is heavier than TENT.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current frontier is TTA that does not depend on large batches or batch normalization at all, both of which sensing violates. Edge streams arrive one window at a time and modern sequence backbones (transformers, the state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) use layer normalization, so batch statistics do not exist to re-estimate. Methods such as <strong>SAR</strong> (sharpness-aware and reliable entropy minimization, which filters high-loss samples and seeks flat minima) and <strong>EATA</strong> (which weights samples by reliability and adds an anti-forgetting regularizer) target exactly the tiny-batch, noisy-stream regime. The follow-on <a class="cross-ref" href="section-66.5.html">Section 66.5</a> pushes further into optimization-free adaptation, dropping backprop entirely, which is often the only viable option on a microcontroller.</p>
+</div>
+
+<div class="callout practical-example">
+<h4>Step-Through: a wrist HAR model meeting a new subject overnight</h4>
+<p>A sleep-and-activity wearable ships a model trained on a lab cohort. A new user straps it on; their tremor and looser band shift the accelerometer variance enough that step counting drops from \(94\%\) to \(78\%\) agreement on the first night. There are no labels: nobody annotates the wearer's night. The team enables TENT on-device. During the night the model sees roughly windows in short batches; it recomputes batch-norm statistics from the wearer's own signal and takes small entropy-minimization steps on \(\gamma,\beta\) only. By morning, agreement has climbed to \(90\%\), most of the gap closed, without a server round trip or a single label. The team leaves plain TENT in place for the stationary overnight case but switches to CoTTA's stochastic-restore variant for the daytime stream, where the wearer moves between contexts every few minutes and unguarded entropy minimization had been drifting toward a "walking" bias. This subject-shift-then-recover pattern is exactly the arc <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> studies for human-activity recognition, and Lab 66 asks you to reproduce it.</p>
+</div>
+
+<h2>A minimal TENT step</h2>
+<p>The whole method is small enough to read. Code 66.4.1 configures a network so that only its batch-norm layers train and their statistics are re-estimated from the incoming batch, then adapts by minimizing prediction entropy. Everything else stays frozen.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+def configure_for_tent(model):
+    """Freeze everything except BN affine params; let BN use batch stats."""
+    model.train()                                  # BN uses batch statistics
+    for p in model.parameters():
+        p.requires_grad_(False)                    # freeze all weights
+    params = []
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.track_running_stats = False          # ignore stale train stats
+            m.running_mean = m.running_var = None  # normalize with this batch
+            for p in m.parameters():               # gamma, beta only
+                p.requires_grad_(True)
+                params.append(p)
+    return params
+
+def softmax_entropy(logits):
+    p = logits.softmax(dim=1)
+    return -(p * p.clamp_min(1e-8).log()).sum(dim=1)   # per-sample entropy
+
+@torch.enable_grad()
+def tent_adapt_step(model, x, optimizer):
+    logits = model(x)                              # forward on unlabeled batch
+    loss = softmax_entropy(logits).mean()          # label-free objective
+    optimizer.zero_grad(); loss.backward(); optimizer.step()
+    return logits.detach()                         # prediction AFTER adapting
+
+# usage on a stream of unlabeled sensor batches
+params = configure_for_tent(model)
+optimizer = torch.optim.Adam(params, lr=1e-3)
+for x_batch in unlabeled_test_stream:              # e.g. accel windows
+    preds = tent_adapt_step(model, x_batch, optimizer).argmax(1)
+</code></pre>
+<div class="code-caption">Code 66.4.1: TENT in full. <code>configure_for_tent</code> freezes every weight except batch-norm scale and shift and switches BN to normalize with the current batch instead of the stale training averages. Each stream batch is predicted only after one entropy-minimizing step, so the model that labels a window is already adapted to it. Fewer than a dozen substantive lines separate a frozen model from a self-adapting one.</div>
+
+<p>Note in Code 66.4.1 that the optimizer is handed only the collected batch-norm parameters, so the several-million-weight backbone never moves. That single restriction is what keeps the entropy objective from steering the model off a cliff, and it is the difference between TENT and a full-backbone update that would overfit the first noisy batch it saw.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: do not re-implement the TTA zoo</h3>
+<p>Code 66.4.1 is worth reading once, but for real deployments the <code>tta</code> ecosystem does it for you. Torchvision-adjacent libraries and research releases (the official <code>tent</code>, <code>cotta</code>, and the unified <code>TTAB</code> / <code>torch-tta</code> benchmarks) wrap TENT, CoTTA, SAR, and EATA behind a single <code>adapt(model, x)</code> call, including the awkward parts: collecting the right parameters, handling models without batch norm, episodic-vs-continual reset policies, and per-method schedulers. That turns roughly 60 to 120 lines of careful per-method plumbing into about 3 lines and, more importantly, gives you the reference implementations that the benchmarks in <a class="cross-ref" href="section-66.7.html">Section 66.7</a> were measured against, so your numbers are comparable.</p>
+</div>
+
+<h2>When TTA helps, and when it quietly hurts</h2>
+<p>TTA is not free robustness. It helps most when the shift is a genuine covariate shift (the input statistics moved but the label meaning did not), when unlabeled target data arrives in reasonable quantity, and when the model uses normalization layers you can re-estimate. It hurts when the shift is a label or concept shift (the classes themselves changed, so confident predictions are confidently wrong), when batches are tiny and non-i.i.d. so batch statistics are unreliable, or when the stream is class-imbalanced enough that entropy minimization collapses toward the majority. Two rules keep you safe. Prefer the least invasive method that closes the gap: statistics-only recomputation first, then TENT, then CoTTA only if the stream is truly continual. And never adapt blind; the whole point of <a class="cross-ref" href="section-66.6.html">Section 66.6</a> is that you must monitor a risk signal during adaptation and be ready to freeze or roll back, because an unlabeled objective can walk your accuracy down as smoothly as it walks it up.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a HAR classifier trained on subjects A-J and a held-out subject K on whom accuracy is degraded. (a) Run statistics-only adaptation (recompute batch-norm statistics from K's stream, no gradient steps) and record the recovery; this is your floor. (b) Enable full TENT (Code 66.4.1) and measure the additional gain. (c) Now corrupt the setup: feed K's windows in class-sorted order (all "walking", then all "sitting") in tiny batches of four. Explain what happens to TENT's accuracy and tie it to the entropy-collapse failure mode. (d) Which of the three CoTTA guards would you add first to fix (c), and why?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>TENT updates only batch-norm scale and shift and freezes every other weight. Give two distinct reasons this restriction is what makes the entropy objective safe rather than destructive.</li>
+<li>Entropy minimization has no access to true labels. Explain in one sentence how it can improve accuracy at all, and in one more how the identical mechanism can degrade it.</li>
+<li>Your backbone is a state-space model with layer normalization and your edge device delivers one window at a time. Which assumption behind vanilla TENT breaks, and which frontier method or which upcoming section would you reach for instead?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-66.5.html">Section 66.5</a>, we drop the gradient step entirely. Backpropagating on a microcontroller between sensor windows is often a non-starter, so we study optimization-free test-time adaptation for cross-person human-activity recognition: methods that repair a model by re-aligning feature statistics or prototypes directly, no optimizer, no learning rate, no risk of the entropy collapse this section warned you about.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 67.3: Counterfactual sensor explanations (TSEvo, MASCOTS). Building Sensory AI." name="description"/>
+<title>Section 67.3: Counterfactual sensor explanations (TSEvo, MASCOTS) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 67: Interpretability and Root-Cause Analysis for Time Series</a></div>
+<h1>Counterfactual sensor explanations (TSEvo, MASCOTS)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They kept asking which samples I looked at. I only ever wanted to answer a simpler question: what would this signal have needed to be for me to relax?"</p>
+<cite>A Contrastive AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the attribution methods of <a class="cross-ref" href="section-67.1.html">Section 67.1</a> and the saliency pitfalls of <a class="cross-ref" href="section-67.2.html">Section 67.2</a>, which answered "which parts of the input mattered?" Here we answer a different question: "what would the input have had to be to change the decision?" We assume the notion of a decision boundary and a differentiable or queryable classifier from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, the idea of a plausible signal manifold from the self-supervised representations of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and basic sensor physics constraints from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. No prior exposure to evolutionary algorithms is required; we introduce the pieces we use.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An attribution map tells an operator that the third second of the vibration trace was "important." It does not tell them what to do about it. A <strong>counterfactual explanation</strong> answers the actionable question directly: it produces the closest alternative signal the model would have classified differently. "This window was flagged as a bearing fault; had the amplitude around 40 ms stayed below this level, it would have read as healthy." For sensor time series this is uniquely powerful and uniquely hard. Powerful, because the answer is a concrete, inspectable trace an engineer can compare against the real one. Hard, because a naive minimal edit produces a jagged, physically impossible signal no real sensor could emit. This section teaches the two dominant strategies for <em>plausible</em> time-series counterfactuals, <strong>TSEvo</strong> (evolutionary multi-objective search) and <strong>MASCOTS</strong> (a symbolic model-agnostic approach), and the desiderata that separate a useful counterfactual from a misleading one.</p>
+</div>
+
+<h2>What a time-series counterfactual is, and why sensors make it hard</h2>
+<p>Formally, given a classifier \(f\), an input signal \(x\) with predicted class \(f(x)=y\), and a target class \(y' \neq y\), a counterfactual is a signal \(x'\) that solves</p>
+$$ x' = \arg\min_{z}\; d(x, z) \quad \text{subject to}\quad f(z) = y', $$
+<p>where \(d\) measures how far the counterfactual strayed. This is the tabular recipe of Wachter and colleagues transplanted onto a sequence, and the transplant fails in three ways for sensors. First, <strong>sparsity is not enough</strong>: changing a scattered handful of samples yields spiky discontinuities that violate the bandwidth and inertia of any real transducer, so we want the changes <em>contiguous</em> (a few coherent segments, not confetti). Second, <strong>Euclidean proximity is a poor proxy for physical closeness</strong>: two traces one sample apart in \(L_2\) can differ by a phantom impulse a mechanical system cannot produce. Third, and most important, the counterfactual must be <strong>plausible</strong>: it must look like something the sensor could have measured, otherwise the model is interrogated off-manifold, the failure mode that made adversarial-looking saliency untrustworthy in <a class="cross-ref" href="section-67.2.html">Section 67.2</a>. A good time-series counterfactual therefore optimizes four coupled objectives at once: validity (it flips the label), proximity (it stays close), sparsity or contiguity (few, connected regions change), and plausibility (it stays on the data manifold).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Attribution and counterfactual explanations are duals. Attribution decomposes a decision that already happened; a counterfactual constructs the nearest decision that did not. The counterfactual is more actionable because it is <em>contrastive</em> in the way humans reason: people ask "why this and not that?", and a counterfactual literally exhibits the "that." But this power is real only if \(x'\) is plausible. An off-manifold counterfactual is an adversarial example wearing an explanation's clothes: it flips the label with a perturbation no physical process could generate, so it explains the model's blind spot rather than the phenomenon. Plausibility is the load-bearing objective, not a nicety.</p>
+</div>
+
+<h2>TSEvo: evolutionary multi-objective search</h2>
+<p>TSEvo (Höllig, Kulbach, and Thoma, ICMLA 2022) treats counterfactual generation as multi-objective optimization solved with a genetic algorithm, specifically the non-dominated sorting genetic algorithm NSGA-II. Rather than collapsing validity, proximity, and sparsity into one weighted scalar (which forces you to guess the weights), it evolves a <em>population</em> of candidates and returns the Pareto front: the set where no candidate can improve on one objective without worsening another. The operator picks a point on that front, trading proximity against sparsity to taste.</p>
+<p>Two choices make TSEvo suited to sensors. It is <strong>model-agnostic and gradient-free</strong>: it only queries \(f(z)\), so it works on a random forest, a boosted-tree fault classifier, or a deployed black box, which matters because much industrial sensing still runs the classical models from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. And its <strong>mutation operators are signal-aware</strong>: instead of adding white noise it splices segments from real instances of the target class, or mutates in the frequency domain, so offspring inherit plausible sensor structure. This "authentic" mutation keeps candidates on the manifold without an explicit density model. It handles multivariate signals natively, evolving which channels change, which is what you need when a counterfactual must decide whether the fault story lives in the accelerometer or the temperature channel.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: exonerating a gearbox on the factory floor</h4>
+<p>A wind-turbine operator runs a black-box classifier on triaxial nacelle vibration; it flags a gearbox window as "stage-2 bearing wear" and schedules an expensive teardown. The maintenance lead wants to know what would have made it read "healthy." TSEvo is pointed at the deployed model with target class <em>healthy</em>. Its authentic-mutation operator splices short segments from known-healthy windows of the <em>same</em> turbine into the flagged trace, and NSGA-II evolves toward validity while minimizing the changed region. The Pareto front offers a sparse counterfactual: flipping the verdict required suppressing a single narrow amplitude burst around the gear-mesh frequency in only the radial axis, roughly 60 ms, leaving the axial and tangential channels untouched. That is a diagnosis a vibration engineer can act on: it localizes the model's evidence to a specific harmonic in a specific axis, which they cross-check against the order-tracking analysis of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>. The counterfactual did not just say "the vibration mattered"; it said <em>which burst, which axis, how much</em>, and the teardown was deferred pending a targeted re-measurement.</p>
+</div>
+
+<h2>MASCOTS: symbolic, model-agnostic counterfactuals</h2>
+<p>Evolutionary search is flexible but can be slow, and its edits, while authentic, are not always human-legible. MASCOTS (a Model-Agnostic Symbolic COunterfactual method for Time Series, 2025) takes a different route: it lifts the signal into a <strong>symbolic representation</strong> before searching. Using a discretization in the family of SAX (Symbolic Aggregate approXimation) and bag-of-patterns encodings, it turns a continuous trace into a short string of symbols over piecewise segments. Counterfactual search then becomes editing symbols, "this rising segment becomes flat," rather than nudging thousands of samples. Two benefits follow. The edits are inherently <strong>contiguous and interpretable</strong>, because a symbol spans a whole segment. And plausibility comes cheaply, because edited symbols map back to shapes drawn from the observed vocabulary, so the reconstruction is composed of segment shapes the sensor has actually produced. MASCOTS is query-only like TSEvo and extends to multivariate signals by symbolizing each channel. The trade is granularity: symbolic edits are coarser than TSEvo's sample-level splices, more readable but occasionally less minimal.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The state of the art is converging on <strong>plausibility measured, not assumed</strong>. TSEvo and MASCOTS both encode plausibility structurally (authentic mutation, symbolic vocabularies), but recent work pushes toward generative plausibility: constraining \(x'\) to a manifold learned by a variational autoencoder or diffusion model over the sensor stream, so the counterfactual is sampled from an explicit density rather than assembled from fragments. Parallel efforts add <strong>actionability constraints</strong> that respect sensor physics (a temperature channel cannot jump 50 K in one sample; a phase and its quadrature must stay consistent), turning the generic distance \(d\) into a physics-aware cost. The open benchmark question, taken up in <a class="cross-ref" href="section-67.7.html">Section 67.7</a>, is how to score these methods on validity, proximity, plausibility, and sparsity simultaneously without one metric hiding a failure in another.</p>
+</div>
+
+<h2>Building a minimal contiguous counterfactual</h2>
+<p>The four objectives are easier to internalize by coding the smallest honest version: a gradient-free search that flips a black-box classifier by editing one contiguous segment while penalizing the size of the change. Code 67.3.1 is the conceptual kernel that TSEvo scales up with a real evolutionary operator and MASCOTS reframes symbolically.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def contiguous_counterfactual(x, classify, target, seg_len=8,
+                              n_iter=400, step=0.4, seed=0):
+    """Flip a black-box classifier by perturbing ONE contiguous window.
+    Objectives: validity (reach target) + proximity (small L2) +
+    contiguity (a single short segment, set by seg_len)."""
+    rng = np.random.default_rng(seed)
+    n = len(x)
+    best, best_cost = None, np.inf
+    for _ in range(n_iter):
+        start = rng.integers(0, n - seg_len)          # pick one window
+        z = x.copy()
+        z[start:start + seg_len] += step * rng.normal(size=seg_len)
+        if classify(z) == target:                     # validity satisfied
+            proximity = np.linalg.norm(z - x)         # how far we strayed
+            cost = proximity                          # contiguity fixed by seg_len
+            if cost < best_cost:
+                best, best_cost = z, cost
+    return best, best_cost
+
+# Toy detector: "fault" if any sample in the mid-window exceeds 1.5
+def classify(sig):
+    return "fault" if sig[20:40].max() &gt; 1.5 else "healthy"
+
+t = np.linspace(0, 1, 64)
+x = 0.3 * np.sin(2 * np.pi * 5 * t)
+x[28] += 1.8                                           # inject a fault spike
+cf, cost = contiguous_counterfactual(x, classify, target="healthy")
+print("original:", classify(x), " counterfactual:", classify(cf),
+      " L2 moved:", round(cost, 3))
+</code></pre>
+<div class="code-caption">Code 67.3.1: A minimal contiguous counterfactual search. It repeatedly perturbs a single short window (enforcing contiguity by construction), keeps only edits that flip the label to the target (validity), and among those retains the smallest total change (proximity). Real methods replace random-restart search with NSGA-II (TSEvo) or symbolic segment edits (MASCOTS), and add an explicit plausibility term; this kernel shows why the objectives are coupled.</div>
+
+<p>Running Code 67.3.1 returns a counterfactual that suppresses just the injected spike, the localized answer the gearbox example delivered at scale. Notice what is missing: there is no plausibility term, so on a real sensor this kernel could still produce a slightly unnatural dip. That gap is what TSEvo's authentic mutation and MASCOTS's symbolic vocabulary close, and why you should reach for them rather than hand-rolling search in production.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: TSInterpret instead of rolling your own</h3>
+<p>The <code>TSInterpret</code> library ships TSEvo and other time-series counterfactual methods behind a single <code>explain</code> call that consumes any query-only classifier and returns the counterfactual trace plus its objective scores. A from-scratch NSGA-II with signal-aware mutation, Pareto bookkeeping, and multivariate channel handling is several hundred lines and easy to get subtly wrong (dominated-solution leaks, mutation that drifts off-manifold). Through the library it is roughly a 5-line call: instantiate the explainer, call it on the flagged window, read the front. That is a several-hundred-line to about-5-line reduction. The full human-review workflow around <code>TSInterpret</code> and <code>Captum</code> is the subject of <a class="cross-ref" href="section-67.6.html">Section 67.6</a>; use the library for the search and spend your effort validating plausibility.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a wearable human-activity classifier (the modeling side is in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) that reads a 3-axis accelerometer window and predicts "walking." (a) Extend Code 67.3.1 to a 3-channel signal and add a plausibility penalty equal to the \(L_2\) distance from the counterfactual to its nearest neighbor among a set of real "running" windows. (b) Generate a counterfactual to the target "running" and report the four objective values (validity, proximity, contiguity as edited length, plausibility). (c) Compare the counterfactual you get with the plausibility term against the one without it, and explain in three sentences why the plausible version is the one you would show a physiotherapist.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>State the four objectives a sensor counterfactual should satisfy, and give a concrete failure that results from dropping the plausibility objective.</li>
+<li>Why does TSEvo return a Pareto front instead of a single counterfactual, and what does the operator gain from being handed the whole front?</li>
+<li>MASCOTS edits symbols rather than samples. Name one advantage and one cost of this choice relative to TSEvo's sample-level splicing.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-67.4.html">Section 67.4</a>, we move from per-instance contrastive edits to explanations that name recurring, human-meaningful structure: concept- and prototype-based methods that say "this window matches the <em>impending-stall</em> prototype" rather than editing a single trace. Where counterfactuals answer "what would have changed the verdict?", prototypes answer "what does this remind the model of?", and together they give an operator both a contrastive and a case-based account of the same alert.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

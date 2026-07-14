@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.5: Optimization-free TTA for cross-person HAR. Building Sensory AI." name="description"/>
+<title>Section 66.5: Optimization-free TTA for cross-person HAR | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>Optimization-free TTA for cross-person HAR</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked me to backpropagate on a coin-cell microcontroller, with a batch of one, no labels, and a new user every morning. I declined, and adapted anyway."</p>
+        <cite>A Gradient-Averse AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the gradient-based test-time adaptation of <a class="cross-ref" href="section-66.4.html">Section 66.4</a> (TENT, CoTTA) and defines itself against it. It assumes the human-activity recognition pipeline and the subject-shift problem of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>, the softmax-confidence and entropy tools of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the frozen-feature-extractor mindset of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. The deployment target throughout is the resource-constrained edge of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, where an autograd engine is a luxury you may not have.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A wrist-worn activity classifier trained on 40 volunteers meets user 41, whose stride, wrist angle, and pace it has never seen. Accuracy on "walking" versus "stairs" quietly drops ten points. The obvious fix from <a class="cross-ref" href="section-66.4.html">Section 66.4</a> is to backpropagate an entropy loss on the incoming stream. But on a wearable that means shipping an optimizer, choosing a learning rate that no one will tune per-user, adapting on batches of one, and risking the silent collapse where TENT drives every window to a single confident class. Optimization-free test-time adaptation refuses the gradient entirely. It keeps the network weights frozen and instead corrects the <em>outputs</em> or the <em>decision boundary</em> in closed form, using only the geometry of the incoming features. No learning rate, no optimizer state, no forgetting, and a per-window cost measured in matrix multiplies. This section shows why that trade is often the right one for cross-person HAR, and exactly how three gradient-free methods work.</p>
+    </div>
+
+    <h2>Why refuse the gradient at all</h2>
+    <p>Gradient-based TTA earns its accuracy, but every term it adds is a liability on a wearable. It needs a learning rate, and the field-honest answer is that you cannot re-tune it for each new wrist; a rate that recovers user 41 can destabilize user 42. It adapts on whatever batch the device can buffer, and cross-person HAR streams arrive one 2-second window at a time, so the batch statistics that TENT leans on are noisy or degenerate. Worst, unsupervised entropy minimization has a trivial optimum: predict one class with full confidence for everything. Under the sustained single-activity stretches typical of daily wear (an hour of sitting), that collapse is not hypothetical. And all of this presumes an autograd runtime and the memory for activations and optimizer moments, which a <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> microcontroller does not have.</p>
+    <p>Optimization-free methods sidestep the whole list. Their premise is that the frozen backbone, trained on 40 subjects, already produces <em>usable</em> features for subject 41; what shifts is not the feature extractor's competence but the mapping from features to labels, plus the class balance the user happens to exhibit. Fixing that mapping is a small, convex, closed-form problem. The three families below attack it at three different depths of the network.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Gradient-based TTA changes the <em>model</em>; optimization-free TTA changes the <em>answer</em>. Because the weights never move, there is no catastrophic forgetting, no learning-rate hyperparameter, and the adaptation is fully reversible: run the backbone once, then post-process its logits or its penultimate features. This reframes adaptation from "continue training in the field" to "solve a tiny inference-time correction," which is why it fits an edge budget that gradient descent never will.</p>
+    </div>
+
+    <h2>Three gradient-free families, from shallow to deep</h2>
+    <p>The methods differ in <em>where</em> they intervene. <strong>Statistic recalibration</strong> is the shallowest: replace the batch-normalization running mean and variance (frozen from training) with statistics computed on the incoming test window, a pure forward-pass operation. This is the optimization-free core that TENT wraps a gradient step around; used alone it already recovers a surprising fraction of the drop from covariate shift, because much of cross-person variation is a shift in feature mean and scale. <strong>Template (prototype) adjustment</strong> intervenes at the classifier: T3A (Test-Time Template Adjustment) discards the trained linear head's fixed weight vectors and rebuilds each class centroid from confidently-predicted test features, so the decision boundary migrates toward the new user's actual feature cloud without a single gradient. <strong>Output correction</strong> is the deepest in reasoning while touching the network least: LAME (Laplacian Adjusted Maximum-likelihood Estimation) leaves logits alone but re-solves the soft label assignment so that windows that are neighbors in feature space receive similar predictions, encoding the prior that consecutive HAR windows rarely jump between unrelated activities.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>T3A (Iwasawa and Matsuo, NeurIPS 2021) and LAME (Boudiaf et al., CVPR 2022) established that a backprop-free correction can match or beat TENT-style adaptation while being provably immune to the entropy-collapse failure mode, because neither has a degenerate all-one-class optimum. LAME in particular is designed for the <em>non-episodic, single-sample-friendly</em> regime that streaming HAR lives in, and its authors show it degrades gracefully where gradient methods diverge. The open frontier is combining these output-space corrections with the conformal risk control of <a class="cross-ref" href="section-66.6.html">Section 66.6</a> so that an unlabeled adaptation still carries an honest guarantee.</p>
+    </div>
+
+    <h2>LAME in detail</h2>
+    <p>LAME makes the neighbor prior precise. Let the frozen backbone produce, for a buffer of \(N\) windows, softmax probabilities \(p_i \in \Delta^{K}\) and \(\ell_2\)-normalized penultimate features \(f_i\). We seek adjusted soft labels \(z_i \in \Delta^{K}\) that stay close to the network's beliefs yet vary smoothly over the feature-space graph. With an affinity \(w_{ij}\) (a k-nearest-neighbor kernel on the \(f_i\)), LAME minimizes</p>
+    $$ \mathcal{L}(Z) = -\sum_{i=1}^{N} z_i^\top \log p_i \;-\; \sum_{i,j} w_{ij}\, z_i^\top z_j, $$
+    <p>where the first term pulls each assignment toward the backbone's evidence and the second rewards agreement between neighbors. The objective is concave in each \(z_i\) over the simplex, and the fixed-point update that solves it is simply</p>
+    \[ z_i \;\leftarrow\; \mathrm{softmax}\!\Big(\log p_i \;+\; \sum_{j} w_{ij}\, z_j\Big), \]
+    <p>iterated to convergence (typically under ten passes). Nothing here touches the weights; the entire cost is building a small affinity matrix and a handful of sparse matrix-vector products. Listing 66.5.1 implements the whole method in a dozen lines, and the crucial property to notice is that the uniform assignment is <em>not</em> a fixed point unless the logits already say so, which is exactly why LAME cannot collapse the way entropy minimization can.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def lame(features, probs, k=5, iters=10):
+    # features: (N, D) L2-normalized penultimate features from a FROZEN backbone
+    # probs:    (N, K) softmax outputs; weights are never updated
+    N = features.shape[0]
+    S = features @ features.T                 # cosine affinity (features are unit norm)
+    knn = np.argsort(-S, axis=1)[:, 1:k + 1]  # k nearest neighbors, excluding self
+    W = np.zeros((N, N))
+    for i in range(N):
+        W[i, knn[i]] = S[i, knn[i]]
+    W = 0.5 * (W + W.T)                        # symmetrize the affinity graph
+
+    logp = np.log(np.clip(probs, 1e-8, 1.0))
+    Z = probs.copy()
+    for _ in range(iters):                     # closed-form fixed point, no gradients
+        A = logp + W @ Z
+        A -= A.max(axis=1, keepdims=True)
+        E = np.exp(A)
+        Z = E / E.sum(axis=1, keepdims=True)   # project each row onto the simplex
+    return Z                                    # adjusted soft labels; argmax to decide</code></pre>
+    <div class="code-caption"><strong>Listing 66.5.1.</strong> LAME as a backprop-free fixed point. The frozen backbone supplies <code>features</code> and <code>probs</code>; adaptation is a k-NN affinity graph plus a few smoothing iterations. There is no optimizer, no learning rate, and no weight update, so the method cannot forget its training or collapse to a single class.</div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a rehab wearable meeting patient number one</h3>
+        <p>A clinical gait-monitoring band, trained on healthy volunteers, is deployed to a stroke-rehabilitation ward where every patient walks with an asymmetric, slow, hemiparetic gait the training set never contained. On the first day the frozen model confuses "slow shuffling walk" with "standing," because the acceleration envelope is muted. TENT was ruled out: the ward's safety review would not sign off on a model whose weights silently mutate on a medical device, and a batch of one produced unstable normalization. LAME, applied over a rolling 64-window buffer, recovered eight of the eleven lost accuracy points on the first patient with zero weight changes and a per-window budget the band's <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> processor absorbed without waking a second core. Because the correction was output-only and reversible, the ward kept the certified backbone bit-for-bit and logged the adjustment separately for audit. Confidence tracked the change honestly (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), rising only where neighbors agreed.</p>
+    </div>
+
+    <h2>When it works, and when it does not</h2>
+    <p>Optimization-free TTA rests on one load-bearing assumption: the frozen features are still <em>discriminative</em> for the new user, even if the head is miscalibrated for them. When that holds (mild-to-moderate covariate shift, a strong self-supervised backbone from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>), rebuilding prototypes or smoothing outputs recovers most of the loss for almost no compute. When the backbone's features themselves degrade (a wholly new sensor placement, a device-firmware change that alters the sampling geometry of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>), no output correction can invent information the features lost, and only genuine feature-space adaptation or retraining will help. LAME carries a second, subtler caveat: its neighbor prior <em>assumes clustered class structure</em>, so on a test buffer that is almost entirely one activity it can over-smooth minority windows into the majority. The practical rule is to gate it on a buffer with adequate predicted-class diversity, and to monitor the adaptation's risk rather than trust it blindly, which is precisely the subject of the next section.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Re-implementing the full optimization-free family (BN-statistic recalibration hooks, a T3A support-set manager with entropy-based pruning, and a LAME solver with several affinity kernels) from scratch runs to roughly 250 lines of careful bookkeeping. Modern TTA libraries expose each as a one-line wrapper around your frozen model:</p>
+        <pre class="language-python"><code class="language-python">from tta_library import LAME, T3A            # e.g. a robustbench-style TTA API
+adapted = LAME(frozen_model, affinity="knn", knn=5)
+preds   = adapted(test_batch)                 # forward-only; weights stay frozen</code></pre>
+        <div class="code-caption"><strong>Listing 66.5.2.</strong> A TTA library collapses roughly 250 lines of prototype and affinity plumbing to about 3, and standardizes the affinity kernels so cross-team results are comparable. What the library cannot decide is whether your backbone's features survive the shift; that judgment stays yours.</div>
+        <p>Listing 66.5.2 hides the plumbing, but the assumption analysis above is still your job: a library will happily run LAME on a single-activity buffer and quietly over-smooth it.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a HAR model trained with a leave-subjects-out split from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> and evaluate it on held-out subjects to establish the cross-person drop. Now apply, in turn, (a) test-time BN-statistic recalibration only, (b) T3A prototype adjustment, and (c) LAME from Listing 66.5.1. Report the accuracy recovered by each, the per-window latency, and, critically, construct a mostly-single-activity buffer and show whether LAME over-smooths its minority windows. Which method gives the best recovery-per-millisecond on <em>your</em> target device?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Entropy minimization (TENT) has a trivial degenerate optimum. State it, and explain why LAME's fixed point does not share it.</p>
+        <p class="quiz-question">2. Optimization-free TTA freezes the backbone. What single assumption about the frozen features must hold for output correction to help, and name a shift that violates it.</p>
+        <p class="quiz-question">3. Why is a batch of one, common in streaming HAR, a bigger problem for gradient-based TTA than for LAME or T3A?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-66.6.html">Section 66.6</a>, we confront the uncomfortable truth that every method in this chapter adapts on <em>unlabeled</em> data, so it can silently make things worse. We will build the monitoring that watches an adaptation in flight, detects when the recovery has turned into drift, and attaches an honest risk bound to a correction that was made without a single ground-truth label.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

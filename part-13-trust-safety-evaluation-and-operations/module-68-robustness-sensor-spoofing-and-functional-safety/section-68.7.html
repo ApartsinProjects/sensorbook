@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 68.7: Reliability-engineering patterns. Building Sensory AI." name="description"/>
+<title>Section 68.7: Reliability-engineering patterns | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 68: Robustness, Sensor Spoofing, and Functional Safety</a></div>
+<h1>Reliability-engineering patterns</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"My model was 99.9% accurate. The wiring harness, the NTP daemon, and the retry loop I forgot to bound were not."</p><cite>A Humbled AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous sections gave you the raw materials of a dependable perception system: an inventory of failure modes (68.1), the adversary who triggers them on purpose (68.2), redundancy and safety envelopes (68.3), runtime monitors (68.4), the standards that demand all of this (68.5), and the safety case that argues you did it (68.6). This section supplies the <strong>engineering discipline that assembles those materials into a system whose reliability you can quantify, budget, and defend.</strong> Reliability engineering is a century-old field, born in aerospace and telecoms, with a precise vocabulary (hazard rate, MTBF, availability, reliability block diagrams) and a catalogue of reusable structural patterns (graceful degradation, circuit breakers, bulkheads, watchdogs, error budgets). None of it is specific to machine learning, and that is exactly the point: a sensor-AI product fails far more often at the seams (a stale timestamp, an unbounded retry, a shared power rail) than inside the network. This section teaches you to reason about the whole system as a set of composable reliability blocks and to reach for a named pattern instead of improvising.</p>
+</div>
+
+<p>A note on prerequisites. This section leans on the redundancy and voting structures of Section 68.3 and the innovation-consistency checks you first met with the Kalman family in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. The quantitative reliability arithmetic reuses the basic probability of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the remaining-useful-life view of a degrading component connects directly to the prognostics of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+
+<h2>Quantifying reliability: hazard, MTBF, and availability</h2>
+<p>You cannot budget what you cannot measure, so reliability engineering starts with a small set of definitions. Model a component's time-to-failure as a random variable \(T\) with survival function \(R(t)=P(T>t)\), the <strong>reliability</strong>. The <strong>hazard rate</strong> \(\lambda(t)\) is the instantaneous failure rate given survival so far, \(\lambda(t)=f(t)/R(t)\), and it traces the familiar bathtub curve: high infant-mortality early, a low flat useful-life plateau, and a rising wear-out tail. On the flat plateau failures are approximately Poisson with constant \(\lambda\), giving the exponential model \(R(t)=e^{-\lambda t}\) and a <strong>mean time between failures</strong> \(\text{MTBF}=1/\lambda\). What operators actually sell against is <strong>availability</strong>, the fraction of time the system is up,</p>
+$$ A = \frac{\text{MTBF}}{\text{MTBF}+\text{MTTR}}, $$
+<p>where MTTR is the mean time to repair or recover. The lesson hidden in that ratio is that recovery speed matters as much as failure frequency: a sensor node that fails weekly but self-recovers in two seconds is more available than one that fails yearly but needs a technician. This is why so many of the patterns below are about shrinking MTTR (fast detection, automatic restart, degraded-but-alive operation) rather than chasing an unreachable zero failure rate.</p>
+
+<h2>Composing blocks: series, parallel, and k-out-of-n</h2>
+<p>Real systems are built from many components, and a <strong>reliability block diagram</strong> (RBD) tells you how their reliabilities combine. Components in <em>series</em> (all must work: the lens, the image sensor, the ribbon cable, the SoC) multiply, \(R_\text{series}=\prod_i R_i\), so a long series chain is always weaker than its weakest link and adding parts can only hurt. Components in <em>parallel</em> (any one suffices: three redundant IMUs feeding a voter) combine through their failure probabilities, \(R_\text{parallel}=1-\prod_i(1-R_i)\). The general redundancy structure from Section 68.3 is <strong>k-out-of-n</strong>: the system works if at least \(k\) of \(n\) identical units work, with</p>
+$$ R_{k/n}=\sum_{i=k}^{n}\binom{n}{i}R^{i}(1-R)^{n-i}. $$
+<p>Two facts from this arithmetic drive most architecture decisions. First, redundancy only helps if the units fail <em>independently</em>; a common-cause failure (shared power rail, shared clock, the same rain on all three cameras, the same bug in one model replicated three times) collapses parallel blocks back into a single block, which is why 68.3 insisted on diverse redundancy. Second, adding a low-reliability component in series with a strong one wastes the strong one. The code below evaluates an RBD for a triple-modality front end so you can see how a single fragile series element caps the whole system.</p>
+
+<pre><code class="language-python">import numpy as np
+from math import comb
+
+def R_series(rs):            # all must survive
+    return np.prod(rs)
+
+def R_parallel(rs):          # any one survives
+    return 1.0 - np.prod([1.0 - r for r in rs])
+
+def R_k_of_n(r, n, k):       # at least k of n identical units
+    return sum(comb(n, i) * r**i * (1 - r)**(n - i) for i in range(k, n + 1))
+
+# A perception front end: a shared power supply (series) feeds a
+# 2-of-3 redundant sensing tier, which feeds a shared inference SoC (series).
+R_power = 0.999            # common-cause: NOT redundant
+R_sensor = 0.98           # one sensing modality over the mission
+R_soc = 0.995
+
+R_sensing_tier = R_k_of_n(R_sensor, n=3, k=2)   # tolerates one dead modality
+R_system = R_series([R_power, R_sensing_tier, R_soc])
+
+print(f"2-of-3 sensing tier reliability: {R_sensing_tier:.5f}")
+print(f"end-to-end system reliability:   {R_system:.5f}")
+print(f"limiting factor is the shared power rail (R={R_power})")
+</code></pre>
+<div class="code-caption">A reliability block diagram evaluated in three primitives. The 2-of-3 sensing tier is very strong (about 0.9988), so the end-to-end number is dominated by the non-redundant power rail and SoC in series with it: redundancy on the sensors cannot rescue a single-point failure upstream.</div>
+
+<p>As the caption notes, the redundant tier reaches roughly 0.9988 on its own, yet the system tracks the shared power rail. That is the RBD earning its keep: it points your reliability budget at the single points of failure instead of at the part you were already proud of.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Machine-learning accuracy and system reliability are different currencies, and confusing them is the most common failure of AI teams shipping into the physical world. Accuracy is a property of the model on a distribution; reliability is a property of the whole pipeline over time, including the sensor, the bus, the clock, the power, the software around the model, and the operator's ability to recover. A perfect classifier sitting in series behind a flaky ribbon cable inherits the cable's reliability, not its own. Spend your hardening effort where the RBD says the system is thin, which is almost never inside the network.</p>
+</div>
+
+<h2>Structural patterns: degrade, isolate, and time-bound</h2>
+<p>Beyond the arithmetic sits a catalogue of structural patterns, each a reusable answer to a recurring failure shape. <strong>Graceful degradation</strong> defines an explicit ladder of reduced-capability modes so the system steps down instead of falling over: a fusion stack that loses lidar drops to a camera-plus-radar mode with a lower speed limit rather than blanking out, an idea that connects directly to the missing-modality robustness of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. The related distinction is <strong>fail-operational versus fail-safe</strong>: a parked robot arm can fail safe (stop and hold), but a vehicle at highway speed must fail operational (keep perceiving well enough to reach a safe state), which forces genuine redundancy rather than a mere shutoff.</p>
+<p>The <strong>bulkhead</strong> pattern isolates resources so one flooding subsystem cannot sink the ship: give the safety-critical obstacle detector its own CPU budget, memory pool, and thread so a runaway logging task or a slow map download cannot starve it. The <strong>circuit breaker</strong> wraps a call to an unreliable dependency (a cloud model, a remote map tile server, a neighbor node) and, after a threshold of failures, trips open to return a fast cached or degraded answer instead of piling up timeouts, then probes periodically to reset. Every remote or retry-able call needs a <strong>bounded timeout with backoff</strong>; an unbounded retry loop is a latent outage, because the moment the dependency stalls, your real-time loop stalls with it. Finally, the <strong>watchdog and heartbeat</strong> pair is the oldest embedded pattern of all: a task that must periodically kick a hardware timer or emit a heartbeat, so that a hung inference thread is detected within one watchdog period and the node is restarted, shrinking MTTR from minutes to milliseconds.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">From the Field: A Warehouse AMR Fleet</h3>
+<p>A fleet of autonomous mobile robots (AMRs) in a distribution center kept freezing for several seconds at a time, once or twice per shift per robot, never crashing but blocking aisles. The perception model was blameless: profiling showed the stalls came from a cloud call that fetched updated no-go zones, which occasionally hung for the full TCP timeout of 30 seconds while the robot held position. The fix was three named patterns and no model changes. A <strong>circuit breaker</strong> around the map call tripped after three failures and served the last-known zones from cache; a <strong>2 second bounded timeout</strong> replaced the 30 second default; and a <strong>bulkhead</strong> moved the map fetch off the perception thread entirely. Per-robot availability, computed as in the formula above, rose from about 0.994 to 0.9998 because MTTR for that failure mode collapsed from 30 seconds to under 2. The reliability came from the architecture, not the network, and the same monitoring is what feeds the fleet dashboard of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+</div>
+
+<h2>Analysis and budgets: FMEA, fault trees, and error budgets</h2>
+<p>Patterns are chosen, not sprinkled, and two classic analyses tell you which failures to defend against. <strong>Failure modes and effects analysis</strong> (FMEA) walks bottom-up through every component, lists how it can fail, and scores each mode by a <strong>risk priority number</strong>, the product of severity, occurrence, and detectability, \(\text{RPN}=S\times O\times D\); the high-RPN rows earn a pattern. <strong>Fault-tree analysis</strong> (FTA) works top-down from a hazard (for example, "vehicle fails to brake for a real obstacle") through AND and OR gates to the combinations of component faults that cause it, and its minimal cut sets are exactly the single points of failure and common-cause pairs your RBD must not contain. These feed the ISO 26262 and SOTIF work of Section 68.5 and the argument of Section 68.6, but they are reliability tools first. On the operational side, the SRE <strong>error budget</strong> reframes reliability as a resource to spend: if the availability target is 99.9%, you are permitted about 43 minutes of downtime a month, and you spend it deliberately on deployments and experiments rather than pretending zero downtime is free. Error budgets pair naturally with the drift and shift monitoring of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, because a model degrading under distribution shift burns availability just as surely as a crashed process.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the reliability math</h3>
+<p>The RBD primitives above are worth writing once to build intuition, but production reliability analysis (Weibull fitting to field failure logs, confidence bounds on MTBF, k-out-of-n with repair, availability from Markov models) is a solved problem. The Python <code>reliability</code> package fits life distributions, plots the bathtub hazard, and runs system RBDs; <code>lifelines</code> handles the censored survival fitting you need when most units have not failed yet. Fitting a Weibull to a censored fleet failure log by hand is roughly 60 to 80 lines of optimization and bookkeeping; <code>reliability.Fitters.Fit_Weibull_2P(failures=..., right_censored=...)</code> is one call that also returns confidence intervals and the goodness-of-fit you would otherwise forget to compute. Use the libraries for the statistics; reserve your own code for the system-specific block structure.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Classical reliability theory assumes components fail; it has no native notion of a component that stays "up" while silently becoming <em>wrong</em>, which is exactly how a learned perception model fails under distribution shift. Current work stitches the two worlds together: treating a model's calibrated uncertainty and OOD score (Chapters <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">18</a> and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">66</a>) as a continuous health signal that feeds a reliability model, so an RBD block can be "degraded" rather than binary up/down, and so error budgets can be spent against a measured epistemic-risk rate. Runtime assurance monitors (Section 68.4) and safety cases for ML (Section 68.6) are the delivery vehicles; the open problem is a principled, auditable mapping from a model's confidence to a hazard rate the whole-system reliability calculation can trust.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the RBD code above and add a fourth stage: a cloud-map dependency in series with reliability \(R_\text{map}=0.97\) over the mission. (a) Recompute end-to-end system reliability and confirm it drops sharply. (b) Now wrap the map call in a circuit breaker that serves a cached answer, modeling this as raising the effective \(R_\text{map}\) to 0.9995 (the cache almost always covers a map outage). Recompute and report the availability improvement, assuming MTTR falls from 30 s to 2 s while MTBF for that stage is unchanged. (c) Which single change bought more reliability, adding a third sensor modality or adding the circuit breaker? Explain using the series-versus-parallel argument.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Two systems have identical MTBF. System X recovers automatically in 3 seconds; System Y needs a 30 minute technician visit. Which is more available, and which reliability lever explains the gap? 2. Why does adding a redundant camera do nothing for reliability if all three cameras share one lens-heater power rail, and which analysis (FMEA, FTA, or RBD) most directly exposes this? 3. A team reports "99.99% model accuracy" as its safety argument. State in one sentence why that number does not bound system availability.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 68</h3>
+<p>stress-test a fusion model under sensor dropout, bias drift, and spoofing; add a runtime safety monitor.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Foundations of reliability engineering</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.wiley.com/en-us/Reliability+Engineering%2C+2nd+Edition-p-9781119302148">Rausand, M. and Hoyland, A. (2004). System Reliability Theory: Models, Statistical Methods, and Applications, 2nd ed. Wiley.</a></p>
+<p class="bib-annotation">The standard graduate reference for hazard functions, reliability block diagrams, k-out-of-n structures, and availability. Everything in the quantitative section of this page is developed rigorously here.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1695475">Avizienis, A., Laprie, J.-C., Randell, B., and Landwehr, C. (2004). Basic Concepts and Taxonomy of Dependable and Secure Computing. IEEE Transactions on Dependable and Secure Computing.</a></p>
+<p class="bib-annotation">The canonical taxonomy of dependability: fault, error, failure, and the means (fault tolerance, fault removal) to attain it. Fixes the vocabulary this section uses.</p>
+</div>
+
+<p class="bib-category">Analysis methods and standards</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.nrc.gov/reading-rm/doc-collections/nuregs/staff/sr0492/">Vesely, W. et al. (1981). Fault Tree Handbook (NUREG-0492). U.S. Nuclear Regulatory Commission.</a></p>
+<p class="bib-annotation">The definitive treatment of fault-tree analysis and minimal cut sets, still the reference for top-down hazard analysis in safety-critical systems.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.iso.org/standard/68383.html">International Organization for Standardization (2018). ISO 26262: Road Vehicles - Functional Safety.</a></p>
+<p class="bib-annotation">Automotive functional-safety standard whose part 5 mandates FMEDA-style hardware failure-rate analysis and single-point-fault metrics; the reliability arithmetic here feeds its ASIL targets.</p>
+</div>
+
+<p class="bib-category">Operational reliability and resilience patterns</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://sre.google/sre-book/table-of-contents/">Beyer, B., Jones, C., Petoff, J., and Murphy, N. (2016). Site Reliability Engineering: How Google Runs Production Systems. O'Reilly.</a></p>
+<p class="bib-annotation">Introduces error budgets, SLOs, and the discipline of spending reliability as a resource. Source for the operational half of this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Nygard, M. (2018). Release It! Design and Deploy Production-Ready Software, 2nd ed. Pragmatic Bookshelf.</a></p>
+<p class="bib-annotation">The practical catalogue of the circuit breaker, bulkhead, timeout, and steady-state patterns used in the structural-patterns section, with field war stories.</p>
+</div>
+
+<p class="bib-category">Reliability tooling</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://reliability.readthedocs.io/">Reid, M. (2024). reliability: A Python library for reliability engineering. Documentation and source.</a></p>
+<p class="bib-annotation">The library behind the shortcut callout: life-distribution fitting (Weibull, exponential), censored data, and system RBDs in a few lines.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://lifelines.readthedocs.io/">Davidson-Pilon, C. (2019). lifelines: Survival analysis in Python. Journal of Open Source Software.</a></p>
+<p class="bib-annotation">Censored survival analysis for fleets where most units have not yet failed; the right tool for estimating MTBF from partial field data.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, we take these reliability patterns off the single device and out to the whole fleet: data contracts that keep the sensor stream trustworthy, model versioning and staged deployment, drift and data-quality monitoring under delayed ground truth, retraining triggers, and the incident response that turns a monitor's alert into a bounded, auditable recovery. The availability arithmetic and the watchdog, circuit-breaker, and error-budget patterns you just met become the operational backbone of running thousands of sensing nodes in production.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

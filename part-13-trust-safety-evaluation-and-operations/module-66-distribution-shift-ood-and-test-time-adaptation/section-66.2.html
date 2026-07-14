@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.2: OOD and novelty detection. Building Sensory AI." name="description"/>
+<title>Section 66.2: OOD and novelty detection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>OOD and novelty detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I was trained to name five gestures. The sixth one, I named with total confidence anyway. That was the moment they should have stopped trusting me."</p>
+<cite>An Overconfident AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the softmax classifier and feature-embedding vocabulary from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>, the calibration and confidence-scoring tools from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the residual-based anomaly and change detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. Section 66.1 established the taxonomy of covariate, label, and concept shift; here we ask a narrower and more actionable question. Given one incoming window, is it something the model has any right to classify at all?</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A closed-set classifier is a machine that always answers. Present it a walking window, a running window, or a window of a person doing jumping jacks it never saw in training, and it returns a probability vector over the classes it knows, summing to one, often peaked and confident. <strong>Out-of-distribution (OOD) detection</strong> and <strong>novelty detection</strong> add the missing option: "this input is not one of my classes, escalate instead of guessing." The goal is a scalar score \(s(x)\) that is high for in-distribution (ID) inputs and low for OOD ones, plus a threshold set on ID data alone, because you rarely have a representative sample of the infinite space of things that can go wrong. This section is about which score to compute, why deep networks make the naive score fail, and how to set the threshold so the gate protects a real deployment rather than a benchmark.</p>
+</div>
+
+<h2>OOD, novelty, and anomaly: three names, one gate</h2>
+<p>The literature uses three words that overlap enough to confuse and differ enough to matter. <strong>Anomaly detection</strong> (Chapter 12) flags a sample as unusual relative to a mostly-normal stream, and classically it works on a single signal with no notion of learned classes. <strong>Novelty detection</strong> flags an input that belongs to a genuinely new category, the sixth gesture, a bearing fault never before catalogued. <strong>OOD detection</strong> is the machine-learning framing: an input drawn from a distribution different from the training distribution \(p_{\text{train}}(x)\), whether that is a new class (semantic shift) or the same classes under new conditions (covariate shift). For a deployed sensor model the three collapse into one operational gate: before I act on this prediction, does the input fall inside the region where my model was ever validated? Everything else in this section builds that gate.</p>
+<p>Two regimes deserve separate names because they demand different scores. <em>Far-OOD</em> is an input from an obviously foreign source: an accelerometer stream fed into an ECG model, a sensor unplugged and reading rail noise. <em>Near-OOD</em> is the hard and common case in sensing: the same modality, same subject population, but a new activity, a new device firmware, a new mounting position. Vision benchmarks are dominated by far-OOD (CIFAR versus SVHN); sensor deployments are dominated by near-OOD, and the scores that ace the former routinely fail the latter.</p>
+
+<h2>Score functions: from softmax to feature geometry</h2>
+<p>The cheapest OOD score is the <strong>maximum softmax probability</strong> (MSP): \(s_{\text{MSP}}(x) = \max_k \, p_k(x)\). It needs no extra training and often works for far-OOD. Its weakness is structural: modern networks are overconfident off the training manifold, so a foreign input can still produce a spiky softmax. The <strong>energy score</strong> repairs much of this by reading the logits before the softmax normalizes away their scale,</p>
+$$ E(x) = -T \log \sum_{k=1}^{K} \exp\bigl(z_k(x)/T\bigr), $$
+<p>where \(z_k\) are the logits and \(T\) is a temperature. Lower total logit mass means lower energy for ID inputs and higher energy for OOD ones, and unlike MSP it is not squashed into \([0,1]\), so it preserves the confidence gap that the softmax destroys. A third family ignores the classifier head entirely and works in the penultimate feature space \(f(x)\). The <strong>Mahalanobis score</strong> fits a class-conditional Gaussian to the training features and scores a test point by its distance to the nearest class mean under the shared covariance \(\Sigma\),</p>
+$$ s_{\text{Maha}}(x) = -\min_{k} \; \bigl(f(x)-\mu_k\bigr)^{\top} \Sigma^{-1} \bigl(f(x)-\mu_k\bigr), $$
+<p>and its non-parametric cousin, the <strong>k-nearest-neighbour score</strong>, uses the distance to the \(k\)-th closest training feature with no Gaussian assumption at all. The feature-space scores tend to win on the near-OOD cases that matter for sensors, because a new activity lands off the training clusters in embedding space even when its logits look ordinary. The quality of these scores rides entirely on the representation, which is why the self-supervised and contrastive encoders of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> give better OOD separation than a representation trained only to minimize cross-entropy.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The softmax throws away exactly the information OOD detection needs. Normalization forces the outputs to sum to one, so a window whose logits are all small (the network is weakly excited by a foreign input) is stretched to look just as confident as a window whose logits are large and correct. The energy score and the feature-distance scores both work by refusing to normalize: they read the raw magnitude of the network's response, which stays low for inputs the network was never built to represent. If you only remember one design rule, it is this. Score OOD before the softmax, or after it in feature space, but never on the probability vector itself.</p>
+</div>
+
+<h2>Setting the threshold without ever seeing the outliers</h2>
+<p>A score is only half a detector; the other half is a threshold \(\tau\), and the defining constraint of real deployment is that you cannot tune \(\tau\) on OOD data because you do not have a representative sample of it. The honest procedure sets \(\tau\) on ID validation data alone to hit a chosen true-positive rate on the ID class, for example the threshold at which \(95\%\) of legitimate windows are accepted. The headline number is then the <strong>false-positive rate at 95% TPR</strong> (FPR95): of the OOD inputs, what fraction slip through the gate as if they were ID. Reporting AUROC alongside FPR95 is standard, but FPR95 is the operational quantity, because it maps directly to how often a novel input reaches your classifier unchallenged. This is the same discipline as the operating-point argument in Chapter 65: a threshold-free score flatters you, a fixed operating point tells you the truth. Two cautions specific to sensing. First, calibrate \(\tau\) on a held-out validation stream that respects subject and session boundaries, or leakage will make the gate look far tighter than it is. Second, the score distribution drifts with the same covariate shifts this chapter studies, so \(\tau\) is not a one-time constant; Section 66.6 returns to monitoring it online.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def energy_score(logits, T=1.0):
+    """Free-energy OOD score: lower for OOD, higher for in-distribution."""
+    return T * np.log(np.exp(logits / T).sum(axis=1))   # logsumexp over classes
+
+def fit_threshold(id_scores, tpr=0.95):
+    """Threshold that ACCEPTS `tpr` of in-distribution windows. OOD never seen."""
+    return np.quantile(id_scores, 1.0 - tpr)
+
+def fpr_at_threshold(ood_scores, tau):
+    """Fraction of OOD windows that leak through the gate as in-distribution."""
+    return float(np.mean(ood_scores >= tau))
+
+rng = np.random.default_rng(0)
+K = 6                                              # six known activities
+id_logits  = rng.normal(0.0, 1.0, (4000, K)); id_logits[:, 0] += 4.0   # excited, correct
+ood_logits = rng.normal(0.0, 1.0, (4000, K))       # novel activity: no class excited
+
+id_s, ood_s = energy_score(id_logits), energy_score(ood_logits)
+tau = fit_threshold(id_s, tpr=0.95)
+print(f"tau={tau:.2f}  FPR95={fpr_at_threshold(ood_s, tau):.3f}")
+</code></pre>
+<div class="code-caption">Code 66.2.1: The whole OOD pipeline in three functions. The energy score reads the raw logits, the threshold is fixed on in-distribution windows alone to accept 95% of them, and FPR95 measures how many novel-activity windows leak through. Note that <code>ood_logits</code> excites no class strongly, which is exactly the signature the energy score catches and a peaked softmax would hide.</div>
+
+<p>Code 66.2.1 is deliberately minimal to expose the logic: the threshold never touches the OOD array, and the reported FPR95 is the number a safety reviewer will ask for. Swapping <code>energy_score</code> for a Mahalanobis or kNN score on penultimate features is a drop-in change and usually the right move for near-OOD sensor data.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the novel fault a compressor made at 3 a.m.</h4>
+<p>An industrial team ships a vibration classifier for a reciprocating compressor, trained on four labelled states: healthy, bearing wear, misalignment, looseness (the modeling lineage is Chapter 37's condition monitoring). Months in, a valve spring fractures, a failure mode absent from the training set. The closed-set classifier, forced to answer, maps the novel spectral signature onto "looseness" at probability \(0.91\), the maintenance crew is dispatched to torque bolts that are already tight, and the real fault runs another week. The retrofit is an OOD gate on the encoder's penultimate features: a kNN distance score fitted on the four healthy-and-known clusters. The valve-spring window lands far from every cluster, the score falls below the ID-calibrated threshold, and instead of a wrong class the system raises "unrecognized state, route to a human." The classifier did not become more accurate; it became honest about the edge of its competence, which for a safety-relevant asset is worth more than another point of in-set F1.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: OpenOOD instead of a pile of score implementations</h3>
+<p>Hand-rolling MSP, energy, ODIN, Mahalanobis, kNN, and ViM, each with its own feature-caching, covariance-fitting, and threshold-sweep code, is a few hundred lines that are easy to get subtly wrong (whitening, per-class means, temperature). The <code>OpenOOD</code> library exposes all of these behind one <code>postprocessor</code> interface and a shared evaluator that computes AUROC and FPR95 on standardized ID/OOD splits, turning roughly 300 lines of bespoke scoring into about 10 lines of configuration. Use your own encoder and let OpenOOD supply the postprocessors and the leakage-aware evaluation harness; write custom scoring code only when you are proposing a genuinely new score.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current reference point is <strong>OpenOOD v1.5</strong> (Yang et al.), which benchmarks over forty methods under a unified protocol and delivered the field's least comfortable finding: on near-OOD, no post-hoc score dominates, and simple feature-distance methods (kNN, Mahalanobis) frequently match or beat elaborate ones. For sensor time series specifically, <strong>HAROOD</strong> (revisited in Section 66.7) shows the same story on wearable activity data, where near-OOD from unseen subjects and activities is far harder than the far-OOD that vision leaderboards reward. Active threads include energy-based and <strong>ViM</strong>-style scores that combine logit and feature information, OOD detection built on the representations of time-series foundation models (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>), and the still-open question of whether generative likelihood can ever be trusted for OOD, given the well-documented failure where deep density models assign higher likelihood to OOD inputs than to their own training data.</p>
+</div>
+
+<h2>When OOD detection is the wrong tool</h2>
+<p>A gate that fires too often is a decommissioned gate. If your near-OOD is really covariate shift you could adapt to (a new device, a new wearing position), then refusing every shifted window wastes information the test-time adaptation of Sections 66.4 and 66.5 could exploit instead. The design question is whether the shift is <em>recoverable</em> (same task, adaptable features) or <em>semantic</em> (a genuinely new class you must not classify). OOD detection is the right response to the second; domain generalization and adaptation are the right response to the first. Confusing them produces either a brittle classifier that hallucinates classes or a paranoid gate that escalates everything, and the whole point of this chapter is to give you the vocabulary to tell them apart before you pick a mechanism.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a six-class HAR model on wrist-IMU data. (a) Extract penultimate features on a held-out ID validation set and implement the Mahalanobis and kNN (\(k=50\)) scores; fix each threshold at 95% ID TPR without touching any OOD data. (b) Build an OOD set two ways: far-OOD by feeding raw gyroscope-only windows, and near-OOD by holding out one activity class from training and using it as the outlier. Report FPR95 for each score on each set. (c) Explain in three sentences why the near-far gap is larger for MSP than for kNN, and state which score you would ship for a wearable that must escalate unknown activities.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why can the maximum softmax probability be high for a far-OOD input, and what specifically does the energy score read that the softmax has discarded?</li>
+<li>You are forbidden from collecting OOD examples before launch. Describe the exact procedure for setting the detection threshold, and name the single number you would put in the safety case.</li>
+<li>Give one concrete sensing situation where firing the OOD gate is the wrong response, and name the chapter mechanism you would use instead.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-66.3.html">Section 66.3</a>, we turn from detecting the shift to surviving it. Instead of gating out every unfamiliar window, domain generalization trains a model whose representation is stable across environments in the first place, and we will meet DIVERSIFY, a method that discovers latent domains inside a single sensor dataset and forces the network to generalize across them before deployment ever begins.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

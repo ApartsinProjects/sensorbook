@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 65.7: Reproducibility and field-validation protocols. Building Sensory AI." name="description"/>
+<title>Section 65.7: Reproducibility and field-validation protocols | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 65: Evaluation Protocols and Leakage-Safe Benchmarking</a></div>
+<h1>Reproducibility and field-validation protocols</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"It worked on my laptop, on a Tuesday, with a random seed I have since misplaced."</p><cite>A Reproducible AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous six sections built honest yardsticks: leakage-safe splits, time-aware folds, rare-event and calibration metrics. This final section asks two harder questions. First, can anyone (including you, six months from now) regenerate that number from the raw data and code? That is <strong>reproducibility</strong>. Second, does the benchmark number actually predict how the system behaves when it meets real sensors, real users, and real physics? That is <strong>field validation</strong>. A model that scores well but cannot be reproduced is a rumor, and a model that reproduces perfectly but was never validated in the field is a laboratory curiosity. Both failures are common and both are avoidable with protocol rather than heroics. This section turns a single evaluation run into a versioned, auditable artifact and then bridges that artifact to prospective evidence from deployment. This is the connective tissue between the benchmarking of this chapter and the fleet operations of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+</div>
+
+<h2>Three R's, and why sensing makes them harder</h2>
+<p>The literature separates three distinct claims that casual usage conflates. <strong>Repeatability</strong>: the same team, same code, same data, same machine gets the same number. <strong>Reproducibility</strong>: a different team, using your released code and data, reaches the same conclusion. <strong>Replicability</strong>: an independent team, collecting fresh data and writing fresh code, reaches the same conclusion. They form a ladder of increasing strength, and a benchmark that clears only the first rung is fragile. What/why: you separate them because each requires a different artifact. Repeatability needs pinned randomness and environments; reproducibility needs released, versioned data and code; replicability needs a clearly specified <em>protocol</em>, not just an implementation.</p>
+<p>Sensing adds hazards that pure software or vision benchmarks rarely face. Firmware revisions silently change a sensor's filtering or gain; a clock drift of a few milliseconds reorders events and quietly breaks time-aware folds (<a class="cross-ref" href="section-65.3.html">Section 65.3</a>); a driver update alters resampling; hardware ages between the day you trained and the day you audit. Nondeterministic GPU kernels, unpinned library versions, and preprocessing that depends on floating-point reduction order all inject variance that has nothing to do with the science. Bouthillier and colleagues showed that this uncontrolled variance is large enough to flip benchmark rankings, so a single-seed comparison is not evidence of anything. The remedy is to treat every source of variance as a named, logged, controlled variable.</p>
+
+<h2>The reproducibility toolkit</h2>
+<p>Concretely, a reproducible sensing evaluation captures five things and stamps them onto every reported number. (1) <strong>Seeds</strong> for every random source (Python, NumPy, the framework, and the data loader workers), plus a determinism flag where the framework offers one; note that full determinism can cost throughput, so you decide it per run rather than globally. (2) <strong>Environment</strong>: exact library versions, CUDA and driver build, OS, and hardware, ideally frozen in a container image so the audit runs the same stack. (3) <strong>Data version</strong>: a content hash of the exact split files, not just a dataset name, because "MHEALTH" or "PTB-XL" says nothing about which subjects landed in which fold. (4) <strong>Code version</strong>: the commit hash, with a clean or explicitly-recorded working tree. (5) <strong>Config</strong>: the full hyperparameter and preprocessing configuration as data, never as edited-in-place constants.</p>
+<p>Why insist on hashing the split rather than naming the dataset? Because the entire chapter has argued that <em>how</em> you split (by user, site, device, time) determines the number more than the model does. A reproducibility manifest that omits the split is reproducing the wrong thing. The function below computes a single run fingerprint from these ingredients; if two runs disagree on the number but share a fingerprint, you have found nondeterminism, and if they share the number but not the fingerprint, you have found a coincidence you should not trust.</p>
+
+<pre><code class="language-python">import hashlib, json, platform, subprocess
+
+def run_fingerprint(split_files, config, seed):
+    """A content-addressed fingerprint of everything that fixes a result."""
+    h = hashlib.sha256()
+    for path in sorted(split_files):            # hash the EXACT split, not its name
+        with open(path, "rb") as f:
+            h.update(hashlib.sha256(f.read()).digest())
+    env = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "commit": subprocess.run(["git", "rev-parse", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip(),
+        "seed": seed,
+        "config": config,                        # full hyperparams + preprocessing
+    }
+    h.update(json.dumps(env, sort_keys=True).encode())
+    return h.hexdigest()[:16], env
+
+fp, env = run_fingerprint(["folds/test_site_A.parquet"], {"lr": 3e-4, "win": 256}, seed=0)
+print("run fingerprint:", fp)
+</code></pre>
+<div class="code-caption">A run fingerprint binds the split contents, code commit, environment, and config into one hash. Store it beside every metric so a reported number is traceable to the exact inputs that produced it; a changed fingerprint on a "rerun" instantly reveals an uncontrolled variable.</div>
+
+<p>The fingerprint above is the honest minimum, and it makes the mechanism visible, but you would not maintain it by hand across hundreds of runs.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The manifest logic above, plus the plumbing to actually store artifacts, grows past a hundred lines once you add data hashing, artifact upload, and a queryable index. An experiment tracker collapses it: <code>mlflow.autolog()</code> or <code>wandb.init(config=...)</code> captures git commit, environment, hyperparameters, metrics, and artifacts in one call, and <code>DVC</code> (or <code>lakeFS</code>) content-addresses the split files so a dataset version is a hash, not a folder name. That is roughly 120 lines of bespoke tracking reduced to two, and the libraries add a searchable UI, run comparison, and lineage graphs you would otherwise never build. Keep the from-scratch fingerprint for teaching what the tracker is doing under the hood.</p>
+</div>
+
+<h2>Pre-registration, metric suites, and reporting standards</h2>
+<p>Reproducing a number is worthless if the number was chosen after seeing the results. The subtle leak here is not in the data but in the <em>analysis</em>: trying twenty splits, five metrics, and three thresholds, then reporting the flattering combination. The defense is <strong>pre-registration</strong>: before you touch the test set, write down the split protocol, the primary metric, the subgroup breakdowns, and the decision rule that says "ship" or "do not ship." The test set is unsealed once. Kapoor and Narayanan document how the absence of this discipline produced a wave of ML-based science that failed to replicate, almost always through some form of leakage or post-hoc metric selection, which is exactly the failure mode this whole chapter is built to prevent (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</p>
+<p>Alongside the metric plan, ship the two standard reporting artifacts. A <strong>datasheet for the dataset</strong> records provenance, sensor models, sampling rates, demographics, and known biases; a <strong>model card</strong> records intended use, the exact evaluation protocol, per-subgroup performance, and out-of-scope conditions. For sensing these are not bureaucratic: "works on wrist-worn PPG, indoors, resting heart rate 50 to 100 bpm, not validated during exercise" is the difference between a safe claim and a recall. Report variance too, never a single number: run multiple seeds and, where feasible, resample the subjects, then quote a mean with a confidence interval bootstrapped over subjects rather than windows.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Reproducibility and field validation answer orthogonal questions. Reproducibility asks "will this number come back?" Field validation asks "does this number mean anything?" A benchmark can be perfectly reproducible and completely misleading if the test distribution never resembled deployment. You need both: the manifest guarantees the number is real, the field protocol guarantees the number is <em>relevant</em>. Never let a reproducibility checkmark stand in for evidence of real-world performance.</p>
+</div>
+
+<h2>From benchmark to field: prospective validation</h2>
+<p>A leakage-safe benchmark is a necessary rehearsal, not the performance. Field validation is the prospective study that earns deployment trust, and it follows a staged protocol. First, <strong>shadow mode</strong>: run the model live on real device streams but suppress its actions, comparing predictions against outcomes without any risk. Next, <strong>reference-standard agreement</strong>: for a subset of field data, obtain trustworthy labels from an instrument you trust more (a clinical 12-lead ECG behind a wrist PPG, a survey-grade GNSS behind a consumer tracker, a load cell behind an inferred force). Then a <strong>staged rollout</strong> to a small, monitored cohort with pre-set stopping rules, widening only as the field metrics hold. Throughout, watch the operational metrics of <a class="cross-ref" href="section-65.1.html">Section 65.1</a> and the drift signals that feed <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, because the field is where covariate shift first shows up.</p>
+<p>For continuous measurements, agreement is quantified with a <strong>Bland-Altman analysis</strong>, not a correlation. Correlation can be high while a device reads systematically 8 bpm low; Bland-Altman instead plots the difference between the device and the reference against their mean, then reports the bias \(\bar{d}\) and the 95% limits of agreement \(\bar{d} \pm 1.96\,s_d\). Those limits, not \(R^2\), tell a clinician whether the error is tolerable for the decision at hand. When ground truth cannot be collected live, a validated simulator or digital twin (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>) can pre-screen failure modes, though it never replaces a prospective field study for a regulated claim.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Field-Validating a Wrist Heart-Rate Sensor</h3>
+<p>A wearables team has a PPG heart-rate model that scores a mean absolute error of 2.1 bpm on their held-out benchmark. Before shipping, they run a prospective field study: 60 participants wear the device alongside a chest-strap ECG reference across sitting, walking, cycling, and typing. The benchmark MAE holds at rest, but the Bland-Altman plot reveals a bias of minus 6 bpm with wide limits of agreement during cycling, where motion artifact and loose wrist contact dominate. The reproducible benchmark was real; it was simply not <em>representative</em>, because the training and test folds under-sampled vigorous motion. The team gates the displayed heart rate by an on-wrist motion-and-contact confidence signal, re-runs the field protocol, and only then updates the model card to state the validated activity range. A clinical claim would additionally follow the regulatory validation path of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take any model you evaluated earlier in this chapter. (1) Write a reproducibility manifest that captures seeds, environment, the content hash of each split file, the code commit, and the full config, and store it beside the metrics. (2) Rerun the evaluation on a second machine (or a fresh container) and confirm the metric returns within the seed-to-seed variance you measured; if it does not, find the uncontrolled variable. (3) Design a one-page prospective field-validation protocol for the model: name the reference standard, the shadow-mode duration, the stopping rules, and the primary agreement metric (Bland-Altman limits for regression, per-subgroup sensitivity for detection). (4) State one deployment condition your benchmark under-samples and how the field study would expose it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Distinguish repeatability, reproducibility, and replicability. Which artifact does each one require, and which is the strongest claim?</p>
+<p>2. Why is hashing the exact split files more informative than recording the dataset name in a reproducibility manifest?</p>
+<p>3. A device correlates with a reference at \(R^2 = 0.98\) yet a Bland-Altman analysis shows a bias of minus 6 bpm. Why can both be true, and which number should decide whether to deploy?</p>
+</div>
+
+<div class="callout lab"><h3 class="callout-title">Lab 65</h3><p>write an evaluation harness that reports standard metrics plus device/site/generalization breakdowns.</p></div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Reproducibility in machine learning</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.jmlr.org/papers/v22/20-303.html">Pineau, J. et al. (2021). Improving Reproducibility in Machine Learning Research (A Report from the NeurIPS 2019 Reproducibility Program). JMLR 22.</a></p><p class="bib-annotation">Introduced the ML reproducibility checklist and code-submission policy now standard at major venues; the template for the manifest discipline in this section.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://proceedings.mlsys.org/paper_files/paper/2021/hash/0184b0cd3cfb185989f858a1d9f5c1eb-Abstract.html">Bouthillier, X. et al. (2021). Accounting for Variance in Machine Learning Benchmarks. MLSys.</a></p><p class="bib-annotation">Shows uncontrolled variance (seeds, data order, hardware) is large enough to flip benchmark rankings, motivating multi-seed reporting with confidence intervals.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://ojs.aaai.org/index.php/AAAI/article/view/11503">Gundersen, O. E. &amp; Kjensmo, S. (2018). State of the Art: Reproducibility in Artificial Intelligence. AAAI.</a></p><p class="bib-annotation">Surveys how rarely AI papers document enough to be reproduced, and formalizes the repeatability/reproducibility/replicability ladder.</p></div>
+
+<p class="bib-category">Leakage, reporting standards, and technical debt</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.cell.com/patterns/fulltext/S2666-3899(23)00159-9">Kapoor, S. &amp; Narayanan, A. (2023). Leakage and the Reproducibility Crisis in Machine-Learning-Based Science. Patterns 4(9).</a></p><p class="bib-annotation">Catalogs eight leakage types behind widespread non-replicable ML science and proposes model-info sheets; the direct rationale for pre-registration here.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3287560.3287596">Mitchell, M. et al. (2019). Model Cards for Model Reporting. FAT*/FAccT.</a></p><p class="bib-annotation">Defines the model card, including intended use, evaluation protocol, and per-subgroup performance; the reporting artifact every deployed sensor model should ship.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3458723">Gebru, T. et al. (2021). Datasheets for Datasets. Communications of the ACM 64(12).</a></p><p class="bib-annotation">Proposes documenting dataset provenance, collection, and known biases; for sensing this captures sensor models, sampling rates, and demographic coverage.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://proceedings.neurips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley, D. et al. (2015). Hidden Technical Debt in Machine Learning Systems. NeurIPS.</a></p><p class="bib-annotation">The classic account of why deployed ML degrades silently; frames why field monitoring and versioned pipelines, not one benchmark, sustain trust.</p></div>
+
+<p class="bib-category">Field validation and method agreement</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(86)90837-8/fulltext">Bland, J. M. &amp; Altman, D. G. (1986). Statistical Methods for Assessing Agreement Between Two Methods of Clinical Measurement. The Lancet 327(8476).</a></p><p class="bib-annotation">The reference procedure for device-versus-reference agreement (bias and limits of agreement), and why correlation is the wrong tool for validation.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.fda.gov/medical-devices/software-medical-device-samd/good-machine-learning-practice-medical-device-development-guiding-principles">FDA, Health Canada &amp; MHRA (2021). Good Machine Learning Practice for Medical Device Development: Guiding Principles.</a></p><p class="bib-annotation">Ten principles that codify representative data, prospective validation, and monitoring; the regulatory backbone for field-validating clinical sensor AI.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, we confront the reason a reproducible, field-validated model still degrades: the world moves. We formalize covariate, label, and concept shift for sensor streams, detect when inputs fall out of distribution, and adapt models at test time (TENT, CoTTA) while monitoring the risk that adaptation itself can introduce.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

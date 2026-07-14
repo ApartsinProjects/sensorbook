@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 65.3: Time-aware cross-validation. Building Sensory AI." name="description"/>
+<title>Section 65.3: Time-aware cross-validation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 65: Evaluation Protocols and Leakage-Safe Benchmarking</a></div>
+<h1>Time-aware cross-validation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My model scored ninety-nine percent, and then I noticed I had been grading Monday's exam with Tuesday's answer key."</p>
+        <cite>A Time-Traveling AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can run ordinary \(k\)-fold cross-validation and that you understand sampling, timestamps, and window overlap from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. It builds directly on the leakage taxonomy of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and on the entity splits of the previous section. The one new idea is that time is not just another column: it carries a direction, and evaluation that ignores that direction quietly cheats.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A deployed sensor model only ever sees the future. It is trained on data up to today and asked about tomorrow, forever. Random \(k\)-fold cross-validation violates this by construction: it shuffles rows, so folds routinely train on 3 p.m. to predict 2 p.m. The score you get back is a fantasy about a world where the model can read ahead. Time-aware cross-validation removes that fantasy by insisting that every training set precede its test set in wall-clock time, and by sealing the seam between them. The result is usually a lower number, and always a more honest one.</p>
+    </div>
+
+    <h2>Why random folds leak time</h2>
+    <p>Standard \(k\)-fold assigns each sample to a fold at random, then trains on \(k-1\) folds and tests on the one left out. That is exactly right when samples are exchangeable, which is what independent draws mean. Sensor streams are not exchangeable. Consecutive windows of an accelerometer, an ECG, or a vibration probe are heavily autocorrelated: the reading at time \(t\) is a near-copy of the reading at \(t-1\). When you shuffle, a test window at time \(t\) lands next to training windows at \(t-1\) and \(t+1\) that are almost identical to it. The model does not need to <em>generalize</em>; it can nearly <em>memorize</em> a neighbor and interpolate. This is <strong>temporal leakage</strong>, and it inflates every metric you report.</p>
+    <p>The damage has two distinct sources, and separating them tells you how to fix it. The first is <em>window overlap</em>: if you segment a stream into windows that slide by less than their length, a single physical instant appears in several windows, and shuffling can drop copies of one instant on both sides of the train/test line. The second is deeper and survives even non-overlapping windows: <em>look-ahead</em>. Any preprocessing fit on the whole dataset (a normalization mean, a PCA basis, a resampling filter, a label built from a future event) smuggles future statistics into the past. A model that learns the population mean has learned something it could not have known at inference time. Both problems reduce to the same violation: the evaluation lets information flow backward in time.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The test in cross-validation is not "did any test row appear in training." It is "could the model, standing at the moment it makes each prediction, have known everything its training set encodes." Autocorrelated neighbors, dataset-wide normalization, and future-derived labels all fail that test without ever duplicating a single row. Time-aware protocols enforce it structurally, so you cannot forget.</p>
+    </div>
+
+    <h2>Forward chaining: expanding and sliding windows</h2>
+    <p>The workhorse fix is <strong>forward-chaining</strong> cross-validation, also called walk-forward or rolling-origin evaluation. Sort everything by time, then cut the timeline into ordered blocks and evaluate on each block using only the blocks before it. Two variants matter. In the <em>expanding-window</em> scheme the training set grows: fold 1 trains on block 1 and tests on block 2, fold 2 trains on blocks 1 to 2 and tests on block 3, and so on. This mirrors a system that retrains on its full history. In the <em>sliding-window</em> scheme the training set is a fixed-length window that marches forward, discarding the oldest block each step. This mirrors a system that deliberately forgets stale data, which is the right model when the process drifts, a theme <a class="cross-ref" href="../module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> takes up in full.</p>
+    <p>Which to choose is a modeling claim, not a coin flip. Use expanding windows when older data stays relevant, for example a gait classifier for a stable population. Use sliding windows when the world moves under you: a machine whose bearings degrade, a user whose behavior shifts with the seasons, or any streaming learner of the kind <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> deploys. Reporting the per-fold score across a forward chain also gives you something a single number cannot: a curve of performance over time that reveals whether the model is quietly decaying.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: turbine bearing prognostics</h3>
+        <p>An industrial team builds a remaining-useful-life model for wind-turbine gearbox bearings from vibration and temperature, in the spirit of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>. Their first evaluation used random \(k\)-fold and reported a stunning 4-hour error on a 30-day horizon. In the field the model was useless, missing failures by days. The cause was textbook temporal leakage: run-to-failure records are monotone, so a shuffled fold trained on the hour <em>after</em> a test window, where the fault signature is even clearer, and the model simply read the degradation trend off its neighbors. Switching to a sliding-window forward chain, with each turbine's timeline kept whole, the reported error rose to 3.5 days. That number was disappointing and correct; it matched what maintenance crews saw. The honest protocol saved them from shipping a model whose only skill was time travel.</p>
+    </div>
+
+    <h2>Purging and embargo: sealing the seam</h2>
+    <p>Ordering the blocks is necessary but not sufficient. Two subtle leaks cross the train/test boundary even in a forward chain, and both are cured by leaving a gap. The first arises from <em>overlapping windows and multi-step labels</em>. If a training sample at time \(t\) carries a label that depends on the interval \([t, t+h]\) (say, "did a fault occur within the next \(h\) samples"), then its label overlaps the start of the test block. That training sample knows something about the test period. <strong>Purging</strong> removes any training sample whose label horizon reaches into the test set. The second leak is pure autocorrelation bleeding across the seam: the last training window and the first test window are adjacent in time and therefore nearly identical. An <strong>embargo</strong> discards a short stretch of samples immediately after the training block, so the test set begins only after the correlation has decayed.</p>
+    <p>How wide should the gap be? Set the purge to the label horizon \(h\), and set the embargo to roughly the autocorrelation length of the signal. A practical rule of thumb is</p>
+    \[ g \;=\; h \;+\; \tau, \qquad \tau \approx W\left(1 - \tfrac{s}{W}\right), \]
+    <p>where \(W\) is the window length, \(s\) is the stride, and \(\tau\) is the number of samples over which windows still share raw data. When windows do not overlap (\(s \ge W\)) the second term vanishes and the embargo need only cover residual physical correlation. This purge-and-embargo discipline is the core of the <em>combinatorial purged cross-validation</em> proposed by Marcos Lopez de Prado for financial series, and it transfers cleanly to any autocorrelated sensor stream. The code below implements the essential idea, an expanding forward chain with a configurable embargo gap.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def purged_walk_forward(n, n_splits=5, embargo=0):
+    """Expanding-window CV: each train block precedes its test block,
+    with an `embargo` gap of samples dropped between them."""
+    block = n // (n_splits + 1)
+    for k in range(1, n_splits + 1):
+        train_end  = block * k
+        test_start = train_end + embargo          # seal the seam
+        test_end   = min(train_end + block, n)
+        if test_start >= test_end:
+            continue
+        yield np.arange(0, train_end), np.arange(test_start, test_end)
+
+for tr, te in purged_walk_forward(1000, n_splits=4, embargo=25):
+    print(f"train 0..{tr[-1]:4d}   embargo 25   test {te[0]}..{te[-1]}")</code></pre>
+    <div class="code-caption"><strong>Listing 65.3.</strong> A minimal purged forward-chaining splitter. Every training index is strictly less than every test index, and the <code>embargo</code> gap removes the autocorrelated samples straddling the boundary. The 25-sample embargo shown would cover, for example, one full window of overlap plus a margin.</div>
+    <p>As Listing 65.3 makes explicit, the training indices are always numerically below the test indices, so no future sample can reach the model, and the embargo carves out the neighbors that would otherwise leak by adjacency. Note also that time-aware splitting composes with the entity splitting of the previous section: to test generalization across both time <em>and</em> devices you keep each device's timeline intact and hold out later time <em>and</em> unseen devices together.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You rarely need to hand-roll the splitter. <code>scikit-learn</code>'s <code>TimeSeriesSplit</code> gives you an expanding forward chain, and since version 0.24 its <code>gap</code> argument supplies the embargo directly. What Listing 65.3 spells out in a dozen lines becomes two, and the object plugs straight into <code>cross_val_score</code> and <code>GridSearchCV</code> so your hyperparameter search inherits the same time-aware protocol.</p>
+        <pre class="language-python"><code class="language-python">from sklearn.model_selection import TimeSeriesSplit
+cv = TimeSeriesSplit(n_splits=5, gap=25)   # gap = embargo, no shuffling</code></pre>
+        <div class="code-caption"><strong>Listing 65.4.</strong> <code>TimeSeriesSplit</code> with <code>gap=25</code> reproduces the embargoed forward chain of Listing 65.3 in two lines and integrates with the rest of the scikit-learn model-selection API. It handles the index bookkeeping and boundary edge cases you would otherwise get subtly wrong.</div>
+    </div>
+
+    <h2>Choosing and reporting the protocol</h2>
+    <p>Three questions pin down the right design. <em>What is the deployment cadence?</em> If the fielded system retrains nightly on all history, evaluate with expanding windows; if it uses a fixed lookback, slide a matching window. <em>What is the label horizon?</em> Set the purge to it, or you leak through the labels. <em>How fast does the signal decorrelate?</em> Set the embargo to that timescale. When in doubt, prefer the more conservative choice: a slightly-too-wide gap costs you a little data, while a too-narrow gap costs you your credibility. Finally, always report the forward chain as a <em>sequence</em> of scores, not just their mean. A model that scores 0.9, 0.88, 0.7, 0.55 across four chronological folds is not a 0.76 model; it is a model that is falling apart, and only the time-ordered breakdown shows it. That decay is often the single most decision-relevant fact your evaluation produces, and it is exactly what feeds the drift monitoring of <a class="cross-ref" href="../module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a labeled human-activity dataset segmented into 2-second windows with 50% overlap, sampled at 50 Hz. (a) Compute the minimum embargo, in samples, needed so that no test window shares raw data with an adjacent training window. (b) The labels mark whether a fall occurs within the next 3 seconds; state the purge you must add. (c) Explain in one sentence why a random 10-fold split on this dataset would report an optimistic F1, and predict which of overlap or look-ahead dominates the inflation here.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does autocorrelation make random \(k\)-fold optimistic even when no single row is duplicated across folds?</p>
+        <p class="quiz-question">2. What distinct leak does purging fix that an embargo does not, and vice versa?</p>
+        <p class="quiz-question">3. When would you deliberately choose a sliding window over an expanding window, and what deployment behavior does each mimic?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-65.4.html">Section 65.4</a>, we turn from <em>when</em> the test data lives to <em>how rare</em> the thing you care about is. Falls, machine failures, and arrhythmias are vanishingly infrequent, and the same accuracy that looks reassuring on a balanced split becomes a lie under heavy imbalance. We build the metrics and resampling protocols that keep rare-event evaluation honest.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

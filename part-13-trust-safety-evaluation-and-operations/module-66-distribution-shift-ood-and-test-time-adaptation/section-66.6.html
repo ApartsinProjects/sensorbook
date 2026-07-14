@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.6: Monitoring risk during adaptation. Building Sensory AI." name="description"/>
+<title>Section 66.6: Monitoring risk during adaptation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>Monitoring risk during adaptation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I minimized my entropy to zero and felt magnificent. I was now certain, calm, and predicting 'walking' for a man who had been asleep for six hours."</p>
+<cite>A Confidently Collapsed AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the test-time adaptation methods of <a class="cross-ref" href="section-66.4.html">Section 66.4</a>, TENT and CoTTA, and the failure they invite: an unsupervised update rule that can drift with no label to correct it. It builds directly on the calibration, confidence, and conformal-prediction tooling of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and on the change-detection control charts of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. No new mathematics is introduced; the ideas are reused as a runtime watchdog. A working streaming-inference mental model from <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> helps but is not required.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Test-time adaptation gave the model a permission it never had before: to rewrite its own weights on a live stream with no supervision. That permission is also the danger. Because the loss is unsupervised, entropy or consistency, nothing in the objective knows the difference between adapting toward the truth and adapting toward a comfortable lie. A TENT model can quietly slide into predicting one class for everything, a CoTTA model can accumulate error across a long deployment until it forgets the task it was shipped to do. None of this raises an exception; the accuracy just rots while every internal signal reports confidence. <strong>Monitoring risk during adaptation</strong> is the discipline of watching label-free proxies for that rot in real time, and of holding a trigger that can throttle, reset, or roll the adapter back before a silent failure reaches the user.</p>
+</div>
+
+<h2>The failure modes an unsupervised update invites</h2>
+<p>Three collapse patterns account for most field incidents with test-time adaptation, and each is invisible to the adaptation loss itself. The first is <strong>entropy collapse</strong>. Entropy minimization, the engine of TENT, is minimized perfectly by a network that outputs the same one-hot vector for every input. On a benign stream that trivial solution is far away, but a burst of ambiguous or out-of-distribution windows, a sensor unplugged, a person out of view, hands the optimizer a shortcut: shrink the output entropy by pushing everything toward the currently dominant class. The loss drops, the confidence rises, and the classifier is now a constant function.</p>
+<p>The second is <strong>class-prior collapse</strong>, a subtler cousin. The model does not freeze on one class but drifts its predicted marginal far from any plausible prior, over-calling the majority activity because doing so lowers batch entropy on average. The third is <strong>error accumulation</strong> in continual adaptation. CoTTA and its relatives update indefinitely; small biases compound across hours or days until the weights have wandered out of the basin they were trained in, a runtime form of catastrophic forgetting. The common thread is that the quantity being optimized (low entropy, temporal consistency) and the quantity we care about (accuracy) come apart under shift, and only the first is observable at test time. That gap is exactly what a monitor must span.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>You cannot monitor adaptation with the adaptation loss. Entropy going down is the symptom of collapse, not evidence against it. A useful watchdog must watch quantities the optimizer is <em>not</em> allowed to game: the diversity of the predicted class distribution, the agreement between the adapting model and a frozen anchor copy, and the drift of internal feature statistics. These are label-free, cheap to compute, and, unlike the training objective, they get <em>worse</em> when adaptation goes wrong.</p>
+</div>
+
+<h2>Label-free risk signals that actually move under failure</h2>
+<p>With no ground truth on the live stream, monitoring reduces to choosing proxies whose behavior under healthy adaptation is distinguishable from their behavior under collapse. Four earn their place. <strong>Predicted-class diversity</strong> is the sharpest early warning: track the running histogram of \(\arg\max\) predictions over a window and compute its entropy \(H(\hat p)\); when the model is collapsing onto one class, \(H(\hat p)\) falls toward zero even as per-sample confidence rises. It is the mirror image of the training signal, which is what makes it trustworthy.</p>
+<p><strong>Anchor disagreement</strong> keeps a frozen copy \(f_0\) of the shipped model and measures the divergence between the adapting model \(f_t\) and the anchor on the same windows, for example the symmetric KL between their softmax outputs. A small, stable disagreement means the adapter is refining; a rising trend means it is wandering. Because the anchor never updates, it is an incorruptible reference frame. <strong>Confidence calibration drift</strong> reuses <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>'s tools: a healthy adapter tends to stay near its shipped reliability, while a collapsing one becomes sharply overconfident, so a running gap between mean confidence and any available proxy accuracy is a red flag. Finally, <strong>feature-statistic drift</strong> watches the batch-norm running means and variances the adapter is allowed to touch; a sudden excursion of these statistics beyond the range seen in calibration is often the first physical sign that the input stream itself, not just the labels, has moved.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: a warehouse exoskeleton that talked itself into one posture</h4>
+<p>An assistive exoskeleton runs an IMU activity classifier (lift, carry, walk, idle) with TENT enabled so it can adapt to each new wearer's gait within the first shift. On a Monday a worker straps in with the waist unit rotated ninety degrees, a mounting the model had never seen. The out-of-distribution windows spike the batch entropy; TENT, minimizing that entropy, seizes the shortcut and within four minutes is predicting "carry" for everything, including when the worker stands idle, so the actuator keeps applying lift assistance. The adaptation loss looks excellent throughout. What catches it is the diversity monitor: the predicted-class entropy \(H(\hat p)\) drops below its threshold and the anchor-disagreement KL climbs past its control limit at almost the same instant. The runtime guard freezes the adapter, rolls the batch-norm statistics back to the last healthy checkpoint, and raises a fleet alert. The worker feels a brief stiffening of the assist, not a runaway. The postmortem log shows the collapse began ninety seconds before any human could have noticed the behavior.</p>
+</div>
+
+<h2>From signals to a trigger: control charts, filtering, and reset</h2>
+<p>A raw signal is not a decision. To act, wrap each proxy in the change-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>: maintain an exponentially weighted moving average of the diversity entropy and the anchor KL, and fire when either crosses a control limit set from a healthy calibration run, or when a CUSUM statistic accumulates enough evidence of a sustained shift. The response is tiered. The cheapest is <strong>sample filtering</strong>: refuse to adapt on windows whose per-sample entropy is above a reliability threshold, so ambiguous and out-of-distribution inputs never get to steer the weights. This is the core idea of EATA (Niu and colleagues, ICML 2022), which pairs entropy-based sample selection with a Fisher-weighted anti-forgetting regularizer that anchors weights important to the original task. The next tier is <strong>rollback</strong>: on a fired alarm, restore the adaptable parameters to the last checkpoint that passed the monitor, the runtime equivalent of a circuit breaker. The strongest tier is <strong>freeze</strong>: disable adaptation entirely and fall back to the frozen anchor for the rest of the session, trading the upside of adaptation for a guaranteed floor.</p>
+
+<pre><code class="language-python">import copy, torch
+import torch.nn.functional as F
+
+class AdaptationMonitor:
+    """Label-free watchdog for a test-time-adapting classifier."""
+    def __init__(self, model, n_classes, div_floor=0.35, kl_ceil=0.8, beta=0.1):
+        self.anchor = copy.deepcopy(model).eval()   # frozen reference f_0
+        self.n = n_classes
+        self.div_floor, self.kl_ceil, self.beta = div_floor, kl_ceil, beta
+        self.hist = torch.ones(n_classes) / n_classes  # running class marginal
+        self.kl_ema = 0.0
+        self.checkpoint = copy.deepcopy(model.state_dict())
+
+    def check(self, model, x):
+        with torch.no_grad():
+            p  = F.softmax(model(x), dim=1)           # adapting model f_t
+            p0 = F.softmax(self.anchor(x), dim=1)     # anchor f_0
+        # 1. predicted-class diversity (normalized to [0,1])
+        self.hist = (1 - self.beta) * self.hist + self.beta * p.mean(0)
+        diversity = -(self.hist * self.hist.clamp_min(1e-9).log()).sum() / \
+                    torch.log(torch.tensor(float(self.n)))
+        # 2. anchor disagreement (symmetric KL, EMA-smoothed)
+        kl = 0.5 * (F.kl_div(p.log(), p0, reduction='batchmean') +
+                    F.kl_div(p0.log(), p, reduction='batchmean'))
+        self.kl_ema = (1 - self.beta) * self.kl_ema + self.beta * kl.item()
+        collapsing = (diversity < self.div_floor) or (self.kl_ema > self.kl_ceil)
+        return collapsing, float(diversity), self.kl_ema
+
+    def rollback(self, model):                        # circuit breaker
+        model.load_state_dict(self.checkpoint)
+</code></pre>
+<div class="code-caption">Code 66.6.1: A minimal adaptation watchdog. It never sees a label. The diversity term falls when the model collapses onto few classes; the anchor-KL term rises when the adapter wanders from the frozen shipped weights. Either breach flips <code>collapsing</code>, which the caller uses to freeze, roll back via <code>rollback</code>, or checkpoint the current healthy state.</div>
+
+<p>Code 66.6.1 is the concrete form of the two most reliable proxies from the previous section, combined into one guard the inference loop calls each batch. In practice you checkpoint whenever the monitor is green for a sustained stretch and call <code>rollback</code> the instant it goes red, so the adapter can improve during good weather yet never spend more than a window's worth of drift. SAR (Niu and colleagues, ICLR 2023) formalizes the same instinct at the optimizer level: it filters high-gradient noisy samples and uses sharpness-aware minimization to keep the adapted weights in a flat, stable region, plus an explicit model-reset when a moving average of the loss signals collapse.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: robust-TTA methods instead of a hand-rolled loop</h3>
+<p>Building the full monitored adapter by hand, the entropy-based sample filter, the Fisher anti-forgetting regularizer, the sharpness-aware step, and the collapse-triggered reset, is roughly 300 to 400 lines of delicate optimizer surgery before it is stable. Reference implementations of EATA and SAR ship all of it behind a wrapper you place around any classifier, so enabling anti-collapse adaptation becomes a few lines and a config, with the reliability filter and reset schedule already tuned on the standard corruption and cross-domain benchmarks. That is roughly a 300-line reduction; write the watchdog of Code 66.6.1 to understand it, then reach for the robust method to ship it.</p>
+</div>
+
+<h2>Guarantees, guardrails, and knowing when to stop</h2>
+<p>Monitoring proxies raise alarms; they do not by themselves bound risk. Where the cost of a wrong action is real, wrap the adapting predictor in the distribution-free machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. Conformal prediction sets, recalibrated on a rolling window, turn a collapsing model into a self-evident one: as calibration degrades, the prediction sets inflate, and a set that swells past a usable size becomes a hard signal to abstain or defer rather than act on a confident guess. This is the runtime-monitoring and safety-envelope stance that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a> makes mandatory for safety-relevant perception: adaptation is permitted only inside an envelope, and the moment the monitor says the model has left it, the system reverts to a certified frozen fallback.</p>
+<p>The operational picture belongs to the fleet. Every alarm, rollback, and freeze is a proxy-quality event that <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>'s monitoring under delayed ground truth aggregates: if the same device rolls back every shift, adaptation is not the fix, retraining or recall is. The final judgment a monitor supports is negative capability, knowing when to stop adapting. A model that has converged on a stable target should freeze and bank the gain; continuing to adapt only exposes it to the next out-of-distribution burst with nothing left to lose. The best adapters spend most of their life not adapting, watched by a watchdog that is cheap, incorruptible, and always allowed to say no.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The current state of the art in stable test-time adaptation, EATA (ICML 2022), SAR (ICLR 2023), and continual variants, treats collapse as a first-class object: it is detected, filtered, and reset rather than merely hoped away. The open problem is a label-free <em>certificate</em> of adaptation safety: a statistic that provably bounds the post-adaptation error, not just correlates with it. Recent work couples conformal risk control with the adaptation loop so the abstention rate itself carries a guarantee, and probes whether a frozen anchor plus disagreement testing can give a sequential, always-valid stopping rule. For sensor fleets the frontier question is sharper still: can the monitor distinguish a benign new user, whom the model should adapt to, from a spoofed or failing sensor, whom it must refuse, using only the label-free signals of this section? That discrimination is where monitoring meets the security concerns of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the TENT-adapted HAR model from <a class="cross-ref" href="section-66.4.html">Section 66.4</a> and a target stream. (a) Inject a 200-window burst of out-of-distribution data (a rotated or unplugged sensor) partway through, and plot the adaptation entropy alongside the predicted-class diversity \(H(\hat p)\) from Code 66.6.1; confirm that the two move in opposite directions during collapse. (b) Set the <code>div_floor</code> and <code>kl_ceil</code> thresholds from a clean calibration run using a control-chart limit from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and measure the detection delay in windows. (c) Compare three responses, freeze, rollback, and do-nothing, on final target accuracy, and report the cost of a false alarm on a stream that was actually healthy.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is a falling adaptation entropy useless, even misleading, as a health signal for a TENT model, and what label-free quantity should you watch instead?</li>
+<li>What does the frozen anchor model give you that no statistic of the adapting model alone can provide?</li>
+<li>Name the three response tiers to a fired alarm in order of increasing cost, and give a sensor scenario where you would jump straight to the strongest one.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-66.7.html">Section 66.7</a>, we leave the runtime and return to measurement: the benchmarks, HAROOD, BenchHAR, and WILDS, that let us quantify all of this chapter's claims about shift, OOD detection, generalization, and adaptation under leakage-safe, reproducible conditions, so that the recovery an adapter reports is a real gain and not a split artifact.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

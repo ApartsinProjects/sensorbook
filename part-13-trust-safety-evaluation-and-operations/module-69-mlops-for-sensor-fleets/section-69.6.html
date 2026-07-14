@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.6: Logging under privacy constraints. Building Sensory AI." name="description"/>
+<title>Section 69.6: Logging under privacy constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Logging under privacy constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me to log everything so I could debug anything. Then a subpoena arrived, and I discovered that everything included the exact walking gait of forty thousand people who never agreed to be a debug artifact."</p>
+<cite>A Chastened AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the provenance and leakage-safe data discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and assumes familiarity with the on-device and federated privacy machinery, differential privacy, secure aggregation, and keeping raw data on the device, from <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>. We treat the legal and ethical framing, consent, proportionality, and biometric law, as the province of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a> and <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>; here the question is narrower and operational: how do you keep enough of a record to run a sensor fleet without turning your log store into a surveillance archive?</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Operating a fleet demands logs: you need them to debug a bad deployment, to reproduce an anomaly, to compute the drift and proxy metrics from the previous sections, and to reconstruct what happened during an incident. But a sensor log is not an application log. A row of accelerometer, PPG, audio, or location data <em>is</em> the personal information, often the biometric identity, of the person carrying the device. The naive instinct, "log the raw payload so we can debug anything later," creates a liability that grows with every device and every day of retention, and it is frequently unlawful. This section teaches the discipline that reconciles the two pressures: log by <strong>data minimization</strong>, transform sensitive signals into non-reversible summaries as close to the sensor as possible, add calibrated noise to the fleet-level aggregates you truly need, and put retention, access, and audit controls around whatever raw data you cannot avoid keeping. The goal is a log you can operate on and defend, not one you have to apologize for.</p>
+</div>
+
+<h2>Why a sensor log is different from an application log</h2>
+<p>Ordinary backend engineering has a comfortable habit: log liberally, keep it for a while, grep it when something breaks. That habit is actively dangerous for sensor fleets for three reasons. First, the payload is the sensitive thing. A stack trace is about your code; a raw inertial-measurement-unit window is about a human's movement, and gait alone is a biometric identifier that re-identifies people across sessions (the activity and behavior signals of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). Second, the volume is enormous and continuous: a fleet streams high-rate signals from every device every second, so "log everything" scales into petabytes of the most intimate data you could hold. Third, the meaning is latent. A single PPG trace looks innocuous, yet it carries heart rate, arrhythmia markers, and stress state; audio captured "just for a bug" contains speech. What looks like a debug convenience is a covert health and behavior dossier.</p>
+<p>The reframe is to treat logging as a design surface with an explicit privacy budget, not as an afterthought you bolt on with a retention cron job. Every field you log should survive a simple question: what operational decision does this enable, and is there a less identifying representation that enables the same decision? Most of the time there is.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Debuggability and privacy are usually framed as opposites, but for sensor systems they are mostly aligned. What you need to operate a fleet is almost never the raw waveform of one identifiable person; it is <em>aggregate</em> behavior (how often does inference latency exceed budget across the fleet), <em>distributional</em> behavior (has the feature distribution drifted), and <em>reproducible</em> behavior (a small, consented, access-controlled sample that reproduces a specific failure). Design for those three and the raw firehose becomes unnecessary. The signals that are cheapest to log safely, counts, quantiles, and coarse feature statistics, are also the ones your monitoring in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/section-69.3.html">Section 69.3</a> actually consumes.</p>
+</div>
+
+<h2>The logging hierarchy: minimize before you emit</h2>
+<p>Organize what a device can send into a hierarchy ordered by sensitivity, and default every log line to the least sensitive tier that answers the operational question. The tiers, from safest to most dangerous, are: <strong>operational metadata</strong> (device id pseudonym, firmware version, model version, timestamps, latency, battery, error codes) that describes the system rather than the subject; <strong>derived scalars and events</strong> (a predicted class label, a confidence score, a "dropout detected" flag) that summarize an inference without the input; <strong>aggregate statistics</strong> (per-device or per-cohort histograms and quantiles of features, computed on-device and emitted periodically); and only at the bottom, <strong>raw or near-raw signal windows</strong>, which should be the rare, deliberately gated exception rather than the default.</p>
+<p>Two transformations move data up the hierarchy toward safety. <strong>Redaction</strong> removes or masks identifying fields: replace a stable <code>device_id</code> with a rotating pseudonym, drop precise GPS in favor of a coarse geohash or an H3 cell, and strip any free-text or audio that could contain speech (the localization and RF-positioning identifiers of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a> are especially re-identifying). <strong>Aggregation</strong> replaces per-sample values with summaries computed before egress, so the raw window never leaves the device. A drift monitor does not need a user's heartbeat; it needs a 32-bin histogram of the beat-interval feature, which reveals distribution shift while hiding the individual.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the sleep wearable that logged too well</h4>
+<p>A sleep-tracking wearable ships with verbose logging enabled to speed up a launch. Each device uploads the raw PPG and accelerometer window whenever the on-device sleep-stage classifier reports low confidence, "so engineering can review hard cases." Within a month the log store holds tens of millions of raw cardiac and movement windows keyed to stable device ids, a de facto medical database assembled without medical-grade consent (the cardiovascular sensing of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>). A privacy review forces a redesign. The new scheme uploads, for a low-confidence event, only the model version, the predicted stage, the confidence, and a 16-dimensional feature vector already stripped of raw morphology; raw windows are collected only from a few thousand users who explicitly opted into a "help improve detection" program, under a 30-day retention limit and role-restricted access. Engineering keeps its ability to debug hard cases, the log store shrinks by three orders of magnitude, and the company stops holding cardiac waveforms it was never authorized to keep. Minimization did not cost debuggability; unbounded collection was the accident.</p>
+</div>
+
+<h2>Differentially private fleet telemetry</h2>
+<p>Aggregation alone can still leak. A per-cohort count of "users whose stress feature exceeded a threshold" can expose an individual when a cohort is small or when an adversary compares two releases that differ by one person. The principled defense is <strong>differential privacy (DP)</strong>: add calibrated random noise to each released statistic so that the presence or absence of any single person changes the output distribution by at most a bounded factor \(e^{\varepsilon}\). Formally, a randomized mechanism \(M\) is \(\varepsilon\)-differentially private if for all neighboring datasets \(D, D'\) differing in one record and all outputs \(S\),</p>
+$$\Pr[M(D) \in S] \le e^{\varepsilon}\, \Pr[M(D') \in S].$$
+<p>For fleet telemetry the most robust flavor is <strong>local differential privacy (LDP)</strong>, where each device privatizes its own contribution before it ever leaves the hardware, so the server never sees a true individual value even if the server is later compromised (this is the same trust model as the on-device privacy of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>). The classic mechanism for a binary attribute is <strong>randomized response</strong>: each device reports its true bit with probability \(p\) and flips it otherwise, and the server debiases the noisy sum to recover an accurate fleet-level proportion while any single report is deniable.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def randomized_response(bit, epsilon, rng):
+    # Local DP for one boolean per device. p is chosen so the flip
+    # probability satisfies epsilon-LDP for a single binary report.
+    p = np.exp(epsilon) / (np.exp(epsilon) + 1.0)
+    return bit if rng.random() < p else 1 - bit
+
+def estimate_true_rate(noisy_bits, epsilon):
+    p = np.exp(epsilon) / (np.exp(epsilon) + 1.0)
+    obs = np.mean(noisy_bits)          # what the server sees
+    return (obs + p - 1.0) / (2.0 * p - 1.0)  # debiased estimate
+
+rng = np.random.default_rng(0)
+epsilon = 1.0
+true_rate = 0.18                       # 18% of devices hit the event
+n = 50_000
+truth = (rng.random(n) < true_rate).astype(int)
+reported = np.array([randomized_response(b, epsilon, rng) for b in truth])
+print(f"true={true_rate:.3f}  estimated={estimate_true_rate(reported, epsilon):.3f}")
+</code></pre>
+<div class="code-caption">Local differential privacy by randomized response: every device flips its own bit before upload, yet the debiased fleet-wide rate is recovered to within sampling error at \(\varepsilon = 1\). The server never holds a truthful per-device value, so a breach of the log store leaks no individual's status.</div>
+
+<p>The code above shows the whole bargain in miniature. At \(\varepsilon = 1\) and fifty thousand devices, the debiased estimate lands within a few tenths of a percent of the truth while each individual report carries plausible deniability. Smaller \(\varepsilon\) buys more privacy at the cost of more variance, so you spend an explicit <em>privacy budget</em>: the total \(\varepsilon\) across all statistics you release, tracked like any other operational quota. This is the accounting that lets you say precisely how private your telemetry is, rather than hoping aggregation was enough.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Hand-rolling randomized response is fine for a single boolean, but real telemetry needs privatized histograms, quantiles, and means with correct budget composition, which is easy to get subtly wrong. Google's <code>differential-privacy</code> library (with the <code>PyDP</code> bindings) and IBM's <code>diffprivlib</code> provide vetted bounded-sum, count, quantile, and histogram mechanisms with automatic \(\varepsilon\) accounting. A DP histogram over a feature that would be roughly 60 lines of clamping, noise calibration, and composition tracking by hand becomes about 4 lines: instantiate the mechanism with your bounds and budget, feed values, read the private result. The library owns the sensitivity analysis and the composition theorem so a mistake there cannot silently blow your privacy guarantee.</p>
+</div>
+
+<h2>Retention, access, and audit for the raw data you keep</h2>
+<p>Some raw collection is unavoidable: reproducing a specific failure sometimes needs the actual window that triggered it. The discipline is to make that collection small, consented, and short-lived, and to wrap it in controls. Set a <strong>retention limit</strong> and enforce it with automatic expiry, not a hopeful policy document; raw sensor windows should live for days, not forever. Gate collection behind explicit, revocable <strong>consent</strong> so raw data comes only from users who opted into a debug or improvement program. Apply <strong>access control</strong> so raw payloads are role-restricted and every read is logged, turning "who looked at this person's heartbeat" into an answerable question. Keep <strong>pseudonymization keys</strong> separate from the payload store so that re-identification requires deliberately joining two systems rather than reading one. And record a <strong>provenance and consent tag</strong> on every raw record, extending the data-contract idea of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/section-69.1.html">Section 69.1</a>, so a later request to delete a user's data can find and purge every window they contributed. These controls are what make a log store defensible when, not if, someone asks what is in it.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You run a fleet of fall-detection pendants for elderly users. Product asks for a dashboard showing, per city, the fraction of devices that triggered at least one false alarm this week, and engineering wants to debug the worst false-alarm cases. (1) Assign each requested data item to a tier of the logging hierarchy and state the least-sensitive representation that still answers it. (2) Choose an \(\varepsilon\) and a mechanism for the per-city fraction, and explain what a city with only 12 devices means for your noise and whether you should report it at all. (3) Specify the retention, consent, and access rules for any raw accelerometer windows engineering is allowed to pull. State one thing you would refuse to log entirely.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why is "log the raw payload so we can debug anything" more dangerous for a PPG stream than for an HTTP request log, even though both are just bytes?<br/>
+2. In local differential privacy, what does the server never possess that it would possess under plain aggregation, and why does that matter after a breach?<br/>
+3. Your privacy budget for the week is \(\varepsilon = 2\). You have already released a DP count at \(\varepsilon = 1.5\). What constrains the next statistic you can release, and what happens to accuracy if you keep spending?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-69.7.html">Section 69.7</a>, we turn logs into action: incident response for sensor fleets, how to detect, triage, contain, and post-mortem a failure using exactly the privacy-respecting telemetry this section taught you to keep, and how to roll back a bad model or quarantine a misbehaving cohort without needing the raw data you were careful not to hoard.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

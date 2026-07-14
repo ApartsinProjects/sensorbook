@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.1: Data contracts for sensors. Building Sensory AI." name="description"/>
+<title>Section 69.1: Data contracts for sensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Data contracts for sensors</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The units changed from g to meters per second squared on a Tuesday. My accuracy dropped on a Wednesday. The incident review found each other on a Friday. Nobody had written down what a valid sample was supposed to look like."</p>
+<cite>A Retrained AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the timing and synchronization vocabulary, sample rate, clock drift, timestamp monotonicity, and gap handling, from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the leakage-safe dataset and provenance discipline built in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. It also builds on the measurement-model idea, units, ranges, and calibration state as first-class properties of a reading, from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. We do not re-derive sampling theory here; we turn those physical facts into an enforceable agreement between the fleet and the model.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A <strong>data contract</strong> is an explicit, versioned, machine-checkable agreement about what a valid batch of sensor data looks like, negotiated between the people who produce it (firmware, ingestion, integrators) and the people who consume it (your model, your monitors, your dashboards). It pins down schema, units, ranges, sample rate, timing, allowed missingness, and the provenance every reading must carry. For ordinary tabular software a contract is a nicety. For a sensor fleet it is load-bearing: the producer is a piece of physical hardware in the field that will be re-flashed, swapped, recalibrated, and mounted upside down by a technician you will never meet, and every one of those events can silently change the meaning of the numbers without changing their shape. This section teaches you to write the contract that turns those silent changes into loud, catchable failures at the ingestion boundary, before they reach the model.</p>
+</div>
+
+<h2>Why sensor data needs a contract that ordinary data does not</h2>
+<p>Most data-quality frameworks were built for rows in a warehouse: check that <code>user_id</code> is not null, that <code>price</code> is positive. Sensor streams break those assumptions in ways that are specific to physical measurement. A reading is not just a number; it is a number <em>in a unit</em>, produced by a device <em>in a calibration state</em>, sampled <em>at a rate</em>, and stamped by a <em>clock</em> that drifts. Any of these can change while the column name, the dtype, and the value range all stay superficially plausible.</p>
+<p>The failure modes that a good contract must anticipate are almost all invisible to a naive null-and-type check. Firmware updates change units or scaling factors (the classic g versus \(\text{m/s}^2\) swap, a factor of \(9.81\) that a range check on acceleration will happily wave through). Sample rate silently shifts when a scheduler is overloaded, so a model trained on \(100\,\text{Hz}\) windows now sees \(83\,\text{Hz}\) windows of the same length in samples but a different length in seconds. Timestamps go non-monotonic after a clock resync or a daylight-saving jump. A saturating sensor clips at its rail and returns a physically impossible constant that sits comfortably inside the nominal range. A replaced unit ships with a different mounting orientation, so the axes are permuted. None of these throw an exception. All of them poison the model. The contract's job is to name each expectation precisely enough that a violation is detectable.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>In conventional software the schema is the contract. In sensor systems the schema is the easy part; the contract is mostly <em>semantics and physics</em>. Two batches can have identical column names, dtypes, and value ranges and still mean completely different things because one is in g and the other in \(\text{m/s}^2\), or one was sampled at \(100\,\text{Hz}\) and the other at \(50\,\text{Hz}\). A data contract for sensors is therefore not a JSON schema with types; it is a schema <em>plus</em> the unit, the expected sample rate, the calibration provenance, and the temporal invariants, all made explicit so that a machine can reject a batch the moment its physical meaning stops matching what the model was trained on.</p>
+</div>
+
+<h2>What a sensor data contract actually specifies</h2>
+<p>A workable contract has four layers, from cheapest to check to most valuable to enforce. The <strong>structural layer</strong> fixes the fields, their dtypes, and their nullability: <code>timestamp</code> is an int64 of microseconds, <code>accel_x/y/z</code> are float32, <code>device_id</code> is a non-null string. The <strong>semantic layer</strong> attaches physical meaning: the unit of each channel, the valid range implied by the sensor's full-scale specification, and a saturation guard that flags long runs of a constant value pinned at the rail. The <strong>temporal layer</strong> encodes the physics of sampling: the nominal rate \(f_s\) and a tolerance, a requirement that timestamps be strictly increasing, and a maximum gap the pipeline will tolerate before it declares a dropout rather than interpolating across it (the sampling and gap concepts from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>). The <strong>provenance layer</strong> requires that every batch declare the sensor model, firmware version, and calibration date, so that a downstream consumer can refuse data from a firmware the model has never seen.</p>
+<p>Concretely, a contract for a triaxial accelerometer channel might assert that the sample rate satisfies \(|f_s - 100| \le 2\,\text{Hz}\), that each axis lies within \([-16g, 16g]\), that no axis holds a constant value for more than \(0.5\,\text{s}\) (a saturation or stuck-sensor signature), and that the batch is tagged with a firmware version drawn from a known-good allowlist. The contract is stored as data, not code, so it can be versioned in the same registry as the model and diffed when either side changes.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the wind farm that lost a factor of 9.81</h4>
+<p>A predictive-maintenance team monitors gearbox vibration across a fleet of two hundred wind turbines (the prognostics modeling is the subject of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>). Their anomaly model consumes \(100\,\text{Hz}\) accelerometer windows reported in g. A vendor pushes a firmware update to forty turbines overnight that, in a well-intentioned "standardization" release, switches the reported unit to \(\text{m/s}^2\). Every value is now \(9.81\) times larger. The dtype is unchanged, the columns are unchanged, and \(16g\) full-scale in \(\text{m/s}^2\) is about \(157\), which still looks like a big-but-plausible vibration to a range check written loosely. For three days the model flags those forty turbines as imminent failures, dispatching crews to healthy machines, until someone reads the firmware changelog. Had a data contract asserted <code>unit == "g"</code> and pinned the firmware version to an allowlist, ingestion would have quarantined the forty affected turbines on the first batch and raised a single "unrecognized firmware, unit mismatch" alert instead of forty false failure predictions. The contract converts a silent semantic drift into an explicit, attributable, one-line failure at the boundary.</p>
+</div>
+
+<h2>Enforcing the contract at the ingestion boundary</h2>
+<p>A contract that is not checked is a comment. The enforcement point is the ingestion boundary, the single choke point where raw batches from the fleet enter your pipeline, and the enforcement policy matters as much as the checks themselves. The two viable policies are <strong>fail-closed</strong> (reject the batch, do not let it reach the model) and <strong>quarantine</strong> (route the batch to a holding area, alert, and continue serving the rest of the fleet). For a safety-relevant consumer you fail closed; for a large fleet where one bad device should not blind you to the other one hundred and ninety-nine, you quarantine per device and keep going. What you never do is silently coerce: clipping an out-of-range value or forward-filling across a dropout hides exactly the signal the contract exists to surface.</p>
+<p>The code below implements a minimal but honest validator: it takes a contract and a batch and returns the list of violations, checking structure, range, saturation, sample rate, and timestamp monotonicity in one pass.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class Contract:
+    unit: str                 # e.g. "g"
+    fs_hz: float              # nominal sample rate
+    fs_tol_hz: float          # allowed deviation
+    lo: float; hi: float      # valid physical range per sample
+    max_stuck_s: float        # longest allowed constant run (saturation guard)
+    firmware_allow: set       # known-good firmware versions
+
+def validate(batch, contract):
+    """Return a list of contract violations for one device batch."""
+    v = []
+    t, x = batch["timestamp_us"], batch["accel"]      # int64 us, float array
+    fw, unit = batch["firmware"], batch["unit"]
+
+    if unit != contract.unit:
+        v.append(f"unit mismatch: got {unit!r}, expected {contract.unit!r}")
+    if fw not in contract.firmware_allow:
+        v.append(f"unrecognized firmware: {fw!r}")
+    if np.any(x &lt; contract.lo) or np.any(x &gt; contract.hi):
+        v.append(f"value out of range [{contract.lo}, {contract.hi}]")
+    if np.any(np.diff(t) &lt;= 0):
+        v.append("non-monotonic or duplicate timestamps")
+
+    # Realized sample rate from the median inter-sample interval
+    dt = np.median(np.diff(t)) / 1e6                   # us -> s
+    fs = 1.0 / dt if dt &gt; 0 else 0.0
+    if abs(fs - contract.fs_hz) &gt; contract.fs_tol_hz:
+        v.append(f"sample rate {fs:.1f} Hz off nominal {contract.fs_hz} Hz")
+
+    # Saturation: any constant run longer than max_stuck_s
+    run_len = max_stuck = 0
+    for i in range(1, len(x)):
+        run_len = run_len + 1 if x[i] == x[i-1] else 0
+        max_stuck = max(max_stuck, run_len)
+    if max_stuck * dt &gt; contract.max_stuck_s:
+        v.append(f"stuck value for {max_stuck*dt:.2f}s (saturation?)")
+    return v
+
+c = Contract(unit="g", fs_hz=100, fs_tol_hz=2, lo=-16, hi=16,
+             max_stuck_s=0.5, firmware_allow={"v3.2.1", "v3.2.2"})
+good = {"timestamp_us": np.arange(500)*10_000, "unit": "g",
+        "firmware": "v3.2.1", "accel": np.random.default_rng(0).normal(0, 1, 500)}
+bad = {**good, "unit": "m/s^2", "accel": good["accel"] * 9.81, "firmware": "v3.3.0"}
+print("good:", validate(good, c))
+print("bad :", validate(bad, c))
+</code></pre>
+<div class="code-caption">Code 69.1.1: A single-pass sensor data-contract validator. It checks the structural, semantic (unit, range, saturation), temporal (realized sample rate, timestamp monotonicity), and provenance (firmware allowlist) layers, and returns an explicit violation list. The <code>bad</code> batch reproduces the wind-farm incident: a unit swap to m/s^2 with an unrecognized firmware is caught on the first batch instead of after three days of false alarms.</div>
+
+<p>Code 69.1.1 makes the contract executable: the same <code>Contract</code> object that documents the agreement is the thing that enforces it, so the documentation cannot drift away from the check. Running it at the ingestion boundary, per device, is what lets you quarantine the forty bad turbines while the other one hundred sixty keep flowing.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: declare the contract, let the library run the sweep</h3>
+<p>The hand-rolled validator in Code 69.1.1 is about forty lines and covers only one channel; a real fleet has dozens of channels and you do not want forty lines each. Declarative validation libraries such as <code>pandera</code> or Great Expectations let you state the schema, dtypes, ranges, nullability, and custom checks (unit equality, monotonic timestamps, allowlisted firmware) as a single declarative object, then validate a whole dataframe in one call with structured, per-row error reports and lazy evaluation that collects every violation at once. That turns roughly forty lines of per-channel index-juggling into three or four lines of schema declaration per channel, and gives you serialization so the contract lives in the model registry next to the weights. Keep the physics (units, sample-rate tolerance, saturation runs) in a couple of custom checks; let the library handle the structural sweep, the error aggregation, and the reporting.</p>
+</div>
+
+<h2>Versioning contracts and evolving them safely</h2>
+<p>A sensor contract is not written once. Firmware ships, sensors get swapped for a newer part, a calibration campaign shifts a range. Each such change is a contract version, and the discipline is the same as for any interface: additive changes (a new optional channel) are backward-compatible; changes that alter meaning (a unit, a range, a required field) are breaking and demand a new major version plus a coordinated model update. Store the contract in a registry keyed by version, tag every ingested batch with the contract version it was validated against, and you gain something valuable for the rest of this chapter: when a monitor fires in <a class="cross-ref" href="section-69.3.html">Section 69.3</a> or an incident opens in <a class="cross-ref" href="section-69.7.html">Section 69.7</a>, you can ask exactly which contract version the offending data claimed to satisfy, and diff it against what the model expects. Contracts also make leakage-safe evaluation auditable: a test set is only comparable to production if both were gathered under the same contract, which ties this section directly back to the benchmarking rigor of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You maintain a fleet of wearable ECG patches whose model expects a \(250\,\text{Hz}\) single-lead signal in millivolts. (a) Write a five-line contract (as a <code>Contract</code>-style object) capturing unit, sample rate and tolerance, physical range, a saturation guard, and a firmware allowlist. (b) A new patch revision reports in microvolts (a factor of \(1000\)) but is otherwise identical in schema; show which check in Code 69.1.1 catches it and which would miss it if you had only a range check. (c) The firmware team wants to add an optional <code>lead_off</code> boolean channel. Argue in two sentences whether this is a backward-compatible change or a breaking one, and what contract version bump it warrants.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Name three sensor failure modes that change the <em>meaning</em> of a batch without changing its dtype or column names, and give the contract check that catches each.</li>
+<li>Why is silently clipping an out-of-range value or forward-filling across a dropout the wrong enforcement policy, even though it keeps the pipeline running?</li>
+<li>Your model was trained on data gathered under contract v2 and production now runs contract v3, which changed the accelerometer range. What single fact must you check before trusting any accuracy comparison between the two, and which earlier chapter's discipline does this invoke?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-69.2.html">Section 69.2</a>, we move from the data side of the interface to the model side: how to version, package, and deploy the models that consume these contracts, so that a given model is always paired with the exact contract version it was trained and validated against, and a rollback restores both together rather than leaving one stranded.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

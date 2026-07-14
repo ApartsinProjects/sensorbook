@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.1: Covariate, label, and concept shift in sensing (builds on the uncertainty tools of Ch 18). Building Sensory AI." name="description"/>
+<title>Section 66.1: Covariate, label, and concept shift in sensing (builds on the uncertainty tools of Ch 18) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>Covariate, label, and concept shift in sensing (builds on the uncertainty tools of Ch 18)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me the world had changed. They would not tell me which part. So I corrected for the wrong one and grew confident about being wrong."</p>
+<cite>A Miscalibrated AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the joint-distribution and conditional-probability vocabulary from the probability primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, the leakage-safe split discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, and above all the calibration and conformal-prediction machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. We treat a trained classifier and its calibrated confidence as given. This section is not about building the model; it is about naming precisely <em>how</em> the deployment distribution differs from the training one, because the name determines whether the fix is a re-weighting, a prior correction, or a retraining. We do not re-derive softmax calibration here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every sensor model is trained on a joint distribution \(P_{\text{src}}(x, y)\) and deployed on a different one, \(P_{\text{tgt}}(x, y)\). "The distribution shifted" is too vague to act on, because the joint factors two ways, \(P(x)P(y \mid x)\) and \(P(y)P(x \mid y)\), and a shift can live in any single factor. <strong>Covariate shift</strong> moves \(P(x)\) while \(P(y \mid x)\) holds: the inputs look new but the labeling rule is intact. <strong>Label (prior) shift</strong> moves \(P(y)\) while \(P(x \mid y)\) holds: the class mix changes but each class still looks the same. <strong>Concept shift</strong> moves \(P(y \mid x)\) itself: the same signal now means something different. These three demand different responses and, critically, only the first two can be corrected with unlabeled target data. This section gives you the taxonomy and the estimators, using Chapter 18's calibrated probabilities as the raw material for both.</p>
+</div>
+
+<h2>Three shifts, one factorization</h2>
+<p>Fix notation. A window of sensor features is \(x\), its label is \(y\), the training world is the source \(P_{\text{src}}\), and the field is the target \(P_{\text{tgt}}\). The reason we bother to distinguish sub-types of shift is that the joint distribution can be written two equivalent ways, and each way isolates a different assumption you might be willing to make:</p>
+$$ P(x, y) = \underbrace{P(y \mid x)\,P(x)}_{\text{discriminative}} = \underbrace{P(x \mid y)\,P(y)}_{\text{generative}}. $$
+<p>A named shift is a claim that <em>exactly one</em> factor on one side moves and the other stays put. Covariate shift asserts \(P_{\text{tgt}}(x) \neq P_{\text{src}}(x)\) but \(P_{\text{tgt}}(y \mid x) = P_{\text{src}}(y \mid x)\). Label shift asserts \(P_{\text{tgt}}(y) \neq P_{\text{src}}(y)\) but \(P_{\text{tgt}}(x \mid y) = P_{\text{src}}(x \mid y)\). Concept shift asserts \(P_{\text{tgt}}(y \mid x) \neq P_{\text{src}}(y \mid x)\), the one factor everything else was trying to hold fixed. The value of the taxonomy is entirely practical: the invariant factor is the lever. If \(P(y \mid x)\) is invariant, your classifier is still correct on any \(x\) it sees and you only need to fix the input coverage. If \(P(x \mid y)\) is invariant, each class still "looks" the same and you only need to fix the class proportions. If neither is invariant, no amount of unlabeled target data can save you, because the mapping you learned is now the wrong mapping.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Covariate and label shift are <em>correctable from unlabeled target data alone</em>, because in each case one factor is assumed invariant and the shift lives entirely in a marginal you can estimate without labels. Concept shift is not, because the thing that moved is the label-generating rule itself: recovering it requires fresh labels from the target domain. This single fact governs the rest of the chapter. Test-time adaptation methods that touch only unlabeled data (the subject of Sections 66.4 and 66.5) are implicitly betting the shift is covariate or label, not concept. When that bet is wrong, they adapt confidently toward the wrong answer, which is why Section 66.6 spends its time monitoring risk during adaptation rather than trusting it.</p>
+</div>
+
+<h2>Covariate shift: the inputs are new, the rule is not</h2>
+<p>Covariate shift is the sensor practitioner's default hazard, because sensors live in the physical world and the physical world is not stationary. A new device revision changes the noise floor; an accelerometer worn tighter changes the amplitude envelope; ambient temperature drifts the bias of a MEMS gyro; a new deployment site has different vibration harmonics. In all of these the labeling rule is untouched: a fall is still a fall, a bearing fault still sounds like a bearing fault. Only the density of inputs \(P(x)\) has moved, often into regions the training set sampled thinly.</p>
+<p>The classical correction is <strong>importance weighting</strong>. Because the risk under the target factors as an expectation under the source re-weighted by the density ratio,</p>
+$$ \mathbb{E}_{\text{tgt}}[\ell] = \mathbb{E}_{\text{src}}\!\left[\, w(x)\,\ell \,\right], \qquad w(x) = \frac{P_{\text{tgt}}(x)}{P_{\text{src}}(x)}, $$
+<p>you can reweight the training loss (or a validation estimate) by \(w(x)\) without ever labeling a target sample. You rarely estimate the two densities separately; the robust trick, echoing the domain-classifier idea, is to train a probe that discriminates source from target and read the ratio off its odds. The catch that Chapter 18 prepares you for: importance weights inflate variance when the two supports barely overlap, and a high weight on a region the model handles badly is exactly where your calibrated confidence should already be widening. Covariate shift and the <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">change-detection</a> machinery of Chapter 12 are two views of the same event: a monitored feature distribution moving off its baseline.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: a vibration model that survived a new turbine but not a re-labeled one</h4>
+<p>A predictive-maintenance team (the modeling side is <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>) ships a bearing-fault classifier trained on a fleet of 1.5 MW turbines. A new 3 MW model arrives with stiffer bearings and a higher running speed, so the vibration spectra shift upward in frequency: pure covariate shift, since a spalled race still produces the same sideband signature relative to shaft speed. Importance weighting on unlabeled data from the new turbines recovers most of the lost accuracy, and the calibrated confidence correctly widens over the unfamiliar spectra. Months later a lubrication-additive change alters what "healthy" sounds like, so windows the model confidently calls "early fault" are now, by the maintenance crew's ground truth, normal. That is concept shift: \(P(y \mid x)\) moved. The same unlabeled-reweighting pipeline that rescued the first case does nothing for the second, and the confidence stays high while the accuracy collapses. The team only caught it because they had held back a small trickle of freshly labeled windows, the one signal that can see a concept shift.</p>
+</div>
+
+<h2>Label shift: the mix changed, the classes did not</h2>
+<p>Label shift is the mirror image and is endemic wherever <em>prevalence</em> is a property of the deployment rather than the sensor. An arrhythmia detector trained on a cardiology ward, where atrial fibrillation is common, is deployed on a healthy-population wearable where it is rare (the wearable side is <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> territory for activity, and cardiac for <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>-style calibration). Each class still looks the same, \(P(x \mid y)\) is invariant, but \(P(y)\) has collapsed toward the negative class. A classifier trained under the ward prior will over-predict the positive.</p>
+<p>The elegant correction is <strong>Black-Box Shift Estimation</strong> (BBSE), and it is where Chapter 18 pays off directly. If \(C\) is the source confusion matrix, \(C_{ij} = P_{\text{src}}(\hat{y} = i \mid y = j)\), and \(q\) is the vector of predicted-label frequencies observed on the unlabeled target, then under label shift they are linked by \(q = C\,\pi_{\text{tgt}}\), so the target prior is recovered by a single linear solve \(\pi_{\text{tgt}} = C^{-1} q\). You then rescale each class posterior by \(\pi_{\text{tgt}}(y) / \pi_{\text{src}}(y)\) and renormalize. The method needs no target labels, only target predictions, but it leans hard on the classifier being well calibrated: a biased \(C\) yields a biased \(\pi_{\text{tgt}}\), which is why the calibrated probabilities of Chapter 18 are the prerequisite and not an afterthought.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def bbse_target_prior(conf_matrix, target_pred_freq):
+    """Estimate the target class prior from a source confusion matrix
+    and the predicted-label frequencies observed on unlabeled target data.
+    conf_matrix[i, j] = P_src(pred = i | true = j). Returns a prior over y."""
+    pi = np.linalg.solve(conf_matrix, target_pred_freq)   # solve q = C @ pi
+    pi = np.clip(pi, 0, None)                              # priors are non-negative
+    return pi / pi.sum()                                  # renormalize to a simplex
+
+def relabel_weights(pi_src, pi_tgt):
+    """Per-class posterior rescaling factor pi_tgt / pi_src (label-shift fix)."""
+    return pi_tgt / pi_src
+
+# Source (ward): AF present in 30% of windows; target (consumer wearable): rare.
+C = np.array([[0.93, 0.07],      # pred=normal  given true normal / true AF
+              [0.07, 0.93]])     # pred=AF      given true normal / true AF
+pi_src = np.array([0.70, 0.30])
+q_target = np.array([0.955, 0.045])          # what the model predicts in the field
+pi_tgt = bbse_target_prior(C, q_target)
+print("estimated target prior:", pi_tgt.round(3))
+print("posterior rescaling   :", relabel_weights(pi_src, pi_tgt).round(3))
+</code></pre>
+<div class="code-caption">Code 66.1.1: Black-Box Shift Estimation for label shift. The confusion matrix <code>C</code> is measured once on a labeled source validation set; <code>q_target</code> is the model's predicted-label histogram on unlabeled field data. One linear solve recovers the target prior, and the rescaling factors correct every posterior without a single target label. The method inherits its accuracy from the classifier's calibration (Chapter 18), which is why a well-calibrated <code>C</code> is non-negotiable.</div>
+
+<p>Code 66.1.1 makes the asymmetry with covariate shift concrete: here we correct a low-dimensional prior over classes, not a density ratio over the whole feature space, so the estimator is stable even with modest unlabeled samples. The one guardrail is that \(C\) must be invertible and well-conditioned, which fails when classes are barely separable, a diagnosis your source-side confusion matrix already reports.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: label-shift correction in a few lines</h3>
+<p>Hand-rolling BBSE, its regularized cousin RLLS, and the confidence rescaling means writing a confusion-matrix estimator, a constrained linear solve, and a posterior reweighter with clipping and renormalization, roughly 40 lines to get right and test. Libraries such as <code>quapy</code> (quantification) and the shift utilities in <code>scikit-learn</code>-adjacent packages collapse this to about three calls: fit a quantifier on source, apply it to target predictions, read off the corrected prior. That is a roughly 40-to-3 line reduction, with the ill-conditioned-\(C\) regularization and the simplex projection handled for you. Reserve the from-scratch version (Code 66.1.1) for when you need to see exactly which assumption is doing the work.</p>
+</div>
+
+<h2>Concept shift: when the meaning of the signal moves</h2>
+<p>Concept shift is the one that breaks the comfortable machinery, because the invariant that covariate and label corrections both relied on, a fixed conditional, is precisely what has changed. The same \(x\) now maps to a different \(y\): a gesture that meant "confirm" is remapped to "cancel" after a firmware update; a "normal" gait pattern becomes "abnormal" as a patient's disease progresses; a network-traffic signature that was benign becomes an attack after an exploit is published. No re-weighting of unlabeled inputs can recover a rule that the unlabeled inputs no longer determine.</p>
+<p>Two practical consequences follow. First, <strong>concept shift is only detectable with labels</strong>, however sparse. A stream of unlabeled data can reveal that \(P(x)\) moved, but it is blind to whether \(P(y \mid x)\) moved, so a thin, continuous trickle of ground truth (audited alarms, clinician confirmations, periodic re-annotation) is the single most valuable monitoring investment you can make. Second, concept shift is often <em>gradual and adversarial</em> rather than abrupt: sensor wear, seasonal drift, or an adversary probing your detector all bend the conditional slowly, which is why the running "sensor failure modes" thread and the change-detection tools of Chapter 12 recur throughout this part. When your calibrated confidence stays high while a small labeled probe shows accuracy falling, you are almost certainly looking at concept shift, and the correct response is retraining or test-time <em>training</em> with labels, not the label-free adaptation of the next sections.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Disentangling the three shifts online, without waiting for enough labels to be sure, is an active problem. Recent work frames it as jointly estimating a density ratio (for the covariate part) and a label-prior shift (for the prior part) and attributing any residual test loss to concept shift, a decomposition that underpins current risk-monitoring methods. On the benchmark side, the WILDS suite and the wearable-specific HAROOD and BenchHAR collections (surveyed in <a class="cross-ref" href="section-66.7.html">Section 66.7</a>) increasingly tag each test split by <em>which</em> shift dominates, so that a method claiming robustness must say robust to what. The open question is reliable concept-shift detection under a tight labeling budget, where every ground-truth label costs a clinician's or operator's attention.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You maintain a step-counter on a wrist wearable. Three field reports arrive. (a) After a hardware revision the accelerometer runs at 100 Hz instead of 50 Hz and the step-detection accuracy drops. (b) A cohort of marathon runners joins, so "running" windows now vastly outnumber "sitting." (c) A software update redefines a "step" to exclude arm-swing artifacts, and the ground-truth labels change. For each, name the shift type, state which conditional is invariant, and say whether unlabeled field data alone can correct it. Then, using Code 66.1.1 as a template, sketch which case its BBSE solve applies to and why it fails on the other two.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Write the two factorizations of \(P(x, y)\) and, for each named shift, state which single factor is assumed invariant and which moves.</li>
+<li>Why can covariate and label shift be corrected from unlabeled target data while concept shift cannot? Answer in terms of what a stream of unlabeled \(x\) can and cannot reveal.</li>
+<li>BBSE recovers the target prior from a linear solve \(\pi_{\text{tgt}} = C^{-1} q\). Name two conditions under which this estimate is unreliable, and connect each to a property of the source classifier from Chapter 18.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-66.2.html">Section 66.2</a>, we sharpen a case the taxonomy quietly assumed away: inputs that belong to <em>no</em> training class at all. Covariate shift stretched \(P(x)\) within the known label space; out-of-distribution and novelty detection ask what to do when a window arrives that the model has no right to classify, and how a calibrated confidence score becomes the first line of defense.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

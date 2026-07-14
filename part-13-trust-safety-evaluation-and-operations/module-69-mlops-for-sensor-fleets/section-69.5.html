@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.5: Retraining triggers and fleet management. Building Sensory AI." name="description"/>
+<title>Section 69.5: Retraining triggers and fleet management | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Retraining triggers and fleet management</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked why I retrained the fleet nine times last month. I said the drift alarm told me to. They asked why the drift alarm fired nine times. I said because I retrained the fleet nine times."</p>
+<cite>A Self-Reinforcing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you already have the monitoring signals from earlier in this chapter: the drift and data-quality detectors of <a class="cross-ref" href="index.html">Section 69.3</a> and the proxy metrics that stand in for delayed labels in <a class="cross-ref" href="index.html">Section 69.4</a>. It builds on the versioning and staged-deployment mechanics of <a class="cross-ref" href="index.html">Section 69.2</a>, which we treat here as a primitive we call rather than re-explain. It leans on distribution-shift concepts from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> and on leakage-safe evaluation from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. Our subject is narrower and operational: given those signals, <em>when</em> do you spend the cost of retraining, and <em>how</em> do you push a new model across a heterogeneous fleet without breaking half of it.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A deployed sensor model decays because the physical world moves underneath it: seasons change, hardware ages, new device revisions ship, users behave in ways the training set never saw. Retraining is the remedy, but retraining is not free and not always safe. Each cycle costs compute, labeling, evaluation, and the operational risk of shipping a regression to thousands of devices at once. A <strong>retraining trigger</strong> is the decision rule that converts monitoring signals into the binary act of spending that cost. <strong>Fleet management</strong> is the discipline of applying the result to a population of devices that are not identical, staged so that a bad model is caught on ten devices instead of ten thousand. This section is about designing triggers that fire when they should and only when they should, and rollouts that fail small.</p>
+</div>
+
+<h2>Four families of trigger, and why calendar alone is not enough</h2>
+<p>The simplest trigger is the <strong>scheduled</strong> one: retrain every quarter regardless of state. It is trivial to implement and easy to reason about, and for slowly drifting domains it is often correct. Its weakness is that it is blind. It retrains when nothing has changed (wasting compute and injecting avoidable deployment risk) and it waits patiently through a fault that appeared the day after the last cycle. Schedule is a floor, not a strategy.</p>
+<p>The second family is <strong>performance-triggered</strong>: retrain when a measured quality metric crosses a threshold. When ground truth is prompt this is the gold standard, because it responds to the thing you actually care about. In sensor fleets truth is usually late or absent, so in practice you trigger on the <em>proxy</em> metrics of <a class="cross-ref" href="index.html">Section 69.4</a>, calibrated confidence, prediction-interval width, agreement between redundant channels, and accept that you are firing on a correlate of accuracy rather than accuracy itself.</p>
+<p>The third family is <strong>data-triggered</strong>: retrain when the input distribution shifts, using the drift statistics of <a class="cross-ref" href="index.html">Section 69.3</a>, or when enough new labeled examples have accumulated to move the decision boundary, or when a previously unseen operating regime appears (a new firmware version, a new mounting site, a device revision). The fourth family is <strong>event-triggered</strong>: a fielded incident, a recall, a regulatory change, or a spoofing discovery (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) forces a cycle out of band. A mature fleet wires all four into one controller: schedule sets the cadence floor, proxy and drift raise the priority, and events preempt everything.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A raw threshold is a trap. Sensor metrics are noisy, so a single-sided threshold with no memory will chatter: it crosses, you retrain, the metric recovers slightly, it crosses again, and you have built a machine that retrains in response to its own retraining. Every production trigger needs three things the naive version lacks: <strong>hysteresis</strong> (fire on a high threshold, only re-arm below a lower one, so noise near the boundary cannot oscillate the decision), <strong>persistence</strong> (require the condition to hold across a window, not a single sample, to reject spikes), and a <strong>cooldown</strong> (a minimum interval between cycles so a legitimate but transient shift cannot spend your entire compute budget in a day). The trigger is not the detector; it is the debounced, rate-limited governor sitting on top of the detector.</p>
+</div>
+
+<h2>A debounced multi-signal trigger controller</h2>
+<p>The controller below fuses several monitoring signals into one retraining decision with the three safeguards from the insight above. Each signal reports a normalized severity in \([0, 1]\); the controller combines them, requires persistence across a window, respects a cooldown, and uses separate arm and disarm thresholds. Note that an <code>event</code> signal bypasses persistence and cooldown, because a confirmed field incident should never be debounced away. The fused severity is a weighted maximum rather than a mean, because for retraining you care about the worst live problem, not the average health.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from collections import deque
+
+@dataclass
+class RetrainTrigger:
+    arm: float = 0.70          # fire when fused severity rises above this
+    disarm: float = 0.45       # only re-arm once it falls back below this (hysteresis)
+    persist: int = 6           # consecutive windows the condition must hold
+    cooldown: int = 30         # minimum windows between two retraining cycles
+    weights: dict = field(default_factory=lambda: {
+        "drift": 1.0, "proxy_conf": 1.0, "new_regime": 0.8, "label_volume": 0.6})
+    _armed: bool = True
+    _hot: deque = field(default_factory=lambda: deque(maxlen=6))
+    _since_last: int = 999
+
+    def step(self, signals: dict, event: bool = False) -> bool:
+        self._since_last += 1
+        if event:                                   # incident preempts everything
+            self._reset()
+            return True
+        fused = max(self.weights.get(k, 0.0) * v for k, v in signals.items())
+        self._hot.append(fused &gt;= self.arm)
+        persistent = len(self._hot) == self._hot.maxlen and all(self._hot)
+        if self._armed and persistent and self._since_last &gt;= self.cooldown:
+            self._reset()
+            return True
+        if not self._armed and fused &lt; self.disarm:  # re-arm only after cooling off
+            self._armed = True
+        return False
+
+    def _reset(self):
+        self._armed, self._since_last = False, 0
+        self._hot.clear()
+
+# One monitoring tick: drift is high but confidence is still fine.
+trig = RetrainTrigger()
+fire = trig.step({"drift": 0.82, "proxy_conf": 0.30, "new_regime": 0.0})
+print("retrain now?", fire)   # False: needs to persist across the window first
+</code></pre>
+<div class="code-caption">A retraining trigger that fuses drift, proxy-confidence, regime-novelty, and label-volume signals with hysteresis, persistence, and a cooldown. The <code>event</code> path bypasses all debouncing so a confirmed incident triggers immediately. Signals are the normalized outputs of the detectors from Sections 69.3 and 69.4; this controller only decides whether their combination warrants spending a retraining cycle.</div>
+
+<p>The controller above is deliberately small so the policy is auditable: an on-call engineer can read why a cycle fired from the signal trace and the threshold constants. In production you would log the fused severity and per-signal contributions on every tick, so a post-hoc review can answer "why did we retrain on the 14th" without rerunning anything.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the drift half</h3>
+<p>The controller above assumes the <code>signals</code> dict already exists. Producing the <code>drift</code> component from raw batches, reference-window bookkeeping, population-stability index or Kolmogorov-Smirnov tests, per-feature aggregation, is roughly 120 to 200 lines to do carefully. Libraries such as <code>river</code> (ADWIN, Page-Hinkley, KSWIN drift detectors) or <code>evidently</code> (dataset-level drift reports) collapse that to about 5 lines: instantiate a detector, call <code>update(x)</code> per sample, read its <code>drift_detected</code> flag straight into <code>signals["drift"]</code>. They handle the sliding windows, the statistical tests, and the multiple-comparison bookkeeping. Keep your own thin trigger policy on top; delegate the detector plumbing.</p>
+</div>
+
+<h2>From "retrain" to "safely deployed": the gated fleet rollout</h2>
+<p>A fired trigger starts a pipeline, it does not ship a model. The retrained candidate must clear a <strong>promotion gate</strong> before any device sees it: it is evaluated on a frozen, leakage-safe holdout (the discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>), and it must beat the incumbent on the primary metric while not regressing on any guardrail slice. The subtle failure here is unique to fleets: a new model can raise <em>fleet-average</em> accuracy while badly regressing a minority cohort, an older device revision, a rare mounting geometry, a specific user population. The gate must therefore be per-cohort, not just global; a candidate that improves the mean but breaks the 2019-hardware cohort should be blocked, not promoted.</p>
+<p>Past the gate, you never flip the whole fleet at once. The house pattern is a <strong>staged rollout</strong>: a <em>shadow</em> phase where the candidate runs alongside the incumbent and its outputs are logged but not acted on; a <em>canary</em> phase on a small, representative slice (often one to five percent, chosen to cover the cohorts, not just random devices); then widening <em>waves</em> with an automatic <strong>rollback</strong> if any wave's live proxy metrics degrade past a bound. Because ground truth is delayed, the canary's kill switch keys off the same proxy and drift signals that drive the trigger, which is why those signals must be trustworthy before you automate any of this.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: the fitness wearable and the winter cohort</h4>
+<p>A wearable vendor runs a heart-rate and activity model on eight device revisions across roughly four million wrists. In late autumn the drift signal climbs steadily; the trigger's persistence window fills and, past cooldown, it fires. The retrained candidate lifts fleet-average step-detection F1 by 1.4 points and clears the global gate. But the per-cohort gate flags a regression: on the two oldest optical-sensor revisions, worn under thick winter sleeves, recall drops 6 points, because the new training mix under-represented low-perfusion cold-skin signals (the PPG physics of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>). A naive fleet-average gate would have shipped the regression to millions. Instead the candidate is held, the winter cold-skin cohort is upsampled, and the next candidate clears both gates. It then rolls out shadow first, then a 2 percent canary weighted toward those old revisions, then three widening waves, with proxy-confidence watched per cohort at each step. The regression that a mean would have hidden was caught at the gate; the staged rollout meant that even an escaped fault would have touched a canary, not the fleet.</p>
+</div>
+
+<h2>Fleet structure: one model, many, or a shared backbone</h2>
+<p>Heterogeneity forces a design choice about how many models the fleet carries. A <strong>single global model</strong> is cheapest to operate and monitor but must generalize across every device revision and environment, and it is the one most likely to hide cohort regressions. <strong>Per-cohort models</strong> (one per device generation, region, or use profile) fit each population better but multiply your retraining, versioning, and monitoring surface by the number of cohorts, and they fragment the data so each model sees less. The common middle path is a <strong>shared backbone with light per-cohort heads or adapters</strong>: the representation is trained fleet-wide, and only a small, cheap head is retrained per cohort when its trigger fires. This is exactly the on-device continual-learning and adapter machinery of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-62-on-device-continual-learning/index.html">Chapter 62</a>, applied at fleet granularity, and it lets a single cohort's trigger fire without forcing a global retrain.</p>
+<p>Whatever the structure, retraining introduces its own hazard: a candidate trained on the newest data can suffer catastrophic forgetting of a rare-but-critical regime that the fresh window under-samples. Guard it by keeping a <strong>frozen regression suite</strong> of hard historical cases (past incidents, rare failure signatures, known-difficult cohorts) that every candidate must still pass, independent of what the recent data looks like. The regression suite is the institutional memory that stops each retrain from quietly relearning last year's mistakes.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Deciding when to retrain is increasingly framed as a cost-aware sequential decision rather than a fixed threshold. Recent work on <em>data-drift-aware retraining policies</em> and reinforcement-learning schedulers (for example, the "Matchmaker" and cost-aware retraining lines) treats each cycle as an action with a compute-and-risk cost and a stochastic accuracy payoff, and learns a policy that beats both fixed schedules and simple drift thresholds on total cost per unit accuracy. On the fleet side, coupling retraining triggers with <em>test-time adaptation</em> (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>) is an active area: cheap on-device adaptation can buy time and postpone a full retrain, changing the economics of the trigger itself. Both directions are early, and neither yet has a settled evaluation protocol for delayed-label sensor fleets.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the <code>RetrainTrigger</code> above and feed it a synthetic 300-tick trace in which <code>drift</code> is a noisy signal that hovers near <code>0.68</code> for 40 ticks, then jumps to a sustained <code>0.9</code>. (1) With the default constants, on which tick does the first cycle fire, and why does the noisy plateau not fire it? (2) Now set <code>persist=1</code> and <code>cooldown=1</code> and count how many cycles fire across the trace; explain the chattering. (3) Add a second signal <code>proxy_conf</code> that is <code>0.0</code> until tick 200 then jumps to <code>0.95</code>, and describe how the weighted-max fusion changes the fire schedule versus using a mean.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why must a retraining trigger use separate arm and disarm thresholds rather than a single threshold, and what specific failure does the gap prevent?</li>
+<li>A candidate raises fleet-average accuracy by 2 points but you refuse to promote it. Give a concrete, sensor-specific reason a per-cohort gate would block it that a global gate would miss.</li>
+<li>Why does the <code>event</code> path in the controller deliberately skip the persistence window and cooldown, and what would go wrong if it did not?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>Triggers and rollouts assume you can log the fleet's signals in the first place, but sensor logs are among the most privacy-sensitive data an organization holds: raw waveforms can re-identify a body, a home, or a location. In <a class="cross-ref" href="section-69.6.html">Section 69.6</a>, we turn to logging under privacy constraints, how to capture enough signal to drive the monitors and triggers of this chapter while minimizing, aggregating, and protecting what leaves the device.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 67.1: Attribution for time series (Integrated Gradients, SHAP-TS). Building Sensory AI." name="description"/>
+<title>Section 67.1: Attribution for time series (Integrated Gradients, SHAP-TS) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 67: Interpretability and Root-Cause Analysis for Time Series</a></div>
+<h1>Attribution for time series (Integrated Gradients, SHAP-TS)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I assigned all the blame to the very first millisecond, because that is where I decided to start counting from. Nobody asked me where zero should be."</p>
+<cite>An Overconfident AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the gradient-based training vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> and the sequence architectures whose predictions we are about to explain, especially the attention models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. Basic multivariate notation for a windowed sensor tensor comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the expectation and baseline-distribution language from the probability primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. We treat a trained model \(f\) as given: this section is not about building it, it is about explaining a single one of its predictions by distributing credit across the input samples that produced it.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An attribution method takes one prediction \(f(x)\) on one input window \(x\) and returns a number for every input coordinate, telling you how much that coordinate contributed to the output. For a sensor window \(x \in \mathbb{R}^{C \times T}\) (C channels, T timesteps) that means an attribution map of the same shape: a heat value on every (channel, timestep) cell. Two methods dominate practice because both rest on axioms rather than intuition. <strong>Integrated Gradients</strong> integrates the model's gradient along a straight path from a baseline to the input and provably satisfies completeness: the attributions sum to \(f(x) - f(\text{baseline})\). <strong>SHAP</strong> assigns each coordinate its Shapley value, the unique credit allocation satisfying a set of game-theoretic fairness axioms. For time series the hard part is not the algorithm, it is the two choices the algorithm hides: what baseline represents "absence" of a signal, and at what granularity credit is meaningful. Get those wrong and the map is confidently, axiomatically wrong.</p>
+</div>
+
+<h2>Why attribution needs axioms, not intuition</h2>
+<p>The naive way to explain a prediction is to read the raw gradient \(\partial f / \partial x\): the sensitivity of the output to each input sample. It is fast and it is misleading, because a trained network saturates. Once a feature is large enough to have already flipped the decision, its local gradient is near zero, so the very sample that caused the alert receives no credit. Attribution methods that earn trust are the ones defined by properties they guarantee rather than by a heuristic they happen to compute.</p>
+<p>Two axioms carry most of the weight. <strong>Sensitivity</strong>: if changing one coordinate changes the prediction, that coordinate gets nonzero attribution. <strong>Completeness</strong> (also called efficiency in the Shapley literature): the attributions add up exactly to the difference between the prediction and a reference prediction. Completeness is what makes an attribution map <em>auditable</em>, because you can sum the highlighted region and check that it accounts for the score you are trying to explain, rather than admiring a pretty heatmap that sums to nothing in particular.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Every attribution method for sensor data is silently answering the question "contribution <em>relative to what?</em>" That reference is the <strong>baseline</strong> (Integrated Gradients) or the <strong>background distribution</strong> (SHAP). For images the field settled on a black image as "absence", and the habit carried over as a zero-vector baseline for time series. For a sensor stream that habit is a bug. Zero is not the absence of an accelerometer reading, it is free-fall; zero is not the absence of an ECG, it is asystole; zero is not silence on a microphone unless the signal was already zero-mean. The baseline encodes what your explanation treats as the uninformative null state, and if the null state is itself a dramatic physical event, completeness will faithfully attribute the prediction to the gap between "normal" and "catastrophe" instead of to the feature you cared about.</p>
+</div>
+
+<h2>Integrated Gradients: crediting the whole path</h2>
+<p>Integrated Gradients (Sundararajan, Taly, and Yan, 2017) fixes gradient saturation by not trusting the gradient at a single point. It defines a straight-line path from a baseline \(x'\) to the input \(x\) and accumulates the gradient along it. For coordinate \(i\),</p>
+$$ \mathrm{IG}_i(x) = (x_i - x'_i)\int_{0}^{1} \frac{\partial f\big(x' + \alpha\,(x - x')\big)}{\partial x_i}\, d\alpha. $$
+<p>The \((x_i - x'_i)\) factor is the displacement of that coordinate from baseline to input; the integral averages its sensitivity over every interpolation along the way, so a feature that mattered early on the path still earns credit even after it saturates. In practice the integral is a Riemann sum over 20 to 300 interpolation steps, and the whole computation is a batched forward-backward pass, cheap enough to run on every flagged window in a fleet. The payoff is the completeness identity: summing \(\mathrm{IG}_i\) over all coordinates equals \(f(x) - f(x')\) exactly (up to the Riemann approximation), which gives you a built-in convergence check. If the sum drifts from that target, add steps.</p>
+<p>For a multivariate window the attribution has the same \(C \times T\) shape as the input, so you can render it as a heatmap over channels and time, or marginalize it: sum over time to rank <em>which sensor</em> drove the decision, or sum over channels to find <em>which instant</em>. The baseline choice reappears here with teeth. A defensible default for a mean-removed sensor window is the per-channel training mean (a "typical quiet" state), or, better, an <em>average over several plausible baselines</em> drawn from healthy operation, which is exactly the expectation that SHAP formalizes next.</p>
+
+<pre><code class="language-python">import torch
+
+def integrated_gradients(model, x, baseline, target, steps=64):
+    """IG for one sensor window. x, baseline: (C, T) tensors. target: output index.
+    Returns a (C, T) attribution map whose sum approximates f(x) - f(baseline)."""
+    alphas = torch.linspace(0, 1, steps).view(-1, 1, 1)          # (steps, 1, 1)
+    path = baseline.unsqueeze(0) + alphas * (x - baseline).unsqueeze(0)
+    path.requires_grad_(True)
+    out = model(path)[:, target]                                 # (steps,)
+    grads = torch.autograd.grad(out.sum(), path)[0]              # (steps, C, T)
+    avg_grad = grads.mean(dim=0)                                 # trapezoid-ish mean
+    attributions = (x - baseline) * avg_grad                    # (C, T)
+    return attributions
+
+# convergence sanity check: does completeness hold?
+# attributions.sum()  ~=  model(x)[target] - model(baseline)[target]
+</code></pre>
+<div class="code-caption">A self-contained Integrated Gradients pass over a multivariate sensor window. The final comment is the completeness check: if <code>attributions.sum()</code> does not track the prediction gap, the Riemann sum has too few steps. The <code>baseline</code> argument is where the physics lives, not a throwaway zero.</div>
+
+<p>The code above is deliberately bare so the mechanism is visible. In production you would not hand-roll the Riemann sum, the gradient bookkeeping, or the multi-baseline averaging.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Captum's <code>IntegratedGradients</code> replaces the whole function above, plus multi-baseline expectation, batching, and the convergence-delta report, with three lines: <code>ig = IntegratedGradients(model); attr, delta = ig.attribute(x, baselines=bg, target=y, n_steps=128, return_convergence_delta=True)</code>. That is roughly 15 lines of hand-written path, gradient, and check logic collapsed to 3, and Captum returns the completeness gap (<code>delta</code>) for free so you never ship an under-converged map. Captum also supplies <code>GradientShap</code> and <code>DeepLiftShap</code> for the Shapley variants below, all with the same call shape. We return to Captum as a review surface in <a class="cross-ref" href="section-67.6.html">Section 67.6</a>.</p>
+</div>
+
+<h2>SHAP for time series: the same axioms, from game theory</h2>
+<p>SHAP (SHapley Additive exPlanations) reaches attribution from cooperative game theory. Treat each input coordinate as a player and \(f\) as the payoff. The Shapley value of coordinate \(i\) is its average marginal contribution over every ordering in which coordinates are added to the "coalition", with absent coordinates replaced by samples from a background distribution:</p>
+$$ \phi_i = \sum_{S \subseteq N \setminus \{i\}} \frac{|S|!\,(|N|-|S|-1)!}{|N|!}\,\big[\,f(S \cup \{i\}) - f(S)\,\big]. $$
+<p>Shapley values are the unique attribution satisfying local accuracy (their completeness), missingness, and consistency, which is why SHAP and Integrated Gradients so often agree: IG is, under mild conditions, the Aumann-Shapley value of the same game, computed by a path integral instead of a sum over coalitions. The exact sum is exponential in the number of players, so a sensor window of \(C \times T\) samples is hopeless at full resolution. This is where <strong>SHAP-TS</strong> becomes an engineering discipline rather than an off-the-shelf call: you must choose the players, the background, and the approximator.</p>
+<ul>
+<li><strong>Players (granularity).</strong> A single sensor sample is rarely a meaningful unit; adjacent samples are correlated and no operator reasons "millisecond 4,113 caused the fault". Group the window into segments (fixed strides, or change-point blocks, or per-channel bands) so that a player is a physically interpretable chunk. Fewer players also makes the approximation tractable.</li>
+<li><strong>Background.</strong> "Absent" means resampled from a background set of normal-operation windows, so the explanation reads as "relative to healthy behavior" rather than "relative to zero". This is the SHAP-native cure for the baseline trap.</li>
+<li><strong>Approximator.</strong> KernelSHAP (model-agnostic, needs many forward passes), DeepSHAP / GradientSHAP (gradient-based, fast, for differentiable nets), or TreeSHAP if you explain a gradient-boosted model over engineered features from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>.</li>
+</ul>
+
+<div class="callout practical-example">
+<h4>Field story: a wearable fall-alert that blamed the wrong second</h4>
+<p>A wearables team ships a fall detector on a wrist accelerometer and gyroscope, a six-channel window at 50 Hz over four seconds, feeding a small temporal-convolution net from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. A clinician reviewing false alarms asks the obvious question: why did it fire? The first attempt uses Integrated Gradients with a zero baseline. The heatmap lights up the pre-impact quiet segment, and everyone is confused, because "the person standing still" is apparently the cause of the fall. The bug is the baseline: against a zero vector, the near-1 g gravity component of the resting hand is a large displacement, so completeness dutifully credits gravity. Switching to a background of the wearer's own quiet-standing windows (SHAP with a personalized background, and IG re-run with the same per-channel mean baseline) moves the attribution onto the 300 ms deceleration spike and the post-impact stillness, which is what a clinician would circle by hand. Same model, same window, same axioms: only the reference changed, and the explanation went from nonsense to actionable. The team folds this into the alert UI so each fall event ships with its attribution ribbon, and false alarms are triaged in seconds. It also connects to <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>-style anomaly review, where the same "relative to normal" framing is the whole point.</p>
+</div>
+
+<h2>Reading a temporal attribution without fooling yourself</h2>
+<p>Two disciplines keep attribution maps from becoming decorative. First, <strong>always report the completeness residual</strong>. Both IG (via its convergence delta) and SHAP (via local accuracy) tell you how much of the prediction the map failed to explain; a large residual means the map is incomplete and the top-ranked feature may be an artifact of under-convergence, not a real driver. Second, <strong>attribution is per-instance, not a global feature-importance</strong>. A map explains <em>this</em> window; aggregating many maps to claim "channel 3 is important overall" is a different, weaker statement and is easy to overstate. When a model is well calibrated (the machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), the attribution of a high-confidence prediction is worth more scrutiny than one drawn from a coin-flip output near the decision boundary, where the gradient landscape is noisy and the map is unstable.</p>
+<p>Attribution answers "which input samples", not "why in mechanism" and not "what would have changed the outcome". The counterfactual question is the subject of <a class="cross-ref" href="section-67.3.html">Section 67.3</a>, and the specifically temporal failure modes of saliency, alignment jitter, and adjacent-sample smearing get their own treatment next.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Baseline selection for time series is an open problem, not a solved default. Recent work replaces the single baseline with learned or distributional references and adapts Integrated Gradients to the sequential structure directly: <strong>Temporal Integrated Gradients</strong> and <strong>WinIT</strong> integrate over time-aware paths so that credit respects temporal dependence rather than treating each timestep as an independent coordinate. The <strong>Dynamask</strong> line learns a smooth per-timestep saliency mask under perturbation, and the toolkit landscape is consolidating in <strong>TSInterpret</strong> and <strong>Captum</strong> (both revisited in <a class="cross-ref" href="section-67.6.html">Section 67.6</a>), with faithfulness measured on <strong>XTSC-Bench</strong> in <a class="cross-ref" href="section-67.7.html">Section 67.7</a>. The practical takeaway for now: prefer a distribution of physically plausible baselines over any single fixed one, and validate the map against a faithfulness metric rather than eyeballing it.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a trained binary anomaly model on a three-channel vibration window (say 128 timesteps). (1) Compute Integrated Gradients twice, once with a zero baseline and once with the per-channel training mean, and plot the completeness delta for each; report which converges tighter at 64 steps. (2) Marginalize each attribution map over time to rank the three channels, and over channels to find the peak instant. (3) Now run KernelSHAP with a background of 50 normal windows, grouping the input into 16 time segments per channel, and compare its channel ranking to IG's. Where they disagree, decide which reference you trust and justify it in one sentence.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>State the completeness axiom and explain why a zero baseline can make a physically correct model produce a nonsensical attribution map on an accelerometer window.</li>
+<li>Why does the raw gradient \(\partial f/\partial x\) systematically under-credit the very feature that triggered a saturated decision, and how does the path integral in Integrated Gradients repair this?</li>
+<li>You have a differentiable transformer and need attributions on thousands of flagged windows per hour. Would you reach for exact KernelSHAP or a gradient-based method (IG / GradientSHAP), and what is the tradeoff you are accepting?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-67.2.html">Section 67.2</a>, we zoom in on the specifically <em>temporal</em> hazards of these maps: why saliency over time is fragile to small phase shifts and resampling, why adjacent-timestep smearing fakes precision the model never had, and how to tell a genuine temporal driver from an artifact of the attribution method itself.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

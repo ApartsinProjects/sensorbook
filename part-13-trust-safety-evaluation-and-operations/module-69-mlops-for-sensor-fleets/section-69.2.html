@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.2: Model versioning and deployment. Building Sensory AI." name="description"/>
+<title>Section 69.2: Model versioning and deployment | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Model versioning and deployment</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You asked which version of me is running. I am four versions, one per device class, and two of them think the accelerometer is in millig."</p>
+<cite>An Incompletely Rolled-Out AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">A model is not a file, it is a contract with the physical world</h3>
+<p>In a pure-software service, a model version is a set of weights: ship the checkpoint, route traffic to it, done. On a sensor fleet the same weights are inert until you also pin the preprocessing that feeds them, the calibration that scales the raw counts, the units the firmware emits, and the hardware that runs the quantized graph. A model that scored 0.94 in the lab will silently collapse to noise on a device whose firmware reports acceleration in millig instead of g, or whose new build changed the anti-alias filter. This section is about giving a deployed sensor model a single, honest identity, so that "which model is on that device" has one answer, and about moving that identity across a fleet of thousands of units without betting the whole field on one push. Versioning here is a safety mechanism, not bookkeeping.</p>
+</div>
+
+<p>This section assumes you have read the sensor <em>data contract</em> in <a class="cross-ref" href="section-69.1.html">Section 69.1</a>, which fixes the schema, units, and ranges a stream must satisfy, and that you build models on leakage-safe datasets from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The versioning discipline below is the operational counterpart of that contract: the data contract governs what flows in, and the model version governs what decides on it. Get monitoring for what happens next in <a class="cross-ref" href="section-69.3.html">Section 69.3</a>.</p>
+
+<h2>What must be versioned together: the deployable unit</h2>
+<p>The core mistake is versioning the weights alone. A sensor model's behavior is determined by an entire pipeline, and any component that changes the mapping from raw counts to decision is part of the version. The <em>deployable unit</em> for a sensor model is the tuple of: the trained weights; the exact preprocessing graph (windowing, resampling, filter coefficients, normalization statistics); the calibration parameters that turn ADC counts into physical units; the input contract it expects (schema, units, sample rate); the target hardware and runtime (the quantized graph for that accelerator, from <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>); and the evaluation report that certified it. If any element changes, the behavior can change, so the version must change.</p>
+<p>Concretely, adopt <strong>semantic versioning with sensor semantics</strong>. A major bump means the input contract changed and old data is incompatible (you moved from 50&nbsp;Hz to 100&nbsp;Hz input, or swapped the feature set). A minor bump means retrained weights on a compatible contract (new training data, same interface). A patch means a hardware-specific rebuild with identical float behavior (re-quantized for a new chip). This lets a fleet operator answer the question that actually matters during an incident: "can device A's stream be fed to the model that device B is running?" The answer is yes only when the major version and contract match.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Version the whole mapping, or version nothing</h3>
+<p>If two builds can produce different decisions on the same raw bytes, they are different models even if the weights are byte-identical. Normalization statistics baked from a different training pool, a filter re-tuned by the firmware team, a quantization step that rounds a threshold: each is a hidden version bump. The only defensible model identity is a content hash over every artifact in the deployable unit. Anything you leave out of the hash is a variable you cannot roll back.</p>
+</div>
+
+<h2>The registry, lineage, and reproducible identity</h2>
+<p>A <em>model registry</em> is the fleet's source of truth: an append-only record mapping each version string to its artifacts, its training run, and its promotion state (staging, canary, production, retired). What makes it trustworthy is <strong>lineage</strong>: every version links back to the exact dataset snapshot, the git commit of the training code, the hyperparameters, and the leakage-safe split protocol used to evaluate it. When a regulator or a post-incident review asks "how was the model on this device trained and tested," lineage is the answer, and for safety-relevant perception it is a requirement, not a nicety (see the safety-case discussion in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>).</p>
+<p>The practical anchor is a <em>content-addressed manifest</em>: hash every artifact, hash the manifest, and let that digest be the model's true identity. Two builds with the same digest are provably the same decision function; two builds that differ anywhere produce different digests and cannot masquerade as each other. The code below builds such a manifest and shows how a device verifies compatibility before it ever runs an inference.</p>
+
+<pre><code class="language-python">import hashlib, json
+from dataclasses import dataclass, asdict
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+@dataclass(frozen=True)
+class ModelManifest:
+    version: str                 # semantic: MAJOR.MINOR.PATCH
+    contract_id: str             # must match the data contract from 69.1
+    input_units: dict            # {"accel": "m/s^2", "gyro": "rad/s"}
+    sample_rate_hz: int
+    target_runtime: str          # e.g. "tflite-int8/hexagon-v66"
+    weights_sha: str
+    preprocessing_sha: str       # windowing + filter coeffs + norm stats
+    calibration_sha: str         # per-unit or per-model calibration
+    eval_report_sha: str         # leakage-safe evaluation that certified it
+
+    def digest(self):
+        payload = json.dumps(asdict(self), sort_keys=True).encode()
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+def device_can_run(manifest, device):
+    """A device runs a model only if contract, units, rate, and runtime all agree."""
+    reasons = []
+    if manifest.contract_id != device["contract_id"]:
+        reasons.append("contract mismatch (major-version incompatible)")
+    if manifest.input_units != device["input_units"]:
+        reasons.append(f"unit mismatch: model wants {manifest.input_units}, "
+                        f"device emits {device['input_units']}")
+    if manifest.sample_rate_hz != device["sample_rate_hz"]:
+        reasons.append("sample-rate mismatch")
+    if manifest.target_runtime != device["runtime"]:
+        reasons.append("runtime/accelerator mismatch")
+    return (len(reasons) == 0, reasons)
+
+m = ModelManifest(
+    version="2.3.1", contract_id="imu-wrist-v2",
+    input_units={"accel": "m/s^2", "gyro": "rad/s"}, sample_rate_hz=50,
+    target_runtime="tflite-int8/hexagon-v66",
+    weights_sha="…", preprocessing_sha="…",
+    calibration_sha="…", eval_report_sha="…")
+
+device = {"contract_id": "imu-wrist-v2",
+          "input_units": {"accel": "millig", "gyro": "rad/s"},  # firmware bug!
+          "sample_rate_hz": 50, "runtime": "tflite-int8/hexagon-v66"}
+
+ok, reasons = device_can_run(m, device)
+print(m.digest(), ok, reasons)
+# -> a stable 16-char id, False, ['unit mismatch: model wants ... device emits millig ...']
+</code></pre>
+<div class="code-caption">A content-addressed model manifest gives every deployable unit a stable identity, and a pre-flight compatibility check rejects the millig-versus-g firmware bug at load time instead of discovering it as a field-wide accuracy collapse.</div>
+
+<p>The manifest above is the object the registry stores and the device verifies. Notice that the compatibility gate catches the epigraph's failure: a device whose firmware reports <code>millig</code> refuses to load a model that expects <code>m/s^2</code>, rather than running and producing confidently wrong output. This is the whole point of tying the model version to the data contract of <a class="cross-ref" href="section-69.1.html">Section 69.1</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Registry and lineage in a few lines</h3>
+<p>You do not hand-roll the registry. MLflow's Model Registry logs artifacts, parameters, and metrics, assigns version numbers, and tracks stage transitions (staging to production to archived) with a roughly ten-line <code>log_model</code> plus <code>transition_model_version_stage</code> call, replacing a few hundred lines of home-grown provenance database, artifact store, and promotion state machine. Pair it with DVC to content-address the dataset snapshot so the lineage link back to data is a hash, not a hope. Keep the sensor-specific manifest (units, contract id, target runtime) as tags on the registered version, since generic registries do not model those fields for you.</p>
+</div>
+
+<h2>Deploying to a heterogeneous fleet: canary, shadow, and staged rollout</h2>
+<p>A sensor fleet is not one server; it is thousands of devices spanning firmware revisions, hardware generations, and physical environments. Pushing a new version to all of them at once is the single riskiest action in fleet operations, because a regression can brick perception on every unit before the first alert fires. Three patterns tame this. In <strong>shadow mode</strong>, the new version runs alongside the incumbent and its outputs are logged but not acted on, so you compare decisions on live data with zero user risk. In a <strong>canary</strong>, you route a small, representative slice of the fleet (say one percent, stratified across device generations and sites) to the new version and hold it there while health metrics accumulate. In a <strong>staged rollout</strong>, you widen exposure in waves, gating each wave on the previous wave's metrics, with an automatic <em>rollback</em> to the pinned previous version if a guardrail trips.</p>
+<p>The stratification is the sensor-specific twist. A canary that samples one percent of devices uniformly can entirely miss the one hardware generation where the new quantization breaks, because that generation is three percent of the fleet. Stratify the canary by the axes that carry sensor nuisance (device model, firmware build, site, and mounting), the same identities that structured your evaluation splits in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. Because true labels arrive late or never in the field, canary health leans on the proxy signals developed in <a class="cross-ref" href="section-69.4.html">Section 69.4</a>: prediction-distribution shift, confidence collapse, disagreement with the shadowed incumbent, and downstream action rates.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wearable sleep-staging update that only broke the old watches</h3>
+<p>A wearables company shipped version 3.0 of its sleep-staging model, retrained with a better preprocessing pipeline and validated at 0.88 agreement with polysomnography under a leave-user-out split. The lab numbers were clean. Rather than a global push they ran a canary stratified by watch generation. Within six hours the proxy dashboard showed that on the two-generations-old watch, the fraction of nights classified as "awake" tripled, while newer watches looked healthy. The cause was mundane and exactly the kind versioning exists to catch: the older watch's optical stack ran firmware that emitted the PPG signal at a slightly different effective gain, and the new normalization statistics, computed mostly from newer-watch data, pushed the old signal out of range. The staged rollout auto-halted at the first wave, the older watches were pinned to version 2.x, and the fix was a generation-specific calibration bundled into a 3.0.1 patch. A uniform global deploy would have degraded sleep tracking for millions of older-watch users overnight; the stratified canary contained it to a supervised one percent.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Where the field is moving</h3>
+<p>Fleet-scale model delivery is converging on GitOps-style declarative deployment: the desired model version per device cohort is a versioned, signed spec, and an agent on each device reconciles toward it, so rollout and rollback are git operations with full audit trails. On the edge side, KServe and NVIDIA Triton with model-repository versioning support atomic swap and shadow serving, while over-the-air frameworks (the update layer behind automotive and industrial fleets, e.g. Eclipse hawkBit and the Uptane security framework for signed, tamper-resistant update delivery) are being extended to treat ML artifacts as first-class, cryptographically signed payloads. The open frontier is closing the loop under delayed ground truth: promoting a canary automatically on proxy metrics alone, with statistically sound guardrails, is still an active research area that <a class="cross-ref" href="section-69.4.html">Section 69.4</a> takes up directly.</p>
+</div>
+
+<h2>Rollback, pinning, and the boring guarantees</h2>
+<p>The deployment mechanism is only as good as its reverse gear. Two guarantees make a fleet operable. First, <strong>every device can be pinned</strong> to a specific, previously certified version and will refuse to auto-update past it, so a known-good state is always reachable in one command. Second, <strong>rollback is atomic and version-complete</strong>: reverting the weights also reverts the preprocessing, calibration, and contract expectations as one unit, because a half-rolled-back model (new weights, old normalization) is a configuration nobody tested. This is why the deployable unit must be atomic from the start; you cannot roll back what you versioned separately. Keep at least the last known-good version resident on the device so rollback does not depend on connectivity, which for intermittently connected sensors (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a>) can be days away.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: design a rollout gate</h3>
+<p>You operate 20,000 vibration sensors across 40 industrial sites, spanning three hardware generations. You have a new bearing-fault model, minor-version bump, validated leave-site-out at 0.91 F1. Design the rollout: (1) choose the canary size and the stratification axes, and justify them; (2) list three proxy metrics you would gate promotion on given that confirmed faults take weeks to label; (3) specify the rollback trigger as a concrete threshold on one of those proxies; (4) explain what the model manifest must contain so that a rollback on generation-2 sensors does not accidentally alter generation-1 behavior.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Two builds have byte-identical weights but different normalization statistics. Are they the same model version? Why does the content-addressed manifest treat them as different?</p>
+<p>2. Why is a uniform 1%-of-fleet canary insufficient for sensor deployments, and what would you stratify on instead?</p>
+<p>3. A rollback reverts the weights but not the preprocessing graph. Describe a concrete failure this can cause, and state the versioning rule that prevents it.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-69.3.html">Section 69.3</a>, we watch the version we just deployed while it runs: how to detect input drift and data-quality decay across a fleet, so that a model still nominally "in production" is caught the moment the physical world stops matching the data it was certified on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 69.7: Incident response. Building Sensory AI." name="description"/>
+<title>Section 69.7: Incident response | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 69: MLOps for Sensor Fleets</a></div>
+<h1>Incident response</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The dashboard is green, the pager is screaming, and forty thousand thermostats are convinced it is minus nine degrees indoors. One of us is wrong, and I have already checked my math."</p>
+<cite>An On-Call AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Monitoring tells you something is wrong; incident response decides what to do about it before it hurts</h3>
+<p>Every earlier section in this chapter built the instruments: data contracts (<a class="cross-ref" href="section-69.1.html">Section 69.1</a>), versioned deployable units (<a class="cross-ref" href="section-69.2.html">Section 69.2</a>), drift and quality monitors (<a class="cross-ref" href="section-69.3.html">Section 69.3</a>), and proxy signals for when ground truth is late (<a class="cross-ref" href="section-69.4.html">Section 69.4</a>). An <em>incident</em> is the moment those instruments fire in a way that demands a human-in-the-loop decision under time pressure: a firmware push silently changed the units on ten thousand devices, a model rollout regressed fall detection on one wristband variant, a spoofing campaign is pushing lidar returns into a phantom-obstacle loop. This section is about the discipline that turns panic into a repeatable procedure: detect, triage, contain, recover, and learn. On a sensor fleet the stakes are physical, so the containment step often has to act on the devices themselves, not just on a load balancer.</p>
+</div>
+
+<p>This section assumes you understand the monitoring signals that <em>raise</em> an incident (Sections 69.3 and 69.4), the versioning that lets you <em>roll one back</em> (Section 69.2), and the privacy-constrained logging (<a class="cross-ref" href="section-69.6.html">Section 69.6</a>) that supplies the evidence you reconstruct a timeline from. It builds directly on the functional-safety framing of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>: incident response is where a documented safe state stops being a diagram and becomes a command you send to the fleet.</p>
+
+<h2>What counts as an incident, and how severe is it</h2>
+<p>Not every alert is an incident. A single device with a stuck accelerometer is a fault your fleet-management layer (<a class="cross-ref" href="section-69.5.html">Section 69.5</a>) should quarantine automatically. An incident is a <em>fleet-scale or safety-relevant</em> deviation: many devices at once, or a small number producing decisions that can harm someone or damage property. The first job of an on-call responder is to place the event on a severity ladder, because severity sets the clock. A useful sensor-fleet ladder runs from SEV-1 (a perception failure that can cause physical harm, or a fleet-wide wrong decision) through SEV-3 (degraded accuracy, no safety impact, business hours acceptable) down to SEV-5 (cosmetic or single-device).</p>
+<p>Severity should be a function you can compute, not a vibe. Two axes dominate: <em>blast radius</em> (the fraction of the fleet affected) and <em>harm potential</em> (what a wrong decision does in the physical world). A drift alert on 0.1% of devices running a step counter is low on both; the same drift on a clinical PPG model flagging atrial fibrillation is high on harm even at small radius, because a missed detection has clinical consequences (see the validation stakes in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>). Encoding this as an explicit rule removes the worst failure mode of on-call: a tired human under-classifying a SEV-1 at 3 a.m. because the graph looked familiar.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The safe fallback is a first-class model, so ship it and test it</h3>
+<p>In pure software you contain an incident by routing traffic away from a bad service. On a fleet you often cannot pause the physical world: the car is still driving, the pacemaker-adjacent monitor is still monitoring. Containment therefore means switching devices into a pre-validated <em>degraded but safe</em> mode, a conservative classical estimator, a wider uncertainty band, or a "refuse and alert a human" policy. That fallback must be versioned, evaluated, and drilled exactly like the primary model. A safe state that has never been exercised on real hardware is a hope, not a control.</p>
+</div>
+
+<h2>The response loop: detect, triage, contain, recover, learn</h2>
+<p>Borrow the incident-command structure that site-reliability practice made standard, and adapt it to sensors. <strong>Detect:</strong> an alert crosses from monitoring into paging with enough context (which model version, which device cohort, which contract field) to act. <strong>Triage:</strong> an incident commander is named, severity is set, and a single communication channel opens so the fleet does not get three conflicting rollbacks. <strong>Contain:</strong> stop the bleeding before you understand it, by halting the rollout, rolling back to the last known-good deployable unit, or tripping devices to the safe fallback. <strong>Recover:</strong> restore normal service on a verified fix. <strong>Learn:</strong> a blameless postmortem that produces action items with owners.</p>
+<p>The sensor-specific twist is that containment actions have propagation delay and cost. A rollback is an over-the-air update to intermittently connected, battery-limited hardware; a device asleep in a field will not get the command for hours (the constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-63-batteryless-and-intermittent-sensing/index.html">Chapter 63</a> apply). This is why the on-device safe-mode trip matters: a local circuit breaker that reacts to the device's own out-of-contract or high-uncertainty signal contains the incident in milliseconds, without waiting for the cloud to notice, decide, and reach back down.</p>
+
+<pre><code class="language-python">import time
+from dataclasses import dataclass, field
+
+@dataclass
+class FleetCircuitBreaker:
+    """Trips a device cohort to a safe fallback when the incident
+    signal (out-of-contract rate or model uncertainty) breaches
+    a threshold, and refuses to auto-recover until it is stable."""
+    error_threshold: float = 0.05      # 5% out-of-contract windows
+    window: int = 200                  # inferences to average over
+    cooldown_s: float = 900.0          # 15 min stable before recovery
+    _recent: list = field(default_factory=list)
+    tripped_at: float | None = None
+
+    def observe(self, out_of_contract: bool, now: float) -> str:
+        self._recent.append(1 if out_of_contract else 0)
+        self._recent = self._recent[-self.window:]
+        rate = sum(self._recent) / len(self._recent)
+
+        if self.tripped_at is None and rate &gt;= self.error_threshold:
+            self.tripped_at = now                 # contain immediately
+            return "TRIP_TO_SAFE_MODE"
+        if self.tripped_at is not None:
+            healthy = rate &lt; self.error_threshold / 2   # hysteresis
+            if healthy and now - self.tripped_at &gt;= self.cooldown_s:
+                self.tripped_at = None
+                return "RECOVER_TO_PRIMARY"
+            return "HOLD_SAFE_MODE"
+        return "NORMAL"
+
+cb = FleetCircuitBreaker()
+t0 = time.time()
+for i in range(300):
+    bad = i &gt; 210            # a firmware push starts breaking the contract
+    print(i, cb.observe(bad, t0 + i))  # watch it TRIP, then HOLD
+</code></pre>
+<div class="code-caption">A per-device circuit breaker with hysteresis: it trips to the safe fallback the moment the out-of-contract rate breaches its budget, then refuses to return to the primary model until the signal has been healthy for a full cooldown. The asymmetric recovery threshold (half the trip threshold) stops it from flapping on the boundary. This is the local containment control referenced above; the cloud rollback is its slower, fleet-wide complement.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The millig incident on a smart-building HVAC fleet</h3>
+<p>A building-automation vendor pushes firmware v7.2 to 40,000 rooftop HVAC controllers. The release notes mention a "sensor driver cleanup." Within twenty minutes the occupancy-and-comfort model starts commanding maximum heat across the affected buildings: its temperature input, previously in degrees Celsius, is now arriving as raw thermistor counts because the driver change dropped a scaling step. The data-contract monitor (Section 69.1) flags a range violation, the on-device circuit breaker above trips each controller to a fixed-setpoint safe mode, and paging fires a SEV-2 (large blast radius, no immediate harm, but real energy cost and tenant discomfort). The incident commander freezes the rollout at 40k of a planned 300k, rolls the cohort back to v7.1, and the timeline reconstructed from privacy-safe logs pins the regression to the exact driver commit. The postmortem action item is a hard one: the deployable-unit contract check must run against a firmware image in CI, not just against the model, so a units change can never ship silently again.</p>
+</div>
+
+<h2>Runbooks, error budgets, and the blameless postmortem</h2>
+<p>Speed under stress comes from preparation, not heroics. A <em>runbook</em> is a per-failure-mode checklist: for "input contract violation after firmware push," it names the rollback command, the safe-mode trigger, the dashboards to open, and the stakeholders to notify. Runbooks turn a novel-feeling 3 a.m. crisis into a known procedure a junior responder can execute. Pair them with an <em>error budget</em>: if your fall-detection service targets 99.5% correct-decision availability, the 0.5% is a budget you spend, and burning it fast is itself the trigger to freeze all rollouts and shift the team from features to reliability. The budget makes the reliability-versus-velocity argument quantitative instead of political.</p>
+<p>After recovery comes the part teams skip and regret: the <strong>blameless postmortem</strong>. It reconstructs a factual timeline (detection latency, containment latency, recovery latency), asks why the safeguards did not catch it earlier, and produces owned action items. Blameless means you interrogate the system, not the engineer who clicked deploy; people who fear punishment hide the context you need. For safety-relevant perception, root-causing is not optional, and the interpretability tooling of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a> is how you turn "the model got worse" into "the model relied on a spectral band the new anti-alias filter removed."</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Do not hand-roll the paging and on-call plumbing</h3>
+<p>The circuit-breaker logic above is genuinely yours to own, because it encodes sensor-specific contract knowledge. The surrounding machinery is not. Alert routing, escalation policies, on-call schedules, deduplication, and incident timelines are a solved problem: an incident platform (PagerDuty, Opsgenie, or the open-source Grafana OnCall) plus a metrics backend (Prometheus with Alertmanager) replaces roughly 800 to 1500 lines of bespoke scheduler, notification, and state-machine code with a few YAML routing rules and a webhook. Let the platform own who-gets-paged-when and the audit trail; spend your engineering on the domain logic it cannot know, namely what a sensor incident is and what the safe state should be.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: design the severity function</h3>
+<p>Write <code>severity(blast_radius_fraction, harm_class)</code> for a fleet that includes both step counters and clinical arrhythmia monitors, where <code>harm_class</code> is one of <code>cosmetic</code>, <code>degraded</code>, or <code>safety</code>. Define the SEV-1 through SEV-5 boundaries so that any <code>safety</code>-class event is at least SEV-2 regardless of blast radius, and any event touching more than 25% of the fleet is at least SEV-3. Then add a fourth input: detection latency. Argue in three sentences whether a slow-detected small incident should be escalated, and encode your answer.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why is "route traffic away from the bad service" an insufficient containment model for a sensor fleet, and what replaces it?</p>
+<p>2. The circuit breaker recovers only when the error rate falls below half the trip threshold. What failure would a symmetric threshold cause, and what is that pattern called?</p>
+<p>3. Your fall-detection service has burned 80% of its monthly error budget by the 10th. What operational decision does that trigger, and why is stating it as a budget better than arguing case by case?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 69</h3>
+<p>build a sensor-AI monitoring dashboard with drift alerts, proxy metrics, and model-version tracking.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Incident response and reliability practice</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://sre.google/sre-book/managing-incidents/">Beyer, Jones, Petoff, and Murphy, eds. (2016). Site Reliability Engineering: How Google Runs Production Systems. O'Reilly.</a></p>
+<p class="bib-annotation">The canonical treatment of incident command, blameless postmortems, and error budgets that this section adapts to physical-world sensor fleets.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://sre.google/workbook/incident-response/">Beyer et al., eds. (2018). The Site Reliability Workbook, Chapter on Incident Response. O'Reilly / Google.</a></p>
+<p class="bib-annotation">Practical runbooks, severity classification, and communication structure; the operational scaffolding a sensor on-call rotation reuses almost verbatim.</p>
+</div>
+
+<p class="bib-category">Safe states and fault tolerance for physical systems</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.iso.org/standard/70939.html">ISO 21448 (2022). Road vehicles: Safety of the intended functionality (SOTIF).</a></p>
+<p class="bib-annotation">Defines how perception systems must degrade to a safe state under conditions the model was not designed for; the standard behind the "ship and drill the fallback" insight.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1467055">Fowler (2004; ongoing). CircuitBreaker pattern. martinfowler.com.</a></p>
+<p class="bib-annotation">The origin of the trip-and-cooldown containment pattern the on-device breaker in this section implements, with hysteresis added for sensor stability.</p>
+</div>
+
+<p class="bib-category">Monitoring, drift, and post-deployment ML failures</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley et al. (2015). Hidden Technical Debt in Machine Learning Systems. NeurIPS.</a></p>
+<p class="bib-annotation">Names the entanglement and pipeline-debt failure modes that turn a small sensor change into a fleet-wide incident; the argument for versioning the whole mapping.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/3324884.3416560">Klaise et al. (2020). Monitoring and Explainability of Models in Production. arXiv/ICSE workshops.</a></p>
+<p class="bib-annotation">Connects production monitoring signals to actionable incident triggers and to the explainability needed for root-cause analysis after an incident.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://developers.google.com/machine-learning/guides/rules-of-ml">Zinkevich (2017, updated). Rules of Machine Learning: Best Practices for ML Engineering. Google.</a></p>
+<p class="bib-annotation">Field-tested guidance on staged rollouts, freshness, and when to freeze changes; the practical basis for error-budget-driven rollout freezes during an incident.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-70-responsible-sensory-ai-and-regulation/index.html">Chapter 70</a>, we step back from operating a fleet to governing it: how surveillance, consent, biometric privacy, fairness across bodies and environments, and regulation (the EU AI Act, GDPR, and FDA pathways) reshape what you are even allowed to build and deploy, and how the incident-response and logging discipline you just learned becomes part of an accountability record a regulator can audit.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

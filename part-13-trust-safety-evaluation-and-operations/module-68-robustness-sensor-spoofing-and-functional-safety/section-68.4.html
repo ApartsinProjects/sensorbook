@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 68.4: Runtime monitoring and assurance. Building Sensory AI." name="description"/>
+<title>Section 68.4: Runtime monitoring and assurance | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 68: Robustness, Sensor Spoofing, and Functional Safety</a></div>
+<h1>Runtime monitoring and assurance</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I could not prove the perception network was correct, so I stopped trying. Instead I gave it a much simpler colleague whose only job was to notice, in real time, when it had clearly stopped being correct."</p>
+<cite>A Pragmatic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the fault taxonomy of <a class="cross-ref" href="index.html">Section 68.1</a> and the redundancy and safety-envelope patterns of <a class="cross-ref" href="index.html">Section 68.3</a>; a monitor is what enforces an envelope and what arbitrates a vote. It leans on the change-detection statistics of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, the calibrated uncertainty and conformal guarantees of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and the out-of-distribution detectors of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. We assume a trained perception model exists and may be wrong in ways we cannot fully enumerate in advance. This section is about the machinery that watches it while it runs, not about the standards that demand such machinery (that is <a class="cross-ref" href="index.html">Section 68.5</a>) or the argument that it is sufficient (Section 68.6).</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>You cannot exhaustively verify a deep perception network before deployment: its input space is astronomically large and its failure surface is not something a proof will close. Runtime assurance sidesteps that impossibility. Instead of certifying the complex component is always right, you deploy a second, far simpler component whose only job is to detect, online and with bounded latency, that the complex one has left its region of validity, and then to trigger a safe response. The complex network is the <strong>doer</strong>; the simple monitor is the <strong>checker</strong>. Because the checker is small, its own correctness is tractable to argue. This asymmetry, hard to build, easy to check, is the load-bearing idea of the whole section. Monitors watch four surfaces (inputs, internal state, outputs, and timing), and their alarms feed a decision layer that degrades gracefully rather than failing silently.</p>
+</div>
+
+<h2>Doers, checkers, and the Simplex architecture</h2>
+<p>The canonical pattern is the <strong>Simplex architecture</strong> (Sha, 2001) and its avionics descendant, the <strong>Run-Time Assurance</strong> (RTA) switch used in modern autonomy stacks. Three parts: a high-performance untrusted controller (the learned perception-and-planning stack), a simple trusted safety controller (a conservative fallback), and a <em>decision module</em> (the monitor) that switches from the former to the latter the instant the system approaches the boundary of a certified-safe operating region. The entire safety argument rests not on the untrusted stack but on two much weaker claims: the monitor detects boundary approach in time, and the fallback keeps the system safe once engaged. Both are simple enough to verify by conventional means.</p>
+<p>The reason this works is a separation of concerns. Correctness of a perception network is a property over an intractable input distribution. Safety of the fallback is a property over a small, hand-designed controller. Detectability of a boundary crossing is a property of a monitor you also designed to be simple. You have traded one impossible obligation for three feasible ones. The cost is that the fallback is conservative, so every false alarm from the monitor degrades performance; monitor design is therefore a tuning of the miss-rate versus false-alarm-rate tradeoff you met in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, now with asymmetric, safety-weighted costs.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A monitor is only as trustworthy as its <em>independence</em> from the thing it monitors. If your out-of-distribution check is a head bolted onto the same backbone that produces the perception output, a corrupted feature map fools both at once and the monitor rubber-stamps the failure. Effective monitors are built on a different information path: a physics-based plausibility model, a redundant sensor of a different modality, an analytically simple bound, or a separately trained detector on raw inputs. Diversity is not a nicety here; a monitor that shares a failure mode with the doer provides assurance only on paper. This is the same argument that makes cross-modal voting in <a class="cross-ref" href="index.html">Section 68.3</a> stronger than replicating one channel three times.</p>
+</div>
+
+<h2>What to watch: inputs, internals, outputs, and timing</h2>
+<p>A complete runtime-monitoring layer instruments four surfaces, because failures announce themselves on different ones.</p>
+<ul>
+<li><strong>Input monitors</strong> ask whether the current sensor frame is one the model has any business processing. This is online out-of-distribution and sensor-health detection: density or reconstruction scores on raw inputs, coverage checks against the training manifold (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>), and the stuck-at, dropout, and saturation flags from <a class="cross-ref" href="index.html">Section 68.1</a>. An input the network never saw in training gets no meaningful output, so catching it early is the cheapest save available.</li>
+<li><strong>Internal monitors</strong> read the model's own confidence. A calibrated predictive-uncertainty signal or a conformal nonconformity score (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) that exceeds its validation quantile is a self-reported "I am guessing." Conformal prediction is especially valuable at runtime because its abstention rate carries a distribution-free statistical guarantee, turning a soft confidence into a monitorable threshold.</li>
+<li><strong>Output monitors</strong> ask whether the produced estimate is physically and logically plausible: does the fused object velocity exceed anything a car can do, does an estimated depth violate the ground plane, does a tracked target teleport between frames? These are cheap invariants derived from physics and geometry, and they catch confident-but-wrong outputs that input and internal monitors miss.</li>
+<li><strong>Timing and liveness monitors</strong> are the watchdogs: heartbeat counters, end-to-end latency budgets, and staleness checks. A perception result that is correct but 300 ms late is a safety fault, and a hung inference thread must be caught by a timer, not by inspecting its (never-arriving) output.</li>
+</ul>
+<p>No single surface is sufficient. A spoofing attack (<a class="cross-ref" href="index.html">Section 68.2</a>) may produce an in-distribution input, a confident model, and a plausible output, and be caught only by cross-checking against a redundant modality. The layered set is what gives coverage.</p>
+
+<h2>Specifying monitors: temporal logic and robustness</h2>
+<p>Ad-hoc <code>if</code> statements do not scale to a safety case, so the mature practice is to write monitored properties as formal <strong>specifications</strong> and synthesize the checker from them. <strong>Signal Temporal Logic</strong> (STL) is the workhorse: it expresses properties over real-valued signals with bounded-time temporal operators. "The estimated headway must always, over the next horizon \(H\), stay above the braking-distance envelope" is written</p>
+$$ \varphi \;=\; \square_{[0,H]}\bigl(d_t \ge d_{\text{safe}}(v_t)\bigr), $$
+<p>where \(\square\) is the "always" operator. STL comes with a <strong>quantitative semantics</strong>: instead of a bare true/false, a monitor computes a <em>robustness degree</em> \(\rho(\varphi, s, t)\) whose sign gives satisfaction and whose magnitude gives the margin. For the property above,</p>
+$$ \rho(\varphi, s, t) \;=\; \min_{t' \in [t, t+H]} \bigl(d_{t'} - d_{\text{safe}}(v_{t'})\bigr). $$
+<p>A positive robustness with a comfortable margin means "safe with room"; a robustness trending toward zero is an early warning the doer is eroding its safety envelope before any hard violation occurs. That gradient is exactly the boundary-approach signal the Simplex decision module needs, which is why STL robustness has become the standard interface between perception monitors and RTA switches.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def d_safe(v, reaction=1.0, decel=6.0, margin=2.0):
+    """Braking-distance envelope: reaction gap + kinematic stop + fixed margin."""
+    return v * reaction + v**2 / (2 * decel) + margin
+
+def stl_always_robustness(dist, vel, horizon):
+    """Robustness of  G_[0,H] (dist >= d_safe(vel))  at each timestep.
+    Positive = satisfied with margin; the min over the horizon is the guarantee."""
+    slack = dist - d_safe(vel)                      # per-step signed margin
+    rho = np.full_like(slack, np.nan)
+    for t in range(len(slack) - horizon):
+        rho[t] = np.min(slack[t : t + horizon + 1]) # 'always' = worst case ahead
+    return rho
+
+# A run where a late, confident perception glitch shrinks the headway.
+vel  = np.full(60, 18.0)                             # 18 m/s (~65 km/h)
+dist = np.concatenate([np.full(40, 55.0), np.linspace(55, 34, 20)])
+rho  = stl_always_robustness(dist, vel, horizon=10)
+
+warn = np.nanargmax(rho < 5.0)   # first step the margin drops below 5 m
+brk  = np.nanargmax(rho < 0.0)   # first step the envelope is actually violated
+print(f"margin at t=0: {rho[0]:.1f} m | early-warning at t={warn} | violation at t={brk}")
+print(f"warning budget: {brk - warn} steps before the fallback must be engaged")</code></pre>
+<div class="code-caption">A monitor synthesized from one STL property. It reports not just whether the braking-distance envelope holds but the shrinking margin, giving the RTA switch a warning budget (here several steps) to engage the conservative fallback before an actual violation.</div>
+
+<p>The code above turns the specification \(\square_{[0,H]}(d \ge d_{\text{safe}})\) into a running scalar. Notice it never inspects the perception network's weights; it consumes only the network's output and a physics model, keeping the monitor on an independent information path as the Key Insight demanded. Reading the robustness trend, not just its sign, is what buys the early warning.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>The hand-rolled loop above handles a single "always" operator. Real specifications nest "eventually," "until," and time bounds, and computing their robustness efficiently over streaming data is fiddly (the min/max envelope needs a sliding-window monotonic-deque trick to stay linear-time). The <code>rtamt</code> library parses full STL from a string and gives you an online, incremental monitor: <code>spec.declare_var('d','float'); spec.spec = 'always[0,10](d &gt;= dsafe)'; spec.parse()</code> then <code>spec.update(...)</code> per sample. Roughly 120 lines of careful window-management code collapse to about 6, and you get correct bounded-future and past-time operators for free. Use the hand-written version to understand robustness; use <code>rtamt</code> in anything that ships.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a highway lane-keeping fallback</h3>
+<p>An automotive Level-2 stack runs a learned lane-and-object perception model at 30 Hz. Its RTA monitor is deliberately dumb: an STL bank checks headway margin (the property above), an input monitor flags when raw camera entropy collapses (low-sun glare, tunnel entry) or the radar returns disagree with vision beyond a gate, and a 40 ms watchdog guards the inference thread. During a sudden sun-glare transition at a hill crest, the vision confidence stays high (the network hallucinates a clear lane) but the radar-vision cross-check robustness goes negative within 60 ms. The monitor does not try to fix perception; it hands control to the trusted fallback, a simple controller that holds the last confident heading and commands a gentle deceleration, and raises a driver takeover request. Three frames later the glare clears, the cross-check recovers positive margin, and the RTA switch releases control back. The learned stack was wrong for 90 ms; the monitor made those 90 ms uneventful. This is the whole value proposition: assurance without solving perception.</p>
+</div>
+
+<h2>From alarm to safe action: latency, coverage, and the case</h2>
+<p>A monitor that detects a hazard too late has detected nothing useful. The governing quantity is the <strong>reaction-time budget</strong>: the physical time-to-hazard must exceed detection latency plus fallback-engagement latency plus the fallback's own settling time. If a pedestrian enters the path 1.2 s away and your monitor plus switch plus brake response consumes 0.9 s, you have 0.3 s of margin and no more; this budget, not detector accuracy alone, is what a reviewer will interrogate. Monitors must therefore run on a bounded-latency path, often a separate lightweight process or a safety microcontroller, never behind the same queue that the heavy network can stall.</p>
+<p>Two further properties turn a set of monitors into an assurance argument. <strong>Coverage</strong>: for every hazard in the hazard analysis, some monitor must be able to observe its precursor; a hazard no monitor can see is an unmitigated gap you must be able to name. <strong>Soundness of the alarm-to-action map</strong>: every alarm must route to a response that is safe even if the alarm is a false positive, so the fallback is engineered to be benign-when-unnecessary (a smooth decelerate-and-alert), not disruptive. These two properties, plus monitor independence and the latency budget, are the evidence the safety case of Section 68.6 will cite. Agentic sensing systems that call tools and take actions (<a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>) need exactly this scaffolding, a checker gating every consequential action, before they can be trusted with anything irreversible.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The open problem is monitoring perception in the <em>semantic</em> space where its failures actually live. Current SOTA moves beyond pixel-level OOD scores toward learned runtime monitors that watch the network's own activations: neuron-activation-pattern monitors (Cheng et al.'s work and the follow-on box-abstraction monitors) build an abstraction of "activation patterns seen on correct training predictions" and flag novel ones at inference, and the 2022 CVPR-era work on out-of-distribution detection for semantic segmentation pushes this into dense prediction. Newer directions synthesize monitors from Signal Temporal Logic over perception outputs, use conformal prediction to give the monitor a distribution-free false-alarm rate, and are formalized in ISO/PAS 8800 (2024) as the runtime-measures pillar of an AI safety argument. The hard, unsolved piece is a monitor with a provable detection guarantee against an adaptive adversary that has read the monitor.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code above to a two-property monitor: keep the headway envelope, and add an STL "recovery" property, \(\square_{[0,T]}\!\bigl(\rho &lt; 0 \Rightarrow \lozenge_{[0,k]}(\rho \ge m)\bigr)\), meaning "any violation must be recovered to margin \(m\) within \(k\) steps." Feed it a run where the fallback engages and re-establishes margin, and a run where it does not. Then measure: for a hazard arriving \(\Delta t\) seconds ahead, at what monitor latency does your reaction-time budget go negative? Plot the budget against detection latency and mark the point where the fallback can no longer save the scenario.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why does putting the OOD monitor on the same backbone as the perception model undermine the assurance argument, and what makes an independent monitor stronger?</li>
+<li>STL gives a robustness <em>degree</em> rather than a boolean. Name one concrete thing a runtime-assurance switch can do with the magnitude and gradient of robustness that it could not do with a bare pass/fail.</li>
+<li>A monitor achieves 99.9% detection accuracy but adds 200 ms of latency. Give a scenario in which it is useless despite that accuracy, and state the inequality it violates.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-68.5.html">Section 68.5</a>, we turn from building monitors to the standards that require them. ISO 26262, ISO 21448 (SOTIF), IEC 61508, and the new ISO/PAS 8800 for AI each define what "safe enough" means, how to allocate integrity levels, and where a runtime monitor sits in the evidence chain, giving the assurance machinery of this section its formal home.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

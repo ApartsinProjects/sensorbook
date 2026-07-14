@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 66.3: Domain generalization for sensors (DIVERSIFY). Building Sensory AI." name="description"/>
+<title>Section 66.3: Domain generalization for sensors (DIVERSIFY) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 66: Distribution Shift, OOD, and Test-Time Adaptation</a></div>
+<h1>Domain generalization for sensors (DIVERSIFY)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They trained me on nine wrists and tested me on a tenth. I had memorized nine wrists. The tenth was a stranger, and strangers were never in my loss function."</p>
+<cite>An Overfit AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you can define covariate, label, and concept shift from <a class="cross-ref" href="section-66.1.html">Section 66.1</a>, and that you have met the representation-learning machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> and the self-supervised and contrastive encoders of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. The running application is human activity recognition, whose classifier we build in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>. Familiarity with the gradient-reversal idea helps but is developed here from scratch. We do not re-teach backpropagation; we assume a working PyTorch mental model.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p><strong>Domain generalization</strong> (DG) asks a harder question than domain adaptation. Adaptation gets to see some unlabeled data from the target before it acts. Generalization gets nothing: you train on a set of <em>source</em> domains (subjects, devices, mounting positions, sessions) and must perform on a <em>target</em> domain you will never observe until it is live. For sensors this is the normal case, not the exotic one. You ship a fitness band to a million wrists you have not measured, a bearing model to a plant whose motors you have not spun, a gait classifier to a clinic whose patients you have not recorded. This section teaches DG through <strong>DIVERSIFY</strong>, a method built precisely for time series where the domains are not even labeled: it manufactures worst-case latent domains, then trains a representation that survives them.</p>
+</div>
+
+<h2>Why sensor domains are latent, and why that breaks textbook DG</h2>
+<p>Classical domain generalization, from methods like domain-adversarial training (DANN), invariant risk minimization (IRM), and group distributionally robust optimization (GroupDRO), assumes you know which domain each sample came from. Give the algorithm a domain label per example and it can penalize any feature that lets a discriminator tell the domains apart, on the theory that a truly invariant feature will also transfer to the unseen one. That assumption is comfortable in vision benchmarks where "domain" means a labeled dataset like sketch, cartoon, or photo. It collapses for wearable and industrial time series.</p>
+<p>The reason is that the shift-inducing factors in a sensor stream are usually not recorded and often not even discrete. A single "subject 07" walking is not one domain: their sensor drifts with skin temperature, the strap loosens over an afternoon, the phone rotates in the pocket, the gait changes with fatigue. The distribution that actually matters is a fine-grained mixture of latent sub-populations, and the coarse label you happened to log (subject ID, device model) is a poor proxy for it. Aligning on the wrong grouping wastes the invariance budget: you make the model blind to distinctions that never hurt transfer while leaving the genuinely fragile ones untouched. What you need is a way to <em>discover</em> the split that will hurt most, then defend against exactly that split.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>DG for sensors has two moves that must not be confused. The first is <em>characterization</em>: find the latent partition of the training data whose sub-distributions are as far apart as possible, because that adversarial worst case is the best available stand-in for the unseen target. The second is <em>alignment</em>: learn a representation under which even that worst-case partition looks the same. Textbook DG only does the second, using a domain label handed to it for free. DIVERSIFY does both, and the first is what earns the second: you cannot align away a gap you have not first exposed.</p>
+</div>
+
+<h2>The DIVERSIFY min-max: manufacture the worst split, then erase it</h2>
+<p>DIVERSIFY (Lu and colleagues, ICLR 2023) formalizes the two moves as an alternating optimization over three networks: a feature extractor \(g\), a task classifier \(h\) for the activity labels, and an auxiliary domain discriminator \(d\). It iterates three steps until convergence.</p>
+<p><strong>Step 1, fine-grained latent-domain characterization.</strong> Cluster the current representations into \(K\) pseudo-domains and assign each window a latent domain label. \(K\) is a small hyperparameter (often 2 to 10), decoupled from the number of subjects. The clustering is not innocent: it is pushed to maximize the between-cluster distribution gap so that the pseudo-domains are the <em>hardest</em> grouping the current features admit.</p>
+<p><strong>Step 2, worst-case latent distribution.</strong> Update the feature extractor to <em>increase</em> the divergence between those pseudo-domains, sharpening the adversarial scenario. Conceptually this seeks</p>
+$$ \max_{\text{partition } \mathcal{Z}} \; \sum_{i \neq j} \mathrm{dist}\bigl(P_{\mathcal{Z}_i}(g(x)),\, P_{\mathcal{Z}_j}(g(x))\bigr), $$
+<p>where \(\mathcal{Z}\) ranges over latent partitions and \(\mathrm{dist}\) is a distributional distance the discriminator estimates. This is the step textbook DG skips entirely.</p>
+<p><strong>Step 3, domain-invariant learning.</strong> Now flip the sign. Train \(g\) to <em>fool</em> the discriminator \(d\) on the latent domains just discovered, while \(h\) keeps the activity labels accurate. Using a gradient-reversal layer, the joint objective is</p>
+$$ \min_{g,h}\; \max_{d}\; \mathcal{L}_{\text{task}}(h \circ g) \;-\; \lambda\, \mathcal{L}_{\text{dom}}(d \circ g), $$
+<p>so \(g\) minimizes task loss and simultaneously destroys any signal \(d\) could use to recover the latent domain. The three steps loop: characterize a worse split, then align it away, repeatedly, so the representation is invariant not to one handed-down grouping but to the most damaging grouping the data can produce. The trade-off parameter \(\lambda\) controls how aggressively invariance is bought at the cost of task accuracy.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>On cross-person and cross-device HAR benchmarks (UCI-HAR, USC-HAD, PAMAP2, and the EMG and gesture datasets in the original study), DIVERSIFY reports consistent gains over the DG field it competes with: DANN, CORAL, GroupDRO, IRM, ANDMask, and Mixup-style augmentation. The reported edge comes from the latent-domain characterization step, not a bigger backbone, which is why the method transfers across modalities from accelerometry to EMG to EEG. The open question at the frontier is how to choose \(K\) and \(\lambda\) without a target-domain validation set, since a wrong \(K\) can either under-split (no worst case found) or over-split (invariance to noise). This couples directly to the calibration and uncertainty tooling of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, which supplies target-free proxies for model reliability.</p>
+</div>
+
+<h2>The mechanism in code: a gradient-reversal domain-adversarial core</h2>
+<p>The engine underneath Step 3 is the gradient-reversal layer: in the forward pass it is the identity, and in the backward pass it multiplies the gradient by \(-\lambda\). That single sign flip turns one optimizer into the min-max of the invariance objective above. The skeleton below is the reusable core; DIVERSIFY wraps it with the clustering of Steps 1 and 2 that supplies the <code>domain</code> labels rather than reading them from a file.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+from torch.autograd import Function
+
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x, lamb):
+        ctx.lamb = lamb
+        return x.view_as(x)              # identity forward
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.lamb * grad, None    # sign-flipped backward
+
+def grad_reverse(x, lamb=1.0):
+    return GradReverse.apply(x, lamb)
+
+class DomainAdversarial(nn.Module):
+    def __init__(self, encoder, feat_dim, n_classes, n_latent_domains):
+        super().__init__()
+        self.g = encoder                                  # shared features g(x)
+        self.h = nn.Linear(feat_dim, n_classes)           # activity head
+        self.d = nn.Linear(feat_dim, n_latent_domains)    # latent-domain head
+
+    def forward(self, x, lamb):
+        f = self.g(x)
+        y_logits = self.h(f)                              # task path
+        d_logits = self.d(grad_reverse(f, lamb))          # adversarial path
+        return y_logits, d_logits
+
+def step(model, x, y, dom, lamb, opt, ce=nn.CrossEntropyLoss()):
+    y_logits, d_logits = model(x, lamb)
+    loss = ce(y_logits, y) + ce(d_logits, dom)   # GRL makes d-term adversarial to g
+    opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+</code></pre>
+<div class="code-caption">Code 66.3.1: The domain-adversarial core of DIVERSIFY's Step 3. The gradient-reversal layer makes the domain cross-entropy push the encoder <em>away</em> from separable latent domains while the task head keeps activities accurate. The <code>dom</code> labels are not ground truth: in the full method they are the pseudo-domain assignments produced by the clustering of Steps 1 and 2.</div>
+
+<p>Notice what Code 66.3.1 does <em>not</em> contain: any real domain label. The <code>dom</code> tensor is synthetic, refreshed each outer iteration by re-clustering the features. That is the entire conceptual difference from DANN, and it is why the method works on raw sensor logs where the only "domain" you ever recorded is a subject ID that does not capture the shift.</p>
+
+<div class="callout practical-example">
+<h4>Step-Through: a sleep-staging wearable that met a new demographic</h4>
+<p>A sleep-tech company trains an accelerometer-plus-PPG sleep-stage classifier on 300 volunteers, mostly office workers aged 25 to 45. It reports strong leave-one-subject-out accuracy and ships. Six months later a partner clinic enrolls shift workers and older adults, and staging accuracy on light-sleep transitions drops sharply. There is no labeled data from the new cohort, so adaptation is off the table; this is a generalization failure. The team retrains with DIVERSIFY, setting \(K = 4\) latent domains. The characterization step does not rediscover "age" or "occupation"; it finds a latent split driven by resting heart-rate variability and movement bout structure, precisely the axes on which shift workers differ. Aligning the representation against that manufactured worst case recovers most of the lost light-sleep accuracy on the held-out clinic cohort, without a single labeled night from it. The lesson generalizes: the useful latent domain was one no one had thought to log, and only the max step surfaced it.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: DeepDG and the reference DIVERSIFY implementation</h3>
+<p>Writing the full three-step loop by hand, the clustering, the divergence-maximizing update, the gradient-reversal alignment, plus dataset plumbing for the HAR benchmarks, is on the order of 500 lines before you have a single result. The authors' DeepDG toolkit (part of the <code>transferlearning</code> repository) ships DIVERSIFY alongside DANN, CORAL, GroupDRO, IRM, and Mixup behind a common trainer, so swapping algorithms is a one-line flag and the leave-one-domain-out evaluation is built in. That is roughly a 500-line reduction to a config plus a call, with the fragile clustering-and-reversal interplay already tuned. Reach for it to get a calibrated baseline, then reimplement only the piece you intend to change.</p>
+</div>
+
+<h2>When DG is the right tool, and when to reach past it</h2>
+<p>Domain generalization earns its keep when you genuinely cannot touch the target before acting: a certified medical device that must not adapt in the field, a firmware-frozen microcontroller classifier, a first-boot experience where no target data exists yet. It is also the honest baseline: if a leave-one-domain-out split (the only trustworthy evaluation here, and a direct application of the leakage-safe discipline from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>'s robustness lens) already gives you an acceptable target error, you may not need adaptation at all, and you avoid its runtime risk.</p>
+<p>But DG has a ceiling. It buys invariance against the worst case <em>the training data can express</em>, and if the true target sits outside that convex hull, no amount of source-only alignment reaches it. When you can observe even a trickle of unlabeled target stream at deployment, spending it is almost always worth more than a better DG regularizer. That is the pivot the rest of this chapter takes: from making one frozen model robust in advance to letting the model quietly adjust itself once the target arrives.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have a 5-subject accelerometer HAR dataset with subject IDs but no other metadata. (a) Build a leave-one-subject-out evaluation and measure the target accuracy gap of a plain classifier. (b) Add the gradient-reversal core of Code 66.3.1, first using the subject ID as the domain label (this is DANN), then using \(K\)-means pseudo-domains refreshed each epoch (this is the DIVERSIFY idea). (c) Sweep \(K \in \{2,3,5,8\}\) and \(\lambda \in \{0.1, 1, 5\}\); report which pseudo-domain count beats the subject-label baseline and explain, in terms of the characterization step, why a too-large \(K\) can hurt.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>State the one capability domain generalization is denied that domain adaptation is granted, and give a concrete sensor scenario where that denial is unavoidable.</li>
+<li>Why does aligning on a logged subject ID often waste the invariance budget, and what does DIVERSIFY's Step 1 do instead?</li>
+<li>In Code 66.3.1, what exactly would break if you removed the gradient-reversal layer and just minimized both cross-entropy terms directly?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-66.4.html">Section 66.4</a>, we lift the constraint that made this section hard: we let the model see the unlabeled target stream at inference time and update itself on the spot. Test-time training and adaptation methods such as TENT and CoTTA turn the frozen, defend-in-advance stance of DG into a live, self-correcting one, and we will see both the accuracy they recover and the new failure mode, silent collapse, that they invite.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 65.4: Rare-event and imbalanced evaluation. Building Sensory AI." name="description"/>
+<title>Section 65.4: Rare-event and imbalanced evaluation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XIII: Trust, Safety, Evaluation, and Operations</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 65: Evaluation Protocols and Leakage-Safe Benchmarking</a></div>
+<h1>Rare-event and imbalanced evaluation</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My fall detector scored 99.8% accuracy. It had never once detected a fall. It had simply learned that people, mostly, do not fall."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the confusion-matrix vocabulary (true and false positives and negatives) and the difference between task and operational metrics from <a class="cross-ref" href="section-65.1.html">Section 65.1</a>. It uses the leakage-safe, provenance-carrying splits built in <a class="cross-ref" href="section-65.2.html">Section 65.2</a> and <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because a mislabeled or leaked positive is far more damaging when positives are scarce. Basic probability and the idea of a bootstrap resample, from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, are enough for the confidence-interval material.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The events that justify a sensing system are almost always the rare ones: a fall, an arrhythmia, a bearing that is about to seize, an intrusion. Yet rarity is exactly what breaks the default evaluation report. When positives are one in a thousand, a model that predicts "negative" forever scores 99.9% accuracy, ROC curves look triumphant, and a single confusion matrix hides the fact that the system is useless. This section is about measuring rare-event detectors truthfully: choosing metrics that do not dissolve under class imbalance, scoring temporal events rather than samples, and attaching credible error bars when your entire positive class is a few dozen examples. The goal is a number that still means something when the thing you care about barely happens.</p>
+    </div>
+
+    <h2>Why accuracy and ROC quietly lie</h2>
+    <p>Class imbalance is the rule, not the exception, in sensory AI. Prevalence, the fraction of samples that are positive, is often \(10^{-2}\) for wearable falls, \(10^{-4}\) for individual anomalous vibration windows, and lower still for security events. Two widely quoted metrics fail silently at these rates. <strong>Accuracy</strong> is dominated by the majority class: at prevalence \(\pi\), the trivial always-negative classifier scores \(1-\pi\), so a 99.9% headline number can mean the detector has never fired. <strong>ROC-AUC</strong> is subtler and more dangerous because it looks rigorous. The ROC curve plots true-positive rate against false-positive rate, and the false-positive rate has the negative count in its denominator. When negatives outnumber positives ten-thousand-to-one, an absolute flood of false alarms barely moves the false-positive rate, so ROC-AUC stays near 1.0 while an operator drowns in false positives. ROC-AUC is invariant to prevalence by construction, which is precisely why it cannot tell you whether the system is deployable.</p>
+    <p>The imbalance-aware alternative is the <strong>precision-recall</strong> view. Precision (also called positive predictive value) is \(\mathrm{TP}/(\mathrm{TP}+\mathrm{FP})\): of the alarms you raised, what fraction were real. Recall (sensitivity) is \(\mathrm{TP}/(\mathrm{TP}+\mathrm{FN})\): of the real events, what fraction you caught. Neither denominator contains the huge true-negative count, so precision-recall analysis reacts sharply to false alarms that ROC ignores. The area under the precision-recall curve (PR-AUC, or average precision) is the imbalance-aware summary statistic, and its no-skill baseline is not 0.5 but the prevalence \(\pi\) itself, which keeps you grounded about how hard the problem is.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Precision is not a property of the model alone; it is a property of the model <em>and</em> the base rate. From Bayes' rule, \(\text{precision} = \frac{\text{TPR}\,\pi}{\text{TPR}\,\pi + \text{FPR}\,(1-\pi)}\). Hold the model's TPR and FPR fixed and drop prevalence by ten times, and precision collapses by roughly ten times. This is why a detector validated on a curated 50/50 benchmark can post excellent precision there and then produce almost entirely false alarms in the field, where the true prevalence is a hundred times lower. Report the prevalence next to every precision number, and evaluate at the prevalence you expect to deploy into.</p>
+    </div>
+
+    <h2>Score the events, not the samples</h2>
+    <p>Rare events in sensor streams are almost never single samples; they are intervals. A fall spans a second of accelerometer data across dozens of windows, a fault develops over minutes, an apnea event lasts tens of seconds. Scoring each window independently, the naive point-wise approach, produces two artifacts that make the report meaningless. First, it inflates the positive count: one real event becomes forty positive windows, so a model that catches the middle of every event but misses the edges looks like it has poor recall when operationally it caught everything that mattered. Second, it undercounts false alarms in operational terms: forty consecutive false-positive windows are one nuisance alarm to a human operator, not forty. The metric and the cost function have drifted apart, exactly the failure <a class="cross-ref" href="section-65.1.html">Section 65.1</a> warns against.</p>
+    <p>Event-based evaluation fixes this by matching predicted segments to ground-truth segments before counting. A predicted alarm that overlaps a true event (by any overlap, or by a required minimum intersection, depending on the protocol) counts as one true positive; a true event with no overlapping alarm is one false negative; an alarm overlapping nothing is one false positive. On top of the event-level confusion matrix, two operational quantities become the currency of rare-event work. The <strong>false-alarm rate</strong> is expressed per unit time, alarms per hour or per device-day, because "how often will this wake someone at 3 a.m." is what a customer actually asks. <strong>Detection latency</strong>, the delay between event onset and the first correct alarm, matters whenever early warning is the point, as in the change-detection methods of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> and the condition monitoring of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>. A report that gives recall, precision, false alarms per device-day, and median latency describes a deployable system; a point-wise F1 alone does not.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an ICU arrhythmia monitor and alarm fatigue</h3>
+        <p>A clinical team deployed an ECG model to flag ventricular tachycardia, a rare and dangerous rhythm, on a cardiac ward (the signal processing behind it is covered in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>). Point-wise the model reported 0.94 F1 and everyone was pleased. In the ward it was switched off within a week. The reason surfaced only under event-based scoring: at the ward's true prevalence the model raised, on average, eleven false alarms per patient per day, each a piercing bedside tone. Nurses began ignoring the monitor, the classic alarm-fatigue failure. Re-evaluating at deployment prevalence and reporting false alarms per patient-day (rather than per-window precision) exposed the problem before the next rollout. Retuning the operating point to accept slightly lower recall cut false alarms to under one per patient-day, and the corrected event-level report, not the flattering point-wise F1, was what earned the monitor back its place at the bedside.</p>
+    </div>
+
+    <h2>How sure are you with twelve positives?</h2>
+    <p>Rarity does not only distort the point estimate; it wrecks its precision. If your held-out test set contains twelve true events and the model catches nine, the reported recall is 0.75, but that estimate rests on twelve Bernoulli trials. Its 95% confidence interval, by the Wilson or Clopper-Pearson method, stretches from roughly 0.43 to 0.93. A competing model that scores 0.83 on the same twelve events is very likely inside the noise, and declaring it the winner is measuring the coin, not the model. Every rare-event metric needs an error bar, and the width of that error bar is governed by the number of positives, not the total sample count. Ten million negatives do nothing to sharpen your recall estimate.</p>
+    <p>The general-purpose tool is the <strong>bootstrap</strong>: resample the evaluation set with replacement many times, recompute the metric on each resample, and read the empirical 2.5th and 97.5th percentiles as the interval. For event-level metrics the resampling unit must be the <em>event or the recording</em>, not the sample, or you fabricate confidence you do not have; this mirrors the clustered-split discipline of <a class="cross-ref" href="section-65.2.html">Section 65.2</a>. The practical consequence is a design constraint felt long before evaluation: to distinguish two detectors at the precision you want, you need enough positive events in the test set, and with a rare target that can mean collecting for months. Reporting a bare 0.75 with no interval is not conservative; it is a claim of certainty you have not earned. The complementary question of whether the model's predicted probabilities are trustworthy, rather than just its thresholded decisions, is taken up as calibration in <a class="cross-ref" href="section-65.6.html">Section 65.6</a> and <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+rng = np.random.default_rng(0)
+n, prevalence = 100_000, 0.001            # 100 true positives among 100k
+y = (rng.random(n) &lt; prevalence).astype(int)
+# A mediocre detector: scores overlap heavily between classes.
+scores = rng.normal(0.0, 1.0, n) + 1.2 * y
+
+print(f"positives           : {y.sum()}")
+print(f"ROC-AUC   (flatters): {roc_auc_score(y, scores):.3f}")
+print(f"PR-AUC    (fair)    : {average_precision_score(y, scores):.3f}")
+print(f"no-skill PR baseline: {y.mean():.3f}")   # equals the prevalence
+
+# Bootstrap a 95% interval for PR-AUC, resampling whole samples here for brevity.
+boot = [average_precision_score(y[i], scores[i])
+        for i in (rng.integers(0, n, n) for _ in range(1000))]
+lo, hi = np.percentile(boot, [2.5, 97.5])
+print(f"PR-AUC 95% CI       : [{lo:.3f}, {hi:.3f}]")</code></pre>
+    <div class="code-caption"><strong>Listing 65.4.1.</strong> On a 0.1%-prevalence problem the same mediocre detector posts a comfortable ROC-AUC while PR-AUC sits only modestly above the prevalence baseline, exposing the imbalance the ROC number hides. The bootstrap interval shows how wide the uncertainty is when the positive class is small. In real work, resample by event or recording, not by sample.</div>
+
+    <p>Listing 65.4.1 makes the gap concrete: the ROC number and the PR number describe the same predictions, but only the second reacts to the class imbalance the deployment will actually face, and only the interval tells you whether a difference between two detectors is real.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Building the precision-recall curve by hand means sorting scores, sweeping every threshold, accumulating true and false positives, and integrating the staircase, roughly 40 lines that are easy to get subtly wrong at ties and endpoints. The library collapses it to one call each, and adds prevalence-aware summaries for free:</p>
+        <pre class="language-python"><code class="language-python">from sklearn.metrics import average_precision_score, precision_recall_curve
+ap = average_precision_score(y, scores)               # PR-AUC in one line
+precision, recall, thresholds = precision_recall_curve(y, scores)</code></pre>
+        <div class="code-caption"><strong>Listing 65.4.2.</strong> The full precision-recall sweep and its area, replacing about 40 lines of threshold-sweeping and staircase integration with 2. You still choose the operating point and the deployment prevalence; the library only does the arithmetic.</div>
+        <p>As Listing 65.4.2 shows, the two lines hand you the curve and its area. What no library decides for you is the operating threshold, the prevalence you evaluate at, or the resampling unit for the bootstrap; those judgments are the section's real content.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take any rare-event detector you have (or simulate one as in Listing 65.4.1) and produce three reports on the same predictions. First, report accuracy and ROC-AUC. Second, report PR-AUC with its prevalence baseline and pick an operating point that yields at most one false alarm per device-day. Third, convert the point-wise scoring to event-based scoring by merging consecutive positive windows into segments, then recompute recall, precision, and false alarms per hour. Explain in two sentences which of the three reports you would show a customer and why the first one is misleading.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can ROC-AUC stay near 1.0 while an operator is flooded with false alarms, and which metric exposes this?</p>
+        <p class="quiz-question">2. A model's TPR and FPR are fixed. You move it from a 50/50 benchmark to a field with 100x lower prevalence. What happens to precision, and why?</p>
+        <p class="quiz-question">3. Your test set has 12 true events and the model catches 9. Why is it wrong to declare a rival at 10/12 the better model, and what would you compute before making any claim?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-65.5.html">Section 65.5</a>, we hold the metrics steady and start breaking the sensors: what a benchmark must do to earn trust when a channel drops out, a signal saturates, or a device degrades mid-recording. Rare-event evaluation and missing-sensor robustness meet in the field, where the alarm you most need is often the one raised while an input is quietly failing.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
