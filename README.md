@@ -9,6 +9,14 @@ researchers/engineers) via explicit level tags (`[F]/[C]/[A]/[R]`) and reading p
 
 **14 parts · 72 chapters · 505 sections · 72 labs · capstone.**
 
+## Status
+
+All **505 sections drafted** in house style (validated: house head on every page, zero
+em-dashes, zero machine-authored tells, all internal links resolve). **Chapter 1** is
+fully finished (43-agent quality sweep + 7 illustrations + pre-publish gate + `bibtest`);
+**Chapters 2–72 are first drafts** awaiting the sweep and illustrations. Next: build the
+EPUB (`html2epub`), and run the pack-wave sweep (see `WAVE_PLAN.md`) chapter by chapter.
+
 ## Repository layout
 
 ```
