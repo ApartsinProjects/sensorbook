@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.5: Failure detection and recovery. Building Sensory AI." name="description"/>
+<title>Section 57.5: Failure detection and recovery | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Failure detection and recovery</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"My lidar returned a perfect, confident map of a world that had not existed for eight hundred milliseconds. Nobody thought to ask it whether it was still awake."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the fused proprioceptive-exteroceptive estimator of <a class="cross-ref" href="section-57.4.html">Section 57.4</a> and the body-state and exteroceptive channels of <a class="cross-ref" href="section-57.1.html">Sections 57.1</a> and <a class="cross-ref" href="section-57.2.html">57.2</a>. The core detection math is the innovation (residual) sequence of the Kalman family from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>; the change-point machinery comes from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>; and the calibrated-confidence tools appear in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. If a robot must remain safe while degraded, read this alongside the functional-safety framing of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every prior section in this chapter assumed the sensors were telling the truth. They will not always. A camera saturates in a tunnel exit, an IMU develops a thermal bias, a wheel spins on ice and lies about odometry, a ROS node crashes and republishes its last stale message forever. The dangerous case is not the sensor that goes silent, which is easy to notice; it is the sensor that keeps producing confident, well-formatted, wrong numbers. A robot that fuses those numbers blindly will drive its beautifully calibrated filter straight into a wall. Failure detection is the discipline of noticing that a stream has stopped being trustworthy, and recovery is the discipline of continuing to operate safely once you know. This is what separates a demo that works on a good day from a system you can deploy.</p>
+    </div>
+
+    <h2>A taxonomy of perception failures</h2>
+    <p>Before you can detect a failure you must name the kinds. Robot perception faults fall into a few families, and each demands a different detector. <strong>Silent faults</strong> are the merciful ones: a sensor stops publishing, a driver returns an error, a message goes missing. A timeout catches these. <strong>Stale-data faults</strong> are subtler: the node is alive, the topic still ticks, but the payload is a frozen copy of an old reading (a common failure of a hung camera driver that keeps republishing its last frame). Here the bytes look healthy, so you must check the timestamp and the content, not merely the arrival. <strong>Out-of-bounds faults</strong> produce physically impossible values: a range of 0 metres, an acceleration of 400 g, a quaternion that is not unit-norm. <strong>Drift and bias faults</strong> are the hardest: the values remain plausible and self-consistent but slowly diverge from reality, like an IMU gyro whose bias grows with temperature. No single-sample check will ever catch drift; only comparison against an independent source will.</p>
+    <p>The reason this taxonomy matters is that detection cost rises steeply down the list. Timeouts are free. Range checks are cheap. Catching a biased-but-plausible stream requires redundancy or a model of what the reading <em>should</em> be, which is exactly where the fused estimator of <a class="cross-ref" href="section-57.4.html">Section 57.4</a> earns its keep: fusion does not merely improve the estimate, it manufactures the cross-checks that make drift detectable.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Detection is impossible without redundancy. If a quantity is measured exactly once, by one sensor, with no model predicting it, then a wrong-but-plausible value is indistinguishable from a right one, by definition. Every failure detector in this section works by exploiting some form of redundancy: two sensors that should agree, a motion model that predicts the next reading, or a physical constraint the data must obey. Design the redundancy in deliberately; do not hope to bolt a detector on afterward to a stack that has none.</p>
+    </div>
+
+    <h2>Detecting failures with the innovation sequence</h2>
+    <p>The single most useful detector for a fused robot comes for free from the estimator you already run. A Kalman-family filter, at each step, predicts the next measurement and compares it to what arrived. That difference is the <strong>innovation</strong> \(\nu_k = z_k - H\hat{x}_{k|k-1}\), and the filter also computes its expected covariance \(S_k = HP_{k|k-1}H^\top + R\). If the sensor is behaving, the innovation should be zero-mean with covariance \(S_k\). If it is faulting, the innovation blows up. You quantify this with the normalized innovation squared, a chi-square statistic:</p>
+    <p>$$ d_k^2 = \nu_k^\top S_k^{-1} \nu_k \sim \chi^2_m $$</p>
+    <p>where \(m\) is the measurement dimension. Under normal operation \(d_k^2\) follows a chi-square distribution with \(m\) degrees of freedom, so you pick a threshold \(\gamma\) at (say) the 99.7th percentile and reject any measurement whose \(d_k^2 > \gamma\) as an outlier. This is a gating test, and it is the same statistic used for data association in tracking (<a class="cross-ref" href="section-57.3.html">Section 57.3</a>) and for change detection in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. The beauty is that it is scale-aware: it does not ask "is this reading far from prediction in metres" but "is it far relative to how uncertain I expected to be", which is exactly the right question.</p>
+    <p>A single-sample gate catches spikes but not slow drift, whose per-sample innovation stays inside the gate while the bias accumulates. For that you accumulate evidence over time with a cumulative sum (CUSUM) of the normalized innovations, the sequential-detection tool of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>: a small persistent bias that no single sample would flag drives the running sum past a threshold in a few seconds. Pairing a per-sample chi-square gate with a windowed CUSUM covers both the spike and the creep.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+class InnovationMonitor:
+    """Chi-square gate + CUSUM on a Kalman filter's innovation stream."""
+    def __init__(self, gate=11.8, cusum_h=25.0, drift=0.5):
+        self.gate = gate        # chi-square 99.7% threshold, m=2 -> ~11.8
+        self.cusum_h = cusum_h  # CUSUM alarm level for slow drift
+        self.drift = drift      # slack: ignore fluctuations below this
+        self.g = 0.0            # running CUSUM statistic
+
+    def check(self, nu, S):
+        d2 = float(nu.T @ np.linalg.solve(S, nu))   # normalized innovation squared
+        spike = d2 > self.gate                        # reject this sample?
+        self.g = max(0.0, self.g + d2 - self.gate * self.drift)
+        drift = self.g > self.cusum_h                 # persistent bias alarm
+        if drift:
+            self.g = 0.0                              # latch + reset after alarm
+        return {"nis": d2, "reject_sample": spike, "drift_alarm": drift}</code></pre>
+    <div class="code-caption"><strong>Listing 57.5.</strong> A dual failure detector on a filter's innovation. <code>reject_sample</code> gates single-step outliers (a lidar glint, a GNSS multipath jump); <code>drift_alarm</code> integrates small biases the gate lets through until they are statistically undeniable. Both use only \(\nu\) and \(S\), which every Kalman update already computes, so the monitor adds microseconds per step.</div>
+
+    <p>Listing 57.5 is deliberately estimator-agnostic: feed it the innovation and covariance from the EKF of <a class="cross-ref" href="section-57.4.html">Section 57.4</a>, or from any of the fusion filters in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>, and it flags both abrupt and creeping faults. When the estimator is a neural network rather than a Kalman filter, the analogous signal is a calibrated predictive uncertainty or a conformal nonconformity score (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>): the model's own "I am surprised" measurement plays the role of \(d_k^2\).</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an autonomous shuttle leaving a tunnel</h3>
+        <p>A low-speed campus shuttle fuses GNSS, wheel odometry, an IMU, and a lidar map-matcher. Emerging from an underpass, GNSS reacquires satellites but reports a multipath-corrupted fix that jumps the vehicle three metres sideways. The raw fix looks healthy: valid fix flag, tight reported accuracy, correct checksum. The innovation monitor is not fooled: the lateral jump produces \(d_k^2 = 40\) against a gate of 11.8, so the fusion node rejects that GNSS update and coasts on odometry, IMU, and lidar map-matching, which still agree with each other. Six seconds later GNSS settles, its innovations fall back inside the gate, and the node silently readmits it. No passenger felt a thing. Had the stack fused the bad fix, the shuttle would have lurched toward the curb and triggered a hard safety stop, the exact false-alarm-versus-safety tradeoff every deployment must tune.</p>
+    </div>
+
+    <h2>Recovery: degrade, do not die</h2>
+    <p>Detection without a plan is just a better-documented crash. Recovery is a ladder of responses, ordered from least to most disruptive, and a robust system climbs only as far as it must. The first rung is <strong>reject and coast</strong>: drop the faulted measurement and let the remaining sensors carry the estimate, exactly as the shuttle did. This works precisely because fusion is redundant; losing one of four inputs widens the covariance but does not break the filter. The second rung is <strong>reconfigure</strong>: formally mark the sensor unhealthy, inflate or remove its noise contribution, and switch the estimator into a degraded mode (for instance, IMU-plus-odometry dead reckoning, the technique of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, when exteroception is lost). The third rung is <strong>reinitialize</strong>: if the estimate itself has diverged (covariance exploded, innovations chi-square failing on every channel at once), the fused state is unrecoverable and must be reset from a fresh absolute fix rather than nursed. The final rung is the <strong>safe stop</strong>: when no consistent state can be recovered and the remaining sensors cannot support the current maneuver, the only correct action is to bring the robot to a controlled halt in its last-known-clear space and hand off to a supervisor.</p>
+    <p>The controller that walks this ladder is a small finite-state machine with hysteresis: it should demote a sensor quickly on strong evidence but readmit it only after a sustained clean stretch, so that a flickering fault does not whipsaw the robot between modes. Two design rules make it trustworthy. First, degraded modes must be tested as first-class citizens, not afterthoughts; a fallback path that has never run in simulation will fail the one time it fires. Second, the health state must be observable: publish it on a diagnostics topic so an operator, a black-box recorder, and the higher-level planner all know the robot is running on three sensors instead of four. A silent degradation is a latent double fault waiting to happen.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling fleet-wide health monitoring means writing per-node heartbeat timers, staleness checks, threshold aggregators, and an alerting fan-out: easily 200 or more lines of bespoke plumbing, plus the bugs in your own timeout logic. In ROS 2 the <code>diagnostic_updater</code> and <code>diagnostic_aggregator</code> stack does it declaratively:</p>
+        <pre class="language-python"><code class="language-python">from diagnostic_updater import Updater, FunctionDiagnosticTask
+from diagnostic_msgs.msg import DiagnosticStatus
+
+def imu_health(stat):
+    if monitor.drift_alarm:
+        stat.summary(DiagnosticStatus.ERROR, "IMU innovation drift")
+    else:
+        stat.summary(DiagnosticStatus.OK, "IMU nominal")
+    return stat
+
+updater = Updater(node)                       # ~6 lines replaces ~200
+updater.add(FunctionDiagnosticTask("imu", imu_health))
+# staleness, heartbeat, and severity roll-up are handled by the framework</code></pre>
+        <div class="code-caption"><strong>Listing 57.5b.</strong> The ROS 2 diagnostics framework owns heartbeat timing, staleness detection, and hierarchical severity aggregation across a fleet of nodes; you write only the per-sensor health predicate. The <code>/diagnostics</code> topic it publishes is what operators, recorders, and planners subscribe to.</div>
+        <p>The framework handles the plumbing, but the health predicate, the actual judgement of "is this sensor lying", is yours to write. It cannot be outsourced, because only you know the physics your sensor must obey.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Classical residual monitoring assumes you have a model that predicts each measurement. As of 2026 the active frontier is learned failure detection for the perception modules that have no clean analytic residual: monocular depth networks, BEV occupancy heads, and end-to-end policies. Approaches include <strong>introspective perception</strong> (a model trained to predict its own error), conformal risk control that gives distribution-free guarantees on detection rate (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), and runtime monitors that flag out-of-distribution inputs before the downstream network acts on them (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>). The open problem is coverage guarantees: an automotive safety case under ISO 21448 (Safety of the Intended Functionality) needs a bound on the probability that a perception fault goes undetected, and learned monitors do not yet supply one that certifiers accept. This is where perception failure detection meets functional safety in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the EKF you built in <a class="cross-ref" href="section-57.4.html">Section 57.4</a> and inject three faults into its logged run: (a) a single 5-metre GNSS spike on one timestep, (b) a stuck lidar-odometry channel that republishes the same pose for two seconds, and (c) a gyro bias that ramps linearly to 0.02 rad/s over ten seconds. Wire in the monitor of Listing 57.5. For each fault, report which detector fired (per-sample gate, CUSUM, or neither), how many samples elapsed before the alarm, and what recovery rung the fault warrants. Then answer: which fault does a pure timeout miss entirely, and why?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is a sensor that publishes confident, well-formed, wrong values more dangerous than one that goes silent, and which detector catches each?</p>
+        <p class="quiz-question">2. The normalized innovation squared \(d_k^2 = \nu_k^\top S_k^{-1}\nu_k\) is compared to a chi-square threshold rather than to a fixed distance in metres. Why is the covariance normalization essential?</p>
+        <p class="quiz-question">3. A per-sample chi-square gate passes every individual reading from a slowly biasing gyro, yet the estimate drifts. What second detector catches this, and what does it accumulate?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-57.6.html">Section 57.6</a>, we confront the clock: a failure detector that fires 300 milliseconds too late is itself a failure, so we turn to latency budgets, hard real-time scheduling, and the deadline guarantees that decide whether a correct answer arrives in time to matter.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

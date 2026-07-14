@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.6: Latency and real-time constraints. Building Sensory AI." name="description"/>
+<title>Section 57.6: Latency and real-time constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Latency and real-time constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"My perception is flawless. It only describes a world that stopped existing forty milliseconds ago."</p><cite>A Punctual AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every previous section in this chapter treated a perception result as if it were about <em>now</em>. It never is. A detection, a fused pose, a depth map: each describes the world as it was when the photons landed, delayed by exposure, transport, inference, and queueing before the robot can act on it. In an offline dataset that delay is invisible. On a moving machine it is the difference between a controller that is stable and one that oscillates, between an arm that catches the part and one that swipes at empty air. This section is about the clock, not the classifier. It asks how much total delay a closed loop can tolerate, where the milliseconds actually go, what "real-time" formally means, and how to keep a stale-but-accurate estimate from steering the robot into last frame's world.</p>
+</div>
+
+<p>This section assumes the timestamping and clock-synchronization machinery of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>: without a common, monotonic clock across sensors and compute, none of the latency accounting below is even measurable. It also builds on the delayed-measurement problem raised at the end of <a class="cross-ref" href="section-57.4.html">Section 57.4</a>, where an exteroceptive fix for time \(t\) arrives long after \(t\). Here we treat delay as a first-class system property to be budgeted, measured, and compensated, not a nuisance to be ignored.</p>
+
+<h2>The sensor-to-action latency budget</h2>
+
+<p>The quantity that matters is not the frame rate of any one sensor but the <em>end-to-end latency</em> \(\tau\): the wall-clock interval from a physical event to the actuator command it influences. Throughput and latency are different axes. A pipeline can produce 60 fused poses per second (high throughput) while each pose is 120 ms old by the time it is published (high latency), because deep pipelines hide latency inside parallel stages. A perception system is fast in the sense that matters only when \(\tau\) is small, and \(\tau\) is the <em>sum</em> along the critical path, not the maximum stage.</p>
+
+<p>Why a budget and not just "as fast as possible"? Because latency in a feedback loop is a phase lag, and phase lag destroys stability. A controller that reacts to a state delayed by \(\tau\) is applying a correction computed for where the robot <em>was</em>, and if \(\tau\) grows past what the control gains assume, the loop overshoots and can diverge. A first-order feel for the ceiling: a delay of \(\tau\) contributes phase lag \(\phi = \omega\tau\) at angular frequency \(\omega\), so at the loop's crossover frequency \(\omega_c\) you are spending phase margin</p>
+
+$$\phi_{\text{lag}} = \omega_c\,\tau \quad\text{(radians)},$$
+
+<p>and once that consumes the available margin the system rings or goes unstable. This is why a legged robot's balance loop budgets single-digit milliseconds while a warehouse mobile base tolerates tens, and why "add a bigger network for more accuracy" is not free: every extra millisecond of inference is spent from a fixed phase-margin account.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Latency is not slowness you can average away; it is a fixed lead the physical world holds over your estimate, and only the <em>worst plausible</em> value of that lead is safe to design against. A perception stack whose median latency is 20 ms but whose 99.9th-percentile latency is 200 ms is a 200 ms system for safety purposes, because the collision happens on the bad frame, not the median one. Tail latency, not mean latency, sets the deadline. Optimizing the average while ignoring the tail is the most common way a demo-fast pipeline becomes a field-unsafe one.</p>
+</div>
+
+<h2>Where the milliseconds go</h2>
+
+<p>Total latency decomposes into stages, each with its own typical cost and its own tail. Sensor <em>exposure and readout</em> is often overlooked: a rolling-shutter camera finishes reading its last row several milliseconds after its first, and a spinning lidar's points for one revolution span a full rotation period. <em>Transport</em> covers the bus and driver: USB, Ethernet, or a CAN frame, plus the operating-system queue where a packet waits for a scheduler slot. <em>Compute</em> is the neural network and the classical fusion, and it is where a garbage-collection pause, a cache miss, or thermal throttling injects the long tail. <em>Queueing and serialization</em> between processes, especially across the message bus of <a class="cross-ref" href="section-57.7.html">Section 57.7</a>, adds delay that grows nonlinearly once any stage saturates and back-pressure builds, the same failure studied for streaming systems in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>.</p>
+
+<p>The only way to manage this is to measure it, per stage, under load, and read the percentiles rather than the mean. The snippet below simulates a 30 Hz depth-perception pipeline, gives each stage a base cost plus a heavy-tailed spike, and reports where the end-to-end distribution lands against a one-frame deadline.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+def stage(base, jitter, tail_p, tail_add, n):
+    """One pipeline stage: Gaussian body plus a rare exponential tail (ms)."""
+    x = rng.normal(base, jitter, n)
+    spikes = rng.random(n) &lt; tail_p          # occasional GC / throttle / cache miss
+    x[spikes] += rng.exponential(tail_add, spikes.sum())
+    return np.clip(x, 0.1, None)
+
+n = 100_000
+exposure  = stage(5,  0.3, 0.000, 0,  n)     # rolling-shutter + readout
+transport = stage(2,  0.5, 0.010, 8,  n)     # bus + driver queue
+inference = stage(18, 1.5, 0.020, 25, n)     # the neural net, occasional throttle
+postproc  = stage(3,  0.4, 0.005, 5,  n)     # tracking + fusion
+total = exposure + transport + inference + postproc
+
+deadline = 33.3                               # one 30 Hz frame period (ms)
+for name, x in [("exposure", exposure), ("transport", transport),
+                ("inference", inference), ("postproc", postproc),
+                ("END-TO-END", total)]:
+    print(f"{name:11s} mean={x.mean():5.1f}  p50={np.percentile(x,50):5.1f}"
+          f"  p99={np.percentile(x,99):6.1f}  p99.9={np.percentile(x,99.9):6.1f}")
+
+print(f"\ndeadline={deadline} ms   frames over budget: "
+      f"{100*(total > deadline).mean():.2f}%")</code></pre>
+<div class="code-caption"><strong>The mean lies; the tail decides.</strong> End-to-end mean sits comfortably under one frame, yet the p99.9 (dominated by the inference spike) breaches the 33.3 ms deadline on a small but nonzero fraction of frames. Those are exactly the frames a controller cannot afford to miss.</div>
+
+<p>Run it and the lesson is immediate: the mean clears the deadline with room to spare, but the p99.9 does not, and a few percent of frames arrive late. Cutting the inference tail (quantization, a smaller model, an accelerator) is the highest-leverage fix, which is the whole subject of edge model optimization in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+<h2>Hard, firm, and soft real time</h2>
+
+<p>"Real-time" does not mean "fast"; it means <em>bounded and predictable</em>. A system is real-time when it guarantees a response before a stated deadline, and the value of a late result defines the class. A <strong>hard</strong> deadline means a late result is a failure with possibly catastrophic cost (a balance controller, an emergency-brake trigger). A <strong>firm</strong> deadline means a late result is simply discarded as useless (a perception frame that missed its control cycle). A <strong>soft</strong> deadline means a late result still has decaying value (a mapping update, a telemetry log). Most robot perception is firm-to-soft; the control loop it feeds is hard. Knowing which is which tells you whether to fight for the tail or to drop the frame and move on.</p>
+
+<p>Meeting a hard deadline requires <em>determinism</em>, and determinism is a property of the whole stack, not the algorithm. Worst-case execution time (WCET), not average time, is the design number. General-purpose operating systems, dynamic memory allocation, page faults, and garbage collection all inject unbounded jitter, which is why hard real-time control runs on an RTOS or a `PREEMPT_RT` kernel with priority-based preemptive scheduling, memory locked into RAM, and no allocation on the hot path. A subtle killer here is <em>priority inversion</em>: a high-priority perception task blocked on a mutex held by a low-priority task that a medium task has preempted, so the urgent work waits on the least urgent. Priority inheritance protocols exist precisely to bound this. The practical rule is to keep the hard-real-time control loop small, deterministic, and isolated, and to let the heavier, jittery perception run at firm deadlines feeding it, never the other way around.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: an ADAS emergency-brake latency budget</h3>
+<p>Consider a forward-collision system on a car at 30 m/s (about 108 km/h). The chain is: camera and radar exposure and readout, sensor-to-compute transport, the detection-and-tracking network (<a class="cross-ref" href="section-57.3.html">Section 57.3</a>), fusion into a threat estimate, the decision logic, and finally the brake actuator's own hydraulic delay. Suppose perception-to-decision totals 90 ms and brake actuation adds 200 ms. In that 290 ms the car travels roughly 8.7 m before deceleration even begins, before counting stopping distance. Every 10 ms shaved from the perception tail is another 0.3 m of clearance, which at the margin is a struck pedestrian versus a stopped car. The engineering consequence is stark: the team does not report the network's mean inference time, it reports the p99.9 measured on the target silicon at operating temperature, because the functional-safety case (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) is written against the worst frame, not the typical one.</p>
+</div>
+
+<h2>Living with latency: timestamp, compensate, predict</h2>
+
+<p>You cannot eliminate \(\tau\), so you account for it. Three disciplines make a delayed estimate usable. First, <strong>timestamp at the source</strong>: every measurement carries the capture time, not the arrival time, so downstream code always knows how old the data is and can associate it with the correct control cycle. Second, handle <strong>out-of-sequence measurements</strong>: a lidar pose for time \(t\) that lands 80 ms late must be fused against the state as it was at \(t\) (via a short state buffer, then re-propagated to now), not slammed into the current state, a correction that the smoothing view of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a> formalizes. Third, <strong>predict forward</strong> to hide the residual delay: use the high-rate proprioceptive process model to extrapolate the last good estimate to the present instant, so the controller acts on a prediction of <em>now</em> rather than a measurement of <em>then</em>. Latency compensation is why fast proprioception (<a class="cross-ref" href="section-57.1.html">Section 57.1</a>) is worth so much: it is the only signal fresh enough to paper over the lag of everything slower.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: ros2_tracing instead of hand-rolled stopwatches</h3>
+<p>Instrumenting every stage of a real pipeline by hand, threading capture timestamps through each node, correlating them across processes, and computing per-callback and end-to-end latency distributions, is a few hundred lines of fragile bookkeeping that also perturbs the timings it measures. The <code>ros2_tracing</code> framework with LTTng captures per-callback start and end, message publish and take events, and end-to-end message-flow latency at nanosecond resolution with near-zero overhead, and the companion analysis notebooks emit the percentile tables and message-flow graphs directly.</p>
+<pre class="language-bash"><code class="language-bash"># Record an instrumented run, then analyze the latency of a message chain.
+ros2 trace start perception_session
+ros2 launch my_robot perception.launch.py      # exercise under real load
+ros2 trace stop perception_session
+# -> Jupyter analysis yields per-callback and end-to-end p50/p99/p99.9 tables</code></pre>
+<p>Roughly 300 lines of manual, timing-perturbing instrumentation collapse into a trace session plus a stock analysis notebook, and the measurement no longer distorts the thing measured.</p>
+</div>
+
+<p>Whether you compensate by prediction or by re-propagation, the honest move is to propagate the age of the data into the uncertainty: an estimate extrapolated 60 ms forward is less certain than a fresh one, and a controller that knows this can slow down rather than commit to a stale guess. That coupling of latency to reported confidence is what keeps a punctual-but-wrong perception system from being worse than a slow-but-honest one.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the pipeline simulator above. (a) Add a fifth stage, <code>queue</code>, whose base cost is small when the pipeline is under-loaded but grows sharply once the mean total exceeds one frame period (model back-pressure). (b) Sweep the inference base cost from 10 to 30 ms and plot the fraction of frames that miss a 33.3 ms deadline; find the knee where the miss rate explodes. (c) Now add a constant-velocity forward-predictor that extrapolates each result by its measured age, and report how much end-to-end <em>effective</em> latency (age of the state the controller actually acts on) the predictor removes, and at what cost in extrapolation error when the robot's acceleration is nonzero.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A pipeline reports 60 fused poses per second. Does that tell you the sensor-to-action latency? Why or why not?<br/>
+2. Why is the p99.9 latency, rather than the mean, the number a functional-safety case is written against?<br/>
+3. Explain priority inversion in one sentence, and name the mechanism that bounds it.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-57.7.html">Section 57.7</a>, we bring the whole chapter together on a concrete platform: integrating the perception stack in ROS 2, where nodes, topics, quality-of-service settings, TF frame trees, and executors turn the timestamping, fusion, and latency-compensation principles of this section into a running system you can launch, trace, and deploy.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

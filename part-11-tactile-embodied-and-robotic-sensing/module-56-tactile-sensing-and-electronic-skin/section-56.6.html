@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 56.6: Visuo-tactile fusion. Building Sensory AI." name="description"/>
+<title>Section 56.6: Visuo-tactile fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 56: Tactile Sensing and Electronic Skin</a></div>
+<h1>Visuo-tactile fusion</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"The camera told me the mug was full. My fingers told me it was empty. One of them was looking at a reflection, and it was not the fingers."</p>
+        <cite>A Skeptical AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on the tactile front ends of <a class="cross-ref" href="section-56.2.html">Section 56.2</a> (camera-based sensors like GelSight and DIGIT) and the tactile representations of <a class="cross-ref" href="section-56.4.html">Section 56.4</a>. It leans on the fusion vocabulary of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> (early, middle, and late fusion) and on the missing-modality machinery of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. Contrastive cross-modal pretraining, invoked below, is developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. A working knowledge of a neural forward pass is assumed.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Vision and touch are the two senses a robot uses to manipulate the world, and they fail in exactly opposite places. A camera sees the whole scene from a distance but goes blind at the moment of contact, when the gripper and the object occlude each other and the interesting physics begins. A tactile sensor is blind to everything it is not touching but reports, at sub-millimeter resolution, precisely the force, slip, and local geometry that vision cannot recover. Fusing them is not one more instance of generic sensor fusion: it is fusion between a modality that is always available and a modality that <em>does not exist until you make contact</em>. That asymmetry, absent from camera-plus-lidar or RGB-plus-depth, is what makes visuo-tactile fusion its own subject and the enabling ingredient of contact-rich manipulation.</p>
+    </div>
+
+    <h2>Why the two modalities are complementary, not redundant</h2>
+    <p>The case for touch begins where vision ends. Consider a robot picking a coffee mug. Vision, covered as a sensing modality throughout Parts IX and X, localizes the mug, proposes a grasp, and guides the hand to it. But once the fingers close, the fingertips and the mug occlude one another in every camera view, and the questions that decide success become physical rather than geometric: is the grip about to slip, how much force is on the handle, is the wall thin porcelain that will crack. None of these are visible. Touch answers all of them directly, because a contact-rich sensor measures the deformation field at the interface (<a class="cross-ref" href="section-56.4.html">Section 56.4</a>). The two senses are therefore <em>complementary</em> in the strict sense of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>: each supplies information the other structurally cannot, so fusing them expands what is observable rather than merely averaging down noise.</p>
+    <p>Formally, let the manipulation state be \(s\) (object pose, contact configuration, grasp stability). Vision induces a likelihood \(p(v \mid s)\) that is sharp over global pose but nearly flat over contact forces; touch induces \(p(\tau \mid s)\) that is sharp over local contact but silent about anything beyond the fingertip. Their product \(p(s \mid v, \tau) \propto p(v \mid s)\, p(\tau \mid s)\, p(s)\) is sharp in <em>both</em> subspaces at once, which is the entire point. The interesting twist is that touch is not merely noisier where vision is strong; it is <em>undefined</em> there. Before contact, \(\tau\) carries no information about grasp force because there is no contact to measure. Touch switches on.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Visuo-tactile fusion is an <em>intermittent-modality</em> problem, not a missing-modality problem. In classic multimodal learning a channel is present but sometimes drops out. Here the tactile channel is <em>expected</em> to be absent for the entire pre-contact phase and to carry signal only after touchdown. A fusion model that treats pre-contact tactile input as "sensor failure" will fight its own data; the right framing is a modality whose availability is a lawful function of the task phase, and whose arrival is itself the most informative event in the episode.</p>
+    </div>
+
+    <h2>Registering touch into the visual frame</h2>
+    <p>To fuse the streams you must place them in a common frame, exactly as <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> demands for any spatial fusion. A tactile reading is expressed in the sensor's own frame, on the fingertip. Vision lives in the camera frame. The bridge is the robot's kinematics: forward kinematics maps the fingertip frame to the base frame through the measured joint angles, and a one-time hand-eye calibration \(T_{\text{cam}\leftarrow\text{base}}\) maps the base frame to the camera. Composing them projects the contact patch to a pixel region, so a GelSight imprint can be overlaid on the exact spot of the object the camera sees. This registration rests on the measurement-model discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: every frame transform carries calibration error, and a few millimeters of hand-eye error will misplace the contact patch by more than a fingertip is wide.</p>
+    <p>Two practical consequences follow. First, the fusion is only as good as the calibration, so contact-rich work budgets real effort for hand-eye calibration and joint-encoder accuracy. Second, when registration is expensive or unreliable, many systems skip explicit geometric alignment and instead let a learned model align the modalities in a shared latent space, which is the dominant modern approach and the subject of the next subsection.</p>
+
+    <h2>Fusion architectures: from cross-attention to contrastive pretraining</h2>
+    <p>Because touch and vision meet most usefully as learned features, visuo-tactile fusion is overwhelmingly <em>middle fusion</em> in the taxonomy of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>: a vision encoder and a tactile encoder each produce an embedding, and the two are combined before a shared head. Three combination patterns dominate. <strong>Concatenation with a gate</strong> is the simplest and handles the intermittent channel gracefully, because a learned gate can zero out the tactile embedding before contact and open it after. <strong>Cross-attention</strong> lets the tactile tokens query the visual tokens (or vice versa), so a slip signal at the fingertip can attend to the visual region it belongs to; this is the same mechanism that powers the multimodal models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. <strong>Contrastive pretraining</strong> aligns the two encoders without labels by pulling paired vision and touch crops together in embedding space and pushing unpaired ones apart, the recipe of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>; the tactile foundation models of <a class="cross-ref" href="section-56.5.html">Section 56.5</a> (UniTouch and its kin) are built this way and give a strong initialization for downstream fusion.</p>
+    <p>Listing 56.6.1 implements the gated variant for grasp-success prediction. The gate is driven by a scalar contact flag, so the network is told, per sample, whether touch is live. This single mechanism turns the intermittent-modality headache into a first-class input.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+class VisuoTactileGrasp(nn.Module):
+    """Predict grasp success from a vision embedding and a tactile embedding,
+    with a learned gate that respects whether contact has occurred."""
+    def __init__(self, d_vis, d_tac, d=64):
+        super().__init__()
+        self.vis = nn.Linear(d_vis, d)
+        self.tac = nn.Linear(d_tac, d)
+        self.gate = nn.Sequential(nn.Linear(1, d), nn.Sigmoid())  # driven by contact flag
+        self.head = nn.Sequential(nn.Linear(2 * d, 64), nn.ReLU(), nn.Linear(64, 1))
+
+    def forward(self, e_vis, e_tac, in_contact):      # in_contact: (B,1) in {0.,1.}
+        v = self.vis(e_vis)
+        t = self.tac(e_tac) * self.gate(in_contact)   # touch is masked before contact
+        return self.head(torch.cat([v, t], dim=-1)).squeeze(-1)  # grasp-success logit</code></pre>
+    <div class="code-caption"><strong>Listing 56.6.1.</strong> Gated middle fusion for grasp-success prediction. The <code>gate</code>, conditioned on a per-sample contact flag, learns to suppress the tactile embedding before touchdown and admit it afterward, so a single model spans the pre-contact and post-contact phases without pretending touch exists when it does not.</div>
+
+    <p>As Listing 56.6.1 shows, the architecture is a few lines; the design content is the gate and the contrastively pretrained encoders that feed it. This mirrors <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>: robustness to an absent modality comes from telling the model, not from hoping it infers absence from zeros.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Writing a cross-attention fusion block from scratch, with per-modality tokenizers, positional handling, masking for the absent tactile channel, and a projection head, is roughly 120 to 200 lines of careful PyTorch. A modern multimodal toolkit collapses the attention scaffold to a short call:</p>
+        <pre class="language-python"><code class="language-python">from torchmultimodal.modules.layers.transformer import TransformerCrossAttentionLayer
+xattn = TransformerCrossAttentionLayer(d_model=64, n_head=4)
+# tactile tokens query visual tokens; key_padding_mask hides touch before contact
+fused = xattn(hidden_states=e_tac, encoder_hidden_states=e_vis,
+              encoder_key_padding_mask=no_contact_mask)</code></pre>
+        <div class="code-caption"><strong>Listing 56.6.2.</strong> TorchMultimodal's cross-attention layer replaces a hand-written masked cross-attention block, cutting roughly 150 lines to about 4. The library handles the attention math and masking; deciding <em>which</em> modality queries which, and when touch is valid, remains your design.</div>
+        <p>The toolkit removes the plumbing, not the intermittent-modality decision that Listing 56.6.2's <code>no_contact_mask</code> encodes.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>In the field: regrasping a cereal box on a warehouse arm</h4>
+        <p>A fulfillment team runs a parallel-jaw gripper with a GelSight fingertip and a wrist camera. Vision alone proposed grasps, but the arm kept crushing thin snack boxes and dropping heavy cans, because a top-down image cannot tell a rigid can from a crushable carton. Following the spirit of the classic vision-and-touch regrasp results (Calandra and colleagues, "More Than a Feeling", 2018), they trained a gated fusion model like Listing 56.6.1: vision picks the initial grasp, and after the fingers close, the tactile embedding drives a regrasp decision (squeeze harder, shift, or lift). Grasp success on a held-out set of never-seen SKUs rose from 78% with vision alone to 94% with fusion, and crush incidents on cartons fell by an order of magnitude, because the first tactile frame revealed compliance that no camera pixel encoded. Critically, they split train and test by <em>object identity</em>, following the leakage-safe protocol of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, so the gain reflects generalization to new products rather than memorized box textures.</p>
+    </div>
+
+    <h2>Evaluating fusion rigorously, and when it actually helps</h2>
+    <p>Fusion is not free, and it does not always win. The discipline is to measure the vision-only baseline first and demand that fusion beat it on <em>held-out contact conditions</em>, not merely on aggregate accuracy where vision already suffices. Paired visuo-tactile datasets make this possible: Touch-and-Go (Yang and colleagues, 2022) provides human-collected vision and GelSight touches on real objects, and ObjectFolder (Gao and colleagues) supplies simulated multisensory objects with vision, touch, and audio. The book's <strong>Lab 56</strong> uses exactly this setup: train a tactile classifier, then fuse it with vision on Touch-and-Go and confirm the lift is concentrated where vision is weak (transparent, reflective, or texture-ambiguous surfaces). The recurring failure mode is a fusion model that quietly ignores touch, learning to route everything through the vision branch because that branch minimizes training loss fastest; the gate value and per-modality ablations are your instruments for catching it.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is shifting from bespoke fusion heads to <em>shared visuo-tactile representations</em> that plug into embodied policies. Contrastively aligned encoders such as UniTouch (<a class="cross-ref" href="section-56.5.html">Section 56.5</a>) map touch into a vision-language embedding space, so a tactile signal can be reasoned about in the same latent as pixels and words, feeding the vision-language-action models of <a class="cross-ref" href="../module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a>. Open questions are cross-sensor transfer (a policy trained on GelSight running on DIGIT without retraining), sim-to-real for tactile signals whose contact physics is expensive to render (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>), and principled uncertainty over the fused state so a policy knows when to look before it grasps.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using a paired dataset (Touch-and-Go or ObjectFolder), train three classifiers for a material or grasp-success label: vision-only, touch-only, and the gated fusion of Listing 56.6.1. Report accuracy overall <em>and</em> sliced by surface type (matte, reflective, transparent). Then log the mean gate value on pre-contact versus post-contact samples. Does the gate learn to open only after contact, and is the fusion lift concentrated on the surfaces where vision-only is weakest? If fusion does not beat vision-only anywhere, diagnose whether the tactile branch is being ignored.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is visuo-tactile fusion described as an intermittent-modality problem rather than an ordinary missing-modality problem, and how does the gate in Listing 56.6.1 encode that distinction?</p>
+        <p class="quiz-question">2. What two transforms register a fingertip tactile reading into the camera image, and what happens to the fused prediction if hand-eye calibration is off by several millimeters?</p>
+        <p class="quiz-question">3. A fusion model reaches the same accuracy as the vision-only baseline. Give two diagnostics that would tell you whether touch is actually contributing.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>Fusion tells you <em>that</em> vision and touch agree on a contact state, but not yet what that contact is doing moment to moment. In <a class="cross-ref" href="section-56.7.html">Section 56.7</a>, we zoom into the tactile stream itself to infer slip onset, contact geometry, and material properties: the fast, local judgments that let a hand tighten its grip a few milliseconds before an object escapes, and that the fusion models of this section rely on as their tactile signal.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

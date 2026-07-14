@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.1: Body-state sensing (encoders, force/torque, IMU). Building Sensory AI." name="description"/>
+<title>Section 57.1: Body-state sensing (encoders, force/torque, IMU) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Body-state sensing (encoders, force/torque, IMU)</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"Before I can ask where the world is, I have to know where my own hand is. Everything else is a coordinate transform."</p>
+        <cite>A Self-Aware AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the transduction vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> (how force, strain, and angle become measurable signals) and the sampling, bandwidth, and time-synchronization ideas of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because proprioceptive channels run at kilohertz rates and must be aligned in time. The inertial measurement unit is treated in depth in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> and its orientation math in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>; here we use it only as one term in the body-state vector. A little linear algebra (a rotation, a Jacobian) is enough; the kinematics is developed as we go.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Proprioception is a robot's sense of its own body: the angles of its joints, the forces flowing through its structure, and the orientation and motion of its base. Unlike every exteroceptive sensor in this book, proprioception does not look outward at all. It answers a prior question that the rest of the perception stack silently depends on: <em>where am I, in my own coordinates, right now?</em> A depth camera that reports an obstacle two meters ahead is useless until you know where the camera is bolted and how the arm holding it is currently posed. This section covers the three proprioceptive workhorses that supply that answer: <strong>joint encoders</strong> for configuration, <strong>force/torque sensors</strong> for interaction, and the <strong>IMU</strong> for the motion of a floating base. Together they produce the body-state vector on which fusion (<a class="cross-ref" href="section-57.4.html">Section 57.4</a>), navigation (<a class="cross-ref" href="section-57.2.html">Section 57.2</a>), and every downstream controller are built.</p>
+    </div>
+
+    <h2>Why body-state comes first</h2>
+    <p>Exteroceptive perception is meaningless without a frame to anchor it. A lidar return is a range and a bearing in the sensor's frame; to place that point in the world you must chain a transform from the sensor, through every joint of the robot, back to a base frame, and (for a mobile robot) from the base into the world. That chain of transforms is exactly the proprioceptive state. Get a single joint angle wrong by a degree and a point a meter away moves by nearly two centimeters, which is the difference between grasping a part and knocking it off the bench. So the <em>why</em> of body-state sensing is that it is the denominator of all spatial reasoning: it converts a self-referential measurement into a world claim.</p>
+    <p>There is a second reason it comes first: latency and rate. Proprioceptive channels are cheap, local, and fast. Encoders and joint-torque sensors are read at 1 to 10 kHz inside the servo loop, whereas a camera delivers frames at 30 to 60 Hz and a lidar sweep at 10 to 20 Hz. When we discuss real-time constraints in <a class="cross-ref" href="section-57.6.html">Section 57.6</a>, the proprioceptive stream is the fast, reliable backbone that carries the robot between the sparse, slow exteroceptive updates. It is measured, not inferred, so it is the closest thing a robot has to ground truth about itself.</p>
+
+    <h2>Joint encoders: measuring configuration</h2>
+    <p>An encoder measures the angle (or, for a prismatic joint, the displacement) of a single joint. There are two families, and the choice between them shapes the whole software stack. An <strong>incremental encoder</strong> emits two pulse trains, channels A and B, ninety degrees out of phase. Counting edges gives displacement; the phase order (A leads B or B leads A) gives direction. This is <em>quadrature</em> encoding, and it multiplies resolution by four because each of the two channels contributes both a rising and a falling edge per cycle. Its weakness is that it is relative: at power-up the robot has no idea where the joint sits and must perform a homing move to find a reference. An <strong>absolute encoder</strong>, by contrast, reports a unique code for every shaft position (via a Gray-coded disk or a magnetic vernier), so it knows the joint angle the instant it is switched on. Absolute encoders cost more but remove the homing dance and survive power loss, which is why they dominate collaborative arms and humanoid joints.</p>
+    <p>The number that matters is resolution. A quadrature encoder with \(N\) lines per revolution resolves</p>
+    $$\Delta\theta = \frac{2\pi}{4N} \quad \text{radians per count},$$
+    <p>so a modest 2048-line encoder gives 8192 counts per revolution, about \(0.044^{\circ}\). That angular resolution turns into end-effector precision through the arm's geometry: a small angular error at a joint is amplified by the length of the links beyond it, which is why the last, longest links of a robot are the ones whose encoders must be finest. When we say a joint reads \(\theta_i\), we always mean an encoder count scaled by \(\Delta\theta\), plus whatever offset homing established. Two practical failure modes lurk here and reappear in <a class="cross-ref" href="section-57.5.html">Section 57.5</a>: <em>count slip</em>, where electrical noise or a missed edge corrupts an incremental count so the whole kinematic chain silently drifts, and <em>gearbox backlash</em>, where the encoder on the motor side of a reducer disagrees with the true link angle by the lash in the gears. Placing a second, absolute encoder on the <em>output</em> side of the gearbox is the standard defense.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Where you mount the encoder decides what you are actually measuring. A motor-side encoder measures the motor, not the link: everything downstream (gear backlash, shaft wind-up, a flexible harmonic drive) sits between the sensor and the thing you care about. High-accuracy and safety-rated robots therefore use <strong>dual encoders</strong>, one before and one after the transmission. The difference between the two is not noise to be filtered away; it is a direct measurement of the torque and flex in the joint, and modern controllers exploit exactly that difference to estimate load without a dedicated torque sensor. Proprioception is full of these "the disagreement is the signal" tricks.</p>
+    </div>
+
+    <h2>Force/torque sensing: measuring interaction</h2>
+    <p>Encoders tell the robot its shape; they say nothing about what it is pushing on. For that we need force sensing, and it comes in two architectures. A <strong>six-axis force/torque (F/T) sensor</strong> is a compact ring, usually bolted at the wrist between the arm and the tool, instrumented with strain gauges arranged so that it resolves the full contact <em>wrench</em>: three forces \((f_x, f_y, f_z)\) and three torques \((\tau_x, \tau_y, \tau_z)\). It is the robot's fingertip pad, reporting the net force and moment the tool exchanges with the world. The alternative is <strong>joint-torque sensing</strong>, where each joint carries a strain-gauged flex element (as in the KUKA LBR iiwa or the Franka arm) so the robot measures the torque at every axis. Joint-torque sensing spreads the measurement over the whole arm and enables whole-body contact detection, whereas a wrist F/T sensor sees only what passes through the wrist and is blind to a collision with the elbow.</p>
+    <p>The bridge between joint torques and the end-effector wrench is the manipulator <strong>Jacobian</strong> \(J(\theta)\), the matrix that maps joint velocities to end-effector velocity. By the principle of virtual work, the same matrix maps forces the other way:</p>
+    $$\boldsymbol{\tau} = J(\theta)^{\top}\, \mathbf{F},$$
+    <p>where \(\boldsymbol{\tau}\) is the vector of joint torques and \(\mathbf{F}\) is the wrench at the tool. This one equation is the workhorse of proprioceptive interaction sensing. Read the joint torques, subtract the part predicted by gravity and the arm's own dynamics, and the residual, pushed through \((J^{\top})^{-1}\), is an estimate of the external force the robot is feeling, with no wrist sensor at all. That is how a collaborative robot stops when you bump it: the measured torque departs from the model, the residual crosses a threshold, and the controller reacts within a couple of milliseconds. Crucially, this force estimate is <em>calibrated in newtons</em>, which complements the rich-but-uncalibrated contact images of the tactile skins in <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-56-tactile-sensing-and-electronic-skin/index.html">Chapter 56</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a Franka arm polishing a curved automotive panel</h3>
+        <p>A manufacturing cell finishes painted door panels, where the robot must press a polishing pad against a doubly-curved surface with a controlled 15 N normal force while sliding along the contour. Position control alone cannot do this: the panel's exact shape varies by a few millimeters part to part, so a fixed trajectory either presses too hard (marring the paint) or lifts off (missing a spot). Instead the controller runs in <em>hybrid force/position</em> mode using the arm's joint-torque sensors. It commands position tangent to the surface and commands force normal to it, reading the estimated contact wrench through \(\boldsymbol{\tau} = J^{\top}\mathbf{F}\) at 1 kHz and adjusting the pad's standoff to hold 15 N regardless of where the surface actually is. The same proprioceptive force channel doubles as a safety monitor: an unexpected lateral force means the pad has caught an edge, and the arm halts before it gouges the panel. No external camera is fast or precise enough to close this loop; the body's own force sense is.</p>
+    </div>
+
+    <h2>The IMU and the floating-base problem</h2>
+    <p>Encoders and torque sensors fully describe an arm bolted to a bench, because the base is fixed and the kinematic chain is closed to the world. A legged robot, a drone, or a humanoid has no such luxury: its base <em>floats</em>, free to translate and rotate, and no joint encoder can observe that base motion. This is the floating-base problem, and it is where the inertial measurement unit enters proprioception. An IMU on the trunk supplies the three angular rates and three linear accelerations that pin down how the base itself is moving, which the encoders cannot. Orientation, especially the direction of gravity (roll and pitch), comes almost for free from the accelerometer at rest, and this "which way is down" signal is what keeps a balancing robot upright.</p>
+    <p>We treat the IMU lightly here because <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> covers its physics and noise and <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a> covers turning its rates into an orientation estimate. The point specific to robot proprioception is fusion of complementary error profiles: joint encoders are precise but only see the articulated body relative to the base, while the IMU sees the base's motion in the world but drifts without bound when integrated. Legged systems combine them in a state estimator (typically a Kalman filter of the family in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) that uses the encoders and a contact assumption, "this foot is planted, so it is not moving," as a measurement to correct the IMU's drift. The result is a single, consistent body-state estimate, the input the rest of Chapter 57 assumes.</p>
+
+    <h2>Assembling the proprioceptive state vector</h2>
+    <p>The three channels combine into one object the whole robot software stack consumes: the body-state vector, joint angles \(\boldsymbol{\theta}\) and velocities \(\dot{\boldsymbol{\theta}}\) from encoders, the contact wrench \(\mathbf{F}\) from force sensing, and the base orientation and motion from the IMU. From \(\boldsymbol{\theta}\) alone, forward kinematics places the end-effector; adding \(\mathbf{F}\) tells you what it is touching; adding the IMU tells you where the whole body is heading. The short program below builds the two most-used pieces for a planar two-link arm: converting encoder counts to a tool position, and using the Jacobian transpose to read an external force from joint torques, the exact computation behind collaborative-robot collision reaction.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# Two-link planar arm: link lengths, and 2048-line quadrature encoders.
+L1, L2 = 0.40, 0.30                 # metres
+counts_per_rev = 4 * 2048          # quadrature x4
+dtheta = 2 * np.pi / counts_per_rev  # radians per count
+
+def encoder_to_angles(counts):
+    """Raw quadrature counts -> joint angles (radians)."""
+    return np.asarray(counts) * dtheta
+
+def forward_kinematics(theta):
+    t1, t2 = theta
+    x = L1*np.cos(t1) + L2*np.cos(t1 + t2)
+    y = L1*np.sin(t1) + L2*np.sin(t1 + t2)
+    return np.array([x, y])
+
+def jacobian(theta):
+    t1, t2 = theta
+    return np.array([
+        [-L1*np.sin(t1) - L2*np.sin(t1+t2), -L2*np.sin(t1+t2)],
+        [ L1*np.cos(t1) + L2*np.cos(t1+t2),  L2*np.cos(t1+t2)],
+    ])
+
+counts = [12000, 9000]                 # read off the two joint encoders
+theta  = encoder_to_angles(counts)
+tool   = forward_kinematics(theta)     # where the hand is, in base frame
+
+# The arm reports joint torques; gravity/dynamics already subtracted.
+tau_external = np.array([-1.8, 0.9])   # N.m residual at the two joints
+J = jacobian(theta)
+# tau = J^T F  ->  F = (J^T)^-1 tau : recover the tip force in newtons.
+F_tip = np.linalg.solve(J.T, tau_external)
+
+print(f"joint angles (deg): {np.degrees(theta).round(2)}")
+print(f"tool position (m):  {tool.round(4)}")
+print(f"external tip force (N): {F_tip.round(2)},  |F| = {np.linalg.norm(F_tip):.2f}")
+</code></pre>
+    <div class="code-caption">Turning raw proprioceptive readings into robot-relevant quantities: encoder counts become a calibrated tool position through forward kinematics, and a joint-torque residual becomes an end-effector force in newtons through the Jacobian transpose. The same two operations underlie both spatial anchoring and collision reaction on a real arm.</div>
+
+    <p>Notice what the code makes explicit: proprioception is not raw sensor bytes but the geometric model that interprets them. The encoder gives counts; only the kinematic chain turns those into a position anyone else can use. This is why body-state sensing is inseparable from the robot's model of itself, and why a wrong link length or a slipped encoder corrupts perception far from the joint that failed.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: kinematics libraries</h3>
+        <p>The hand-written forward kinematics and Jacobian above are fine for two links, but a real 7-axis arm has a much longer chain, and deriving each Jacobian column by hand is error-prone. A robotics library removes it entirely. With <code>pinocchio</code> you load the robot's URDF and call <code>pin.forwardKinematics</code> and <code>pin.computeJointJacobians</code>; the roughly 25 lines of trigonometry here collapse to about 4 lines, and the library handles arbitrary joint counts, spatial (6-D) wrenches, gravity terms, and the full dynamics for the torque residual. You supply the URDF and the sensor readings; it supplies the math. Reserve the from-scratch version for understanding what the library is doing, not for production.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the code above to detect a collision. (1) Pick a torque threshold and flag when \(\lVert \mathbf{F}_{\text{tip}} \rVert\) exceeds an equivalent force limit of 20 N. (2) Now corrupt one encoder by adding 500 spurious counts (simulating count slip) before computing kinematics, and report how far the tool position moves and how the force estimate changes. (3) Argue why a dual encoder on the gearbox output would catch the count-slip fault that the force channel alone would misattribute to a real contact.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why does an incremental encoder require a homing move at power-up while an absolute encoder does not, and what does quadrature buy you in resolution?</li>
+            <li>A wrist force/torque sensor and whole-arm joint-torque sensing both estimate contact force. Give one scenario each where one sees a contact the other misses.</li>
+            <li>Encoders are precise but cannot observe base motion; an IMU observes base motion but drifts. What measurement does a legged-robot state estimator use to correct the IMU drift, and where does it come from?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>With the robot's own body pinned down, we can finally trust its outward-facing sensors. In <a class="cross-ref" href="section-57.2.html">Section 57.2</a>, we turn to exteroception: how a mobile robot fuses wheel odometry, IMU, and depth or lidar into a consistent estimate of where it is in the world, and why the proprioceptive backbone built here is the frame that every exteroceptive measurement is expressed in.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

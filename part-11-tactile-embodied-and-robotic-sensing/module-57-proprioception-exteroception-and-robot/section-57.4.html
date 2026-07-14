@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.4: Proprioception-exteroception fusion. Building Sensory AI." name="description"/>
+<title>Section 57.4: Proprioception-exteroception fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Proprioception-exteroception fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My joints tell me where I think I am. The world tells me where I actually am. The trick is knowing which one to believe when they disagree, and by exactly how much."</p>
+<cite>A Self-Localizing AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>A robot carries two fundamentally different kinds of sense. <em>Proprioception</em> (<a class="cross-ref" href="section-57.1.html">Section 57.1</a>) reads the body from the inside: joint encoders, an IMU, force and torque, wheel or leg odometry. It is fast, always available, and never blinded by fog or glare, but it drifts, because integrating velocity accumulates error without bound. <em>Exteroception</em> (<a class="cross-ref" href="section-57.2.html">Section 57.2</a>) reads the world from the outside: cameras, depth, lidar, radar. It is drift-free and absolute, but it is slower, can be occluded, and is noisy or missing exactly when the terrain gets interesting. This section is about marrying them. The organizing idea is simple and powerful: proprioception supplies the <strong>prediction</strong>, exteroception supplies the <strong>correction</strong>. Get that division of labor right and a legged robot walks blind across a gap for half a second when its depth camera flares, then snaps back to a lidar-anchored estimate the instant the world reappears. Get it wrong and the robot either trusts a hallucinated elevation map into a fall, or ignores good vision and dead-reckons itself into a wall.</p>
+</div>
+
+<p>This section builds directly on the Kalman family (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) and on the probabilistic-fusion algebra of combining two estimates by their inverse covariances (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>). What is new is that the two streams are not symmetric peers, as in the generic fusion of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>. One is the motion model and one is the observation, and knowing which is which is the whole design.</p>
+
+<h2>Proprioception is the process model</h2>
+
+<p>In a Bayesian filter the <em>process model</em> propagates the state forward between measurements and inflates its covariance to reflect growing ignorance. On a robot, that process model <em>is</em> proprioception. A wheeled base integrates wheel encoders and yaw rate into a dead-reckoned pose; a legged robot uses <em>leg odometry</em>, which combines joint encoders (forward kinematics to each foot) with the IMU and a contact estimate: if a foot is planted and not slipping, the base must have moved opposite to the measured foot motion. This kinematic-inertial estimate runs at hundreds of hertz, matches the control loop, and needs no external infrastructure.</p>
+
+<p>The catch is unbounded drift. Every prediction step adds process noise \(Q\), so the covariance grows without a correction:</p>
+
+$$\mathbf{x}_{k} = f(\mathbf{x}_{k-1}, \mathbf{u}_k), \qquad P_k = F_k P_{k-1} F_k^\top + Q_k .$$
+
+<p>Here \(\mathbf{u}_k\) is the proprioceptive input (joint velocities, IMU rates) and \(Q_k\) encodes how much you distrust it: foot slip, encoder quantization, and IMU bias all live in \(Q\). This is the same dead-reckoning growth analyzed for inertial navigation in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>; the legged twist is that contact events make \(Q\) <em>time-varying</em>. A confidently planted stance foot gives tiny process noise; the moment slip is detected, \(Q\) must jump so the filter stops trusting kinematics and leans on exteroception instead.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Proprioception and exteroception fail in complementary bands, which is exactly why fusing them works. Proprioception is trustworthy at high frequency and short horizon (what happened in the last 10 ms) but unbounded at low frequency (where am I after a minute). Exteroception is trustworthy at low frequency and long horizon (absolute position against a map) but slow, intermittent, and occlusion-prone at high frequency. Fusion is not averaging two noisy copies of the same thing; it is letting each modality cover the band where the other is blind. The estimator that forgets this, and treats a stale lidar fix as if it were as fresh as the IMU, will lag through every fast maneuver.</p>
+</div>
+
+<h2>Exteroception is the correction</h2>
+
+<p>Exteroceptive measurements enter as the filter's <em>update</em> step: an absolute, drift-free constraint that pulls the drifting prediction back and shrinks its covariance. A lidar scan-match against a map, a visual-odometry pose, or a detected landmark (<a class="cross-ref" href="section-57.3.html">Section 57.3</a>) each yields an observation \(\mathbf{z}_k = h(\mathbf{x}_k) + \mathbf{v}_k\) whose covariance \(R\) says how much to trust it. The Kalman gain then blends prediction and correction in inverse proportion to their uncertainties, the multivariate version of the precision-weighted average from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>.</p>
+
+<p>Two engineering realities make this harder than the textbook update. First, the two streams live in <em>different frames</em>: joint encoders speak the body frame, a wrist camera speaks the sensor frame, and fusing them demands an accurate extrinsic calibration (the hand-eye transform). A one-degree error in that transform injects a systematic, drift-like bias that no amount of filtering removes, which is why calibration quality caps fusion accuracy. Second, exteroception arrives <em>late</em>: a lidar pose for time \(t\) may land 80 ms after the fact, so it must be applied as a delayed update against the state as it was at \(t\), not the state now. Ignoring that latency is a classic silent bug, and it is the subject of <a class="cross-ref" href="section-57.6.html">Section 57.6</a>.</p>
+
+<p>The snippet below makes the division of labor concrete: a 2D base estimator dead-reckons on proprioceptive velocity every step and folds in a sparse, noisy exteroceptive position fix when one is available. Watch the covariance trace grow during the blind stretch and collapse at each fix.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def fuse_step(x, P, u, dt, Q, z=None, R=None, H=np.eye(2)):
+    """One predict/update cycle for a 2D base pose.
+    u  : proprioceptive velocity (m/s), the process input
+    z  : exteroceptive position fix (m) or None if unavailable
+    """
+    # predict: proprioception drives the motion model
+    x = x + u * dt                      # dead-reckon
+    P = P + Q * dt                      # covariance grows, so drift
+
+    # update: exteroception corrects, only when present
+    if z is not None:
+        S = H @ P @ H.T + R             # innovation covariance
+        K = P @ H.T @ np.linalg.inv(S)  # Kalman gain
+        x = x + K @ (z - H @ x)
+        P = (np.eye(2) - K @ H) @ P
+    return x, P
+
+rng = np.random.default_rng(0)
+x, P = np.zeros(2), np.eye(2) * 0.01
+Q, R = np.eye(2) * 0.5, np.eye(2) * 0.04   # trust vision ~ heavily
+true = np.zeros(2)
+for k in range(30):
+    u = np.array([1.0, 0.2])               # commanded velocity
+    true = true + u * 0.1
+    z = None
+    if k % 10 == 9:                         # exteroceptive fix every 1 s
+        z = true + rng.normal(0, 0.2, 2)
+    x, P = fuse_step(x, P, u + rng.normal(0, 0.3, 2), 0.1, Q, z, R)
+    print(f"k={k:2d} trace(P)={np.trace(P):.3f}  err={np.linalg.norm(x-true):.3f}")</code></pre>
+<div class="code-caption"><strong>Proprioception predicts, exteroception corrects.</strong> The covariance trace climbs on every proprioceptive-only step and drops sharply at each exteroceptive fix (steps 9, 19, 29), the numerical signature of drift-then-correction that defines this fusion pattern.</div>
+
+<p>The loop above is the skeleton of every classical proprioception-exteroception estimator: the two modalities never enter symmetrically, one is always the predict and the other the update.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a quadruped that walks when the camera lies</h3>
+<p>A quadruped like ANYmal or Spot crossing a rubble field runs leg-inertial odometry at 400 Hz as its process model: joint encoders plus IMU plus per-foot contact give a base velocity estimate every 2.5 ms. On top, a lidar or depth-built elevation map supplies exteroceptive foothold constraints at 10 to 20 Hz. When the robot steps into its own dust cloud or faces low sun, the depth map briefly fills with noise or holes. A naive controller would place a foot on a phantom ledge and fall. The fused estimator instead detects that exteroception has gone unreliable (high innovation, low map confidence), inflates \(R\) so the vision update is nearly ignored, and coasts on proprioception for the fraction of a second the terrain is invisible, feeling for contact rather than trusting a bad map. When the camera clears, the exteroceptive update reasserts the absolute foothold geometry. This graceful hand-off, not raw sensor quality, is what separates a robot that finishes the traverse from one that does not.</p>
+</div>
+
+<h2>Learned fusion and confidence gating</h2>
+
+<p>The classical filter gates exteroception with a hand-tuned \(R\) and slip detector. The frontier learns the gate. Instead of hard rules for when the elevation map is trustworthy, a network is trained to blend a proprioceptive state with a (possibly corrupted) exteroceptive one and to <em>down-weight vision automatically</em> when the two disagree in ways that predict a fall. This is the same missing-modality robustness studied for deep multimodal fusion in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, specialized to locomotion.</p>
+
+<div class="callout research-frontier">
+<h4>Research Frontier</h4>
+<p>The reference result is Miki et al., <em>"Learning robust perceptive locomotion for quadrupedal robots in the wild"</em> (Science Robotics, 2022), deployed on ANYmal. Its policy runs a <strong>belief encoder</strong>: a recurrent module fuses proprioception with an exteroceptive height sample and learns an internal confidence, attending to vision on clean terrain and falling back to proprioception when the map is occluded, deformable, or simply wrong. Trained entirely in simulation with randomized terrain and sensor noise (the sim-to-real recipe of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>), it crossed vegetation, mud, and snow where map-trusting controllers failed. The through-line to <a class="cross-ref" href="../module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a>: end-to-end embodied policies increasingly <em>learn</em> the proprioception-exteroception weighting that this section computes by hand, but the classical filter remains the interpretable, certifiable fallback that safety cases still demand.</p>
+</div>
+
+<p>Whether the gate is hand-tuned or learned, calibrating its confidence matters: an over-confident fusion that reports tiny covariance while quietly drifting is more dangerous than an honest noisy one, which is why the calibration and conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> apply directly to the fused state estimate.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: robot_localization instead of a hand-rolled EKF</h3>
+<p>Wiring the predict/update loop above into a real multi-rate system, with delayed exteroceptive updates, per-source frames, and IMU-plus-odometry-plus-GPS fusion, is several hundred lines of careful, easy-to-get-wrong estimator code. The ROS 2 <code>robot_localization</code> package (Moore and Stouch) does it declaratively.</p>
+<pre class="language-yaml"><code class="language-yaml">ekf_filter_node:
+  ros__parameters:
+    frequency: 50.0
+    odom0: /wheel/odometry        # proprioceptive: x,y,yaw velocity
+    odom0_config: [false,false,false, false,false,false,
+                   true,true,false, false,false,true, false,false,false]
+    imu0: /imu/data               # proprioceptive: yaw rate + accel
+    imu0_config: [false,false,false, false,false,true, ...]
+    pose0: /lidar/pose            # exteroceptive: absolute x,y,yaw
+    pose0_differential: false</code></pre>
+<div class="code-caption"><strong>Declarative proprioception-exteroception fusion.</strong> Each source is tagged with which state dimensions it observes; the node runs the delayed-update EKF internally.</div>
+<p>Roughly 300 lines of multi-rate, latency-aware EKF shrink to one YAML block, and the package owns the frame bookkeeping and delayed-measurement handling that hand-rolled filters routinely botch.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Start from the <code>fuse_step</code> loop. (a) Make the exteroceptive fixes stop entirely after step 15 (simulate a permanent camera failure) and plot <code>trace(P)</code>; confirm it grows without bound, the drift signature. (b) Now simulate <em>slip</em>: for steps 5 to 8, add a large constant bias to <code>u</code> but keep <code>Q</code> unchanged, and show the fused error spikes because the filter still trusts the corrupted process input. (c) Fix it by inflating <code>Q</code> during those steps (a slip-triggered process-noise bump) and explain, in terms of the Kalman gain, why a larger <code>Q</code> makes the next exteroceptive fix correct the state faster.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p class="quiz-question">1. Why does proprioception enter a Bayesian filter as the process model and exteroception as the measurement update, rather than treating both as symmetric observations to average?</p>
+<p class="quiz-question">2. A robot's fused pose is accurate over short maneuvers but slowly wrong over minutes even though its lidar is perfect. Name the most likely culprit, and say whether it lives in \(Q\), \(R\), or the extrinsic calibration.</p>
+<p class="quiz-question">3. Give two distinct situations in which the estimator should temporarily <em>ignore</em> exteroception and coast on proprioception, and state what signal triggers each.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-57.5.html">Section 57.5</a>, we turn the disagreement between proprioception and exteroception from a nuisance into a diagnostic: a large, persistent innovation is not just something to down-weight, it is evidence that a sensor has failed. We build on this fusion loop to detect foot slip, a stuck encoder, or a blinded camera, and to recover safely rather than dead-reckon into a wall.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

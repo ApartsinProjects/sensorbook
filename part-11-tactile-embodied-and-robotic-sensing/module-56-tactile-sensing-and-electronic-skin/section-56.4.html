@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 56.4: Tactile representations and features. Building Sensory AI." name="description"/>
+<title>Section 56.4: Tactile representations and features | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 56: Tactile Sensing and Electronic Skin</a></div>
+<h1>Tactile representations and features</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A finger does not report megapascals. It reports where the world pushed back, how hard, and which way it is starting to slide. My job is to write that down in numbers a network can love."</p>
+<cite>A Recently Fingertipped AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The previous sections gave us the hardware: gel cameras that photograph a deforming membrane (<a class="cross-ref" href="section-56.2.html">Section 56.2</a>) and taxel arrays that read pressure or capacitance across a grid (<a class="cross-ref" href="section-56.3.html">Section 56.3</a>). Raw, both are almost unusable. A GelSight frame is a 320x240 RGB image dominated by illumination, not contact; a 16x16 e-skin patch is a stream of drifting integers. This section is the bridge from those bytes to something a model can reason over. It answers three questions in order: what <em>shape</em> does tactile data actually take (image, grid-over-time, or irregular graph), which <em>handcrafted features</em> (contact area, centroid, normal and shear force, texture spectrum) capture the physics cheaply and interpretably, and when to hand the whole problem to a <em>learned encoder</em> instead. Get the representation right and every downstream task in this chapter, from grasp stability to material recognition, becomes a short classifier on top. Get it wrong and you fight sensor drift and illumination forever.</p>
+</div>
+
+<p>This section assumes you can turn a signal into features (the general toolkit of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>), read a spectrum (<a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>), and reason about learned embeddings for sensor streams (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>). What is new here is the physics of contact, which constrains every feature: touch is local, it carries a direction (normal versus shear), and its signature spans two very different time scales.</p>
+
+<h2>The three shapes of a tactile signal</h2>
+
+<p>Before choosing features you must name the data structure, because it fixes the architecture exactly as the modality axes did in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-01-what-is-sensory-ai/index.html">Chapter 1</a>. Tactile sensors emit one of three shapes.</p>
+
+<p><strong>The tactile image.</strong> A camera-based sensor gives a dense 2D field: raw RGB, or, after photometric stereo, a per-pixel surface-normal map \(\mathbf{n}(u,v)\) that integrates to a height map \(z(u,v)\) of the imprinted geometry. Printed markers add a second field, a displacement vector \(\mathbf{d}(u,v)\) per marker tracking how the gel sheared. This is the richest tactile shape, spatial resolution in the tens of microns, and it is processed like any image with 2D convolutions or a vision transformer.</p>
+
+<p><strong>The taxel grid over time.</strong> A capacitive or piezoresistive array is a low-resolution pressure movie: a tensor of shape \((T, H, W)\) with \(H, W\) in the range of 4 to 32. Treat it as a single-channel video. The spatial dimension is coarse but the temporal dimension is fast, which is where slip and vibration hide.</p>
+
+<p><strong>The irregular graph.</strong> Electronic skin wrapped over a curved robot link is not a grid at all. Taxels sit at scattered 3D positions with a known neighbor topology, so the natural object is a graph whose nodes carry pressure and whose edges carry geodesic distance. This is exactly the setting for the graph neural networks of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a>, and it is why "flatten to a vector" quietly destroys e-skin data: it throws away the geometry that says which taxels are physically adjacent.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Touch is a two-timescale signal, and no single feature window captures both. The <em>quasi-static</em> component (contact shape, area, total force) lives at 1 to 30 Hz and answers "what am I holding and how hard". The <em>dynamic</em> component (incipient slip, texture-induced vibration, making and breaking contact) lives at 100 Hz to several kilohertz and answers "is it moving". A representation that low-pass filters for a clean pressure map has already thrown away the band where slip lives. Good tactile pipelines keep two representations in parallel, one per timescale.</p>
+</div>
+
+<h2>Handcrafted features: geometry, force, and texture</h2>
+
+<p>Before reaching for a network, a handful of physics-grounded features solve a surprising share of tactile tasks, and they stay interpretable, which matters for the safety cases of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>. Group them by the physical question they answer.</p>
+
+<p><strong>Contact geometry.</strong> Threshold the pressure or height field to get a binary contact mask, then read its image moments. The zeroth moment is contact area \(A\); the first moments give the pressure centroid \((\bar u, \bar v)\), the point about which contact torque balances; the second central moments give the covariance whose eigenvectors are the contact's principal axes and whose eigenvalue ratio is its elongation. An edge presses as a thin high-eccentricity blob, a flat face as a broad round one. These few numbers already separate most everyday contact primitives.</p>
+
+<p><strong>Force and its direction.</strong> Summing pressure over the mask estimates total normal force \(F_z\). Direction comes from the marker field: the mean displacement \(\overline{\mathbf{d}}\) is proportional to net shear \((F_x, F_y)\), while the <em>divergence</em> of the displacement field reports normal load and its <em>curl</em> reports applied torque about the contact normal. The ratio of shear magnitude to normal force, compared against an estimated friction coefficient \(\mu\), is the classic incipient-slip signal that <a class="cross-ref" href="section-56.7.html">Section 56.7</a> builds on.</p>
+
+<p><strong>Texture and micro-vibration.</strong> Slide across a surface and fine structure excites vibrations. The features here are spectral, not spatial: band-power, spectral centroid, and roughness estimates from the high-frequency channel, the tactile analogue of the acoustic features in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>. Corduroy and glass differ far more in their vibration spectrum than in any static pressure map.</p>
+
+<p>The code below computes the geometry block from a single pressure frame. It is the seed of a real tactile feature extractor and is referenced again in the exercise.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def contact_features(P, thresh=0.05):
+    """Geometry features from one HxW tactile pressure frame P (>=0)."""
+    mask = P > thresh * P.max()
+    if not mask.any():
+        return dict(area=0, cx=np.nan, cy=np.nan, force=0.0, elong=np.nan)
+
+    ys, xs = np.nonzero(mask)
+    w = P[ys, xs]                       # pressure as pixel weight
+    force = float(w.sum())              # total normal force (uncalibrated)
+    cx = float((w * xs).sum() / w.sum())  # pressure centroid, x
+    cy = float((w * ys).sum() / w.sum())  # pressure centroid, y
+
+    # weighted second central moments -> principal-axis elongation
+    dx, dy = xs - cx, ys - cy
+    cov = np.array([[(w*dx*dx).sum(), (w*dx*dy).sum()],
+                    [(w*dx*dy).sum(), (w*dy*dy).sum()]]) / w.sum()
+    lam = np.linalg.eigvalsh(cov)       # ascending eigenvalues
+    elong = float(np.sqrt(lam[1] / max(lam[0], 1e-9)))
+    return dict(area=int(mask.sum()), cx=cx, cy=cy, force=force, elong=elong)
+
+# a synthetic "edge" contact: a thin diagonal ridge
+P = np.zeros((16, 16))
+for i in range(16):
+    P[i, min(15, i)] = 1.0
+print(contact_features(P))</code></pre>
+<div class="code-caption"><strong>Contact-geometry features from one pressure frame.</strong> Image moments turn a raw grid into five interpretable numbers; the high <code>elong</code> value flags a thin edge contact rather than a flat face, with no training data at all.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a warehouse gripper that knows what it grabbed</h3>
+<p>A logistics robot at a fulfilment center runs a GelSight-style fingertip on a parallel gripper. Before any learned model, the controller computes exactly the five features above at 60 Hz. A near-round high-area contact with rising force means a boxed item is seated: close and lift. A thin high-elongation contact near the fingertip edge means it has caught only the lip of a poly bag, and the mean marker displacement is already climbing toward the friction cone: the grasp planner re-approaches rather than lifting into a drop. None of this needs a neural network, and because the features are physical, a failed pick is auditable after the fact. The learned encoders in the next section earn their keep on the harder residue, deformable and transparent items, not on this bread-and-butter geometry.</p>
+</div>
+
+<h2>Learned tactile representations</h2>
+
+<p>Handcrafted features are transparent but brittle at the edges: they assume you already know which physical quantity matters. When the task is "does this grasp feel stable" across thousands of unseen objects, the mapping from raw gel image to answer is too tangled to hand-design, and you learn the representation instead. Three patterns dominate.</p>
+
+<p><strong>Treat the tactile image as an image.</strong> A ResNet or vision-transformer backbone consumes the raw or normal-map frame and emits an embedding, following the neural-representation playbook of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>. Because a tactile frame really is an image, ImageNet-pretrained weights transfer as a useful initialization, an accident of camera-based tactile hardware that array sensors do not enjoy.</p>
+
+<p><strong>Encode the sequence.</strong> For slip and manipulation, a single frame is not enough; a temporal convolution or transformer over a window produces a spatio-temporal embedding that carries the dynamic band the geometry features drop.</p>
+
+<p><strong>Pretrain without labels.</strong> Tactile labels are expensive (you cannot crowdsource the feel of an object), so self-supervised objectives, contrastive learning across augmented touches or across the visual and tactile views of one contact, learn a general encoder from unlabeled interaction logs. This is the self-supervised recipe of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and it is the direct on-ramp to the tactile foundation models of <a class="cross-ref" href="section-56.5.html">Section 56.5</a>.</p>
+
+<div class="callout research-frontier">
+<h4>Research Frontier</h4>
+<p>The current frontier collapses the "which encoder" question into a single pretrained backbone. Meta AI's <strong>Sparsh</strong> (Higuera et al., CoRL 2024) is a family of self-supervised touch encoders trained on unlabeled data from DIGIT, GelSight, and DIGIT 360, and it beats task-specific hand-tuned pipelines across the <strong>TacBench</strong> suite, precisely because it learns a transferable representation rather than a per-sensor feature set. <strong>T3</strong> (Transferable Tactile Transformers, Zhao et al., 2024) pushes further, pretraining across many sensor bodies so one encoder serves fingertips it never saw, and <strong>UniTouch</strong> aligns tactile embeddings to a shared vision-language space. The through-line for this section: the field is migrating from designing features to <em>reusing a learned tactile representation</em>, exactly as vision did a decade earlier.</p>
+</div>
+
+<h2>Making representations sensor-invariant</h2>
+
+<p>A tactile feature is worthless if it means something different on Tuesday. Three effects break naive representations, and handling them is the unglamorous core of a deployable pipeline.</p>
+
+<p><strong>Zero drift and offset.</strong> Piezoresistive and capacitive taxels drift with temperature and viscoelastic relaxation, so the "no contact" baseline wanders. Always subtract a running no-load reference before extracting features; report pressure relative to baseline, never as a raw reading. This is the tactile instance of the leakage-safe hygiene stressed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: if calibration state leaks across the train and test split, your accuracy is a fiction.</p>
+
+<p><strong>Per-sensor gain.</strong> No two gel fingers or e-skin patches are identical; illumination, membrane thickness, and taxel sensitivity all vary. Normalize each sensor to a common scale (per-taxel min-max or z-scoring against a calibration press) so a model trained on finger A transfers to finger B. Cross-sensor generalization is the headline weakness of hand-tuned tactile systems and the main thing the foundation models above buy back.</p>
+
+<p><strong>Illumination and marker bias (camera sensors).</strong> Convert to a photometric-stereo normal map early. The normal map depends on geometry, not on the LED that happens to be brightest, so it is far more portable across sensor units than raw RGB.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let the sensor SDK do the physics</h3>
+<p>Reconstructing a height map from raw gel RGB by hand means calibrating a lookup table from image gradients to surface normals, then Poisson-integrating, easily 150+ lines of careful numerics. The vendor SDKs ship it.</p>
+<pre class="language-python"><code class="language-python">from digit_interface import Digit          # or gelsight sdk
+d = Digit("D20001"); d.connect()
+frame = d.get_frame()                       # calibrated, baseline-subtracted
+# gelsight_sdk: nn reconstruction to gradients -> height
+gx, gy = reconstructor.get_gradients(frame)
+height  = poisson_reconstruct(gx, gy)       # one call</code></pre>
+<div class="code-caption"><strong>Height reconstruction via a vendor SDK.</strong> The DIGIT and GelSight SDKs handle connection, baseline subtraction, and the gradient-to-height pipeline in a few calls.</div>
+<p>Roughly 150 lines of photometric-stereo and Poisson-integration code shrink to about five, and the SDK owns the per-sensor calibration table you would otherwise have to measure yourself.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend <code>contact_features</code> to return contact <em>orientation</em> in radians, the angle of the principal axis, using the eigenvectors of the covariance matrix (currently it returns only the eigenvalue ratio). (a) Add the angle and test it on the synthetic diagonal ridge; you should recover roughly 45 degrees. (b) Explain in one sentence why orientation is invariant to total force but <code>force</code> is not. (c) The frame is a single snapshot. Name one manipulation-relevant quantity from this section that this function provably cannot compute, and say what extra data it needs.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p class="quiz-question">1. Tactile signals are described as living on two timescales. Which features belong to each, and why does low-pass filtering for a clean pressure map hurt slip detection?</p>
+<p class="quiz-question">2. Why is flattening an e-skin patch into a vector a worse idea than flattening a rigid grid taxel array, and what representation fixes it?</p>
+<p class="quiz-question">3. You train a grasp-stability classifier on gel finger A and it fails on finger B. Name two representation-level fixes before you reach for more data.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-56.5.html">Section 56.5</a>, we take the "reuse a learned representation" thread to its conclusion: tactile foundation models. Sparsh, UniTouch, and T3 replace the per-sensor feature engineering of this section with a single pretrained encoder that transfers across sensor bodies and tasks, and we will see what they can and cannot do, and how they connect to the visuo-tactile fusion of <a class="cross-ref" href="section-56.6.html">Section 56.6</a>.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

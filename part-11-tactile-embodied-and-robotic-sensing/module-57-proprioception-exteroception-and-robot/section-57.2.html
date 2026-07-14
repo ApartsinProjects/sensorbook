@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.2: Exteroceptive fusion for navigation. Building Sensory AI." name="description"/>
+<title>Section 57.2: Exteroceptive fusion for navigation | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Exteroceptive fusion for navigation</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"The lidar swore the corridor was clear. The depth camera saw a glass door. I trusted the one that was wrong about glass, and now I am part of the door."</p>
+        <cite>A Chastened AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the body-state sensing of <a class="cross-ref" href="section-57.1.html">Section 57.1</a> (wheel odometry and IMU), which supplies the moving frame that exteroceptive readings are stamped into. It draws on the range-sensing physics of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-40-depth-and-3d-sensing-fundamentals/index.html">Chapter 40</a> and the lidar geometry of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a>, the fusion taxonomy of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>, and the recursive-estimation view of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. It is a companion to, not a duplicate of, the map-building of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>: here the map is a means to the immediate end of moving safely.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Proprioception tells a robot where its body is; exteroception tells it where the <em>world</em> is. Navigation lives entirely in the second category, and no single exteroceptive sensor is trustworthy enough to steer by alone. A 2D lidar is crisp and long-range but sees one horizontal slice and is fooled by glass and by a table it passes underneath. A depth camera sees a dense frustum but only a few meters ahead and blinks in sunlight. Sonar is cheap and catches glass but is angularly blurry. Fusion for navigation is the discipline of pouring all of these, each with its own field of view, range, and failure surface, into one shared spatial representation that a motion planner can query with a single question: is the cell in front of me free or occupied. This section builds that representation and shows why the fusion happens in a common metric grid rather than in the sensors themselves.</p>
+    </div>
+
+    <h2>What navigation asks of exteroception</h2>
+    <p>A mobile robot planner does not want raw point clouds; it wants a decision surface. Concretely it needs two products. The first is a <em>local obstacle field</em>: for every patch of ground within a few meters, is it safe to drive over. The second is a <em>global position fix</em>: where is the robot in a map frame that does not drift, so a goal expressed as "the loading dock" stays put as the robot moves. Exteroceptive fusion produces both, and they have different tempos. The obstacle field must refresh at sensor rate (10 to 30 Hz) because a forklift can appear in a tenth of a second. The global fix can update slowly because the world's geometry does not move. Recognizing that navigation is really two fusion problems at two timescales, not one, is the first design decision, and it explains why production stacks keep a fast local costmap separate from a slow global localizer.</p>
+    <p>Both products are fusion in the strict sense of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a>: they combine sources that are individually incomplete. The lidar defines the obstacle field's outline; the depth camera fills the low overhangs the lidar's single scan-plane misses; sonar patches the glass the other two pass straight through. The point is not redundancy but coverage of each other's blind spots.</p>
+
+    <h2>One robot, many sensors, one frame</h2>
+    <p>You cannot fuse readings that live in different coordinate frames, and every exteroceptive sensor reports in its own. A lidar return is a range and bearing in the lidar's frame, bolted somewhere on the chassis; a depth pixel is a point in the camera's optical frame, tilted down at the floor. The bridge is a static transform tree: each sensor's mounting pose relative to a common robot base is measured once, and forward kinematics (from <a class="cross-ref" href="section-57.1.html">Section 57.1</a>) plus the odometry pose place that base in the world. Composing the chain lets a depth point and a lidar return be written as coordinates of the same metric grid cell, which is the precondition for fusing them at all.</p>
+    <p>This registration inherits the calibration discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: a two-degree error in a sensor's mounting angle throws a return at five meters off by roughly seventeen centimeters, enough to hallucinate an obstacle in a clear doorway or, worse, to erase a real one. Time alignment matters just as much. A scan captured while the robot spins must be stamped with the pose <em>at capture time</em>, not at arrival time, or the whole scan smears; this is the synchronization problem of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> reappearing as motion distortion.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Navigation fuses in the <em>map</em>, not in the sensor. Rather than train one network to consume lidar, depth, and sonar jointly, the classical and still-dominant approach projects every sensor independently into a shared occupancy grid and lets the grid be the fusion operator. This works because occupancy is additive in log-odds: two sensors that both see a cell as occupied reinforce each other by simple summation, and a sensor's blind spot contributes nothing rather than a confident zero. The grid is a late-fusion substrate that is robust precisely because it demands no agreement about sensor models, only a shared frame and a per-sensor hit-or-miss vote.</p>
+    </div>
+
+    <h2>The occupancy grid as a fusion substrate</h2>
+    <p>The workhorse representation is the probabilistic occupancy grid (Moravec and Elfes, 1985): tile the ground into cells, and hold for each cell the posterior probability that it is occupied. The elegant part is the update. Storing occupancy in <em>log-odds</em> turns Bayesian fusion into addition. For cell \(m\) with prior log-odds \(l_0\), each measurement \(z_t\) contributes an inverse-sensor-model term, and the running estimate is
+    $$l_t(m) = l_{t-1}(m) + \operatorname{logit}\, p(m \mid z_t) - l_0.$$
+    A ray that passes through a cell and ends beyond it votes "free" (a negative term); the cell where the ray terminates votes "occupied" (a positive term); unobserved cells are untouched. Because the terms simply sum, a depth camera and a lidar contribute to the same accumulator with no special fusion logic, and a sensor that never illuminates a cell leaves its estimate at the prior instead of corrupting it. Listing 57.2.1 implements one sensor's contribution for a 2D ray so the mechanism is concrete.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+L_OCC, L_FREE, L_MIN, L_MAX = 0.85, -0.4, -5.0, 5.0   # log-odds votes and clamps
+
+def integrate_ray(logodds, res, origin, angle, rng, max_rng):
+    """Fuse one range return into a log-odds occupancy grid (in place).
+    logodds: HxW grid; res: metres/cell; origin: sensor (x,y) in metres."""
+    hit = rng < max_rng                      # a miss = no obstacle seen, only free space
+    end = min(rng, max_rng)
+    n = int(end / res)
+    ox, oy = origin
+    for k in range(n):                       # walk the beam, marking free space
+        x = int((ox + k * res * np.cos(angle)) / res)
+        y = int((oy + k * res * np.sin(angle)) / res)
+        if 0 <= y < logodds.shape[0] and 0 <= x < logodds.shape[1]:
+            logodds[y, x] = np.clip(logodds[y, x] + L_FREE, L_MIN, L_MAX)
+    if hit:                                   # only a true return marks a cell occupied
+        x = int((ox + rng * np.cos(angle)) / res)
+        y = int((oy + rng * np.sin(angle)) / res)
+        if 0 <= y < logodds.shape[0] and 0 <= x < logodds.shape[1]:
+            logodds[y, x] = np.clip(logodds[y, x] + L_OCC, L_MIN, L_MAX)
+
+def prob(logodds):                            # recover occupancy probability when queried
+    return 1.0 - 1.0 / (1.0 + np.exp(logodds))</code></pre>
+    <div class="code-caption"><strong>Listing 57.2.1.</strong> Log-odds occupancy update for a single range beam. Calling <code>integrate_ray</code> once per lidar bearing and once per depth column, into the <em>same</em> <code>logodds</code> grid, fuses the two sensors by summation. The <code>clip</code> bounds keep any one sensor from saturating a cell, so a later disagreeing sensor can still change the estimate; the miss-versus-hit distinction is what lets a clear beam carve out free space.</div>
+
+    <p>As Listing 57.2.1 shows, "fusion" here is nothing more than routing several sensors' rays into one accumulator, which is why the occupancy grid has survived four decades of navigation research. The clamps matter for navigation dynamics: bounding the log-odds keeps the map <em>adaptive</em>, so when a parked pallet is removed the cell can be voted back to free within a few scans instead of staying occupied forever.</p>
+
+    <h2>From occupancy to a plannable costmap</h2>
+    <p>A raw occupancy grid is not yet a thing a planner can drive on, because a robot has width and a cell marked "occupied" is dangerous for a whole robot-radius around it. Production navigation wraps the fused occupancy in a <em>layered costmap</em>: an obstacle layer that integrates the live sensors exactly as above, an inflation layer that grows a safety cushion around obstacles by the robot's footprint, and often a static layer holding the prior map from <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>. The layers compose top to bottom into a single cost field the planner queries. Keeping each sensor and each concern in its own layer is what makes the stack debuggable: when the robot freezes in an open hallway, you can switch off the sonar layer and watch the phantom obstacle vanish.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Hand-rolling multi-sensor fusion, ray-casting, footprint inflation, and layer composition into a real-time costmap is on the order of 1500 to 2500 lines of C++ once you handle transform lookups, out-of-range clearing, and rolling windows. The Nav2 <code>costmap_2d</code> package delivers all of it as configuration:</p>
+        <pre class="language-yaml"><code class="language-yaml">local_costmap:
+  plugins: ["obstacle_layer", "inflation_layer"]
+  obstacle_layer:
+    observation_sources: laser depth      # both sensors fuse into one grid
+    laser: {topic: /scan,        data_type: LaserScan,     clearing: true, marking: true}
+    depth: {topic: /camera/points, data_type: PointCloud2, clearing: true, marking: true}
+  inflation_layer: {inflation_radius: 0.55, cost_scaling_factor: 3.0}</code></pre>
+        <div class="code-caption"><strong>Listing 57.2.2.</strong> A Nav2 layered costmap fusing a laser scan and a depth point cloud, replacing roughly 2000 lines of custom grid, ray-casting, and inflation code with a dozen lines of YAML. The library owns the geometry and the real-time bookkeeping; deciding <em>which</em> sensors to trust for marking versus clearing, and how large the inflation cushion should be, remains your engineering judgment.</div>
+        <p>The wiring of <code>costmap_2d</code> into a running robot is the subject of <a class="cross-ref" href="section-57.7.html">Section 57.7</a>; here the point is that the fusion is a solved, reusable substrate.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h4>In the field: a warehouse AMR that kept stopping at glass loading doors</h4>
+        <p>A fleet of autonomous mobile robots (AMRs) ran a single 2D safety lidar and navigated cleanly until the loading bays were fitted with glass roll-up doors. The lidar passed straight through the glass, mapped the truck bay behind it as free space, and the robots drove into the doors. The fix was pure exteroceptive fusion: they added a downward-canted depth camera and a ring of ultrasonic sensors, and configured all three as marking sources in one obstacle layer like Listing 57.2.2. Sonar reflects off glass and voted the door occupied; the depth camera caught the low pallet jacks the lidar's scan-plane sailed over; the lidar still owned the long-range corridor picture. Door collisions went to zero, and the low-obstacle near-misses that nobody had been tracking dropped sharply as a side effect. The lesson is that the fix was not a better sensor but a <em>second and third</em> sensor covering the first one's specific blindness, fused in the grid where their disagreements resolve by voting.</p>
+    </div>
+
+    <h2>Folding in a global fix</h2>
+    <p>The obstacle field keeps the robot from hitting things, but it drifts with the odometry it is stamped against, so a goal set an hour ago slowly wanders. The second fusion product corrects this: exteroceptive readings are matched against a prior map to produce a drift-free pose in the map frame. Two mechanisms dominate. Scan-matching localization (adaptive Monte Carlo localization, AMCL) aligns the live lidar scan to the static map and outputs a corrected pose; where the sky is visible, a GNSS fix from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a> supplies an absolute anchor. Either way, the global fix is fused with the fast odometry through a recursive estimator in the Kalman family of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, so the pose is smooth between corrections and accurate across them. The deep interplay between this exteroceptive fix and the proprioceptive dead-reckoning that carries the robot between fixes is important enough to get its own treatment in <a class="cross-ref" href="section-57.4.html">Section 57.4</a>; here it is enough that the global fix and the local costmap are separate, cooperating products.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The frontier is moving beyond the flat occupancy grid toward learned, three-dimensional navigation substrates. Bird's-eye-view and 3D-occupancy networks (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>) fuse multiple cameras and lidar into a dense, semantic occupancy volume that distinguishes drivable pavement from a curb the way a binary grid never could, and neural-field maps (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-51-neural-fields-and-gaussian-splatting-for-sensing/index.html">Chapter 51</a>) hold a continuous, queryable geometry instead of a fixed lattice. Open problems are running these representations inside the tens-of-milliseconds latency budget of a moving robot (<a class="cross-ref" href="section-57.6.html">Section 57.6</a>), and giving them the calibrated uncertainty (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) that the humble log-odds grid provides almost for free.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Simulate two range sensors observing a small 2D scene with a glass wall (invisible to sensor A, opaque to sensor B) and a low obstacle (visible to A, invisible to B). Using Listing 57.2.1, integrate both sensors' beams into one shared log-odds grid, then into two separate grids. Threshold each to occupied/free and compare against ground truth. Quantify how many cells the fused grid gets right that neither single-sensor grid does, and identify the cell type where the fused grid still fails. Then vary <code>L_MIN</code> and observe how quickly a removed obstacle is forgotten.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Navigation fusion produces two separate products at two tempos. Name them and explain why keeping them separate is a deliberate design choice rather than an implementation accident.</p>
+        <p class="quiz-question">2. Why does storing occupancy in log-odds turn multi-sensor fusion into simple addition, and what does clamping the log-odds buy you when a parked obstacle later drives away?</p>
+        <p class="quiz-question">3. A robot repeatedly stops in the middle of a clear corridor. Give two specific fusion-side causes (one registration-related, one sensor-model-related) and how the layered-costmap structure helps you isolate which one it is.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>The fused occupancy field of this section answers "is this cell free," but it treats every obstacle as an anonymous blob of geometry. A navigating robot in a warehouse full of moving people and forklifts needs more: it must know that <em>this</em> blob is a person walking left and <em>that</em> one is a pallet at rest. In <a class="cross-ref" href="section-57.3.html">Section 57.3</a>, we add the detection and tracking layer that turns the fused sensor stream into labeled, persistent objects with velocities, the representation a planner needs to yield to a pedestrian rather than merely swerve around a wall of points.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

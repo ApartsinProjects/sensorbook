@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.3: Detection and tracking in the perception stack. Building Sensory AI." name="description"/>
+<title>Section 57.3: Detection and tracking in the perception stack | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>Detection and tracking in the perception stack</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A detector told me there was a pedestrian. The next frame told me there was a pedestrian. It never once told me it was the same pedestrian, and that omission is where robots get people killed."</p>
+<cite>A Frame-Amnesiac AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a robot needs to track, not just detect</h3>
+<p>A detector answers "what is in this frame, and where." A robot needs to answer "which of the things I saw last frame is this, how fast is it moving, and where will it be when my arm or wheel gets there." That gap between per-frame recognition and a persistent, moving-object world model is the job of the detection-and-tracking stage of the perception stack. It sits after the exteroceptive front end of <a class="cross-ref" href="section-57.2.html">Section 57.2</a> and before the planner: cameras and lidar produce raw measurements, a detector turns each frame into a set of object hypotheses, and a tracker stitches those hypotheses across time into <em>tracks</em>, each carrying an identity, a state estimate, and an uncertainty. Without the tracker the robot is a strobe-light perceiver that re-discovers the world every 30 to 100 milliseconds and can never estimate velocity, predict intent, or notice that an object vanished behind an occluder and came back. This section builds that stage: the detect-then-track architecture, the data-association problem at its core, and the track lifecycle that keeps the world model honest.</p>
+</div>
+
+<p>This section assumes you know the recursive Bayes filter and the constant-velocity Kalman model from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and that you have met the detectors that produce the inputs here: 3D boxes from point clouds in <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-42-point-clouds-and-lidar-ai/index.html">Chapter 42</a> and the bird's-eye-view detectors of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-43-bev-perception-and-3d-occupancy/index.html">Chapter 43</a>. The tracker treats the detector as a black-box measurement source; what is new is the machinery that gives those measurements memory.</p>
+
+<h2>The detect-then-track architecture</h2>
+<p>The dominant paradigm in robotics is <em>tracking-by-detection</em>. Every frame, a detector emits a list of detections \(\{z_1, \dots, z_m\}\), each a box, a class label, a confidence, and often a lidar-derived position and extent. The tracker maintains a set of tracks \(\{T_1, \dots, T_n\}\), each a Kalman-style state (position, velocity, size, heading) with a covariance. One tracking cycle is three steps. <strong>Predict:</strong> propagate every track's state forward by the elapsed time with a motion model, inflating covariance. <strong>Associate:</strong> decide which detection, if any, belongs to which track. <strong>Update:</strong> for matched pairs, correct the track with the detection; for unmatched detections, consider spawning new tracks; for unmatched tracks, coast on prediction and eventually delete.</p>
+<p>Why separate detection from tracking at all, rather than train one network to output tracks end to end? Because the two stages have different failure modes and different time constants. A detector is a stateless pattern recognizer you can train, validate, and swap on a leakage-safe benchmark (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>) without touching the temporal logic. The tracker is a lightweight recursive estimator that runs in microseconds and encodes physics and identity constraints a single-frame network has no way to represent. Keeping them modular means a false negative in one frame is survivable: the track coasts on its motion model until the detector reacquires. That graceful degradation is exactly why safety-critical stacks keep an explicit filter in the loop rather than trusting a monolithic network.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Association is the hard part, not detection</h3>
+<p>Newcomers assume the detector is where accuracy lives. In a mature stack the detector is usually good enough, and the errors that reach the planner are association errors: two pedestrians who cross paths swap identities, so their velocity estimates flip and the planner briefs for a collision that will not happen; a parked car's track jumps onto a passing cyclist; a reflection spawns a ghost track that triggers phantom braking. The metric that captures this, IDF1 and the identity-switch count in the MOT and nuScenes tracking benchmarks, is often what separates a demo from a deployable system. Get association right and a mediocre detector still yields stable tracks; get it wrong and a perfect detector still produces a schizophrenic world model.</p>
+</div>
+
+<h2>Data association: the gating and assignment problem</h2>
+<p>Association is a matching between \(n\) tracks and \(m\) detections. Two ideas make it tractable. First, <em>gating</em>: a detection can only match a track if it falls within a plausibility region around the track's prediction. The natural region is the Mahalanobis distance in the measurement space, since the Kalman filter already gives us the innovation covariance \(S\):</p>
+$$ d^2(T_i, z_j) = (z_j - \hat{z}_i)^\top S_i^{-1} (z_j - \hat{z}_i), $$
+<p>and we admit a pair only if \(d^2\) is below a chi-square threshold for the measurement dimension. Gating throws away impossible pairings cheaply and shrinks the assignment problem. Second, <em>global assignment</em>: among the surviving candidate pairs, choose the one-to-one matching that minimizes total cost. Greedy nearest-neighbor is fast but makes locally-good, globally-bad choices when objects are dense; the Hungarian algorithm solves the linear assignment optimally in \(O(k^3)\), which is trivial for the few dozen objects a robot tracks at once. The cost can be Mahalanobis distance, negative 3D IoU between predicted and detected boxes, or, in modern trackers, a blend of geometric distance and a learned appearance-embedding distance so that identity survives a few frames of occlusion.</p>
+<p>The code below runs one full associate-and-update cycle: predict a set of constant-velocity tracks, gate and solve the assignment with the Hungarian method, then Kalman-update the matches. It is the beating heart of every tracking-by-detection system, and it is under 40 lines.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+def associate_and_update(tracks, dets, dt, R, gate=9.21):
+    """tracks: list of dicts with state x=[px,py,vx,vy] and cov P.
+       dets: array of measured positions [px,py]. Returns updated tracks."""
+    F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]])  # const-velocity
+    H = np.array([[1,0,0,0],[0,1,0,0]])                         # observe position
+    Q = 0.1 * np.eye(4)
+
+    # 1) PREDICT every track forward.
+    for t in tracks:
+        t["x"] = F @ t["x"]
+        t["P"] = F @ t["P"] @ F.T + Q
+
+    # 2) Build a gated Mahalanobis cost matrix (tracks x detections).
+    cost = np.full((len(tracks), len(dets)), 1e6)
+    for i, t in enumerate(tracks):
+        S = H @ t["P"] @ H.T + R          # innovation covariance
+        Sinv = np.linalg.inv(S)
+        for j, z in enumerate(dets):
+            y = z - H @ t["x"]            # innovation
+            d2 = float(y @ Sinv @ y)
+            if d2 < gate:                 # chi-square gate, 2 dof, ~99%
+                cost[i, j] = d2
+
+    # 3) Optimal one-to-one assignment, then KF update on valid matches.
+    rows, cols = linear_sum_assignment(cost)
+    for i, j in zip(rows, cols):
+        if cost[i, j] >= 1e6:            # gated out: not a real match
+            continue
+        t = tracks[i]
+        S = H @ t["P"] @ H.T + R
+        K = t["P"] @ H.T @ np.linalg.inv(S)      # Kalman gain
+        t["x"] = t["x"] + K @ (dets[j] - H @ t["x"])
+        t["P"] = (np.eye(4) - K @ H) @ t["P"]
+        t["hits"] = t.get("hits", 0) + 1
+    return tracks
+</code></pre>
+<div class="code-caption">One predict-gate-assign-update cycle of a tracking-by-detection filter. The chi-square gate at 9.21 admits matches inside the 99% ellipse for a 2-DOF position measurement; <code>linear_sum_assignment</code> is the Hungarian solver. This is the exact loop the practical example below runs at 10 Hz.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">A production tracker in a handful of lines</h3>
+<p>The loop above is the teaching version. A deployable multi-object tracker also needs track birth and death, appearance embeddings, camera-motion compensation, and Kalman bookkeeping for boxes, easily 600 to 900 lines to do well. Libraries such as <code>boxmot</code> (which packages ByteTrack, OC-SORT, BoT-SORT, and DeepOCSORT) collapse that to a constructor and one call per frame:</p>
+<pre><code class="language-python">from boxmot import ByteTrack
+tracker = ByteTrack()
+# dets: (N, 6) array of [x1, y1, x2, y2, conf, class]
+tracks = tracker.update(dets, frame)   # (M, 8): boxes + persistent track id
+</code></pre>
+<div class="code-caption">Persistent multi-object tracking in two lines with <code>boxmot</code>. The library owns gating, Hungarian assignment, track lifecycle, and re-identification embeddings, turning roughly 700 lines of tracker into one <code>update</code> call while leaving the detector choice to you.</div>
+<p>Reach for the library in production; write the loop yourself once, so you can debug an identity switch when the library's defaults do not fit your sensor geometry.</p>
+</div>
+
+<h2>Track lifecycle: birth, confirmation, coasting, and death</h2>
+<p>A world model that trusts every detection instantly is noisy; one that never lets go of a track hallucinates. The lifecycle policy manages that tradeoff with a small state machine. A new detection with no matching track opens a <em>tentative</em> track. It is promoted to <em>confirmed</em> only after it is matched in some number of consecutive frames (a hit streak), which rejects single-frame false positives such as sensor glitches or reflections. A confirmed track that misses detections <em>coasts</em>: it keeps predicting through the gap, its covariance growing, so it survives brief occlusions and detector dropouts. If it goes unmatched for too long (a miss streak past a threshold, roughly one second of coasting for road users), it is <em>deleted</em>. The ByteTrack insight worth internalizing is to associate in two passes: match high-confidence detections first, then give the leftover low-confidence detections a second chance to continue existing tracks rather than discarding them, which recovers objects that dim during occlusion without admitting them as new tracks.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Automotive: keeping a cyclist alive behind a bus</h3>
+<p>A delivery robot merging into a bike lane runs a lidar BEV detector at 10 Hz feeding the tracker above. A cyclist approaches from behind and is briefly fully occluded by a parked bus for about 0.8 seconds. During the occlusion the detector returns nothing for that object, so the cyclist's track goes unmatched. Because the track is confirmed, it coasts: the constant-velocity model carries the estimate forward at the last known 6 m/s, and its position covariance grows each frame, widening the gate. When the cyclist reappears past the bus, the new detection lands inside that inflated gate, the Hungarian solver rebinds it to the same track id, and the Kalman update snaps the estimate back with no identity switch. The planner therefore sees one continuous cyclist with a stable velocity, not a stranger materializing at close range, and yields correctly. Without lifecycle coasting the robot would have deleted the track at second frame of occlusion and treated the reappearance as a sudden intrusion, triggering a hard brake in traffic.</p>
+</div>
+
+<h2>Where learning enters, and the honest limits</h2>
+<p>Two components of this stage are increasingly learned rather than hand-tuned. The <em>appearance embedding</em> that lets association survive long occlusions is a small network producing a per-detection feature vector, so the assignment cost blends geometry with visual identity (DeepSORT, BoT-SORT, DeepOCSORT). And end-to-end <em>tracking transformers</em> such as MOTR and query-based 3D trackers propagate object queries across frames so association is implicit in the attention, drawing on the sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. The tradeoff is the recurring one of this book: the learned tracker can exploit appearance cues a Kalman filter cannot, but it is a black box whose failure under distribution shift is hard to bound, whereas the explicit filter degrades predictably and its covariance is a calibrated uncertainty a planner can reason about (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>). Safety-critical robots today keep the explicit filter and treat learned components as cost terms inside it. A second honest limit: the constant-velocity model in the code assumes objects do not accelerate hard, which is fine for cars and wrong for a bouncing ball or a darting toddler; those cases need the interacting-multiple-model and nonlinear filters of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>. And every track this stage produces is only as trustworthy as the association upstream of the fusion in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>: a swapped identity poisons everything downstream.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The frontier is unifying detection and tracking in one query-based model that also fuses modalities. On the nuScenes tracking benchmark, camera-lidar trackers built on transformer detection heads (the BEVFusion and TransFusion lineage, and 3D adaptations of MOTR-style query propagation) close the gap to lidar-only trackers while adding appearance robustness. Standalone tracker heads such as SimpleTrack, CenterPoint tracking, and the ByteTrack and OC-SORT family remain the pragmatic baselines because they are modular and fast, and they still top many leaderboards on identity metrics. The open questions are joint calibration of detection confidence and track uncertainty so the two are consistent, long-horizon identity through minute-scale occlusions, and open-vocabulary tracking of object classes the detector was never trained on, an ability the vision-language-action models of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a> begin to promise.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: provoke an identity switch, then prevent it</h3>
+<p>Using the <code>associate_and_update</code> function, simulate two objects moving in straight lines that cross paths at the origin, sampling their positions with small Gaussian noise at 10 Hz. (1) Run the tracker through the crossing and count identity switches (a switch is when a track id ends up bound to the other object's trajectory). (2) Explain geometrically why the crossing induces the switch when the cost is position-only. (3) Add a scalar "appearance" feature to each object (say a color value that differs between them), include an appearance term in the cost matrix, and show the switch disappears. (4) State one real-world case where even the appearance term fails and coasting is the only defense.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>State the three steps of one tracking-by-detection cycle and say what happens to a detection that matches no track and to a track that matches no detection.</li>
+<li>Why is the Mahalanobis distance, rather than plain Euclidean distance, the right gating metric between a predicted track and a detection? What does the filter supply that makes it computable?</li>
+<li>A confirmed track coasts through a 0.8 s occlusion and reacquires with no identity switch. Which two lifecycle mechanisms made that possible, and what would break if the miss-streak deletion threshold were set to a single frame?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-57.4.html">Section 57.4</a>, we fuse the exteroceptive tracks built here with the robot's own proprioceptive state from <a class="cross-ref" href="section-57.1.html">Section 57.1</a>: the tracker estimates where the world is, but those estimates are expressed in a sensor frame that is itself moving, so knowing the robot's own motion is what lets a coasting track stay anchored while the robot drives past it.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

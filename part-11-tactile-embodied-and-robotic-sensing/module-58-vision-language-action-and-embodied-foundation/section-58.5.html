@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.5: Humanoid and general robot foundation models (GR00T, Gemini Robotics). Building Sensory AI." name="description"/>
+<title>Section 58.5: Humanoid and general robot foundation models (GR00T, Gemini Robotics) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>Humanoid and general robot foundation models (GR00T, Gemini Robotics)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You gave it a body with forty joints and asked it to think fast and move faster. So it grew two brains and stopped arguing with itself."</p>
+        <cite>A Two-Minded AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on the generalist-policy recipe of <a class="cross-ref" href="section-58.3.html">Section 58.3</a> and the continuous, flow-matching action heads of <a class="cross-ref" href="section-58.4.html">Section 58.4</a>. It assumes the robot-perception vocabulary (proprioception, exteroception, the sensing stack of a mobile manipulator) from <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>, the multimodal grounding argument of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, and the synthetic-data pipelines of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>. Cross-embodiment data itself is treated in <a class="cross-ref" href="section-58.6.html">Section 58.6</a>; here we care about the models built to absorb it.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The policies of the previous sections mostly drive one tabletop arm. A humanoid is a harder object: two arms, dozens of joints, legs or a wheeled base, a moving head with cameras, and a whole-body balance problem that couples every action to every other. It also has the least data of any robot, because teleoperating forty degrees of freedom is slow and expensive. Humanoid and general-robot foundation models (NVIDIA's GR00T and Google DeepMind's Gemini Robotics) answer this with two moves. First, a <strong>dual-brain architecture</strong> that splits slow, semantic reasoning from fast, reactive control, so a heavy vision-language model does not have to run at motor rates. Second, a <strong>data pyramid</strong> that pretrains on abundant human video and synthetic rollouts and reserves scarce real-robot demonstrations for the top. This section is about those two ideas and what they mean when the body has legs.</p>
+    </div>
+
+    <h2>Why a humanoid needs a different kind of model</h2>
+    <p>A generalist tabletop policy assumes a fixed camera, a 7-DoF arm, and a stable base. A humanoid breaks all three assumptions at once. The <em>what</em> changes: the action space is now a high-dimensional whole-body command (both arms, hands with many fingers, torso, neck, and a base or legs), and the observations arrive from cameras that move because the robot moves its own head. The <em>why it is hard</em> is data scarcity multiplied by dimensionality. Collecting demonstrations for a 40-DoF system by teleoperation is far slower than for a single arm, so the naive path of "record a million trajectories on this exact robot" is closed. And the balance coupling means a policy cannot treat the arms in isolation; a reach that shifts the center of mass must be compensated elsewhere in the same command. The design response is to stop asking one network to do everything at once and instead separate the timescales of cognition and control, an idea borrowed almost directly from the fast-and-slow account of human thinking.</p>
+
+    <h2>GR00T: two systems and a data pyramid</h2>
+    <p>NVIDIA's Isaac GR00T N1 is an open foundation model for humanoids built around an explicit <strong>System 2 / System 1</strong> split. System 2 is a vision-language model (an Eagle-family VLM) that runs slowly, perhaps a few hertz, and produces a semantic latent: it reads the cameras and the instruction and decides <em>what</em> to do. System 1 is a <strong>diffusion transformer</strong> action head that runs fast, well above 100 Hz, conditioned on that latent plus the robot's proprioception, and generates the smooth motor <em>chunks</em> that actually move the joints. The two are trained together but decoupled in the loop, so the expensive VLM does not gate the control rate. The action head factorizes as a chunk distribution over a horizon \(H\), conditioned on the slow latent \(\mathbf{z}\), the recent observations, and the proprioceptive state \(\mathbf{q}\):</p>
+    $$\pi_\theta(\mathbf{a}_{t:t+H} \mid \mathbf{z},\, \mathbf{o}_{t-k:t},\, \mathbf{q}_t),\qquad \mathbf{z} = f_{\text{VLM}}(\mathbf{o}_t,\, \ell).$$
+    <p>The second idea is the <strong>data pyramid</strong>. The base is the widest and cheapest: internet-scale human video, from which the model learns how hands approach objects and how tasks decompose, with latent actions inferred rather than measured. The middle is synthetic data generated in simulation and by neural trajectory augmentation, the digital-twin and domain-randomization machinery of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>. The narrow, precious top is real teleoperated robot data. Pretraining flows bottom to top so the scarce real data mostly has to <em>align</em> an already-competent model to a specific body rather than teach manipulation from nothing. Because it is openly released, GR00T is also the natural on-ramp for a lab that wants to study the recipe rather than admire it from outside.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The System 2 / System 1 split is not a packaging convenience, it is what makes the latency budget feasible. A 2-billion-parameter VLM cannot run in a 200 Hz balance loop, and a network small enough for that loop cannot ground an open-vocabulary instruction. Separating them lets each operate at its natural rate: semantics at a few hertz, motor commands two orders of magnitude faster, joined by a low-dimensional latent. The same principle recurs in Gemini Robotics as an on-board fast policy backed by an off-board reasoning model, and it echoes the predictive-rollout logic of the world models in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>: think slowly about the plan, act quickly on the world.</p>
+    </div>
+
+    <h2>Gemini Robotics: embodied reasoning meets dexterous control</h2>
+    <p>Google DeepMind's Gemini Robotics takes a large multimodal model, Gemini, and pushes it into the physical world along two tracks. <strong>Gemini Robotics-ER</strong> (embodied reasoning) is a vision-language model tuned to reason about space, contacts, and affordances: it can point to where a grasp should go, estimate object poses, and predict trajectories, without directly emitting motor commands. <strong>Gemini Robotics</strong> proper is the vision-language-action model that closes the loop and produces actions, and it is notable for dexterity (folding, wrapping, fine bimanual manipulation) and for <em>steerability</em>, meaning it follows nuanced natural-language corrections mid-task. Two properties matter most for a sensing-systems reader. First, strong <strong>generalization</strong>: because the backbone inherits Gemini's world knowledge, the policy handles objects, instructions, and environments outside its robot training set, the open-vocabulary transfer argued for in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. Second, an explicit <strong>on-device</strong> variant, Gemini Robotics On-Device, runs the policy locally on the robot for low latency and offline operation, which pulls the whole architecture squarely into the edge-deployment constraints of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a bimanual humanoid on a light-assembly line</h3>
+        <p>A contract manufacturer wants an Apptronik-class humanoid to assemble a small consumer product: pick a housing with one hand, thread a cable with the other, seat a clip, and place the unit on a conveyor. From-scratch teleoperation of the two-armed sequence yields only a few hundred episodes in a week, nowhere near enough for a fresh policy. Instead the team fine-tunes an openly released GR00T checkpoint. The slow System 2 model already parses "seat the clip on the left tab" from the wrist and head cameras; the fast diffusion head, adapted on those few hundred episodes plus thousands of simulated variations, produces the compliant, coordinated two-arm motion. When a supervisor says "rotate the housing before you thread it," the model's steerable, language-conditioned reasoning adjusts without a code change. The scarce real data did what the pyramid promises: it aligned a competent model to one body and one cell, rather than teaching manipulation from zero.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Wiring a dual-system humanoid policy by hand (a VLM encoder, a proprioception projector, a diffusion action head, the observation and action normalization per embodiment, and the asynchronous slow/fast loop) is a multi-hundred-line effort, roughly 400 to 700 lines before you have anything that moves a joint. The open Isaac GR00T release collapses inference to about five lines through <code>Gr00tPolicy</code>: it loads the checkpoint, applies the correct per-embodiment data transforms, runs both systems, and returns a de-normalized action chunk. You supply cameras, state, and an instruction; the library owns the tokenizers, the sampler, and the un-normalization.</p>
+    </div>
+
+    <p>The snippet below shows that inference path for GR00T: a multi-camera-plus-proprioception observation and a language goal in, a whole-body action chunk out, ready for the low-level controller. It is the code behind the assembly-cell story above.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from gr00t.model.policy import Gr00tPolicy
+from gr00t.data.embodiment_tags import EmbodimentTag
+
+# Load the open humanoid foundation model with its embodiment-specific transforms.
+policy = Gr00tPolicy(
+    model_path="nvidia/GR00T-N1.5-3B",
+    embodiment_tag=EmbodimentTag.GR1,          # selects joints + action stats
+    device="cuda",
+)
+
+# One observation step: head + wrist cameras, joint state, and the instruction.
+obs = {
+    "video.ego_view":   np.zeros((1, 256, 256, 3), dtype=np.uint8),   # head cam
+    "video.wrist_view": np.zeros((1, 256, 256, 3), dtype=np.uint8),   # wrist cam
+    "state.joints":     np.zeros((1, 40), dtype=np.float32),          # proprioception
+    "annotation.human.task_description": ["seat the clip on the left tab"],
+}
+
+action = policy.get_action(obs)          # runs System 2 (slow) + System 1 (fast)
+print(action["action.joints"].shape)     # -> (H, 40): a whole-body action chunk
+</code></pre>
+    <div class="code-caption">GR00T inference through <code>Gr00tPolicy</code>. The <code>embodiment_tag</code> selects the joint layout and the per-robot action statistics baked into the checkpoint, which is the cross-embodiment hook that lets one model drive different humanoids. The returned chunk of \(H\) future whole-body commands is what the section calls action chunking.</div>
+
+    <p>Two failure modes deserve naming, both amplified by the extra degrees of freedom. First, <strong>embodiment-tag mismatch</strong>: point the policy at the wrong joint layout or action statistics and it emits confident, physically wrong whole-body commands, with no signal in the loss to warn you, the higher-dimensional cousin of the action-space mismatch from <a class="cross-ref" href="section-58.3.html">Section 58.3</a>. Second, <strong>proprioception drift</strong>: humanoid policies lean heavily on joint-state inputs for balance and coordination, so an uncalibrated encoder or a stale state estimate corrupts the fast head even when the cameras look fine, which is exactly why the proprioceptive-sensing discipline of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a> is load-bearing here and not a detail.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026 the humanoid-foundation-model line is moving fast. NVIDIA's GR00T N1.5 refines the N1 dual-system design with better language following and data mixtures, and ships alongside GR00T-Dreams and Cosmos-based world models that <em>generate</em> synthetic training trajectories to widen the pyramid's middle layer. Google DeepMind's Gemini Robotics-ER and the On-Device release push embodied reasoning and local low-latency control respectively, with demonstrated adaptation to new humanoids such as Apptronik Apollo. The open question is generalization across bodies: whether a single checkpoint can transfer to an unseen robot morphology with only a handful of demonstrations, rather than per-embodiment fine-tuning, remains the frontier these systems are chasing.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You must deploy a dual-system humanoid policy on a robot whose onboard compute can run the fast action head at 150 Hz but can only run the vision-language model at 3 Hz. (1) Explain why running System 2 at 3 Hz and System 1 at 150 Hz is acceptable for most manipulation tasks, and name one task property that would break this assumption. (2) The head camera moves as the robot turns, so the slow latent can be up to 300 ms stale relative to the fast loop. Describe one concrete mitigation. (3) Argue whether you would pretrain on human video for a task that requires forces no human hand produces, and what the data pyramid does in that case.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p>1. What does the System 2 / System 1 split buy you that a single monolithic policy cannot, and at what rates does each part run?</p>
+        <p>2. Describe the three layers of the data pyramid from base to top, and why real robot data sits at the narrow top rather than the base.</p>
+        <p>3. What does the embodiment tag select in a GR00T checkpoint, and why is a mismatch a silent failure rather than a loud one?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-58.6.html">Section 58.6</a>, we open up the data that feeds every model in this chapter: sim-to-real transfer and the Open X-Embodiment collection, where dozens of labs pooled robot trajectories into one dataset and where the domain gap between a simulator and a real sensing rig becomes the thing you have to engineer around.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

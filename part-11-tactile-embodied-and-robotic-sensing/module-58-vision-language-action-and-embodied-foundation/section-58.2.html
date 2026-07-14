@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.2: RT-1/RT-2 and web-scale knowledge transfer. Building Sensory AI." name="description"/>
+<title>Section 58.2: RT-1/RT-2 and web-scale knowledge transfer | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>RT-1/RT-2 and web-scale knowledge transfer</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to pick up the extinct animal. Nobody ever showed me a dinosaur on a tabletop. I had, however, read the entire internet, so I reached for the plastic T-rex."</p>
+<cite>A Suspiciously Well-Read AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why these two models matter</h3>
+<p><a class="cross-ref" href="section-58.1.html">Section 58.1</a> made the case that a policy should be one differentiable function from pixels and a language goal to motor commands. RT-1 and RT-2 are the two experiments that turned that idea into working robots and, more importantly, established the recipe every open VLA in this chapter now copies. RT-1 showed that a single transformer can swallow the messy, multi-task data of a whole robot fleet and come out a competent generalist. RT-2 showed the payoff of the sharpest trick in the field: if you write robot actions as <em>text tokens</em> and co-train the policy on the same internet-scale image-and-text data a vision-language model already learns from, the robot inherits semantic knowledge it never saw a single demonstration of. A robot that has never been taught what "extinct" means can still pick the toy dinosaur off the table. This section explains exactly how that transfer is engineered, why it works, and what it costs.</p>
+</div>
+
+<p>This section assumes the transformer machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> (tokens, attention, next-token prediction) and the vision-language models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, which RT-2 reuses wholesale as its backbone. Both models come from Google's robotics effort; RT stands for Robotics Transformer.</p>
+
+<h2>RT-1: one transformer that eats a whole fleet's data</h2>
+<p>RT-1 (2022) answered a narrower question than RT-2: can a single network absorb <em>large, diverse, real</em> robot data and stay reliable? Prior policies were trained per task and brittle. RT-1 was trained on roughly 130,000 teleoperated demonstrations spanning about 700 language-described tasks (pick, place, open drawer, knock over, move near), collected over months on a fleet of thirteen mobile manipulators. The architecture is deliberately plain: each camera frame passes through an ImageNet-pretrained EfficientNet whose features are conditioned on the instruction by FiLM layers (the language embedding scales and shifts the vision features, so "pick up the apple" and "pick up the can" light up different channels), a TokenLearner module compresses each frame to eight learned tokens to keep the sequence short, and a decoder-only transformer attends over a short history of frames and emits the action for the current step. The whole thing runs closed-loop at about 3 Hz on the robot.</p>
+<p>The decision that made RT-1 matter, though, is not the vision trunk. It is how the <em>output</em> is represented.</p>
+
+<h2>Actions as tokens: casting control as next-token prediction</h2>
+<p>A manipulator command at one step is a small vector: a change in end-effector position \((\Delta x, \Delta y, \Delta z)\), a change in orientation (three more numbers), a gripper open/close command, and a discrete mode flag that says whether the arm is moving, the base is moving, or the episode should terminate. RT-1 turns each continuous dimension into a categorical variable by <em>discretizing</em> it into \(K = 256\) uniform bins. For dimension \(j\) with range \([a_j^{\min}, a_j^{\max}]\), the action value \(a_j\) becomes the integer bin</p>
+$$ b_j \;=\; \operatorname{round}\!\left( \frac{a_j - a_j^{\min}}{a_j^{\max} - a_j^{\min}} \,(K-1) \right), \qquad b_j \in \{0, 1, \dots, K-1\}. $$
+<p>Now an action is just a short string of integer tokens, and predicting it is exactly the categorical next-token problem transformers are built for: the policy outputs a softmax over 256 classes per dimension and is trained with plain cross-entropy, no specialized regression head or Gaussian-mixture output. At run time you take the arg-max bin per dimension and invert the map to get a real command. The price is quantization error bounded by half a bin width, which the code below measures.</p>
+
+<pre><code class="language-python">import numpy as np
+
+K = 256  # bins per action dimension, as in RT-1 / RT-2
+# One 7-DoF end-effector action: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+lo = np.array([-0.05, -0.05, -0.05, -0.25, -0.25, -0.25, 0.0])
+hi = np.array([ 0.05,  0.05,  0.05,  0.25,  0.25,  0.25, 1.0])
+
+def to_tokens(a):
+    frac = (a - lo) / (hi - lo)
+    return np.clip(np.round(frac * (K - 1)), 0, K - 1).astype(int)
+
+def from_tokens(b):
+    return lo + (b / (K - 1)) * (hi - lo)
+
+a = np.array([0.021, -0.034, 0.005, 0.11, -0.19, 0.02, 1.0])
+b = to_tokens(a)                       # -> the action as 7 integer tokens
+a_hat = from_tokens(b)                 # decode back to a command
+print("tokens      :", b)
+print("max abs err :", np.max(np.abs(a - a_hat)))   # <= half a bin width
+</code></pre>
+<div class="code-caption">Encoding a 7-DoF robot command into 256-bin integer tokens and decoding it back. The round-trip error is bounded by half a bin, so a 10 cm translation range quantizes to a worst-case error under 0.2 mm, well below teleoperation noise. This encode/decode pair is the entire interface between a language model and a robot arm in RT-1 and RT-2.</div>
+
+<p>The snippet is the whole conceptual bridge. Once actions are tokens over a fixed vocabulary, a policy is a language model whose sentences happen to be motions, and any architecture that predicts tokens can drive a robot. RT-1 built that language model from scratch on robot data alone. RT-2 asked the obvious follow-up: why start from scratch when a model that already speaks token has read the internet?</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The tokenization is the transfer mechanism</h3>
+<p>Web-scale transfer in RT-2 is not a clever loss or an adapter network. It is a <em>representation choice</em>. Because actions are emitted in the same discrete token space the vision-language model uses for words, a robot action and an answer to "what is in this image?" are, to the network, the same kind of output. Gradients from millions of internet question-answer pairs and gradients from a few hundred thousand robot steps flow into <em>one</em> shared set of weights. The semantic structure the model learns from the web (that a dinosaur is an animal, that a red can differs from a green one, that "the bag about to fall" refers to the one near the edge) is automatically available when it decides where to move the gripper. Change the output representation and the free lunch disappears.</p>
+</div>
+
+<h2>RT-2: co-training on the web so semantics transfer</h2>
+<p>RT-2 (2023) takes a large pretrained vision-language model, either PaLI-X or PaLM-E with billions of parameters, and <em>co-fine-tunes</em> it on a mixture of two data sources at once: the original web vision-language tasks (visual question answering, captioning, grounding) and the RT-1 robot demonstrations, with the robot actions written in the token scheme above. To make actions share the model's existing vocabulary, RT-2 overwrites the 256 least-frequently-used text tokens and reuses them as the action bins, so no new output head is added at all; the model simply learns to emit an "action sentence" when the prompt is a robot observation plus an instruction, and a normal answer otherwise. Keeping the web data in the training mixture is essential: fine-tuning on robot data alone would let the model forget its internet knowledge (catastrophic forgetting), and it is precisely that knowledge we are trying to keep.</p>
+<p>The result is <em>emergent semantic generalization</em> the RT-1 data could never supply. RT-2 can act on objects, categories, and relations that appear nowhere in its robot demonstrations: "pick up the extinct animal" (the toy dinosaur), "move the banana to the sum of two plus one" (it reads the numbers), "move the Coke can to Taylor Swift" (it recognizes the face on a photo). None of these were demonstrated. They transfer because the visual and linguistic concepts live in the web-pretrained weights, and the shared token interface lets a manipulation decision query them. RT-2 roughly doubled RT-1's success rate on novel objects, backgrounds, and instructions in the paper's evaluations, and it can even do short chain-of-thought reasoning about which object to grasp before emitting the action tokens.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Warehouse robotics: the "clear the spill hazard" instruction</h3>
+<p>Picture a fulfillment-center arm whose demonstration set covers picking labeled products into totes. A supervisor issues an instruction the robot was never trained on: "move the thing someone could slip on into the bin." A from-scratch RT-1-style policy has no concept of "slip hazard"; the phrase is out of distribution and it stalls. An RT-2-style policy inherits from web text and images the association between spills, wet floors, banana peels, and the idea of a slipping hazard, so it grounds the phrase to the stray produce on the floor and picks it, then acts. The robot solved a task defined by world knowledge, not by a demonstration, which is exactly the capability that lets a single deployed policy absorb the long tail of instructions a real facility throws at it without a new data-collection campaign. The distribution-shift robustness this implies is analyzed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>.</p>
+</div>
+
+<h2>What actually transfers, and what it costs</h2>
+<p>Be precise about which knowledge crosses the gap. Web-scale training transfers <em>semantics and grounding</em>: recognizing objects, parsing instructions, resolving references, associating words with pixels. It does not transfer <em>dynamics or contact skill</em>. The internet contains almost no examples of the forces, slip, and fine motor corrections a fingertip needs, which is why the contact modalities of <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a> and real robot data remain irreplaceable for the low-level control loop. RT-2 gets much smarter about <em>what</em> to do and only modestly better at <em>how</em> to move. The costs are real too: a multi-billion-parameter VLM cannot run onboard, so RT-2 was served from a cloud TPU at roughly 1 to 3 Hz, a latency and connectivity burden that the smaller open policies of the next section were designed to escape. And every claim of generalization has to be tested on genuinely held-out objects and instructions, not paraphrases of the training set, or the leakage-safe evaluation discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is quietly violated and the "emergent" skill is really memorization.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>RT-1 (Brohan et al., 2022, "RT-1: Robotics Transformer for Real-World Control at Scale") and RT-2 (Brohan et al., 2023, "RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control") set the template, and RT-2-X (Open X-Embodiment collaboration, 2023) then trained the same recipe on data pooled across 22 robot embodiments, showing that skills transfer <em>across different robot bodies</em>, not just from web to robot. The live questions are: how small can the backbone get before web-transfer collapses (the open policies of <a class="cross-ref" href="section-58.3.html">Section 58.3</a> push this hard), whether discrete action tokens should give way to continuous flow-matching or diffusion heads for smoother, higher-frequency control (<a class="cross-ref" href="section-58.4.html">Section 58.4</a>), and how to inject the contact and tactile knowledge the web simply does not contain.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let LeRobot own the data and normalization plumbing</h3>
+<p>Reproducing the RT pipeline by hand means writing dataset loaders for teleoperation logs, per-dimension action normalization statistics, the bin encode/decode above, image and instruction batching, and the closed-loop rollout harness, easily 300 to 400 lines before a single gradient step. Hugging Face's <code>lerobot</code> library ships all of it, plus pretrained VLA checkpoints and the standard manipulation benchmarks:</p>
+<pre><code class="language-python">from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+# Downloads, decodes video, and returns normalized (image, instruction, action)
+# samples ready for a VLA, with dataset action stats handled for you.
+ds = LeRobotDataset("lerobot/berkeley_autolab_ur5")
+sample = ds[0]
+print(sample["observation.images.image"].shape, sample["action"].shape)
+</code></pre>
+<div class="code-caption">Loading a standardized manipulation dataset in three lines with <code>lerobot</code>. The library owns video decoding, action normalization statistics, and the sample format every open VLA in this chapter expects, so your code focuses on the policy, not the data plumbing.</div>
+<p>The action tensor it hands back is the continuous command; the 256-bin tokenizer from earlier is the one small piece you still supply if your backbone consumes discrete tokens.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: probe where the transfer lives</h3>
+<p>(1) Using the encode/decode snippet, sweep \(K \in \{16, 64, 256, 1024\}\) and plot worst-case quantization error against a realistic teleoperation noise floor of about 1 mm; argue why RT-1 settled near 256 bins rather than maximizing \(K\). (2) Design a controlled evaluation that separates <em>semantic</em> generalization from <em>motor</em> generalization: specify one held-out set that changes only the object's identity or the instruction's wording (testing web transfer) and one that changes only the required motion or contact (testing skill), and state which one you expect an RT-2-style model to pass and which to fail. (3) Explain why keeping web VQA data in RT-2's training mixture is not optional, referencing catastrophic forgetting.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Write the formula that maps a continuous action dimension to one of \(K\) bins, and state the bound on the resulting reconstruction error.</li>
+<li>In one sentence each, state what RT-2 inherits from web-scale pretraining and what it does <em>not</em>, and why that distinction matters for control that involves contact.</li>
+<li>Why does representing actions as tokens in the model's existing vocabulary, rather than adding a separate regression head, make web-to-robot transfer possible?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-58.3.html">Section 58.3</a>, we turn from Google's closed, cloud-served RT models to the open generalist policies (Octo and OpenVLA) that put a downloadable VLA on a single GPU. They keep RT-2's core insight, a pretrained backbone plus tokenized actions, while shrinking the model, opening the weights, and training on the pooled multi-robot data that makes one policy drive many different arms.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

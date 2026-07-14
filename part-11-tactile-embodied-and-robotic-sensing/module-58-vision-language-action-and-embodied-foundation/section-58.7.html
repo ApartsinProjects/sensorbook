@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.7: Evaluation, safety, and generalization. Building Sensory AI." name="description"/>
+<title>Section 58.7: Evaluation, safety, and generalization | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>Evaluation, safety, and generalization</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"A 92 percent success rate sounds like a grade. It is really a coin I flipped 25 times on one tabletop, on one Tuesday, with one lighting rig. Ask me again in a different kitchen."</p>
+        <cite>A Rigorously Evaluated AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section closes Chapter 58, so it assumes the VLA policy of <a class="cross-ref" href="section-58.1.html">Section 58.1</a> and the model families of Sections 58.2 through 58.5, plus the sim-to-real and Open X-Embodiment data pipeline of <a class="cross-ref" href="section-58.6.html">Section 58.6</a>. It leans on calibrated uncertainty from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> and the leakage-safe benchmarking discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>. No new probability is introduced beyond a binomial confidence interval, developed here.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A VLA that scores well on a demo is not a VLA you can deploy. Three questions decide whether a learned policy earns a place next to a person or a payload: does the reported number mean anything (evaluation), does it hold when the world moves off the training distribution (generalization), and what happens on the trials it fails (safety). These are not afterthoughts bolted onto a finished model; they are the part of robot learning where most of the honest difficulty lives, because a policy that maps pixels to motor torques can hurt someone, and because success rate is a noisy statistic collected on physical hardware that no two labs configure the same way. This section gives you the measurement tools (confidence intervals on tiny trial counts, a taxonomy of distribution shift, sim-and-real benchmark protocols) and the runtime tools (action constraints, uncertainty-gated fallback) that turn a promising checkpoint into a system you can stand next to.</p>
+    </div>
+
+    <h2>Evaluating a policy that acts</h2>
+    <p>Classification is scored on a held-out set you can store in a file. A VLA is scored by <em>running it</em>, many times, on hardware or in a simulator, and counting task successes. That single fact drives everything hard about VLA evaluation. First, the sample size is tiny: a real-robot evaluation of 25 or 50 rollouts per task is common, because each rollout costs a minute of wall-clock and a human to reset the scene. A reported "88 percent" from 25 trials is 22 successes, and the 95 percent Wilson confidence interval on that runs roughly from 70 to 96 percent. Comparing two policies at 88 versus 80 percent on 25 trials each is comparing noise. The discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> applies with force here: report intervals, fix the number of trials before you look, and never tune on the eval scenes.</p>
+    <p>Second, the protocol is the experiment. A success is whatever a rubric says it is (object in bin, drawer fully closed), and small choices (start-pose randomization, distractor objects, the exact instruction wording) swing the number more than the model does. This is why real-robot results are famously hard to reproduce across labs, and why simulation benchmarks matter: <strong>LIBERO</strong> and <strong>CALVIN</strong> fix the scenes, resets, and success detector so two policies face the identical gauntlet, and the harness we build in <a href="#lab-58">Lab 58</a> runs against exactly these. Simulation buys reproducibility and thousands of cheap trials; it costs realism, because a policy can exploit rendering artifacts a real camera never produces. The bridge is a real-to-sim evaluator like <strong>SIMPLER</strong>, which tunes a simulator so that measured sim success rank-correlates with real success, letting you screen checkpoints cheaply before spending robot time.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The headline metric of a VLA is a <em>binomial proportion estimated from a small n on a specific scene distribution</em>. Two consequences follow that beginners routinely miss. (1) Precision scales as \(\sqrt{p(1-p)/n}\), so halving the interval needs four times the rollouts; there is no cheap way to make a 25-trial number trustworthy. (2) The scene distribution is part of the metric, not a footnote. "92 percent success" is meaningless without the objects, lighting, and instruction set it was measured on, exactly because generalization (the next subsection) is the property you actually care about, and a single in-distribution number tells you nothing about it.</p>
+    </div>
+
+    <h2>Measuring generalization: the axes of shift</h2>
+    <p>"Does it generalize?" is too coarse to test. VLA evaluation decomposes generalization into named axes of distribution shift, each held out deliberately so a single number becomes a profile. The standard axes: <strong>visual</strong> (new backgrounds, lighting, camera pose, distractors), <strong>object</strong> (unseen instances or categories of the same task), <strong>instruction</strong> (paraphrases and novel phrasings of a known skill), <strong>task</strong> (novel compositions or long-horizon chains of known skills), and <strong>embodiment</strong> (a different robot arm or gripper than any in training). A policy can be strong on visual shift and collapse on object shift; reporting one aggregate hides the failure you will hit in the field. This axis-by-axis view is the manipulation-domain instance of the general theory in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, and it is where the web-scale pretraining of RT-2 and OpenVLA pays off: semantic priors from the vision-language backbone transfer to unseen objects and instructions far better than to unseen embodiments, whose motor statistics no web image teaches.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: a warehouse pick-and-place fleet</h3>
+        <p>An e-commerce operator fine-tunes an open VLA to pick items from a tote into a shipping box across 40 stations. Lab acceptance shows 94 percent on 50 trials, and the fleet ships. Week one, station 12 (near a skylight) drops to 71 percent by mid-afternoon: a pure <em>visual</em> shift from moving sunlight the acceptance suite never sampled. Week two, a new SKU (a mirror-finish cosmetics tin) fails 3 of 4 grasps: <em>object</em> shift onto a specular surface outside training. The fix was not a better model but a better evaluation: the team rebuilt acceptance as a per-axis matrix (lighting sweep, held-out SKU set, paraphrased pick instructions), each with a fixed trial count and a Wilson interval, and gated deployment on the <em>worst</em> axis rather than the average. The average had been hiding both cliffs.</p>
+    </div>
+
+    <h2>Safety: wrapping a stochastic policy in guarantees</h2>
+    <p>A VLA is a probabilistic function whose output is torque. You cannot make behavior cloning provably correct, so safety is enforced <em>around</em> the policy, at the interface where its action becomes motion, by a layer that is simple enough to trust. Three mechanisms compose. <strong>Action-space constraints</strong> clamp every command to a safe envelope: per-step velocity and displacement limits, a workspace bounding box, force and torque ceilings enforced by the low-level controller. This turns "the model must never command a dangerous motion" (unverifiable) into "no command leaves the envelope" (a two-line check). <strong>Runtime monitors</strong> watch execution and trip a stop on contact-force spikes, joint-limit approach, or a watchdog timeout, the embodied cousin of the functional-safety guards in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>. <strong>Uncertainty gating</strong> uses the policy's own confidence, calibrated per <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: when the action distribution is diffuse or an ensemble disagrees, the robot slows, holds, or asks a human rather than committing to a guess. A policy that knows when it does not know is worth more in a shared space than one that is slightly more accurate on average.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+from scipy.stats import norm
+
+def wilson_interval(successes, n, conf=0.95):
+    """95% CI for a success RATE from a small number of rollouts."""
+    if n == 0:
+        return (0.0, 1.0)
+    z = norm.ppf(1 - (1 - conf) / 2)
+    p = successes / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2*n)) / denom
+    half = z * np.sqrt(p*(1-p)/n + z**2/(4*n**2)) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+def safe_action(mean_action, ensemble_std, env_low, env_high,
+                unc_threshold=0.03):
+    """Clamp to a safe envelope; gate to a HOLD when the policy is unsure."""
+    action = np.clip(mean_action, env_low, env_high)      # hard envelope
+    if float(np.max(ensemble_std)) > unc_threshold:        # uncertainty gate
+        return np.zeros_like(action), "HOLD_ASK_HUMAN"
+    return action, "EXECUTE"
+
+lo, hi = wilson_interval(22, 25)          # 22/25 successes
+print(f"88% point estimate, 95% CI = [{lo:.2f}, {hi:.2f}]")
+env_low  = np.array([-0.05,-0.05,-0.05, 0.0])
+env_high = np.array([ 0.05, 0.05, 0.05, 1.0])
+act, mode = safe_action(np.array([0.09,-0.01,0.0,1.0]),   # dx exceeds envelope
+                        np.array([0.01,0.01,0.05,0.0]),   # dz very uncertain
+                        env_low, env_high)
+print(mode, act)</code></pre>
+    <div class="code-caption">A minimal evaluation-and-safety kernel: a Wilson interval that faithfully reports the uncertainty of a 22-of-25 rollout result, and a safety wrapper that clamps a VLA action to a hard envelope and gates to a human-handoff HOLD when the ensemble disagrees. Both run in isolation from the multi-megabyte policy they wrap, which is the point: the trusted layer is small.</div>
+    <p>The code above pairs the two ideas of this section. The <code>wilson_interval</code> call turns "88 percent" into an honest range you can compare against a threshold; the <code>safe_action</code> wrapper is the deployable safety envelope, clamping the out-of-range command and returning a <code>HOLD_ASK_HUMAN</code> mode when the per-dimension ensemble spread crosses a calibrated bound.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026 the field is converging on scalable, standardized VLA evaluation. <strong>SIMPLER</strong> established real-to-sim rank correlation as a screening tool; community efforts now push toward shared, hosted evaluation so that reported numbers are comparable across labs rather than each lab's private tabletop. On the safety side, uncertainty-aligned planning (the <strong>KnowNo</strong> line of work) uses conformal prediction to give a VLA a statistically calibrated "ask for help" trigger with a bounded task-failure rate, moving safety from a hand-tuned threshold toward a guarantee. The open problem remains embodiment generalization: no current benchmark cleanly predicts how a policy trained on one arm will perform on another, and cross-embodiment transfer (Open X-Embodiment, GR00T) is measured but not yet reliably forecast.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: don't hand-roll the eval harness</h3>
+        <p>The rollout loop, per-axis scene generation, success detector, and metrics aggregation are the same across projects and easy to get subtly wrong (a mismatched success rubric silently inflates every number). The LIBERO and CALVIN benchmark suites, the SIMPLER real-to-sim evaluator, and the LeRobot evaluation utilities ship all of it: standardized task sets, deterministic resets, a scored success detector, and batched parallel rollouts. What is roughly 150 to 250 lines of environment wiring, seeding, and metric bookkeeping collapses to loading a benchmark, calling <code>evaluate(policy, suite)</code>, and reading back per-task success with confidence intervals. Write the loop once to understand it (the Wilson interval above is the piece worth owning), then let the suite own reproducibility so your numbers are comparable to published ones.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>(1) Using <code>wilson_interval</code>, find the smallest number of rollouts \(n\) at which an observed 90 percent success rate has a 95 percent lower bound above 80 percent. Explain to a skeptical manager why the common "run 20 trials" budget cannot support that claim. (2) Extend <code>safe_action</code> into a three-tier gate: EXECUTE, SLOW (scale the action by 0.3), and HOLD, driven by two uncertainty thresholds. Then simulate 200 actions with uncertainties drawn from a distribution that is higher near a workspace boundary, and report what fraction of near-boundary actions are caught by the SLOW or HOLD tiers versus interior actions. (3) Design a per-axis generalization matrix for the warehouse example: name the held-out set for each of the five shift axes and the trial count you would fix per cell.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why is a raw success rate from 25 real-robot rollouts a weak basis for claiming one VLA beats another, and what should be reported instead?</li>
+            <li>Name the five axes of generalization shift and give a concrete field failure that a single aggregate success rate would hide.</li>
+            <li>Safety wraps the policy rather than fixing it. State the three enforcement mechanisms and explain why each is placed <em>outside</em> the learned network instead of trained into it.</li>
+        </ol>
+    </div>
+
+    <div class="callout lab" id="lab-58">
+        <h3 class="callout-title">Lab 58</h3>
+        <p>Fine-tune or evaluate an open VLA policy on a manipulation benchmark subset (LIBERO/CALVIN). Load a pretrained OpenVLA or Octo checkpoint, run a fixed set of rollouts on a benchmark task suite, and report per-task success with Wilson confidence intervals. Then hold out one generalization axis (a distractor-heavy visual variant or a paraphrased instruction set) and quantify the drop. Finally, wrap the policy in the <code>safe_action</code> envelope-and-gate from this section and measure how the uncertainty gate trades success rate against unsafe-command rate.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Benchmarks and evaluation</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2306.03310">Liu, Zhu, Chen, et al. (2023). LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning. NeurIPS Datasets and Benchmarks.</a></p>
+            <p class="bib-annotation">The standard fixed-scene manipulation benchmark used throughout this section; its deterministic resets and success detector are what make cross-policy comparison meaningful.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2112.03227">Mees, Hermann, Rosete-Beas, Burgard (2022). CALVIN: A Benchmark for Language-Conditioned Policy Learning for Long-Horizon Robot Manipulation. IEEE RA-L.</a></p>
+            <p class="bib-annotation">Introduces long-horizon, language-conditioned evaluation with instruction and task compositional shift, the source of the "task" generalization axis.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2405.05941">Li, Xu, Xie, et al. (2024). Evaluating Real-World Robot Manipulation Policies in Simulation (SIMPLER). CoRL.</a></p>
+            <p class="bib-annotation">Builds simulators whose success rates rank-correlate with real hardware, the real-to-sim screening tool that lets you triage checkpoints before spending robot time.</p>
+        </div>
+
+        <p class="bib-category">Policies and generalization</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2406.09246">Kim, Pertsch, Karamcheti, et al. (2024). OpenVLA: An Open-Source Vision-Language-Action Model.</a></p>
+            <p class="bib-annotation">Reports a careful per-axis generalization study on an open checkpoint, the model most readily fine-tuned and evaluated in Lab 58.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2405.12213">Octo Model Team (2024). Octo: An Open-Source Generalist Robot Policy. RSS.</a></p>
+            <p class="bib-annotation">A generalist policy whose evaluation spans multiple embodiments, illustrating why embodiment shift is the hardest axis to forecast.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2310.08864">Open X-Embodiment Collaboration (2023). Open X-Embodiment: Robotic Learning Datasets and RT-X Models.</a></p>
+            <p class="bib-annotation">The cross-embodiment dataset and evaluation that defines the embodiment-generalization problem this section flags as still open.</p>
+        </div>
+
+        <p class="bib-category">Safety and calibrated uncertainty</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2307.01928">Ren, Dixit, Bodrova, et al. (2023). Robots That Ask For Help: Uncertainty Alignment for Large Language Model Planners (KnowNo). CoRL.</a></p>
+            <p class="bib-annotation">Uses conformal prediction to give an embodied policy a statistically calibrated "ask a human" trigger with a bounded failure rate, the principled version of the uncertainty gate.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://arxiv.org/abs/2107.07511">Angelopoulos, Bates (2021). A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification.</a></p>
+            <p class="bib-annotation">The reference for distribution-free intervals underlying the calibrated gating threshold; pairs directly with Chapter 18.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>Evaluation and safety told you whether a VLA is trustworthy; the next question is whether it can run where it must. In <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, we open Part XII and turn to edge AI fundamentals and model optimization: quantization, pruning, and compilation that shrink a multi-billion-parameter policy to fit the latency and power budget of a robot's onboard computer, without discarding the safety envelope this section built.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

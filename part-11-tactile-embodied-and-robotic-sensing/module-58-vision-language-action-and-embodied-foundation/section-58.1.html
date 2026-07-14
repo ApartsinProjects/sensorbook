@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.1: From perception to action: the VLA idea. Building Sensory AI." name="description"/>
+<title>Section 58.1: From perception to action: the VLA idea | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>From perception to action: the VLA idea</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"Every other model in this book stops when it has an answer. I only start there: my answer has to move a real gripper, and the gripper does not care how confident I feel."</p>
+        <cite>An Embodied AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the sense-of-self supplied by <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a> (joint state, contact force, base motion) and the multimodal sensor-plus-language grounding of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. You should be comfortable with the transformer backbone of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a> and the idea of a learned policy that maps observations to decisions. No control theory beyond "a controller sends commands at a fixed rate" is required; the imitation-learning objective is developed here from scratch. The specific model families (RT-2, OpenVLA, the flow-matching policies) arrive in the sections that follow; this one builds the shared idea they all instantiate.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>For most of this book, perception ends with a claim about the world: a class label, a depth map, a fused state estimate. A <strong>Vision-Language-Action model</strong> (VLA) refuses to stop there. It is a single learned function that takes what the robot sees, reads a natural-language instruction, and emits the low-level actions that drive motors, closing the loop from raw pixels to motion inside one network. The bet is radical and simple: instead of hand-building the long pipeline that classical robotics uses to get from a camera to a joint command, train one model to do the whole thing by imitation, and inherit web-scale semantic knowledge by starting from a pretrained vision-language backbone. This section explains what "action" means as a model output, why folding perception and control into one policy is worth the trouble, and how the perception-to-action loop actually runs on hardware. Everything else in Chapter 58 is a variation on this idea.</p>
+    </div>
+
+    <h2>What breaks in the classical pipeline</h2>
+    <p>The textbook robotics stack is a chain: perception detects objects, a state estimator fuses them into a world model, a planner computes a collision-free trajectory, and a controller tracks it. Each stage has clean inputs and outputs, and each has been engineered for decades. The trouble is the seams. Perception hands the planner a symbolic scene ("mug at pose X"), and the moment the real world does not fit the schema (the mug is transparent, half-occluded, or simply an object nobody enumerated) the abstraction leaks and the downstream stages act confidently on a wrong premise. Worse, the instruction "clear the table" has no place to enter this pipeline: it is neither a pose nor a trajectory, and translating open-ended human intent into planner goals is exactly the part no one automated well.</p>
+    <p>A VLA collapses the chain. It treats robot control as a supervised learning problem: given an observation \(o_t\) (camera images plus proprioceptive state) and a language instruction \(\ell\), predict the action \(a_t\) a competent demonstrator would take. Formally it learns a policy</p>
+    $$\pi_\theta(a_t \mid o_{1:t},\, \ell),$$
+    <p>trained by behavior cloning to match a dataset of teleoperated demonstrations. There is no explicit object detector, no symbolic planner, no hand-tuned interface between stages to leak. The instruction enters naturally, because the same network that reads the pixels also reads the words. What replaces the engineered pipeline is data: the model must see enough demonstrations to learn the perception-to-action mapping that engineers used to build by hand.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The reason a VLA is worth building on top of a <em>pretrained</em> vision-language model, rather than trained from scratch on robot data alone, is that robot demonstrations are scarce and expensive (a human must physically teleoperate every trajectory), while the visual and linguistic knowledge a robot needs (what a spatula is, that "the red one" refers to color, that a full glass should stay upright) is abundant on the web. Freezing or fine-tuning a backbone that already knows these things means the robot data only has to teach the last mile: how knowledge turns into motion. The action head is small; the semantic prior it rides on is enormous. That transfer, explored in <a class="cross-ref" href="section-58.2.html">Section 58.2</a>, is the whole economic argument for the VLA approach.</p>
+    </div>
+
+    <h2>What "action" means as a model output</h2>
+    <p>A classifier outputs a category; a VLA outputs a command a controller can execute. Concretely, an action \(a_t\) is a short vector: most commonly a change in end-effector pose (three translations, three rotations) plus a gripper open/close signal, expressed as a delta to apply over the next control step. Some policies output absolute target poses, others output raw joint-position targets; the interface is a design choice, but the shape is always "a handful of continuous numbers, many times per second."</p>
+    <p>Two ideas make this learnable with transformer machinery. The first is <strong>action tokenization</strong>: each continuous action dimension is discretized into a fixed number of bins, so predicting an action becomes predicting a short sequence of tokens, exactly the task language models already excel at. The policy emits tokens; a detokenizer maps them back to metric commands. The second is <strong>action chunking</strong>: rather than predict one step and re-plan, the policy predicts a short horizon of \(H\) future actions at once and executes them open-loop before querying again. Chunking cuts the number of expensive forward passes, and, more importantly, it suppresses the compounding, jittery errors that a step-by-step policy accumulates, because a committed multi-step plan is smoother than a sequence of independently sampled twitches. The cost is reactivity: a long chunk cannot respond to a surprise mid-execution, so \(H\) trades smoothness against responsiveness.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# A VLA's action space for a 6-DoF arm + gripper: 7 continuous dims.
+# Each dim is discretized into 256 bins over a known metric range.
+ACTION_LOW  = np.array([-0.05, -0.05, -0.05, -0.10, -0.10, -0.10, 0.0])  # dx,dy,dz,droll,dpitch,dyaw,grip
+ACTION_HIGH = np.array([ 0.05,  0.05,  0.05,  0.10,  0.10,  0.10, 1.0])
+N_BINS = 256
+
+def tokenize(action):
+    """Continuous action -> integer tokens the transformer predicts."""
+    clipped = np.clip(action, ACTION_LOW, ACTION_HIGH)
+    frac = (clipped - ACTION_LOW) / (ACTION_HIGH - ACTION_LOW)
+    return np.round(frac * (N_BINS - 1)).astype(int)
+
+def detokenize(tokens):
+    """Predicted tokens -> metric command the controller executes."""
+    frac = tokens / (N_BINS - 1)
+    return ACTION_LOW + frac * (ACTION_HIGH - ACTION_LOW)
+
+# One action chunk = H future actions predicted in a single forward pass.
+H = 8
+demo_chunk = np.random.uniform(ACTION_LOW, ACTION_HIGH, size=(H, 7))
+tokens = np.stack([tokenize(a) for a in demo_chunk])   # what the model learns to emit
+recovered = np.stack([detokenize(t) for t in tokens])  # what the robot actually runs
+
+err = np.abs(recovered - demo_chunk).max()
+print(f"chunk shape (H x dims): {tokens.shape}")
+print(f"max detokenization error: {err:.4f}  (bounded by one bin width)")
+</code></pre>
+    <div class="code-caption">The action interface at the heart of every VLA: a continuous end-effector command is clipped to a known range, binned into discrete tokens the transformer predicts, and detokenized back into a metric command. Predicting a chunk of \(H\) steps at once (here 8) is what turns control into a sequence-prediction problem and smooths execution. The quantization error is bounded by one bin width, the price of reusing language-model machinery for continuous control.</div>
+
+    <p>The snippet above is deliberately minimal, but it exposes the load-bearing choices. The bin count sets the finest motion the policy can command (256 bins over a 10 cm range resolves under half a millimeter per step), and the metric range must bracket the demonstrations or the clipping silently caps real motions. Predicting the chunk as a token grid is precisely what lets a vision-language backbone, designed to emit text, instead emit robot commands with no change to its architecture.</p>
+
+    <h2>The perception-to-action loop on real hardware</h2>
+    <p>A VLA is not run once; it is run in a loop against a moving world. At each cycle the robot captures its observation (typically one or more RGB views plus the proprioceptive state from <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>), the policy conditions on that observation and the fixed instruction, predicts an action chunk, and a low-level controller executes the chunk while the next observation is already being gathered. Two clocks matter here and they differ by an order of magnitude. The policy runs at perhaps 3 to 10 Hz because a large transformer forward pass is expensive, while the joint controller runs at hundreds of hertz to keep the arm stable. Action chunking bridges the gap: one slow policy query supplies many fast controller setpoints. This is the same fast-backbone, slow-update pattern that legged state estimation used in Chapter 57, turned around to drive action instead of estimate state.</p>
+    <p>A subtlety separates a VLA from a plain image classifier: it is a closed-loop system, so its own errors feed back into its future inputs. If the policy nudges the gripper slightly off course, the next observation shows that off-course scene, which was rare in the demonstrations, so the next prediction can be worse still. This <em>covariate shift</em> is the classic failure mode of behavior cloning, and it is why demonstration coverage, recovery examples, and action chunking (which limits how far a single mistake propagates before the next correction) all matter more here than in any offline perception task. It also connects the VLA to the predictive world-model view of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>: acting well requires an implicit sense of how the scene will respond to the action, even when the model never predicts a future frame explicitly.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a mobile manipulator tidying a lab kitchen</h3>
+        <p>Consider a wheeled robot with a single arm asked, in plain English, to "put the mug in the sink." A classical stack would need a mug detector, a grasp planner, a base-motion planner, and a hand-coded state machine sequencing approach, grasp, transport, and release, with a brittle handoff at every join and no obvious slot for the sentence itself. A VLA takes the wrist and overhead camera feeds and the instruction string directly, and at roughly 5 Hz emits end-effector deltas that carry the arm to the mug, close the gripper, lift, and release over the sink, all as one learned behavior. When a colleague slides a second mug into view, the policy does not re-plan symbolically; it simply conditions on the new pixels and the unchanged instruction and keeps acting. The instruction "put the <em>blue</em> mug in the sink" changes the behavior with no code change at all, because the language and the vision share one model. The failure modes are equally telling: a mug in a pose absent from the training demonstrations, or a reflective steel sink the demonstrations never showed, degrades the policy exactly where its data thinned out, not where an engineer forgot a branch.</p>
+    </div>
+
+    <h2>Why fold it all into one model</h2>
+    <p>The unifying argument for VLAs has three strands. <strong>Generalization</strong>: a modular pipeline generalizes only as far as its weakest hand-built stage, whereas a single network trained on diverse data can transfer visual and linguistic knowledge across the seams that used to break, recognizing a novel object it was never explicitly programmed to detect. <strong>Instruction-following</strong>: because language and control share parameters, open-ended human intent enters as an input rather than requiring a bespoke goal encoder, which is the capability classical robotics most lacked. <strong>Scaling</strong>: the approach improves with more demonstrations and larger backbones the way language models improve with more text, so progress becomes a data-and-compute problem rather than an endless-engineering problem. The counterweights are real and worth stating plainly: demonstrations are costly, closed-loop behavior cloning suffers covariate shift, a black-box policy is hard to certify for safety, and the calibrated uncertainty machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> is far less mature for actions than for predictions. The rest of this chapter is the story of how the field is pushing each strand forward and blunting each counterweight.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026 the VLA idea has crystallized into a recognizable recipe: a pretrained vision-language transformer backbone, an action head that either tokenizes actions (RT-2, OpenVLA) or generates them with a flow-matching or diffusion process (the \(\pi_0\) family), trained by imitation on large multi-robot corpora such as Open X-Embodiment, and increasingly evaluated on shared benchmarks (LIBERO, CALVIN). The live research questions are exactly the counterweights above: how to get past the ceiling of teleoperated data (via simulation and cross-embodiment transfer, Section 58.6), how to make a single policy control many different robot bodies (Section 58.5), and how to evaluate and bound the behavior of a black-box policy well enough to deploy it safely (Section 58.7). The idea introduced here is settled; making it reliable is the frontier.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: don't hand-roll the action head</h3>
+        <p>The tokenizer, detokenizer, and chunking loop sketched above are worth writing once to understand them, but you should not maintain them. Open VLA frameworks (the reference OpenVLA and Octo codebases, and the LeRobot library) ship a full policy interface: image and proprioception preprocessing, the tokenized or diffusion action head, chunked rollout against a robot or simulator, and pretrained checkpoints to fine-tune. What is roughly 60 to 80 lines of careful, easy-to-get-subtly-wrong glue here (bin ranges that must match the checkpoint, chunk bookkeeping, the two-clock control loop) collapses to a handful of calls: load a checkpoint, call <code>policy.select_action(observation)</code> inside the control loop, and let the library own the tokenization and timing. Reserve the from-scratch version for building intuition, and use it as the mental model when the library's abstractions leak.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using the tokenizer code above, study the accuracy-versus-reactivity tradeoffs. (1) Sweep <code>N_BINS</code> over {16, 64, 256, 1024} and, for a fixed set of random demonstration actions, plot the maximum detokenization error against bin count; relate the curve to the finest motion the policy could ever command. (2) Simulate covariate shift: starting from a target trajectory, add a small fixed bias to every executed action (as if the policy were slightly miscalibrated) and integrate the position over 40 steps for chunk sizes \(H \in \{1, 8, 32\}\), re-querying a "corrected" action only at chunk boundaries. Report how end position drift depends on \(H\), and explain why neither the smallest nor the largest chunk is best.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>State the policy a VLA learns, \(\pi_\theta(a_t \mid o_{1:t}, \ell)\), in words: what are \(o\), \(\ell\), and \(a\) physically, and what training signal fits \(\theta\)?</li>
+            <li>Why does starting from a pretrained vision-language backbone reduce the amount of robot demonstration data needed, and what specifically does the robot data still have to teach?</li>
+            <li>Action chunking predicts \(H\) future actions per query. Give one benefit and one cost of a larger \(H\), and connect the cost to the covariate-shift failure of behavior cloning.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-58.2.html">Section 58.2</a>, we make the transfer argument concrete: the RT-1 and RT-2 models show how a policy built on a web-pretrained vision-language backbone inherits semantic knowledge it never saw a robot demonstrate, letting it act on objects and instructions that appear in no teleoperation log. That is the first payoff of folding perception and action into one model, and the reason the rest of the chapter builds on VLAs rather than pipelines.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

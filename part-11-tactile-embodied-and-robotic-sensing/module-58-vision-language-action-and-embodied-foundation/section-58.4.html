@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.4: Flow-matching and open-world VLAs (π0/π0.5). Building Sensory AI." name="description"/>
+<title>Section 58.4: Flow-matching and open-world VLAs (π0/π0.5) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>Flow-matching and open-world VLAs (π0/π0.5)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They asked for a policy that could fold laundry. I asked which laundry. They said all of it. That was the first honest spec I had ever been handed."</p>
+        <cite>An Unfolding AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the open generalist policies of <a class="cross-ref" href="section-58.3.html">Section 58.3</a>: it assumes you know why action chunking and continuous (rather than discretized) action heads matter. It uses the transformer vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, the score- and denoising-based generative modeling introduced alongside diffusion, and the multimodal fusion framing of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. The heterogeneous cross-embodiment data these models train on is the subject of <a class="cross-ref" href="section-58.6.html">Section 58.6</a>; here we care about the action head and the open-world generalization it enables.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>The generalist policies of the previous section could act, but their action heads were bottlenecks: discretized tokens are coarse and slow to decode, and diffusion heads need many denoising steps. Physical Intelligence's <strong>&pi;<sub>0</sub></strong> ("pi-zero") replaced that head with <strong>flow matching</strong>, a generative recipe that produces smooth, continuous, high-frequency action chunks in a handful of network evaluations while riding on top of a pretrained vision-language backbone. Its successor <strong>&pi;<sub>0.5</sub></strong> then pushed the harder question: not "can the robot do a task in the lab" but "can it walk into a home it has never seen and clean the kitchen." This section is about how flow matching turns a language model into a dexterous, real-time controller, and how co-training on wildly heterogeneous data buys <em>open-world</em> generalization rather than lab generalization.</p>
+    </div>
+
+    <h2>Why flow matching for actions</h2>
+    <p>Manipulation demonstrations are <strong>multimodal and high-dimensional</strong>. There are several equally good ways to grasp a mug, a mean-squared-error head averages them into a motion that grasps nothing, and the field's fix (Section 58.3) was to sample from a generative head. Diffusion works but pays a tax: sampling walks backward through many noise levels, so a policy that must issue actions at 50&nbsp;Hz cannot afford twenty denoising steps per chunk. <strong>Flow matching</strong> is the answer &pi;<sub>0</sub> reaches for. Instead of learning to reverse a stochastic noising process, it learns a deterministic <em>velocity field</em> that transports a sample of pure noise straight to a data sample along a nearly linear path, so a few large integration steps suffice.</p>
+    <p>Concretely, take a clean action chunk \(\mathbf{a}_1\) (a short horizon of future robot commands) and a noise sample \(\mathbf{a}_0 \sim \mathcal{N}(0, I)\). Define the interpolant \(\mathbf{a}_\tau = (1-\tau)\,\mathbf{a}_0 + \tau\,\mathbf{a}_1\) for flow time \(\tau \in [0,1]\). The target velocity along this straight path is simply the displacement \(\mathbf{a}_1 - \mathbf{a}_0\), and the network \(v_\theta\), conditioned on the observation \(\mathbf{o}\) and instruction \(\ell\), is trained to regress it:</p>
+    $$\mathcal{L}(\theta) = \mathbb{E}_{\tau,\,\mathbf{a}_0,\,\mathbf{a}_1}\big\lVert v_\theta(\mathbf{a}_\tau, \tau \mid \mathbf{o}, \ell) - (\mathbf{a}_1 - \mathbf{a}_0)\big\rVert^2 .$$
+    <p>At inference you draw noise and integrate the learned field forward from \(\tau=0\) to \(\tau=1\) with a few Euler steps. That is the whole trick: a plain regression loss (no score matching, no noise schedule to tune) that yields a fast continuous sampler. Because the loss is an expectation over flow time \(\tau\), one network learns to denoise at every level at once.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Flow matching and diffusion are cousins, but the practical difference is <strong>steps per action</strong>. A diffusion head that needs ten to fifty function evaluations to sample one chunk cannot close a 50&nbsp;Hz loop on a bimanual robot; a flow-matching head that samples in five to ten Euler steps can. &pi;<sub>0</sub> gets that speed <em>and</em> continuous, full-precision actions, which is why it can drive dexterous, contact-rich tasks (folding a shirt, bagging groceries) where discretized-token policies produce jerky, low-resolution motion. The action head is not a detail here; it is the thing that decides whether the policy is a demo or a dishwasher-loader.</p>
+    </div>
+
+    <h2>&pi;<sub>0</sub>: a VLM trunk with a flow-matching action expert</h2>
+    <p>&pi;<sub>0</sub>'s architecture is two coupled transformers. The <em>trunk</em> is a pretrained vision-language model (PaliGemma, a 3B-parameter VLM) that ingests one or more camera images and the language instruction and provides the semantic grounding, the web knowledge that lets "the striped towel" mean something. Bolted alongside it is a smaller <strong>action expert</strong> (roughly 300M parameters) that receives the robot's proprioceptive state and the noisy action chunk, attends into the VLM's features, and outputs the flow-matching velocity. The two share attention but keep separate weights, so the language backbone is not disturbed by the fast-changing, continuous action stream. The policy predicts a chunk of \(H\) future steps (about 50 actions, half a second at 50&nbsp;Hz) conditioned on recent observations:</p>
+    $$\pi_\theta(\mathbf{a}_{t:t+H} \mid \mathbf{o}_t, \ell), \qquad \mathbf{a}_{t:t+H} = \mathrm{FlowSample}\big(v_\theta(\cdot \mid \mathbf{o}_t, \ell)\big).$$
+    <p>Three properties make it a foundation model rather than a single-robot controller. It is <strong>cross-embodiment</strong>: trained on a large mixture spanning single-arm, dual-arm, and mobile manipulators, with the action-vector dimensionality padded to a common width so one head serves many bodies, exactly the flexibility argued for in <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>. It is <strong>high-frequency</strong>: the flow head's cheap sampling sustains 50&nbsp;Hz control, enough for the closed-loop feedback that contact-rich tasks demand. And it is <strong>post-trainable</strong>: a broad pretraining phase on the full mixture, followed by fine-tuning on a curated high-quality set for the target task, mirrors the pretrain-then-align pattern of language models. Leakage-safe evaluation (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>) is what keeps the reported success rates on those tasks honest, since the training mixture is large enough to accidentally contain your test scene.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: clearing a real restaurant bus-tub</h3>
+        <p>A hospitality-robotics team fits a dual-arm mobile base with wrist and overhead cameras and wants it to clear tables: stack plates, drop cutlery in a caddy, toss napkins. Their first attempt with a discretized-token policy loads plates in slow, staccato motions and crushes a paper cup when the gripper overshoots between coarse bins. Switching to a &pi;<sub>0</sub>-style flow-matching head, they fine-tune on about 2,000 teleoperated bussing episodes on top of the released base checkpoint. The continuous 50&nbsp;Hz output produces smooth, compliant motions that adapt mid-grasp when a plate slides, and the shared VLM trunk lets a single instruction ("clear the table but leave the full glasses") route correctly without a new model. The cup survives. The win is not a higher benchmark number; it is that continuous high-rate control is what contact-rich, deformable-object work actually requires.</p>
+    </div>
+
+    <h2>&pi;<sub>0.5</sub>: co-training for open-world generalization</h2>
+    <p>&pi;<sub>0</sub> is dexterous but still generalizes best inside its training distribution. <strong>&pi;<sub>0.5</sub></strong> targets the harder prize: performing long-horizon tasks in <em>entirely new environments</em>, a real home the robot has never entered. The core idea is <strong>co-training on heterogeneous data</strong>. Alongside robot trajectories, the model trains on web image-text data, on high-level semantic subtask labels, on verbal instructions, and on data from other robots, so that the visual and semantic representations are forced to generalize far beyond the specific homes in the robot set. The claim, supported by the released results, is that this mixture is what transfers: a policy that has seen the breadth of the web plus the physics of many robots can enter an unseen kitchen and still parse the scene into actionable structure.</p>
+    <p>&pi;<sub>0.5</sub> also runs a <strong>hierarchical (dual-process) inference</strong>. At each step the same model first predicts a high-level semantic subtask in words ("pick up the plate," "open the drawer"), then conditions the flow-matching action expert on that subtask to produce the low-level motion. This mirrors the perception-to-action decomposition of <a class="cross-ref" href="section-58.1.html">Section 58.1</a> but keeps both levels inside one network, so the semantic plan and the motor command stay coupled. The result is a policy demonstrated cleaning multiple unseen kitchens and bedrooms end to end, tasks whose horizon (many minutes, dozens of subgoals) would compound a low-level-only policy into failure.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: openpi</h3>
+        <p>Writing a flow-matching action head from scratch (the interpolant, the flow-time embedding, the Euler sampler, the cross-attention into a VLM trunk, and the per-embodiment action normalization) is roughly 250 to 400 lines before it runs on a real arm. Physical Intelligence's open <code>openpi</code> release collapses loading a &pi;<sub>0</sub> or &pi;<sub>0.5</sub> checkpoint and sampling an action chunk to about ten lines: <code>policy = from_pretrained_checkpoint(...)</code> then <code>policy.infer(observation)["actions"]</code>, with the sampler, the normalization statistics, and the VLM wiring all handled for you.</p>
+    </div>
+
+    <p>The snippet below implements the flow-matching loss and sampler in isolation, so the mechanism referenced above is concrete rather than a black box. It is deliberately backbone-free: swap the toy MLP for a VLM-conditioned expert and this is the &pi;<sub>0</sub> action head.</p>
+
+    <pre class="language-python"><code class="language-python">import torch, torch.nn as nn
+
+class FlowActionHead(nn.Module):
+    def __init__(self, action_dim, cond_dim, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(action_dim + cond_dim + 1, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, action_dim))          # predicts velocity
+
+    def velocity(self, a_tau, tau, cond):
+        x = torch.cat([a_tau, tau, cond], dim=-1)
+        return self.net(x)
+
+def flow_loss(head, a1, cond):                       # a1: clean action chunk
+    a0  = torch.randn_like(a1)                        # noise sample
+    tau = torch.rand(a1.size(0), 1)                   # flow time in [0,1]
+    a_tau  = (1 - tau) * a0 + tau * a1                # straight interpolant
+    target = a1 - a0                                  # constant path velocity
+    return ((head.velocity(a_tau, tau, cond) - target) ** 2).mean()
+
+@torch.no_grad()
+def sample(head, cond, action_dim, steps=8):         # few-step Euler integration
+    a = torch.randn(cond.size(0), action_dim)
+    for k in range(steps):
+        tau = torch.full((cond.size(0), 1), k / steps)
+        a = a + (1.0 / steps) * head.velocity(a, tau, cond)
+    return a                                          # -> continuous action chunk</code></pre>
+    <div class="code-caption">The complete flow-matching contract in three functions: a velocity network, a regression loss against the constant path velocity \(\mathbf{a}_1-\mathbf{a}_0\), and an eight-step Euler sampler that turns noise into a continuous action chunk. Replacing <code>cond</code> with features from a PaliGemma trunk and <code>a1</code> with a padded cross-embodiment chunk is the step from this toy to &pi;<sub>0</sub>.</div>
+
+    <p>Two cautions carry over from open policies and matter more here. First, <strong>observation-distribution match</strong>: open-world generalization is real but bounded by what the co-training mixture covered, and a camera viewpoint or lighting far from the training set still degrades gracefully into failure, the distribution-shift theme of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. Second, <strong>sampler step count</strong>: too few Euler steps and the chunk is under-integrated and jerky, too many and you lose the latency advantage that justified flow matching in the first place; five to ten is the usual sweet spot and is worth tuning per robot.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026 the flow-matching VLA line is the most active in embodied foundation models. &pi;<sub>0</sub> and its open <code>openpi</code> weights established the flow-matching action expert on a PaliGemma trunk; &pi;<sub>0.5</sub> added heterogeneous co-training and hierarchical inference for open-world home tasks, and a "knowledge-insulation" variant reported better preservation of the VLM's semantics during action fine-tuning. The open competitive frontier now pairs these action heads with stronger backbones and explicit reasoning, the direction the humanoid and general-robot foundation models of <a class="cross-ref" href="section-58.5.html">Section 58.5</a> extend. The open research question is whether flow-matching heads or the newer discrete-continuous hybrids win on the reliability metrics that safety-critical deployment (<a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>) actually requires.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the <code>FlowActionHead</code> above and train it on a two-mode toy target: for a fixed condition vector, let the clean action \(\mathbf{a}_1\) be drawn with equal probability from two well-separated Gaussians (two "ways to grasp"). After training, sample 500 chunks and plot them. Confirm the sampler recovers <em>both</em> modes rather than the average between them, then sweep the Euler step count from 2 to 32 and report how sample sharpness and wall-clock trade off. Explain, in two sentences, why an MSE regression head would have collapsed to the midpoint.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why can a flow-matching action head sustain 50&nbsp;Hz control when a many-step diffusion head cannot, and what exactly does each network evaluation compute?</li>
+            <li>&pi;<sub>0</sub> keeps the VLM trunk and the action expert as separate-weight transformers that share attention. What would you lose by instead fine-tuning the action objective straight into the VLM's own weights?</li>
+            <li>&pi;<sub>0.5</sub> co-trains on web image-text and other-robot data it will never literally reproduce at deployment. State the mechanism by which that heterogeneous data buys generalization to an unseen kitchen.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-58.5.html">Section 58.5</a>, we scale the trunk and the body together: humanoid and general-robot foundation models like GR00T and Gemini Robotics take the flow-matching and co-training ideas here and ask what changes when the embodiment is a full humanoid with many more degrees of freedom and the backbone is a frontier multimodal reasoner.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

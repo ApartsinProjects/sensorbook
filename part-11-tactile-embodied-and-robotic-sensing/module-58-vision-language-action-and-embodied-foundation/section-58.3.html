@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 58.3: Open generalist policies (Octo, OpenVLA). Building Sensory AI." name="description"/>
+<title>Section 58.3: Open generalist policies (Octo, OpenVLA) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 58: Vision-Language-Action and Embodied Foundation Models</a></div>
+<h1>Open generalist policies (Octo, OpenVLA)</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The last team told me their policy was general. It generalized beautifully to their lab, their lighting, and their one blue block."</p>
+        <cite>A Skeptical AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the vision-language-action framing of <a class="cross-ref" href="section-58.1.html">Section 58.1</a> and the web-scale transfer story of RT-2 in <a class="cross-ref" href="section-58.2.html">Section 58.2</a>. It leans on the transformer architecture of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, the self-supervised pretraining logic of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and the multimodal fusion vocabulary of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. The Open X-Embodiment dataset these models train on is treated in depth in <a class="cross-ref" href="section-58.6.html">Section 58.6</a>; here we care about what an <em>open, reproducible</em> generalist policy looks like and how you actually run one.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>RT-1 and RT-2 proved that a single transformer can control a robot and inherit knowledge from the web, but both are Google-internal: closed weights, proprietary data, a fixed robot. That is a fine research result and a poor foundation for a field. Octo and OpenVLA are the answer to a simple question, can the generalist-policy recipe be made <em>open, embodiment-flexible, and fine-tunable on a single GPU</em>. Both are trained on the Open X-Embodiment collection, both ship weights and training code, and both are designed to be adapted to a new robot with a few hundred demonstrations rather than a data center. This section is about that opening-up: what design choices Octo (a diffusion-headed transformer) and OpenVLA (a 7-billion-parameter VLM turned policy) make differently, and why "open" changes what you can build.</p>
+    </div>
+
+    <h2>Why open generalist policies matter</h2>
+    <p>A generalist policy is a single model that maps camera images plus a language instruction to robot actions across many tasks and, ideally, many robots. RT-2 showed the ceiling; Octo and OpenVLA lower the floor so the rest of us can reach it. The <em>what</em> is a downloadable checkpoint you can fine-tune. The <em>why</em> is threefold. First, <strong>reproducibility</strong>: closed policies cannot be audited, ablated, or compared fairly, and robotics has a long history of numbers that do not survive contact with another lab. Second, <strong>embodiment transfer</strong>: your robot is almost certainly not the one the model was trained on, so the policy must accept a different camera layout, a different gripper, and a different action space without retraining from scratch. Third, <strong>cost</strong>: pretraining on Open X-Embodiment costs thousands of GPU-hours, but <em>adapting</em> an open checkpoint to a new setup should cost an afternoon. Octo and OpenVLA were built to make that adaptation the common case, and the leakage-safe evaluation discipline of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> is what keeps the resulting success rates honest.</p>
+
+    <h2>Octo: a small transformer with a diffusion action head</h2>
+    <p>Octo is deliberately compact (roughly 27 to 93 million parameters depending on the variant) and built around <strong>flexibility of inputs and outputs</strong>. Images and language go through lightweight tokenizers, are concatenated with learned <em>readout</em> tokens, and pass through a transformer trunk. The trunk itself is frozen in spirit: new observations (an extra wrist camera) or new action spaces (a bimanual robot) are attached by adding tokens and a new head, not by editing the backbone. The <em>how</em> of actions is the interesting part. Rather than discretizing the action space into bins, Octo predicts continuous actions with a <strong>diffusion head</strong>: the readout token conditions a small denoising network that turns Gaussian noise into an action chunk over a handful of steps. Diffusion matters here because manipulation demonstrations are <em>multimodal</em>, meaning there are several equally good ways to reach a cup, and a mean-squared-error head averages them into a useless motion through the middle. A diffusion head samples one coherent mode instead of blending them.</p>
+    <p>Octo also predicts an <strong>action chunk</strong>, a short horizon of \(H\) future steps at once, rather than a single next action. Chunking cuts the number of model calls per second, smooths the trajectory, and reduces the compounding-error problem where each tiny prediction mistake feeds the next input. The policy factorizes as a chunk distribution conditioned on the observation history:</p>
+    $$\pi_\theta(\mathbf{a}_{t:t+H} \mid \mathbf{o}_{t-k:t},\, \ell),$$
+    <p>where \(\ell\) is the language instruction and \(\mathbf{o}\) the recent observations. You run the chunk open-loop for a few steps, then re-plan, a pattern borrowed from receptive-horizon control and closely related to the world-model rollouts of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-53-world-models-and-predictive-sensing/index.html">Chapter 53</a>.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Octo and OpenVLA sit at opposite ends of a <strong>capacity-versus-latency</strong> tradeoff, and neither is universally right. OpenVLA fine-tunes a 7B pretrained vision-language model (a Llama-2 language core with SigLIP and DINOv2 vision encoders) and outputs <em>discretized</em> action tokens through the ordinary language-model head, so it inherits deep web semantics and open-vocabulary grounding, at the cost of running a 7B model in the control loop. Octo carries almost no web knowledge but is two orders of magnitude smaller, samples continuous actions, and fine-tunes in an hour on one GPU. Choose OpenVLA when the task hinges on understanding unfamiliar objects and instructions; choose Octo when it hinges on smooth, fast, cheap control of a well-defined workspace.</p>
+    </div>
+
+    <h2>OpenVLA: a vision-language model repurposed as a policy</h2>
+    <p>OpenVLA takes the RT-2 idea and makes it reproducible. It starts from a pretrained 7B VLM and fine-tunes it on roughly 970,000 robot trajectories from Open X-Embodiment. Actions are emitted the same way RT-2 does it: each continuous action dimension is quantized into 256 bins, and those bins reuse rarely-used token IDs from the language vocabulary, so predicting an action is literally next-token prediction. Because the backbone already grounds language in images from web-scale pretraining, OpenVLA generalizes to object names and instructions it never saw in any robot demonstration, the same open-vocabulary transfer argued for in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. Its practical contribution is efficiency: OpenVLA fine-tunes with LoRA adapters on a single consumer GPU and serves quantized to 4-bit, turning a research artifact into something a small lab can actually deploy.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: adapting an open policy to a warehouse pick cell</h3>
+        <p>An e-commerce fulfillment startup runs a tabletop arm that must pick loose items (a mug, a taped box, a bag of screws) into a tote. Training a policy from scratch on their 300 teleoperated demonstrations overfits and stalls at a low success rate. Instead they fine-tune OpenVLA with LoRA on those 300 episodes overnight on one workstation GPU. Because the backbone already knows what "the striped bag" and "the smaller box" mean, the cell handles item names it was never demonstrated on, and new SKUs need a label, not a retraining run. When throughput later becomes the bottleneck and the item vocabulary stabilizes, they distill the behavior into an Octo-scale policy whose diffusion head runs the arm faster and cheaper, trading the open-vocabulary breadth they no longer need for the control latency they now do. Both steps started from a downloadable checkpoint, which is the entire point.</p>
+    </div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Loading a pretrained generalist policy, tokenizing an image plus instruction, and sampling an action chunk is a from-scratch effort of roughly 300 to 500 lines (image preprocessing, tokenizer wiring, the diffusion sampler, un-normalization). The published checkpoints collapse it to about five. Octo loads with <code>OctoModel.load_pretrained("hf://rail-berkeley/octo-base")</code> and OpenVLA with a standard Hugging Face <code>AutoModelForVision2Seq.from_pretrained</code> call; both handle the tokenizers, the action de-normalization statistics, and the sampling loop for you.</p>
+    </div>
+
+    <p>The snippet below shows the OpenVLA inference path end to end, the one referenced above: an image and instruction in, a de-normalized 7-DoF action out, ready to send to the controller.</p>
+
+    <pre class="language-python"><code class="language-python">import torch
+from PIL import Image
+from transformers import AutoModelForVision2Seq, AutoProcessor
+
+# Load the open 7B policy once (4-bit fits a single 24 GB GPU).
+proc  = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+model = AutoModelForVision2Seq.from_pretrained(
+    "openvla/openvla-7b", torch_dtype=torch.bfloat16,
+    load_in_4bit=True, trust_remote_code=True)
+
+image  = Image.open("wrist_cam.png")                 # current observation
+prompt = "In: What action should the robot take to pick up the striped bag?\nOut:"
+inputs = proc(prompt, image).to("cuda", dtype=torch.bfloat16)
+
+# unnorm_key selects the per-robot action statistics baked into the checkpoint.
+action = model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+print(action)          # -> [dx, dy, dz, droll, dpitch, dyaw, gripper]</code></pre>
+    <div class="code-caption">OpenVLA turns a wrist-camera frame and a natural-language goal into a de-normalized end-effector delta. The <code>unnorm_key</code> maps the model's normalized output back into the metric action space of a specific robot, which is exactly the embodiment-flexibility hook that lets one checkpoint drive many arms.</div>
+
+    <p>Two failure modes deserve naming, both echoing the reliability themes of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. First, <strong>action-space mismatch</strong>: if the <code>unnorm_key</code> or gripper convention does not match your hardware, the arm moves confidently and wrongly, and nothing in the loss will warn you. Second, <strong>observation-gap brittleness</strong>: these policies are trained on specific camera viewpoints, and a wrist camera mounted ten centimeters off the training pose can drop success from high to near zero. Open weights do not exempt you from calibrating the sensing rig to the distribution the model expects; if anything they make that your job.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>As of 2026 the open-policy line has moved past discretized-token control. OpenVLA-OFT (an "optimized fine-tuning" recipe) shows that continuous action chunking with parallel decoding sharply raises both success rate and control frequency over the original autoregressive OpenVLA, and TraceVLA and SpatialVLA add explicit spatial and trajectory grounding. The field-wide shift is toward continuous, chunked action heads (the direction the flow-matching models of <a class="cross-ref" href="section-58.4.html">Section 58.4</a> take to its conclusion), with the discretized-token approach of the original OpenVLA now read as the simple, reproducible baseline that opened the door rather than the frontier itself.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>You are given 250 teleoperated demonstrations on a new 6-DoF arm with a parallel gripper and a single overhead camera. (1) Argue whether Octo or OpenVLA is the better starting point given that the task vocabulary is fixed to eight known objects but the cell must run at 15 Hz control. (2) The pretrained checkpoint expects a wrist camera and you only have an overhead one. Describe two concrete mitigations before you spend a GPU-day on fine-tuning. (3) State one leakage risk in evaluating the fine-tuned policy and how you would design the test split to avoid it.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p>1. Why does Octo use a diffusion action head instead of a mean-squared-error regressor, and what property of manipulation demonstrations forces that choice?</p>
+        <p>2. How does OpenVLA emit a continuous 7-DoF action using only a language-model head, and what is the resolution cost of that trick?</p>
+        <p>3. What does the <code>unnorm_key</code> do, and why is it the mechanism that lets one generalist checkpoint control robots with different action scales?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-58.4.html">Section 58.4</a>, we follow the continuous-action thread to its current destination: flow-matching and open-world VLAs (the π0 and π0.5 family), where the action head becomes a learned velocity field that generates smooth, high-frequency motion and the policy is designed to act in genuinely open environments rather than a curated tabletop.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

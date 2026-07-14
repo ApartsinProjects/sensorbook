@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 57.7: ROS 2 perception integration. Building Sensory AI." name="description"/>
+<title>Section 57.7: ROS 2 perception integration | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part XI: Tactile, Embodied, and Robotic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 57: Proprioception, Exteroception, and Robot Perception</a></div>
+<h1>ROS 2 perception integration</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The algorithm was correct. The transform was ten milliseconds stale, the QoS was mismatched, and the depth cloud arrived on a topic nobody subscribed to. My beautiful fusion node saw nothing at all."</p>
+<cite>A Freshly Humbled Integration AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every idea in this chapter, body-state sensing, exteroceptive fusion, detection and tracking, failure recovery, has so far lived as isolated mathematics. On a real robot none of it runs in a single script. It runs as a graph of concurrent processes exchanging typed messages over a middleware, each with its own clock, its own frame of reference, and its own tolerance for late or dropped data. <strong>ROS 2</strong> (the Robot Operating System, version 2) is the framework that most of the field uses to wire that graph together. It is not an algorithm; it is the plumbing that lets a lidar driver, a depth camera, an IMU filter, a neural detector, and a planner cooperate without any one of them knowing the others exist. This section is about that plumbing: the message types perception speaks, the coordinate-frame bookkeeping that keeps sensors geometrically consistent, the time-synchronization machinery that pairs measurements taken at the same instant, and the quality-of-service knobs that decide whether a stream is reliable-but-buffered or fast-but-lossy. Get the plumbing right and your estimator from <a class="cross-ref" href="section-57.4.html">Section 57.4</a> just works on hardware. Get it wrong and correct math produces silence.</p>
+</div>
+
+<p>This section assumes the timing and synchronization foundations of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and the real-time budgeting of <a class="cross-ref" href="section-57.6.html">Section 57.6</a>. Here we make those concrete inside one concrete middleware rather than in the abstract.</p>
+
+<h2>The graph: nodes, topics, and DDS</h2>
+
+<p>A ROS 2 system is a set of <em>nodes</em> (independent units of computation) that communicate over named <em>topics</em> using a publish-subscribe model. A camera driver node publishes on <code>/camera/image_raw</code>; a detector node subscribes to it and publishes bounding boxes on <code>/detections</code>; a tracker subscribes to those. No node holds a reference to another. This decoupling is what lets you swap a classical detector for a neural one, or run the detector on a separate compute board, by changing a topic name rather than rewriting the caller. Underneath, ROS 2 delegates transport to <strong>DDS</strong> (the Data Distribution Service, an industrial pub-sub standard), which handles discovery, serialization, and delivery with no central broker. That decentralization matters for robots: there is no ROS master to become a single point of failure, and two nodes on the same machine can bypass the network stack entirely.</p>
+
+<p>Perception messages are standardized so that any node can consume any sensor. The <code>sensor_msgs</code> package defines <code>Image</code>, <code>PointCloud2</code>, <code>LaserScan</code>, <code>Imu</code>, and <code>CameraInfo</code> among others; every one carries a <code>std_msgs/Header</code> with a timestamp and a <code>frame_id</code>. Those two fields, when the measurement was taken and in which coordinate frame, are the entire basis for fusing heterogeneous sensors, and forgetting to populate them correctly is the single most common integration bug.</p>
+
+<h2>tf2: the coordinate-frame spine</h2>
+
+<p>A robot has many frames: <code>base_link</code> at its center, <code>lidar_link</code> where the lidar sits, <code>camera_optical_frame</code>, an <code>odom</code> frame that drifts smoothly, a <code>map</code> frame that is globally consistent. A lidar point is meaningless until you know it is expressed in <code>lidar_link</code> and can transform it into <code>base_link</code> to reason about obstacles near the body. <strong>tf2</strong> is the ROS 2 subsystem that maintains this tree of time-stamped rigid transforms and answers queries of the form "give me the transform from frame A to frame B at time \(t\)." Because transforms are time-stamped, tf2 interpolates: if a wheel moved between two published <code>odom</code> updates, tf2 returns the pose at the exact instant your camera frame was captured. This is what makes proprioception-exteroception fusion geometrically honest. The composed transform from a sensor frame to the map frame is just a chain of homogeneous matrices,</p>
+
+$$T^{\text{map}}_{\text{sensor}} = T^{\text{map}}_{\text{odom}}\, T^{\text{odom}}_{\text{base}}\, T^{\text{base}}_{\text{sensor}},$$
+
+<p>and tf2 walks that chain for you, raising an exception if any link is missing or too old. The static links (sensor mounts) are published once; the dynamic links (<code>odom</code> to <code>base</code>) stream from the estimator of <a class="cross-ref" href="section-57.4.html">Section 57.4</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>In ROS 2 perception, the timestamp is not metadata, it is part of the measurement. A point cloud stamped with the arrival time instead of the capture time will be transformed by the wrong pose, projecting obstacles centimeters to meters off their true location during motion. The two most damaging integration errors are almost never in the perception algorithm: they are a wrong or missing <code>frame_id</code>, and a timestamp that reflects when the CPU noticed the data rather than when the sensor sampled it. Fix the header first; debug the math second.</p>
+</div>
+
+<h2>Time synchronization and quality of service</h2>
+
+<p>Fusion nodes usually need several streams that belong to the same instant: an RGB image, its depth map, and the IMU state when both were captured. The streams arrive on separate topics at different rates with jitter, so you cannot simply grab the latest of each. ROS 2 provides <code>message_filters</code> with an <strong>approximate-time synchronizer</strong> that buffers recent messages per topic and emits a tuple only when it finds one message from each whose stamps fall inside a tolerance window. This is the practical realization of the alignment problem from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, packaged as a callback.</p>
+
+<p>Equally important is <strong>QoS</strong> (quality of service), the per-topic contract that governs delivery. A <code>Reliable</code> publisher retransmits until every subscriber acknowledges; <code>BestEffort</code> fires and forgets. High-rate sensor data (lidar, images) is almost always <code>BestEffort</code> with a shallow <code>KEEP_LAST</code> history, because a robot moving at speed wants the freshest scan, not a guaranteed-delivered stale one. A mismatched QoS, a <code>Reliable</code> subscriber on a <code>BestEffort</code> topic, causes the connection to silently never form: the subscriber simply receives nothing, with no error. This is the classic "my node sees no data" failure, and it is a delivery contract problem, not a code problem.</p>
+
+<pre><code class="language-python">import rclpy
+from rclpy.node import Node
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+from sensor_msgs.msg import Image, PointCloud2
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                        history=HistoryPolicy.KEEP_LAST, depth=5)
+
+class FusionNode(Node):
+    def __init__(self):
+        super().__init__("rgbd_fusion")
+        img = Subscriber(self, Image, "/camera/image_raw", qos_profile=SENSOR_QOS)
+        cloud = Subscriber(self, PointCloud2, "/lidar/points", qos_profile=SENSOR_QOS)
+        # pair messages whose stamps agree within ~20 ms
+        self.sync = ApproximateTimeSynchronizer([img, cloud], queue_size=10, slop=0.02)
+        self.sync.registerCallback(self.on_pair)
+
+    def on_pair(self, image, cloud):
+        dt = abs((image.header.stamp.sec + image.header.stamp.nanosec * 1e-9) -
+                 (cloud.header.stamp.sec + cloud.header.stamp.nanosec * 1e-9))
+        self.get_logger().info(f"aligned pair, |dt|={dt*1e3:.1f} ms")
+        # ... transform cloud into camera frame via tf2, run fusion ...
+
+def main():
+    rclpy.init(); rclpy.spin(FusionNode()); rclpy.shutdown()
+</code></pre>
+<div class="code-caption">A minimal ROS 2 fusion node. The <code>ApproximateTimeSynchronizer</code> pairs an image with a lidar cloud only when their header stamps agree within the 20 ms <code>slop</code>, and the shared <code>BEST_EFFORT</code> QoS ensures the subscriptions actually connect to the high-rate sensor publishers. The synchronizer and QoS logic are the two lines that turn correct math into a node that receives data on hardware.</div>
+
+<p>The code above is referenced in the lab below. Note how little of it is perception: the substance is delivery contracts and stamp alignment, exactly the concerns that never appear in a paper but decide whether the paper's method survives contact with a robot.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: message_filters and tf2 do the hard bookkeeping</h3>
+<p>Hand-rolling time synchronization means a per-topic ring buffer, a windowed matching search across streams, and drop policies for stragglers: comfortably 150 to 200 lines, and it is where subtle off-by-one-frame bugs breed. The <code>ApproximateTimeSynchronizer</code> reduces it to the three lines above. Likewise, computing an interpolated sensor-to-map transform by hand means storing a time-series of poses, doing spherical-linear quaternion interpolation, and chaining matrices with staleness checks; <code>tf2</code>'s <code>lookup_transform(target, source, stamp)</code> is one call. Together they remove roughly 300 lines of exactly the code you least want to write yourself and most want battle-tested.</p>
+</div>
+
+<h2>Composition, lifecycle, and Nav2</h2>
+
+<p>Passing a multi-megabyte point cloud between processes means serializing and copying it, which at 20 Hz wastes real bandwidth. ROS 2 answers with <strong>components</strong>: nodes compiled as shared libraries and loaded into one process, where <em>intra-process communication</em> passes a pointer instead of a copy. A perception pipeline (driver, filter, detector) composed into a single container can cut end-to-end latency dramatically, which connects directly to the budgets of <a class="cross-ref" href="section-57.6.html">Section 57.6</a>. ROS 2 also offers <strong>managed lifecycle nodes</strong> with explicit <code>unconfigured</code>, <code>inactive</code>, and <code>active</code> states, so a sensor driver can be brought up, checked, and only then allowed to publish, which is the clean hook for the failure detection and recovery of <a class="cross-ref" href="section-57.5.html">Section 57.5</a>. Above all this sits <strong>Nav2</strong>, the navigation stack that consumes the fused, transformed perception to build costmaps and plan paths, tying this chapter's perception to the spatial reasoning of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a warehouse AMR that went blind at the dock</h3>
+<p>A team deploying an autonomous mobile robot (AMR) in a logistics warehouse hit an intermittent fault: near the loading dock the robot occasionally froze, reporting no obstacles despite a wall in front of it. The perception code was unchanged from a working simulation. The cause was pure integration. The depth-camera driver published its point cloud with <code>Reliable</code> QoS, while the costmap's subscriber requested <code>BestEffort</code>; in simulation the timing masked the mismatch, but on the loaded robot the connection intermittently failed to form and the costmap received nothing, defaulting to "clear." A second, compounding bug: the driver stamped clouds with wall-clock arrival time, so during the robot's turn into the dock, tf2 transformed points with a pose up to 40 ms stale, smearing the wall out of the safety zone. Both fixes were one line each: align the QoS profiles, and stamp clouds with the sensor's hardware capture time. No perception algorithm changed. The robot's "blindness" was entirely in the plumbing, which is precisely where field-deployment bugs concentrate.</p>
+</div>
+
+<h2>When ROS 2 is the right choice</h2>
+
+<p>ROS 2 earns its complexity when you have many heterogeneous sensors, multiple compute units, and a need to reuse community drivers and stacks like Nav2. For a single-sensor embedded classifier on a microcontroller (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), it is overkill; a bare inference loop is simpler and lighter. The decision hinges on graph complexity, not on prestige. And a running caution on evaluation: a perception node that passes in a simulator can still fail on hardware purely from QoS, stamping, or frame errors, so the leakage-safe discipline of validating on real recorded rosbags, not just simulation, applies to integration exactly as it applies to models.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the <code>FusionNode</code> above and record a rosbag containing <code>/camera/image_raw</code> at 30 Hz and <code>/lidar/points</code> at 10 Hz with realistic jitter. (a) Sweep the <code>slop</code> parameter from 5 ms to 100 ms and plot the fraction of lidar messages that get paired versus the mean absolute stamp difference of the pairs; identify the knee. (b) Deliberately set the subscriber QoS to <code>Reliable</code> while leaving the publisher <code>BestEffort</code> and confirm from the node logs that zero pairs arrive. (c) Republish the cloud with arrival-time stamps instead of capture-time stamps, transform a static wall through tf2 during a simulated turn, and measure the induced position error in centimeters as a function of angular velocity.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A subscriber receives no messages but the topic clearly has a publisher and correct name. Name the two most likely non-code causes and how you would confirm each.<br/>
+2. Why must a <code>PointCloud2</code> carry the sensor's capture timestamp rather than its arrival timestamp, and what geometric error results from getting this wrong during motion?<br/>
+3. When does composing several perception nodes into one process meaningfully reduce latency, and what specifically is being avoided?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 57</h3>
+<p>Build a small robot perception pipeline in simulation/ROS 2 fusing IMU, depth, and lidar. Stand up driver nodes (or bag playback) for an IMU, a depth camera, and a lidar; publish correct static transforms into tf2; write a fusion node that uses an approximate-time synchronizer to pair depth and lidar and looks up the IMU-anchored <code>odom</code> to <code>base</code> transform at each pair's stamp; feed the transformed obstacles into a Nav2 costmap and confirm the robot plans around them. Validate on a recorded rosbag, not only live simulation, and log per-pair stamp differences to verify your synchronizer's <code>slop</code> is tight.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Framework and middleware</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.science.org/doi/10.1126/scirobotics.abm6074">Macenski, Foote, Gerkey, Lalancette, Woodall (2022). Robot Operating System 2: Design, architecture, and uses in the wild. Science Robotics 7(66).</a></p>
+<p class="bib-annotation">The authoritative overview of ROS 2's DDS-based architecture, QoS model, and real-world deployments; the reference to cite for why ROS 2 differs from ROS 1.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.omg.org/spec/DDS/1.4/">Object Management Group (2015). Data Distribution Service (DDS) Specification, v1.4.</a></p>
+<p class="bib-annotation">The formal pub-sub standard underneath ROS 2, defining discovery, reliability, and the QoS policies that govern every topic connection.</p>
+</div>
+
+<p class="bib-category">Transforms and time</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/6556373">Foote (2013). tf: The transform library. IEEE Conference on Technologies for Practical Robot Applications (TePRA).</a></p>
+<p class="bib-annotation">The design of the time-stamped transform tree that became tf2; explains interpolation and the frame-consistency guarantees perception relies on.</p>
+</div>
+
+<p class="bib-category">Navigation and perception stacks</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/9341207">Macenski, Martin, White, Ginés Clavero (2020). The Marathon 2: A navigation system. IEEE/RSJ IROS.</a></p>
+<p class="bib-annotation">The Nav2 architecture paper, showing how costmaps consume fused, transformed perception and how lifecycle-managed nodes structure a deployable stack.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.ros.org/reps/rep-0105.html">Meeussen (2010). REP 105: Coordinate Frames for Mobile Platforms.</a></p>
+<p class="bib-annotation">The convention that fixes the map / odom / base_link frame hierarchy; the shared contract that lets independent perception and estimation nodes interoperate.</p>
+</div>
+
+<p class="bib-category">Documentation and tooling</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Quality-of-Service-Settings.html">Open Robotics (2024). ROS 2 Documentation: Quality of Service settings.</a></p>
+<p class="bib-annotation">The practical reference for reliability, history, and durability policies and the incompatibility rules behind silent "no data" failures.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://github.com/ros2/message_filters">Open Robotics (2024). message_filters package: ApproximateTime and ExactTime synchronizers.</a></p>
+<p class="bib-annotation">Source and documentation for the multi-topic synchronizers used to pair measurements from different sensors at matched timestamps.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>With perception wired into a running ROS 2 graph, the robot can see, transform, and fuse the world in real time. In <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-58-vision-language-action-and-embodied-foundation/index.html">Chapter 58</a>, we close the loop from perception to action: vision-language-action models that map raw sensor streams and natural-language goals directly to robot commands, turning the perceptual substrate of this chapter into embodied behavior.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
