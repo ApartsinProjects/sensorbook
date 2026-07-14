@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.7: Failure modes and diagnostics. Building Sensory AI." name="description"/>
+<title>Section 9.7: Failure modes and diagnostics | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Bayesian Filtering and the Kalman Family</a></div>
+<h1>Failure modes and diagnostics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A Kalman filter never tells you it is wrong. It tells you, with great confidence, exactly the wrong thing. The innovation sequence is the only witness that will testify against it."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every earlier section in this chapter assumed the filter works: the model matches the plant, the noise covariances are honest, and the arithmetic is exact. Deployed on real sensors, all three assumptions leak. A Kalman filter that has quietly diverged still emits a smooth, plausible-looking track with a tight covariance, which is precisely what makes silent failure dangerous. This section is about turning that silence into an alarm. You will learn the diagnostic that a running filter hands you for free, the innovation sequence, and how to convert it into statistical tests (NIS and NEES) that flag inconsistency in real time. Then we catalogue the failure taxonomy, divergence, covariance collapse, and numerical breakdown, and pair each symptom with a concrete fix. Diagnostics are the difference between a filter you trust in a lab and one you certify for a moving vehicle.</p>
+</div>
+
+<p>This section assumes you are comfortable with the linear Kalman recursion and its covariance bookkeeping from <a href="index.html">Sections 9.3</a> and the noise-tuning intuition from Section 9.4. The consistency tests below are chi-square arguments, so the Gaussian-and-quadratic-form machinery from <a href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> is the prerequisite you will lean on hardest.</p>
+
+<h2>The innovation sequence: your filter's built-in witness</h2>
+<p>At every measurement update the filter computes the innovation (measurement residual): the gap between what it predicted the sensor would read and what the sensor actually reported.</p>
+<p>$$\nu_k = z_k - H_k \hat{x}_{k|k-1}, \qquad S_k = H_k P_{k|k-1} H_k^\top + R_k$$</p>
+<p>Here \(\nu_k\) is the innovation and \(S_k\) is its predicted covariance. The theory makes a sharp, testable claim: if the model, the noise covariances, and the arithmetic are all correct, the innovation sequence is <em>zero-mean, white, and has exactly covariance \(S_k\)</em>. That is not a soft heuristic; it is a structural consequence of the Kalman gain being optimal. A well-tuned filter has extracted all the predictable structure from the data, so what is left over must be unpredictable (white) noise. Any departure from whiteness means predictable signal is still sitting in the residuals, which means the filter is leaving information on the table or, worse, has the wrong model.</p>
+<p>This is what makes \(\nu_k\) the single most valuable diagnostic you own: it is computed anyway, on every step, with no ground truth required. You do not need to know the true state to check that your residuals look like the noise they are supposed to be. Three cheap checks fall out immediately. A running <em>mean</em> of \(\nu_k\) that drifts away from zero signals a bias, often an uncalibrated sensor offset or an unmodeled acceleration. An <em>autocorrelation</em> at nonzero lag signals that the dynamics model is too simple to explain the motion. And a sample variance that persistently exceeds \(S_k\) signals that your covariances are optimistic.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Whiteness of the innovations is the operational definition of "this filter is working." Optimality and whiteness are two names for the same property. If you can only monitor one thing about a deployed Kalman filter, monitor whether its residuals still look like white noise; every classic failure mode shows up there first, usually before the state estimate visibly drifts.</p>
+</div>
+
+<h2>Consistency tests: NIS and NES made quantitative</h2>
+<p>To turn "looks white" into a threshold an alarm can fire on, we normalize the innovation by its own predicted covariance. The Normalized Innovation Squared (NIS) is</p>
+<p>$$\epsilon_{\nu,k} = \nu_k^\top S_k^{-1} \nu_k.$$</p>
+<p>Under the correct model, \(\epsilon_{\nu,k}\) is a chi-square random variable with \(m\) degrees of freedom, where \(m\) is the measurement dimension. That gives you a calibrated confidence interval with no tuning: for a scalar sensor, \(\epsilon_{\nu,k}\) should land inside \([0.001, 5.0]\) about 95% of the time, and its time average should sit near \(m\). If NIS runs consistently high, the filter is <em>overconfident</em>: it believes its predictions more than the data warrant, so \(R\) or \(Q\) is too small. If NIS runs consistently low, the filter is <em>underconfident</em> and wasting information. NIS needs no ground truth, so it is the test you run in production.</p>
+<p>When you do have ground truth, in simulation, on a motion-capture rig, or from a survey-grade reference, use the Normalized Estimation Error Squared (NEES), \(\bar{\epsilon}_{x,k} = \tilde{x}_k^\top P_{k|k}^{-1} \tilde{x}_k\) with \(\tilde{x}_k = x_k - \hat{x}_{k|k}\). NEES is chi-square with \(n\) degrees of freedom (\(n\) the state dimension) and directly answers the question NIS cannot: is the reported covariance \(P\) an honest description of the actual error? A filter can pass NIS and still fail NEES if the innovations look fine but the state uncertainty is miscalibrated. Run NEES on your bench before deployment; run NIS forever after. Both feed the same downstream story as the calibration diagnostics you will meet in <a href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: a number is only useful if its stated uncertainty is trustworthy.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import chi2
+
+def nis_monitor(innovations, S_list, alpha=0.05):
+    """Flag steps where NIS leaves the chi-square consistency band."""
+    m = innovations[0].shape[0]              # measurement dimension
+    lo, hi = chi2.ppf(alpha/2, m), chi2.ppf(1 - alpha/2, m)
+    nis = np.array([nu @ np.linalg.solve(S, nu)
+                    for nu, S in zip(innovations, S_list)])
+    flags = (nis < lo) | (nis > hi)
+    print(f"mean NIS = {nis.mean():.2f} (expected {m}); "
+          f"{100*flags.mean():.1f}% of steps outside [{lo:.2f}, {hi:.2f}]")
+    return nis, flags                        # sustained high mean -> overconfident filter
+</code></pre>
+<div class="code-caption">A ten-line NIS monitor that a filter can run every step. The printed mean should hover near the measurement dimension \(m\); a mean well above \(m\) or a large fraction of flagged steps is the earliest quantitative sign of an overconfident or diverging filter, long before the track looks wrong to a human.</div>
+<p>The <code>nis_monitor</code> above is deliberately stateless so you can drop it into a replay harness. In a live system you would keep a sliding window of NIS values and alarm on the windowed average, which smooths out the single-sample chi-square noise while still catching a sustained drift within a few seconds.</p>
+
+<h2>The failure taxonomy: divergence, collapse, and numerical breakdown</h2>
+<p>Three failure families cover almost everything you will see in the field, and each has a signature in the diagnostics above.</p>
+<p><strong>Divergence</strong> is when the estimate walks away from the truth while the covariance stays small. It comes from model mismatch: a constant-velocity filter tracking a turning target, or an unmodeled bias. The signature is unmistakable in the residuals, NIS climbs and stays high, and the innovation mean drifts, even as \(P\) reports serene confidence. This is the failure covered structurally in Section 9.5; here the point is that NIS <em>detects</em> it. <strong>Covariance collapse</strong> is the overconfidence endgame: after many consistent measurements \(P\) shrinks so far that the gain \(K_k \to 0\) and the filter stops listening to its sensors. New measurements, even correct ones, no longer move the estimate, so a later disturbance goes untracked. The classic cure is a floor on \(P\) or a fading-memory factor that gently inflates the prediction covariance so the filter never fully stops learning. <strong>Numerical breakdown</strong> is arithmetic, not statistics: the standard covariance update \(P_{k|k} = (I - K_k H_k) P_{k|k-1}\) is not guaranteed to stay symmetric or positive definite in finite precision, and once \(P\) loses positive-definiteness the whole recursion produces nonsense (negative variances, NaNs).</p>
+<p>Two robustness upgrades handle the last two families almost for free. The <em>Joseph-form</em> update, \(P_{k|k} = (I - K_k H_k)P_{k|k-1}(I - K_k H_k)^\top + K_k R_k K_k^\top\), is algebraically identical to the short form but preserves symmetry and positive-definiteness because it is a sum of two positive-semidefinite terms. For ill-conditioned problems, propagate a factor of \(P\) instead of \(P\) itself (square-root or UD filtering), which doubles the effective numerical precision. Neither changes the estimate when everything is well conditioned; both keep the filter alive when it is not.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: the drone that flew straight through a turn</h3>
+<p>An indoor delivery drone fused optical-flow velocity with a downward rangefinder in a constant-velocity Kalman filter. On the bench it tracked beautifully. In the warehouse it periodically overshot corners by half a meter, enough to clip shelving. The state track looked smooth and the reported position covariance was a tight few centimeters, so nothing on the telemetry dashboard looked wrong. The team added the NIS monitor from this section. During every overshoot NIS spiked to 40-plus against an expected value near 1 and stayed high through the turn: the innovations were screaming that a constant-velocity model could not explain a banking maneuver, even though \(P\) claimed serenity. Two fixes landed together: a fading-memory factor of 1.02 to stop the covariance collapsing between corners, and a switch to a constant-acceleration state so the model could represent the turn. Post-fix NIS averaged 1.1 and the overshoots vanished. The lesson: the failure was visible in the residuals for weeks before anyone was watching them.</p>
+</div>
+
+<h2>From diagnostics to fixes: gating and the robustness playbook</h2>
+<p>The same NIS quantity that flags model mismatch also defends the filter against bad measurements. Outliers, an optical multipath return, a GNSS reflection off a building, a mis-associated radar detection, arrive as innovations with huge NIS. <em>Gating</em> exploits this: before applying an update, test whether \(\nu_k^\top S_k^{-1}\nu_k\) exceeds a chi-square threshold (say the 99% quantile), and if it does, reject or down-weight the measurement rather than let it yank the state. This Mahalanobis gate is the workhorse of data association in multi-target tracking and the entry point to the robust and adaptive filters of <a href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>. A word of caution: gating and divergence look alike through the same lens. If nearly every measurement gets gated out, the problem is not a run of outliers; it is that your filter has diverged and is rejecting <em>correct</em> data because its prediction is wrong. A gate that rejects more than a few percent of measurements is itself an alarm.</p>
+<p>Where does this leave the diagnostic loop? Monitor NIS in production; run NEES on the bench; gate on NIS to survive outliers; reach for Joseph form and square-root propagation to survive the arithmetic; add fading memory to survive collapse. Persistent inconsistency that none of these fix is the honest signal that your <em>model</em> is wrong, which is the doorway to the nonlinear and particle methods ahead. The residual-based reasoning here is the same logic that underpins classical change and anomaly detection in <a href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> and the spoofing defenses in <a href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>: a residual that stops looking like noise is always trying to tell you something.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: consistency checks you do not have to hand-roll</h3>
+<p>A production-grade NIS/NEES harness with sliding windows, chi-square bands, and per-sensor gating is roughly 120 to 150 lines to write, test, and get numerically right. FilterPy exposes the innovation and its covariance as <code>kf.y</code> and <code>kf.S</code> after every <code>update()</code>, so the consistency test collapses to <code>nis = kf.y @ np.linalg.solve(kf.S, kf.y)</code>, and its <code>KalmanFilter</code> class ships a Joseph-form update option out of the box. That is one attribute access plus one line versus a full residual-bookkeeping module: the library owns the covariance plumbing and the numerically safe update, and you own only the threshold policy.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take your Lab 9 position tracker and deliberately mistune it: set the process-noise \(Q\) to one tenth of its correct value so the filter becomes overconfident. Log NIS every step and plot it against the 95% chi-square band. (a) Confirm the mean NIS rises well above the measurement dimension. (b) Now inject a single 10-sigma outlier measurement and show that a Mahalanobis gate at the 99% threshold rejects it while an ungated filter takes a visible position jump. (c) Re-run with the correct \(Q\) and verify NIS returns to its expected mean. Report the three NIS traces on one axis.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Your deployed filter produces a smooth track with a tight covariance, yet NIS averages 25 against an expected value of 2. Is the filter overconfident or underconfident, and which noise matrix would you suspect first?</li>
+<li>Why can you monitor NIS in the field but not NEES, and what does NEES tell you that NIS cannot?</li>
+<li>A gate is rejecting 40% of your measurements. Give the two competing explanations and the diagnostic that distinguishes them.</li>
+</ol>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 9</h3>
+<p>implement a Kalman filter for noisy position tracking; extend it to sensor dropout.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Foundational texts on filter consistency</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://onlinelibrary.wiley.com/doi/book/10.1002/0471221279">Bar-Shalom, Y., Li, X.-R., and Kirubarajan, T. (2001). Estimation with Applications to Tracking and Navigation. Wiley.</a></p>
+<p class="bib-annotation">The canonical reference for NIS and NEES consistency testing and Mahalanobis gating; Chapter 5 defines the exact chi-square checks used in this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1109/TAC.1970.1099422">Mehra, R. K. (1970). On the identification of variances and adaptive Kalman filtering. IEEE Transactions on Automatic Control.</a></p>
+<p class="bib-annotation">Introduces innovation-based tests for filter optimality and adaptive estimation of Q and R, the theoretical root of the whiteness diagnostic.</p>
+</div>
+
+<p class="bib-category">Numerical robustness</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ntrs.nasa.gov/citations/19770005172">Bierman, G. J. (1977). Factorization Methods for Discrete Sequential Estimation. Academic Press.</a></p>
+<p class="bib-annotation">The definitive treatment of square-root and UD-factorization filtering that keeps the covariance positive definite in finite precision.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1137/1.9781611971538">Grewal, M. S. and Andrews, A. P. (2015). Kalman Filtering: Theory and Practice Using MATLAB (4th ed.). Wiley.</a></p>
+<p class="bib-annotation">Practical chapters on the Joseph-form update, covariance collapse, and divergence with worked numerical failure cases.</p>
+</div>
+
+<p class="bib-category">Robust and adaptive filtering</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1016/0005-1098(72)90011-1">Jazwinski, A. H. (1970). Stochastic Processes and Filtering Theory. Academic Press.</a></p>
+<p class="bib-annotation">Establishes fading-memory and limited-memory filtering as principled cures for covariance collapse and model-mismatch divergence.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://github.com/rlabbe/filterpy">Labbe, R. (2018). FilterPy: Kalman and Bayesian Filters in Python.</a></p>
+<p class="bib-annotation">Open-source library exposing innovations, innovation covariance, and a Joseph-form update, making the consistency tests in this section a one-liner.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1109/9.917680">Reid, D. B. (1979). An algorithm for tracking multiple targets. IEEE Transactions on Automatic Control.</a></p>
+<p class="bib-annotation">Foundational multi-target tracking paper whose gating and association logic rests directly on the Mahalanobis-distance test built here.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, we confront the failure this section could only diagnose: a model that is wrong because the world is nonlinear. When persistent NIS inconsistency traces back to curved dynamics rather than mistuned noise, the fix is not a bigger \(Q\) but a better filter. The Extended and Unscented Kalman filters linearize the problem, particle filters abandon the Gaussian assumption entirely, and the diagnostics you just learned become the yardstick for choosing among them.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

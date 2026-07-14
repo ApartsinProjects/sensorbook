@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.4: Change-point detection (CUSUM, BOCPD). Building Sensory AI." name="description"/>
+<title>Section 12.4: Change-point detection (CUSUM, BOCPD) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Classical Anomaly and Change Detection</a></div>
+<h1>Change-point detection (CUSUM, BOCPD)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A single high reading, I ignore; that is just noise doing its job. But when the noise stops averaging back to where it used to live, I know the world underneath it moved, and I say so."</p>
+<cite>A Vigilant AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the residual-and-threshold view of <a class="cross-ref" href="section-12.3.html">Section 12.3</a>: we assume you can already turn a raw stream into a sequence of roughly white, roughly zero-mean residuals. It leans hard on the probability toolkit of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> (likelihoods, log-likelihood ratios, Bayes' rule, and the difference between a prior and a posterior), and on the sampling and time notation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (a stream indexed by \(t\), one sample per step). The control-chart intuition of <a class="cross-ref" href="section-12.2.html">Section 12.2</a> is a useful contrast but not required. No prior exposure to sequential analysis is assumed.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Detecting the moment, not just the outlier</h3>
+<p>The anomaly detectors of the previous sections answer "is <em>this sample</em> weird?" Change-point detection answers a harder and often more valuable question: "did the <em>process that generates my samples</em> just change, and if so, when?" A gyroscope bias that drifts, a bearing whose vibration spectrum shifts after a crack forms, a patient whose resting heart rate steps up two days before a fever, a robot whose contact force regime changes the instant it grips an object: none of these are single-sample spikes. Each is a <em>sustained shift in the underlying distribution</em>, invisible to a per-sample threshold but unmistakable once you accumulate evidence over time. This section develops two complementary engines for that accumulation. CUSUM is the frequentist workhorse: minimal, fast, provably near-optimal for detecting a known shift with the smallest possible delay. Bayesian online change-point detection (BOCPD) is the probabilistic generalist: it maintains a full posterior over "how long since the last change," adapts to unknown shift sizes, and hands downstream logic a calibrated probability instead of a bare alarm.</p>
+</div>
+
+<h2>The problem: a shift hiding under noise</h2>
+<p><strong>What</strong> we are detecting is a <em>change point</em>: a time \(\tau\) before which the samples follow one distribution and after which they follow another. Formally, \(x_t \sim p_0\) for \(t &lt; \tau\) and \(x_t \sim p_1\) for \(t \ge \tau\), with \(\tau\) unknown. <strong>Why</strong> this is not solved by the thresholds of <a class="cross-ref" href="section-12.3.html">Section 12.3</a> is a matter of magnitude versus persistence. A shift of half a standard deviation is buried inside the per-sample noise: any threshold loose enough to ignore normal jitter will also ignore the shift, and any threshold tight enough to catch it will fire constantly on noise alone. The signal is not in any one sample; it is in the fact that <em>many</em> consecutive samples all lean the same way. <strong>How</strong> every method here works is by turning that persistence into an accumulating statistic, so that a small but consistent bias grows without bound while zero-mean noise cancels itself out. <strong>When</strong> you reach for these tools is exactly when the interesting events are regime shifts rather than spikes: sensor recalibration drift, fault onset, activity transitions, mode changes in a controller.</p>
+
+<h2>CUSUM: accumulate the log-likelihood ratio</h2>
+<p>CUSUM (cumulative sum) is the sequential test that detects a shift with the smallest average delay for a fixed false-alarm rate; that optimality (Page, 1954; Lorden, 1971) is why it has survived seventy years in production. The idea is to score each sample by how much more consistent it is with the post-change distribution \(p_1\) than with the pre-change \(p_0\), using the log-likelihood ratio \(s_t = \log \frac{p_1(x_t)}{p_0(x_t)}\). Under normal operation \(s_t\) is negative on average; after the change it turns positive on average. The one-sided CUSUM statistic accumulates these scores but <em>refuses to go below zero</em>, so quiet periods reset it rather than digging an ever-deeper hole:</p>
+$$g_t = \max\!\left(0,\; g_{t-1} + s_t\right), \qquad \text{alarm when } g_t > h.$$
+<p>For the common case of detecting a mean shift of size \(\delta\) in Gaussian noise of standard deviation \(\sigma\), the score simplifies to \(s_t = \frac{\delta}{\sigma^2}\big(x_t - \mu_0 - \tfrac{\delta}{2}\big)\), which is just the residual minus half the shift you are hunting for. That is the whole algorithm: subtract a slack, add it up, clamp at zero, alarm at a threshold \(h\). The threshold trades the two quantities you actually care about, the mean time between false alarms and the detection delay, and both have closed-form approximations you can solve for a target alarm budget rather than guess.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def cusum(x, mu0, sigma, delta, h):
+    """One-sided CUSUM for an upward mean shift of size `delta`.
+    Returns the first index where the accumulated evidence crosses h, else None."""
+    k = delta / 2.0                       # reference 'slack': half the target shift
+    g = 0.0
+    for t, xt in enumerate(x):
+        s = (delta / sigma**2) * (xt - mu0 - k)   # log-likelihood-ratio score
+        g = max(0.0, g + s)               # accumulate, but never below zero
+        if g > h:
+            return t                      # change declared here
+    return None
+
+rng = np.random.default_rng(0)
+stream = np.concatenate([rng.normal(0.0, 1.0, 200),      # in-control
+                         rng.normal(0.6, 1.0, 200)])     # +0.6 sigma shift at t=200
+print(cusum(stream, mu0=0.0, sigma=1.0, delta=0.6, h=5.0))   # -> ~223, a short delay
+</code></pre>
+<div class="code-caption">Code 12.4.1: One-sided CUSUM in a dozen lines. The <code>max(0, ...)</code> clamp is the entire trick: it makes the statistic forget in-control history so that only a <em>sustained</em> lean accumulates. A 0.6-sigma shift that no per-sample threshold would catch is flagged about two dozen samples after it begins.</div>
+
+<p>Code 12.4.1 shows why CUSUM catches what thresholds miss: at \(t = 200\) the mean moves by only 0.6 standard deviations, so every individual sample still looks plausible, yet within roughly twenty steps the accumulated score crosses \(h\). Run the same stream through a fixed three-sigma limit and it never fires. Two practical notes matter. First, one-sided CUSUM detects shifts in one direction; run two in parallel (one for up, one for down) to catch both. Second, CUSUM assumes it knows \(\mu_0\) and \(\sigma\), so it pairs naturally with the robust baseline estimation of <a class="cross-ref" href="section-12.3.html">Section 12.3</a> to supply those in-control parameters.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The slack is the shift you refuse to chase</h3>
+<p>Every CUSUM has a reference value \(k\) (here \(\delta/2\)) subtracted from each score. It is not a nuisance knob; it <em>defines the smallest change worth an alarm</em>. Shifts smaller than the slack make the score negative on average and are deliberately allowed to drain away; shifts larger than it accumulate. Choosing \(k\) is therefore an act of stating your detection goal, not tuning a filter: set it to half the smallest shift you are unwilling to miss. This is the same design philosophy as the process-noise choice in <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>: the parameter encodes what you believe matters, and the algorithm mechanically follows.</p>
+</div>
+
+<h2>BOCPD: a posterior over "time since the last change"</h2>
+<p>CUSUM is superb when you know the shift you are hunting and the noise is stationary. Real sensor streams often violate both: the shift size is unknown, the pre-change parameters themselves drift, and you would like a probability rather than a binary alarm to feed a risk-weighted decision. Bayesian online change-point detection (Adams and MacKay, 2007) answers this by tracking a distribution over the <em>run length</em> \(r_t\), the number of steps since the most recent change point. At every step it does two things: it <em>grows</em> each run length by one with probability \(1 - H\) (no change) or <em>resets</em> it to zero with hazard probability \(H\) (a change just happened), and it weights each hypothesis by how well the recent data, modeled by that run's sufficient statistics, predicts the new sample. The recursion over the joint of run length and data is</p>
+$$p(r_t, x_{1:t}) = \sum_{r_{t-1}} p(r_t \mid r_{t-1})\, p(x_t \mid r_{t-1}, x_{1:t-1})\, p(r_{t-1}, x_{1:t-1}),$$
+<p>and normalizing gives \(p(r_t \mid x_{1:t})\), a full posterior you can read at any instant. A change point is signalled when probability mass suddenly collapses onto \(r_t = 0\). The payoff over CUSUM is threefold: BOCPD needs no known shift size (a conjugate prior, typically Normal-Gamma for Gaussian data, integrates over all possible new means and variances), it reports calibrated uncertainty that composes cleanly with the conformal and calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and it can retrospectively refine <em>where</em> the change occurred, not merely that one did. The cost is more computation per step and a hazard rate \(H\) you must set, encoding how often you a priori expect changes.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wind-turbine gearbox that announces its own crack</h3>
+<p>An offshore wind operator streams accelerometer data from each gearbox at 20 kHz and reduces it, using the spectral features of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, to a once-per-minute scalar: the energy in the gear-mesh sideband. When a tooth begins to spall, that energy does not spike; it steps up by a fraction of its normal spread and stays there. A three-sigma alarm on the raw feature stayed silent for days while the crack grew. The team ran a two-sided CUSUM on the sideband energy with slack set to half the smallest fault-scale shift their reliability engineers cared about, and it raised a flag eleven hours after onset, well inside the maintenance window. They added BOCPD in parallel for a second reason: the posterior probability of a recent change point fed directly into a work-order priority score, so a 0.9-probability change on a turbine near end-of-warranty jumped the queue over a 0.4-probability change on a fresh unit. The bare CUSUM alarm could not express that gradient; the Bayesian posterior could. This condition-monitoring pattern is developed in depth in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: offline segmentation and online detection in a few lines</h3>
+<p>Hand-rolling a full BOCPD recursion with conjugate updates and a growing run-length matrix is roughly eighty to a hundred lines of careful, easy-to-misindex probability code. The <code>ruptures</code> library collapses <em>offline, multi</em>-change-point segmentation of a whole recorded stream to about three lines (<code>algo = rpt.Pelt(model="rbf").fit(signal); bkps = algo.predict(pen=10)</code>), handling the dynamic-programming search over all segmentations that would otherwise be a project in itself. For the streaming Bayesian case, <code>bayesian_changepoint_detection</code> ships the Adams-MacKay recursion and standard conjugate likelihoods, turning the hundred-line derivation above into a single <code>online_changepoint_detection(data, hazard, likelihood)</code> call. Build CUSUM by hand once (it is genuinely a dozen lines and worth understanding); reach for a library the moment you need multi-change segmentation or the full Bayesian posterior, where the bookkeeping, not the idea, is the hard part.</p>
+</div>
+
+<h2>Choosing between them, and what they share</h2>
+<p><strong>How</strong> you choose comes down to three questions. Do you know the shift you are hunting? If yes, CUSUM detects it with provably minimal delay and almost no compute, which is why it dominates on microcontrollers and in the streaming edge budgets of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>. Do you need a calibrated probability, an unknown or multiple shift sizes, or retrospective localization? Then BOCPD earns its extra cost. Do you have the whole recording and want the single best set of segment boundaries offline? Then neither online method is ideal; a dynamic-programming segmenter (PELT, Binary Segmentation) is the right tool. What all of them share is the defining move of this section: they convert <em>persistence</em> into <em>accumulated evidence</em>, so that a change too small to see in any one sample becomes unmistakable once summed. That is also their shared failure mode. A slow drift with no sharp onset (a gyro bias creeping over hours) has no single \(\tau\) to find, and both methods will either lag badly or fragment it into many spurious points; for those, the state-augmentation approach of <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, estimating the drift as a hidden state, fits better than declaring change points.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: instrument a fever detector</h3>
+<p>A wearable estimates resting heart rate once per hour. In health it sits near 58 bpm with a standard deviation of about 4 bpm; a developing infection raises the baseline by roughly 6 bpm and holds it there. (1) Design a one-sided CUSUM to detect the upward shift: choose the slack \(k\) and justify it from the 6 bpm target, then pick a threshold \(h\) so that false alarms average no more than one per month at hourly sampling. (2) The person's healthy baseline also drifts seasonally by a few bpm over weeks. Explain why a fixed \(\mu_0\) will eventually cause false alarms, and describe how a slowly updated in-control estimate from <a class="cross-ref" href="section-12.3.html">Section 12.3</a> fixes it without masking a true fever. (3) Argue in two sentences when you would switch to BOCPD here, and what its hazard rate \(H\) would represent physiologically. Clinical validation of such alarms is covered in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Explain in one sentence why a 0.5-sigma mean shift is invisible to a three-sigma per-sample threshold but caught by CUSUM within tens of samples.</p>
+<p>2. What does the CUSUM reference value (slack) \(k\) encode, and what goes wrong if you set it to zero?</p>
+<p>3. Name two capabilities BOCPD gives you that one-sided CUSUM cannot, and state the price you pay for them.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-12.5.html">Section 12.5</a>, we leave the world of univariate, one-parameter-at-a-time detection and move to methods that learn the shape of "normal" directly from unlabeled data. Isolation Forest, Local Outlier Factor, and one-class SVM each carve out a region of feature space that ordinary sensor behavior occupies, then flag whatever falls outside it, giving us anomaly detectors that need no explicit distribution and no known shift size at all.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

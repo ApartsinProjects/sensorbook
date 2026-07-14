@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.2: Unscented Kalman filter and sigma points. Building Sensory AI." name="description"/>
+<title>Section 10.2: Unscented Kalman filter and sigma points | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Unscented Kalman filter and sigma points</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The extended filter asked the function for its slope and believed the answer. I prefer to send a small delegation through the function and see who comes back."</p><cite>A Prudent AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The extended Kalman filter of <a class="cross-ref" href="section-10.1.html">Section 10.1</a> keeps the Gaussian machinery alive by replacing each nonlinear model with its first-order Taylor expansion at the current mean. That works when the function is gently curved over the width of your uncertainty, and it fails, sometimes silently, when it is not: the Jacobian describes the tangent line, not the function, and a confidently wrong tangent produces a confidently wrong covariance. The unscented Kalman filter (UKF) attacks the same problem from the opposite side. Instead of linearizing the function, it approximates the <em>distribution</em>. It picks a small, carefully chosen set of sample points, the <strong>sigma points</strong>, pushes each one through the true nonlinear function untouched, and reconstructs a Gaussian from where they land. No derivatives, no tangent lines, no Jacobians to derive or debug. This section builds the unscented transform that does the pushing, wires it into the predict-correct recursion, and shows why "propagate points, then refit" beats "differentiate, then propagate" for the moderately nonlinear models that fill real sensor systems.</p>
+</div>
+
+<p>This section assumes the linear Kalman recursion and the meaning of the state mean and covariance from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, the linearization idea and Jacobian notation from <a class="cross-ref" href="section-10.1.html">Section 10.1</a>, and comfort with Gaussians, covariance, and matrix square roots from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Like the EKF, the UKF still assumes the belief is a single Gaussian; when that assumption itself breaks, you reach for the particle filter of <a class="cross-ref" href="section-10.3.html">Section 10.3</a>.</p>
+
+<h2>The idea: approximate the distribution, not the function</h2>
+
+<p>Here is the intuition that names the method. It is easier to approximate a probability distribution than an arbitrary nonlinear function. If you want to know what a Gaussian looks like after passing through some curved map \(g\), you do not need to know \(g\) everywhere; you need to know it at a handful of representative places. The <strong>unscented transform</strong> chooses those places deterministically so that they carry the mean and covariance of the input exactly, propagates them through the real \(g\), and reads the output mean and covariance back off the transformed set. The claim, which the derivation makes precise, is that this captures the true posterior mean and covariance to <em>second order</em> in the Taylor expansion for any nonlinearity, and to third order when the input is Gaussian and the weights are tuned. The EKF, by contrast, is accurate only to first order. You get better statistics for the same Gaussian-in, Gaussian-out contract, and you never touch a derivative.</p>
+
+<h2>Choosing the sigma points</h2>
+
+<p>Let the state have dimension \(n\), with mean \(\hat{x}\) and covariance \(P\). The unscented transform draws \(2n+1\) sigma points: one at the mean, and a symmetric pair along each of the \(n\) principal axes of the covariance. The spread along axis \(i\) is set by a column of the <strong>matrix square root</strong> \(\sqrt{(n+\lambda)P}\), usually the lower-triangular Cholesky factor, so the cloud has exactly the covariance \(P\) scaled by \(n+\lambda\):</p>
+
+$$\mathcal{X}_0 = \hat{x}, \qquad \mathcal{X}_i = \hat{x} + \left(\sqrt{(n+\lambda)P}\right)_i, \qquad \mathcal{X}_{i+n} = \hat{x} - \left(\sqrt{(n+\lambda)P}\right)_i,$$
+
+<p>for \(i = 1, \dots, n\). Each point carries two weights, one for reconstructing the mean (\(W_i^{m}\)) and one for the covariance (\(W_i^{c}\)):</p>
+
+$$W_0^{m} = \frac{\lambda}{n+\lambda}, \quad W_0^{c} = \frac{\lambda}{n+\lambda} + (1 - \alpha^2 + \beta), \quad W_i^{m} = W_i^{c} = \frac{1}{2(n+\lambda)}.$$
+
+<p>The composite scaling parameter is \(\lambda = \alpha^2(n+\kappa) - n\). The three knobs each have a job. <strong>\(\alpha\)</strong> (small, e.g. \(10^{-3}\)) controls how tightly the sigma points hug the mean, keeping them inside the region where the function is well-behaved and suppressing higher-order sampling error. <strong>\(\beta\)</strong> folds in prior knowledge of the distribution's shape; \(\beta = 2\) is optimal for a Gaussian and shows up only in the covariance weight of the center point. <strong>\(\kappa\)</strong> is a secondary spread control, usually \(0\) or \(3-n\). These are the Merwe scaled-sigma-point defaults, and for most sensor work you set \(\alpha, \beta, \kappa\) once and forget them.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The sigma points are not random samples and there are not many of them. They are a deterministic, minimal quadrature rule: \(2n+1\) points chosen precisely so their weighted mean and weighted covariance reproduce \(\hat{x}\) and \(P\) exactly. Because the propagated mean is computed from where the <em>real</em> function sent those points, the transform sees the function's curvature that a single tangent plane at the mean is blind to. This is why the UKF corrects the bias the EKF misses: the EKF evaluates \(g\) at one point, the UKF evaluates it at \(2n+1\) and lets their spread report the nonlinearity.</p>
+</div>
+
+<h2>The unscented transform in code</h2>
+
+<p>The whole method is short enough to write once and trust. The function below generates the sigma points and weights, and a second function pushes them through any map and refits a Gaussian. We test it on the classic pain point for linearization: converting a noisy range-and-bearing reading (polar) into a Cartesian position, a map curved enough that evaluating it only at the mean is measurably biased.</p>
+
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+def sigma_points(mean, cov, alpha=1e-3, beta=2.0, kappa=0.0):
+    n = mean.size
+    lam = alpha**2 * (n + kappa) - n
+    S = np.linalg.cholesky((n + lam) * cov)      # scaled matrix square root
+    pts = np.vstack([mean, mean + S.T, mean - S.T])   # 2n+1 sigma points
+    wm = np.full(2 * n + 1, 1.0 / (2 * (n + lam)))
+    wc = wm.copy()
+    wm[0] = lam / (n + lam)
+    wc[0] = wm[0] + (1 - alpha**2 + beta)
+    return pts, wm, wc
+
+def unscented_transform(pts, wm, wc, f):
+    y = np.array([f(p) for p in pts])            # push each point through real f
+    mean = wm @ y
+    d = y - mean
+    cov = (wc[:, None] * d).T @ d
+    return mean, cov
+
+def polar_to_xy(s):                              # nonlinear sensor->world map
+    r, th = s
+    return np.array([r * np.cos(th), r * np.sin(th)])
+
+mean = np.array([30.0, 0.9])                     # range 30 m, bearing 0.9 rad
+cov  = np.diag([1.0**2, 0.35**2])                # range / bearing noise
+pts, wm, wc = sigma_points(mean, cov)
+ut_mean, _ = unscented_transform(pts, wm, wc, polar_to_xy)
+
+samples = rng.multivariate_normal(mean, cov, 400_000)
+mc_mean = np.array([polar_to_xy(s) for s in samples]).mean(0)   # truth
+lin_mean = polar_to_xy(mean)                     # EKF-style: f(mean) only
+
+print("Monte-Carlo mean :", mc_mean.round(3))
+print("unscented  mean :", ut_mean.round(3))
+print("linearized mean :", lin_mean.round(3))</code></pre>
+<div class="code-caption">The unscented transform in twenty lines. <code>sigma_points</code> builds the deterministic \(2n+1\) point cloud and its two weight vectors; <code>unscented_transform</code> propagates them through the true <code>polar_to_xy</code> map and refits a Gaussian. The printout shows the unscented mean landing on the Monte-Carlo truth while the linearized guess <code>f(mean)</code>, the value an EKF would use, sits noticeably off because a wide bearing spread biases the true mean inward.</div>
+
+<p>Run it and the unscented mean tracks the 400,000-sample Monte-Carlo truth to a few centimeters, while the linearized <code>f(mean)</code> is off by a visible margin. That gap is exactly the second-order term the EKF drops and the UKF keeps, purchased with nine function evaluations here and zero calculus.</p>
+
+<h2>Wiring the transform into the filter</h2>
+
+<p>The full UKF is just the recursion of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> with every "propagate the Gaussian" step replaced by an unscented transform. <strong>Predict:</strong> draw sigma points from \((\hat{x}_{t-1}, P_{t-1})\), push them through the motion model \(f\), and refit to get the predicted mean and covariance, then add the process noise \(Q\). <strong>Correct:</strong> draw fresh sigma points from the predicted Gaussian, push them through the measurement model \(h\) to get predicted measurements, and compute three things from the propagated sets: the innovation covariance \(S = P_{zz} + R\), the state-measurement cross-covariance \(P_{xz}\), and from them the Kalman gain \(K = P_{xz} S^{-1}\). The mean and covariance update, \(\hat{x} = \hat{x}^- + K(z - \hat{z})\) and \(P = P^- - K S K^{\top}\), are algebraically identical to the linear filter. The only structural change from the EKF is that Jacobians \(F\) and \(H\) are gone; the cross-covariance \(P_{xz}\), which the EKF forms as \(P^- H^{\top}\), now falls straight out of the sigma-point spread.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: automotive radar tracking a merging vehicle</h3>
+<p>An automotive radar reports each detection in its own polar frame: range, range-rate, and azimuth. The tracker, though, reasons in the ego vehicle's Cartesian frame, where a constant-velocity motion model is linear and clean. The coupling between them, the measurement model that maps Cartesian state to range-bearing-Doppler, is sharply nonlinear, and it is worst exactly where it matters: a vehicle cutting in from an adjacent lane at close range and wide azimuth, where bearing uncertainty of a few degrees smears across a meter of lateral position. An EKF linearizes that map at the predicted mean and, during the fast lateral transient, produces an innovation covariance that is subtly the wrong shape, so the gate either rejects good detections or admits clutter. Swapping in a UKF changes two functions and deletes the hand-derived Jacobian; the sigma points fan out across the true azimuth arc, the innovation covariance bulges in the correct lateral direction, and the track stays locked through the merge. This is the standard reason radar and lidar stacks (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>) reach for the UKF before anything heavier.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: FilterPy's UnscentedKalmanFilter</h3>
+<p>Everything above, sigma-point generation, the predict transform, the innovation and cross-covariance in the correct step, the gain and update, is packaged in <code>filterpy.kalman.UnscentedKalmanFilter</code> paired with <code>MerweScaledSigmaPoints</code>. You supply only the two model functions \(f\) and \(h\), the noise covariances \(Q\) and \(R\), and the sigma-point parameters; the library runs the recursion. That replaces roughly sixty to eighty lines of hand-written sigma-point bookkeeping, Cholesky factoring, and weighted refitting with about eight lines of setup and a one-line <code>ukf.predict(); ukf.update(z)</code> loop, and it handles the numerical guards (positive-definite covariance repair) you would otherwise discover the hard way in production. Build the transform once by hand to understand it, as above; ship the library version.</p>
+</div>
+
+<h2>When to choose it, and what it still cannot do</h2>
+
+<p>Reach for the UKF when the models are meaningfully nonlinear over the width of your uncertainty, when analytic Jacobians are painful, error-prone, or expensive to derive (attitude and orientation estimation in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a> is a canonical case, where quaternion kinematics make Jacobians treacherous), or when you simply want a derivative-free drop-in that is more robust than the EKF at essentially the same cost. The compute is \(O(n^3)\) per step from the Cholesky factorization, the same order as the EKF, with a small constant factor from the \(2n+1\) function evaluations; for the low-dimensional states typical of sensor tracking this difference is negligible. The hard limit is inherited, not introduced: the UKF still represents the belief as one Gaussian. If the true posterior is multi-modal, if you are tracking through a data-association ambiguity or a bimodal likelihood, no choice of sigma points saves you, because the output is refit to a single mean and covariance by construction. That wall is where <a class="cross-ref" href="section-10.3.html">Section 10.3</a> begins.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The sigma-point idea generalizes well beyond the original 2004 unscented transform. The broader family of <strong>sigma-point Kalman filters</strong> swaps in different deterministic quadrature rules: the <strong>cubature Kalman filter (CKF)</strong> uses a spherical-radial rule with \(2n\) equally weighted points and is numerically more stable in high dimension, and the <strong>Gauss-Hermite Kalman filter</strong> trades cost for higher-order accuracy. On the software side, <code>filterpy</code> remains the standard teaching and prototyping implementation, while performance-critical robotics stacks increasingly express these filters inside factor-graph optimizers such as GTSAM (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>), where the sigma-point linearization becomes one factor among many rather than a standalone recursion. The current practical guidance is unchanged: for moderate-dimension, moderately nonlinear, unimodal problems, a square-root UKF or CKF is the robust default before you pay for sampling.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code above into a working scalar-to-2D tracker. (1) Wrap the transform in a predict-correct loop for a 2-D constant-velocity target observed by the <code>polar_to_xy</code>-style range-bearing sensor, and confirm the track holds. (2) Reduce \(\alpha\) from \(10^{-3}\) toward \(1\) and report how the sigma-point spread and the estimated covariance change; explain why a larger spread can hurt when the function is only locally well-behaved. (3) Replace the unscented mean with the linearized mean \(f(\hat{x})\) inside the correct step and measure the tracking error increase, isolating exactly the bias the UKF removes. (4) Push the bearing noise up until the true posterior becomes visibly banana-shaped, and describe, from the printed covariance, how a single-Gaussian filter misrepresents it.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>The EKF and the UKF both output a Gaussian from a Gaussian. What does each one approximate to get there, the function or the distribution, and to what order in the Taylor expansion is each accurate?</li>
+<li>Why does the center sigma point have a different covariance weight \(W_0^c\) from its mean weight \(W_0^m\), and which parameter injects that difference?</li>
+<li>The UKF removes the Jacobians \(F\) and \(H\) entirely. Where does the information those Jacobians carried, specifically the state-measurement cross-covariance \(P_{xz}\), now come from instead?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-10.3.html">Section 10.3</a>, we cross the wall the UKF cannot climb. When the belief is multi-modal or the noise is anything but Gaussian, we stop refitting a single Gaussian and instead represent the posterior with a cloud of many weighted samples, the particles, propagated by the same predict-correct logic but weighted by importance sampling. The sigma points you just met were a deterministic handful chosen to match two moments; the particle filter trades that elegance for a stochastic swarm that can chase any shape the posterior takes.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

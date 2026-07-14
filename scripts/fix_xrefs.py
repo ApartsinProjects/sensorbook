@@ -25,7 +25,7 @@ for part in scaffold.parse_plan()["parts"]:
     for chap in part["chapters"]:
         CH_INDEX[chap["number"]] = f"{scaffold.part_dir(part)}/{scaffold.module_dir(chap)}/index.html"
 
-HREF_RE = re.compile(r'(href=")([^"]*?module-(\d+)-[^"]*?/index\.html)(")')
+HREF_RE = re.compile(r'(href=")([^"]*?module-(\d+)-[^"]*?/(?:index\.html|section-[0-9.]+\.html))(")')
 
 
 def fix_file(f: Path) -> int:

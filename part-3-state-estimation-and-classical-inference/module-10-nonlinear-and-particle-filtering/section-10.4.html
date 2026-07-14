@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.4: Resampling and degeneracy. Building Sensory AI." name="description"/>
+<title>Section 10.4: Resampling and degeneracy | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Resampling and degeneracy</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A thousand particles set out to represent the posterior. By step fifty, nine hundred and ninety-nine were carrying weight zero and one was doing all the work. That one was very tired."</p>
+<cite>An Overworked AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p><a class="cross-ref" href="section-10.3.html">Section 10.3</a> built the particle filter: represent the posterior by a cloud of weighted samples, push each through the dynamics, and reweight by how well it explains the measurement. Left to run, that scheme quietly self-destructs. The importance weights spread out over time until nearly every particle holds a negligible share and one lucky sample carries almost all of it. Your thousand-particle filter becomes a one-particle filter that still costs a thousand particles to run. This section explains that failure, called weight degeneracy, gives you the one number that detects it (the effective sample size), and introduces resampling, the correction that rescues the filter by culling low-weight particles and cloning high-weight ones. It then confronts the price of that rescue: resampling trades weight degeneracy for a second disease, sample impoverishment, and the art of a healthy particle filter is balancing the two.</p>
+</div>
+
+<p>This section assumes the particle-filter mechanics and importance weights of <a class="cross-ref" href="section-10.3.html">Section 10.3</a>, plus comfort with sampling, variance, and the categorical distribution from the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> primer. Nothing else is needed. We keep the notation of the chapter: a set of \(N\) particles \(\{\mathbf{x}_k^{(i)}\}\) with normalized weights \(\{w_k^{(i)}\}\) summing to one approximates the filtering posterior \(p(\mathbf{x}_k \mid \mathbf{z}_{1:k})\).</p>
+
+<h2>Why the weights collapse: the degeneracy problem</h2>
+
+<p><strong>What happens.</strong> In sequential importance sampling, each new measurement multiplies every particle's weight by a likelihood factor and then the whole set is renormalized. Multiplying many random factors and renormalizing is exactly the recipe for one factor to dominate. A theorem of Doucet and colleagues makes it precise: the variance of the importance weights can only grow with time. There is no steady state where the weights stay balanced. Given enough steps, the normalized weight of a single particle converges to one and all others to zero.</p>
+
+<p><strong>Why it matters.</strong> A degenerate filter still produces a number, so like the mistuned Kalman filter of <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/section-9.4.html">Section 9.4</a> it fails silently. Every particle except one contributes nothing to the posterior estimate, yet you still pay the full compute cost of propagating all \(N\) of them through the dynamics and the likelihood at every step. Worse, the surviving particle almost never sits at the true state, so the estimate is both expensive and wrong, and its reported spread collapses to a point that lies to you about your own uncertainty. That miscalibration is the same failure the book returns to in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<h2>Measuring the damage: effective sample size</h2>
+
+<p>You cannot fix what you cannot detect, and the detector is the <span>effective sample size</span> (ESS), a single scalar that estimates how many of your \(N\) particles are actually pulling their weight. The standard approximation is</p>
+
+$$ \widehat{N}_{\text{eff}} = \frac{1}{\sum_{i=1}^{N} \left(w_k^{(i)}\right)^2}. $$
+
+<p><strong>How to read it.</strong> When all weights are equal, \(w^{(i)} = 1/N\), the sum of squares is \(1/N\) and \(\widehat{N}_{\text{eff}} = N\): every particle counts. When one weight is one and the rest are zero, the sum of squares is one and \(\widehat{N}_{\text{eff}} = 1\): the filter has degenerated to a single sample. The ratio \(\widehat{N}_{\text{eff}}/N\) is therefore a health gauge running from 1 (perfect) toward \(1/N\) (dead). It is cheap, it needs no ground truth, and it is the trigger every practical particle filter watches.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Resampling does not make your estimate more accurate at the instant you apply it; it can only lose information, because it discards the low-weight particles that still carried a sliver of probability. Its entire value is preventive. By spending particles now on the high-probability regions, it keeps the filter from wasting all of them on dead samples later. This is why you resample only when ESS says you must, not on every step: each resampling is a small, deliberate loss of diversity taken to avoid a total loss of representation.</p>
+</div>
+
+<h2>The fix: resampling as survival of the fittest</h2>
+
+<p><strong>What it does.</strong> Resampling replaces the weighted particle set with a new set of \(N\) equally weighted particles, drawn with replacement so that the expected number of copies of particle \(i\) is proportional to its weight \(N w^{(i)}\). High-weight particles get cloned several times; low-weight particles vanish. After resampling, all weights reset to \(1/N\), and the cloud is concentrated where the posterior mass actually is. The catch is that cloning creates duplicates: several new particles sit at identical states. The diversity of the cloud drops, and this is <span>sample impoverishment</span>. It is most dangerous when process noise is small, because then the dynamics barely separate the duplicates on the next step and the filter can collapse onto a single trajectory even though its weights look healthy.</p>
+
+<p><strong>How to draw the copies.</strong> The naive method, <em>multinomial resampling</em>, draws \(N\) independent uniforms and, for each, picks the particle whose cumulative weight interval it lands in. It is unbiased but adds the most Monte Carlo variance of any scheme. Three better methods reduce that variance by making the draws less independent:</p>
+
+<ul>
+<li><strong>Stratified resampling</strong> partitions \([0,1)\) into \(N\) equal strata and draws one uniform inside each, guaranteeing coverage across the whole weight range.</li>
+<li><strong>Systematic resampling</strong> goes further: it draws a single uniform \(u \sim \mathcal{U}[0, 1/N)\) and places the \(N\) sample points on the regular grid \(u + i/N\). It is \(O(N)\), the simplest to code, and has the lowest variance in practice, which is why it is the default in most libraries.</li>
+<li><strong>Residual resampling</strong> deterministically keeps \(\lfloor N w^{(i)} \rfloor\) copies of each particle, then draws the remainder multinomially, cutting variance by handling the integer part exactly.</li>
+</ul>
+
+<p>All four are unbiased in expectation; they differ only in the variance they inject. For sensor filters running at hundreds of hertz, systematic resampling is almost always the right default.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def effective_sample_size(w):
+    """Estimated number of 'active' particles from normalized weights w."""
+    return 1.0 / np.sum(w**2)
+
+def systematic_resample(w, rng):
+    """Return indices of resampled particles. O(N), low variance."""
+    N = len(w)
+    positions = (rng.random() + np.arange(N)) / N     # one jitter, regular grid
+    cumulative = np.cumsum(w)
+    cumulative[-1] = 1.0                               # guard against round-off
+    return np.searchsorted(cumulative, positions)
+
+def maybe_resample(particles, w, rng, thresh_ratio=0.5):
+    """Adaptive resampling: only when ESS drops below thresh_ratio * N."""
+    N = len(w)
+    if effective_sample_size(w) &lt; thresh_ratio * N:
+        idx = systematic_resample(w, rng)
+        return particles[idx], np.full(N, 1.0 / N), True
+    return particles, w, False                         # weights carried forward
+</code></pre>
+<div class="code-caption">Effective sample size, systematic resampling, and the adaptive trigger that ties them together. <code>systematic_resample</code> spends a single random draw and one <code>searchsorted</code> pass, so it is \(O(N)\); <code>maybe_resample</code> fires only when <code>effective_sample_size</code> falls below half the particle count, carrying the weights forward untouched otherwise. These three functions are the entire degeneracy-control layer of a particle filter.</div>
+
+<p>The code above shows the discipline in full. The ESS is computed every step; resampling fires only when the health gauge crosses a threshold (a ratio of \(0.5\), meaning half the particles have effectively died, is the common choice). Between triggers the weights simply accumulate, so a filter watching a well-modelled, slowly changing state may go many steps without resampling at all, preserving diversity for free.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a warehouse robot that teleported through a wall</h3>
+<p>An indoor delivery robot localized itself with a particle filter over a floor map, fusing wheel odometry with a lidar scan match, a classic setup revisited in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>. On long straight aisles the lidar saw two identical parallel walls, so two clusters of particles, one at the true pose and one shifted by an aisle width, both explained the scans well. The team resampled on every single step to keep things simple. Every resample randomly culled a few particles, and after a few hundred steps the plausible-but-wrong cluster happened to get wiped out entirely by pure resampling noise, along with all diversity in the true cluster. When the robot reached a junction that finally disambiguated the two hypotheses, the correct particles were gone. The estimate snapped to the wrong aisle, and the robot planned a path straight through a shelving unit. The fix was two lines: compute ESS, and resample only when it dropped below \(N/2\). Keeping diversity alive between triggers let both hypotheses survive until the geometry, not the random number generator, decided between them.</p>
+</div>
+
+<h2>Keeping diversity alive: roughening and regularization</h2>
+
+<p>Adaptive resampling reduces how often you impoverish the cloud, but when process noise is genuinely tiny the duplicates still pile up. Two standard remedies inject diversity back. <strong>Roughening</strong> (also called jitter) adds a small zero-mean noise to each resampled particle, spreading the clones apart; the noise scale is typically tied to the inter-particle spacing so it shrinks as the cloud converges. The <strong>regularized particle filter</strong> makes this principled: instead of resampling from the discrete set, it resamples from a continuous kernel-density estimate built on the particles, so every child is a fresh, distinct sample. Both cost a little bias in exchange for robustness against collapse, and both are worth reaching for whenever a low-noise system keeps degenerating despite adaptive resampling. A different route, deferring diversity loss by analytically marginalizing part of the state, is the subject of <a class="cross-ref" href="section-10.5.html">Section 10.5</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The right tool: resampling off the shelf</h3>
+<p>Rolling your own multinomial, stratified, systematic, and residual resamplers plus an ESS gate is roughly fifty lines to write and, more to the point, roughly fifty lines to get subtly wrong (the round-off guard on the cumulative sum is a classic silent bug). <code>filterpy</code> ships all four resamplers and the ESS helper, so the whole degeneracy layer collapses to about five lines:</p>
+<pre><code class="language-python">from filterpy.monte_carlo import systematic_resample
+from filterpy.monte_carlo import neff        # effective sample size
+
+if neff(weights) &lt; N / 2:                     # ESS below half the particles
+    idx = systematic_resample(weights)       # validated, O(N)
+    particles[:] = particles[idx]
+    weights.fill(1.0 / N)                     # reset to uniform
+</code></pre>
+<div class="code-caption">The same adaptive systematic-resampling logic using <code>filterpy.monte_carlo</code>. The library provides <code>neff</code> (effective sample size) and battle-tested <code>systematic_resample</code>, <code>stratified_resample</code>, <code>residual_resample</code>, and <code>multinomial_resample</code>, replacing about fifty lines of hand-written and easily mis-indexed sampling code with five.</div>
+</div>
+
+<h2>When each choice is right</h2>
+
+<p><strong>When to resample:</strong> almost always adaptively, on an ESS threshold near \(N/2\). Resample every step only if you have a specific reason, and expect faster impoverishment if you do. <strong>Which scheme:</strong> systematic by default for its low variance and \(O(N)\) cost; residual when you want to squeeze variance further; multinomial essentially never, except as a textbook baseline. <strong>When to add roughening or a regularized filter:</strong> when process noise is small enough that resampled duplicates do not naturally separate, the tell being an ESS that looks healthy while the distinct-particle count quietly collapses. These knobs, together with the proposal design of <a class="cross-ref" href="section-10.3.html">Section 10.3</a>, are the whole tuning surface of a particle filter, and they recur wherever these filters power real systems, from the localization of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a> to the SLAM back ends of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the one-dimensional particle filter you built for <a class="cross-ref" href="section-10.3.html">Section 10.3</a> and run it for 300 steps with \(N = 1000\) particles.</p>
+<ol>
+<li>Disable resampling entirely and log \(\widehat{N}_{\text{eff}}\) at every step. Plot it and note how many steps pass before the effective sample size falls below 10.</li>
+<li>Enable adaptive systematic resampling at the \(N/2\) threshold and overlay the ESS trace. Count how many times resampling actually fired.</li>
+<li>Now shrink the process noise by a factor of 100 and count the number of <em>distinct</em> particle values after 300 steps, with and without roughening. Explain what the ESS gauge failed to warn you about.</li>
+</ol>
+<details>
+<summary>Hint</summary>
+<p>ESS measures weight balance, not spatial diversity. A cloud of a thousand identical duplicates has perfect ESS and zero diversity, which is exactly the blind spot roughening exists to cover.</p>
+</details>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Weight degeneracy and sample impoverishment are opposite failures. Which one does resampling cure, and which one does it cause?</li>
+<li>Your filter reports \(\widehat{N}_{\text{eff}} = 950\) out of 1000 particles yet its estimate is badly wrong and barely moves. What is going on, and why did ESS not catch it?</li>
+<li>Why is systematic resampling usually preferred over multinomial resampling even though both are unbiased in expectation?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-10.5.html">Section 10.5</a>, we attack degeneracy from the other end. Instead of curing a collapsed cloud after the fact, Rao-Blackwellization shrinks the space the particles have to cover in the first place: it samples only the states that truly need it and solves the rest analytically with a Kalman filter riding on each particle. Fewer sampled dimensions means slower weight variance growth, so the same particle budget buys a far healthier filter.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.6: Uncertainty from the information matrix. Building Sensory AI." name="description"/>
+<title>Section 11.6: Uncertainty from the information matrix | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>Uncertainty from the information matrix</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I gave the robot a pose. It asked, sensibly, how sure I was. I handed it a matrix, and only then did I realize I had been guessing in one direction the whole time."</p>
+        <cite>A Self-Aware AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the MAP / nonlinear-least-squares formulation of <a class="cross-ref" href="section-11.2.html">Section 11.2</a>, where the linearized problem's Hessian is the information matrix, and the marginalization machinery (Schur complements, the information form) of <a class="cross-ref" href="section-11.4.html">Section 11.4</a>. It leans on the covariance-versus-information duality and the meaning of a Gaussian's precision matrix from the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> uncertainty primer, and on the information form of the Kalman filter from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. Cholesky and QR factorization are reviewed in Appendix A.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Solving a factor graph gives you an answer: the most likely trajectory and map. But an answer without a confidence is dangerous, because a downstream planner cannot tell a centimeter-accurate pose from one that is meters off. The wonderful thing about factor-graph estimation is that the uncertainty is not a separate computation bolted on afterward; it is already sitting inside the optimizer. The same matrix you factorized to find the solution, the information matrix \(\Lambda = J^\top \Sigma^{-1} J\), <em>is</em> the inverse of the posterior covariance. Reading uncertainty out of it is a matter of inverting the parts you care about, and the sparse structure of the graph lets you do that without ever forming a giant dense inverse. This section is about turning the byproduct of optimization into calibrated error bars: how to recover marginal covariances efficiently, how to read the ellipsoids they define, how to spot unobservable directions the graph never pinned down, and how to check whether the numbers are honest before a controller trusts them.</p>
+    </div>
+
+    <h2>The Hessian you already computed is the inverse covariance</h2>
+    <p>At the MAP solution the negative log-posterior is, to second order, a quadratic bowl, and its curvature is the information matrix. Recall from <a class="cross-ref" href="section-11.2.html">Section 11.2</a> that stacking every factor's whitened residual into \(r(x)\) and its Jacobian into \(J\) turns one Gauss-Newton step into the normal equations \(J^\top J\,\delta = -J^\top r\). The matrix on the left is exactly the (Gauss-Newton) Hessian, and it is the posterior information matrix</p>
+    \[ \Lambda = J^\top J = \sum_k J_k^\top \Sigma_k^{-1} J_k, \]
+    <p>a sum of one term per factor, each measurement contributing its own slab of certainty. Under the Laplace approximation, the posterior over the whole state is Gaussian with covariance</p>
+    \[ \Sigma_x = \Lambda^{-1}. \]
+    <p>This is the entire idea in one line: the covariance is the inverse of the information matrix, and the information matrix is the thing the solver factorizes anyway. A pose that many factors constrain has a large diagonal block in \(\Lambda\) and therefore a small block in \(\Sigma_x\): more evidence means more information means less variance. That duality, information adds while covariance shrinks, is the same one that makes the information form of the Kalman filter in <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> so convenient for fusing many sensors.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Optimization and uncertainty quantification are not two jobs. Finding the mean requires factorizing \(\Lambda\) (via Cholesky, \(\Lambda = R^\top R\), or the QR of \(J\)), and that very factor \(R\) is also the key to the covariance. The square-root factor is doing double duty: solving \(R^\top R\,\delta = -J^\top r\) gives the update, and back-substituting through \(R\) gives entries of \(\Lambda^{-1}\). You never pay twice. This is why serious SLAM back ends report covariances almost for free, while a black-box optimizer that only returns the argmin has thrown away half of what it computed.</p>
+    </div>
+
+    <h2>Recover marginal covariances without inverting the whole thing</h2>
+    <p>Naively you might write \(\Sigma_x = \Lambda^{-1}\) and call a dense inverse. For a real SLAM problem with tens of thousands of variables this is both ruinously expensive (\(O(n^3)\)) and pointless: you rarely want the full \(n \times n\) covariance. You want a few <strong>marginal</strong> blocks, the \(6 \times 6\) covariance of the current pose, or the \(3 \times 3\) covariance of a landmark you are about to associate. The marginal covariance of variable \(i\) is the diagonal block \((\Lambda^{-1})_{ii}\), and cross-covariance between two variables is the off-diagonal block \((\Lambda^{-1})_{ij}\). Two subtleties matter. First, the marginal block of the inverse is <em>not</em> the inverse of the marginal block of \(\Lambda\); you cannot just invert the local diagonal block and get the right answer, because that ignores how the rest of the graph constrains the variable. Second, marginal covariance (uncertainty after accounting for everything else being unknown) differs from conditional covariance (uncertainty if everything else were fixed), and confusing the two silently produces overconfident error bars.</p>
+    <p>The efficient route uses the square-root factor \(R\) directly. Kaess and Dellaert's recursive formula computes selected entries of \(\Sigma_x = R^{-1}R^{-\top}\) starting from the bottom-right of \(R\) and working up, touching only the entries dictated by the sparsity of \(R\). Because a smoother keeps \(R\) sparse (this is exactly what variable ordering and the iSAM2 Bayes tree of <a class="cross-ref" href="section-11.3.html">Section 11.3</a> preserve), recovering the marginal for one variable costs work proportional to the fill of a few columns, not a full inverse. Listing 11.6 shows the exact relationship on a small dense problem so you can see the structure before trusting a library to exploit the sparsity.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# Tiny pose graph: 3 variables, 2 dims each (e.g. planar landmarks/poses).
+# Build the information matrix Lambda = J^T J from three stacked factors.
+J = np.array([
+    [ 1., 0., 0., 0., 0., 0.],   # prior on x0
+    [ 0., 1., 0., 0., 0., 0.],
+    [-1., 0., 1., 0., 0., 0.],   # relative x0 -> x1
+    [ 0.,-1., 0., 1., 0., 0.],
+    [ 0., 0.,-1., 0., 1., 0.],   # relative x1 -> x2
+    [ 0., 0., 0.,-1., 0., 1.],
+])
+Lam = J.T @ J                       # information matrix (6x6, block-tridiagonal)
+
+R = np.linalg.cholesky(Lam).T       # square-root information factor, Lam = R^T R
+Sigma = np.linalg.inv(R) @ np.linalg.inv(R).T   # full covariance = R^-1 R^-T
+
+# Marginal covariance of the LAST variable x2 = bottom-right 2x2 block.
+marg_x2 = Sigma[4:6, 4:6]
+# WRONG way: inverting only x2's own information block ignores the rest of the graph.
+naive_x2 = np.linalg.inv(Lam[4:6, 4:6])
+print("marginal cov of x2 (correct):\n", np.round(marg_x2, 3))
+print("naive block-inverse (too confident):\n", np.round(naive_x2, 3))</code></pre>
+    <div class="code-caption"><strong>Listing 11.6.</strong> The posterior covariance is \(\Lambda^{-1} = R^{-1}R^{-\top}\), where \(R\) is the Cholesky (square-root information) factor the solver already produced. The correct marginal for \(x_2\) is the diagonal block of the <em>full</em> inverse; inverting only \(x_2\)'s own information block ignores how the chain leading up to it accumulates uncertainty and reports a covariance that is too small.</div>
+
+    <p>Run Listing 11.6 and the two printed blocks disagree: the correct marginal is larger, because \(x_2\) sits at the end of a chain and inherits the accumulated uncertainty of \(x_0\) and \(x_1\), while the naive block-inverse pretends the earlier poses are known exactly. This is the single most common uncertainty bug in hand-rolled estimators, and it always fails in the dangerous direction, toward overconfidence.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Implementing recursive marginal-covariance recovery over a Bayes tree, correct ordering, sparse back-substitution, and cross-covariance blocks, is a few hundred lines and easy to get subtly wrong. GTSAM exposes it as one call on the solved graph:</p>
+        <pre class="language-python"><code class="language-python">from gtsam import Marginals
+# graph and result (a Values) come from your optimizer, e.g. LevenbergMarquardt
+marginals = Marginals(graph, result)
+cov_pose_k = marginals.marginalCovariance(pose_key)          # 6x6 for SE(3)
+joint = marginals.jointMarginalCovariance([key_i, key_j])    # includes cross-cov</code></pre>
+        <div class="code-caption"><strong>Listing 11.6b.</strong> <code>gtsam.Marginals</code> recovers the marginal (and joint) covariance of any variable from the already-factorized information matrix, exploiting sparsity so a single pose's covariance costs a handful of back-substitutions instead of a full \(n\times n\) inverse. This collapses roughly 200 lines of recursive covariance-recovery bookkeeping into two calls.</div>
+        <p>The <code>marginalCovariance</code> call in Listing 11.6b is what a data-association or active-exploration module queries thousands of times per second; its speed is the whole reason the square-root form is preferred over a dense inverse.</p>
+    </div>
+
+    <h2>Reading the matrix: ellipsoids, correlations, and directions the graph never saw</h2>
+    <p>A covariance block is not just a set of standard deviations; its eigenstructure is a shape. The eigenvectors of a pose's \(\Sigma\) point along the axes of the \(1\sigma\) uncertainty ellipsoid, and the eigenvalues are the squared semi-axis lengths. A long, thin ellipsoid means the estimate is well pinned in some directions and loose in others, which is exactly what happens to a robot driving down a featureless corridor: it localizes across the corridor from the walls but slides freely along it, so one eigenvalue dwarfs the rest. Off-diagonal (cross-covariance) blocks tell you which variables move together; a strong correlation between two landmarks means observing one refines the other, information a naive per-variable error bar would miss entirely.</p>
+    <p>The extreme case is an eigenvalue that goes to zero: an <strong>unobservable direction</strong>. If nothing in the graph constrains some combination of states, \(\Lambda\) is rank-deficient (singular) in that direction and the covariance is formally infinite. In pure SLAM this is the <em>gauge freedom</em>: with only relative measurements the whole map can be translated and rotated at no cost, so the global pose is unobservable until you anchor it with a prior. A near-singular \(\Lambda\) also shows up as an exploding condition number, which is your early warning that the problem is under-constrained and any covariance you extract is unreliable. Checking the smallest eigenvalue of the information matrix before trusting its inverse is cheap insurance.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a delivery drone deciding where to look</h3>
+        <p>A visual-inertial delivery drone runs a factor-graph estimator fusing IMU pre-integration factors with camera landmark factors. Between GPS-denied urban canyons its estimator keeps solving, but the interesting signal is the covariance. As the drone flies a straight boulevard with few side features, the marginal covariance of its position develops one large eigenvalue aligned with the flight direction: it knows where it is across the street but is growing unsure along it. The onboard active-perception module reads that eigenvector, recognizes the weak axis, and steers the gimbal camera toward a building facade off to the side, injecting landmark factors that constrain precisely the loose direction. Within a second the offending eigenvalue collapses and the position ellipsoid rounds out. The drone did not just estimate; it noticed <em>what it did not know</em> and acted to fix it, all from reading the information matrix. This closes the loop between estimation here and the localization and active-sensing ideas in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>.</p>
+    </div>
+
+    <h2>Are the error bars honest? Consistency before trust</h2>
+    <p>A covariance is only useful if it is calibrated: a reported \(1\sigma\) should contain the truth about 68 percent of the time. Factor-graph covariances are systematically optimistic for two reasons. First, the Laplace approximation replaces the true posterior with a Gaussian fit at the mode, ignoring curvature and multimodality, so on strongly nonlinear problems (bearing-only landmarks, large rotations) the real spread exceeds the reported one. Second, wrong noise models feed \(\Lambda\) the wrong \(\Sigma_k\): if you tell the graph your odometry is twice as precise as it really is, every downstream covariance inherits that lie. The standard check is the <strong>normalized estimation error squared</strong> (NEES): on data where ground truth is known, compute \(\epsilon = (x - \hat{x})^\top \Sigma_x^{-1} (x - \hat{x})\) and confirm it follows a chi-square distribution with the right degrees of freedom. A NEES that runs high means the filter is overconfident (the usual failure); one that runs low means it is needlessly conservative. This consistency testing connects directly to the calibration and coverage machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, and it must be run on held-out trajectories, never the ones you tuned the noise model on, to avoid the leakage traps of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Estimator consistency is an active research area precisely because linearized covariances lie in predictable ways. First-Estimates Jacobian (FEJ) methods, central to OpenVINS and MSCKF-family visual-inertial estimators, fix the linearization point of each state so that spurious information is not injected along the four unobservable directions of visual-inertial SLAM (global position and yaw), preserving observability and keeping NEES honest. Observability-constrained EKF/smoother variants target the same defect from the filter side. On the sampling side, when the Gaussian assumption breaks, people fall back to particle or Rao-Blackwellized representations (<a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>) or to unscented propagation for a better second moment. The frontier question is calibrated, real-time uncertainty for the learned front ends now feeding these graphs: a deep feature detector that emits an overconfident measurement covariance corrupts the whole information matrix, so learned, well-calibrated per-measurement covariances are an open and consequential problem carried into the SLAM systems of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using the setup in Listing 11.6: (a) extend the chain to five variables and confirm that the marginal covariance of the last variable grows monotonically as you add poses, matching the intuition that end-of-chain uncertainty accumulates. (b) Remove the prior factor (the first two rows of \(J\)) and show that \(\Lambda\) becomes singular; identify the null-space vector and explain what physical freedom it represents. (c) Multiply the prior factor's rows by 10 (a tighter anchor) and report how the marginal covariance of every variable changes; explain why anchoring one pose harder tightens the whole graph.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is the marginal covariance of a variable <em>not</em> equal to the inverse of that variable's own diagonal block in the information matrix, and which direction does the error go if you use the block inverse anyway?</p>
+        <p class="quiz-question">2. You solved a factor graph and the smallest eigenvalue of \(\Lambda\) is essentially zero. What does that tell you about the problem, and what is the standard fix in a relative-measurement-only SLAM graph?</p>
+        <p class="quiz-question">3. Your estimator reports tight covariances but its NEES on held-out trajectories runs far above the chi-square expectation. Name two distinct causes and state which is a modeling error and which is a linearization error.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-11.7.html">Section 11.7</a>, we pull the whole chapter together and answer the practical question it has been building toward: why modern SLAM and visual-inertial odometry systems abandoned the recursive filter for the factor-graph smoother. Loop closure, marginalization, robust costs, and the calibrated uncertainty of this section are not separate tricks; they are the reasons a graph-based back end became the default architecture for machines that must know both where they are and how sure they are.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

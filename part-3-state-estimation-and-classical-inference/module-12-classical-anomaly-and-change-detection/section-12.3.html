@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.3: Residuals and thresholds. Building Sensory AI." name="description"/>
+<title>Section 12.3: Residuals and thresholds | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Classical Anomaly and Change Detection</a></div>
+<h1>Residuals and thresholds</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I never flag the world for being strange. I flag it for being stranger than my model expected, and only after I have measured exactly how surprised I am."</p><cite>A Model-Based AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Raw sensor values are almost never the right thing to threshold. A vibration amplitude of 4.0 mm/s means nothing until you know what the machine <em>should</em> be doing right now; a heart rate of 140 is alarming at rest and unremarkable mid-sprint. The fix that runs through this whole chapter is to detect on the <strong>residual</strong>: build a model of normal behavior, ask it to predict the next reading, and watch the gap between prediction and reality. A good model absorbs everything explainable, so what is left over is close to pure noise when the system is healthy and swells when something breaks. Residual-based detection then reduces to two questions this section answers in order. First, how do you turn a raw residual into a single comparable "surprise" number, regardless of units or how noisy the channel is? Second, where do you put the line that separates ordinary surprise from an alarm, and how do you set it so the false-alarm rate is a number you chose rather than an accident of your data? Get these two right and the exotic detectors later in the chapter become refinements, not necessities.</p>
+</div>
+
+<p>This section builds directly on the state-estimation machinery of Part III. The cleanest residual you will ever meet is the Kalman <em>innovation</em> from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and we lean on the tail probabilities and Gaussian reasoning from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. It is the model-based cousin of the control-chart view in <a class="cross-ref" href="section-12.2.html">Section 12.2</a>: there we charted a stationary statistic, here we chart the error of a predictor that can track a moving normal.</p>
+
+<h2>What a residual is, and why it is the right substrate</h2>
+
+<p>Let a predictor produce \(\hat{y}_t\) for the quantity you actually observe, \(y_t\). The residual is simply</p>
+
+$$r_t \;=\; y_t - \hat{y}_t.$$
+
+<p>The predictor can be anything: a one-step forecast from an ARIMA or exponential-smoothing model, the reconstruction of an autoencoder, a physics model of the plant, or a Bayesian filter running in parallel with the real sensor. The point of subtracting is <strong>decorrelation from context</strong>. A model that already knows the daily temperature cycle, the current motor speed, or the patient's activity level folds all of that structure into \(\hat{y}_t\), so \(r_t\) no longer carries it. What remains is the part the model could not anticipate, which is exactly the part worth alarming on. This is why detecting on residuals turns hard contextual anomalies (Section 12.1) into ordinary point anomalies on a well-behaved signal: the model has already done the contextualizing.</p>
+
+<p>The gold-standard residual is the filter innovation \(\nu_t = z_t - H\hat{x}_{t|t-1}\), the measurement minus its prediction. Its beauty is that a correctly tuned Kalman filter tells you not only the innovation but its covariance \(S_t = HP_{t|t-1}H^\top + R\), so you know precisely how large an innovation should look when nothing is wrong. That paired uncertainty is what makes the whitening step below principled rather than a guess.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A residual detector is only as trustworthy as the model that generates it. Under healthy operation the residual should be <em>white</em>: zero mean, constant variance, no autocorrelation. If your residuals still trend, oscillate, or wander, the model has left structure on the table, and every threshold you set will fight that leftover structure instead of detecting faults. So the first diagnostic in any residual pipeline is not "is my threshold good" but "are my healthy-state residuals actually white." Whiteness testing is the honest precondition for everything that follows.</p>
+</div>
+
+<h2>Whitening: turning a residual into a comparable surprise</h2>
+
+<p>A residual of \(+3\) is large for a temperature channel that normally errs by \(0.1\,^\circ\)C and trivial for one that swings by \(50\). To compare across channels and to attach a probability to a residual, you must normalize by its expected scale. For a scalar residual with healthy-state mean \(\mu_r\) and standard deviation \(\sigma_r\), the standardized residual (a running z-score) is</p>
+
+$$s_t \;=\; \frac{r_t - \mu_r}{\sigma_r}.$$
+
+<p>For a vector residual you cannot divide componentwise, because the components are usually correlated. The correct generalization weights by the inverse covariance, giving the squared <strong>Mahalanobis distance</strong>, which for a filter innovation is the normalized innovation squared (NIS):</p>
+
+$$d_t^2 \;=\; \nu_t^\top S_t^{-1} \nu_t.$$
+
+<p>The payoff is distributional. If the healthy residual is Gaussian, \(s_t\) is a standard normal and \(d_t^2\) follows a chi-square distribution with degrees of freedom equal to the measurement dimension. That is what lets you translate "how big is this residual" into "how improbable is this residual under normal," which is the currency a threshold actually spends. A crucial practical caution: estimate \(\mu_r\), \(\sigma_r\), and the covariance from a window that contains only healthy data. If a fault leaks into the statistics you normalize by, the detector calibrates itself to think the fault is normal, a leakage failure mode we return to in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+<h2>Setting the threshold so the false-alarm rate is a decision</h2>
+
+<p>A threshold \(\tau\) fires an alarm whenever \(|s_t| > \tau\) (or \(d_t^2 > \tau\)). The amateur move is to pick \(\tau = 3\) because "three sigma" sounds rigorous. The professional move is to start from the false-alarm rate you can afford and solve backwards for \(\tau\). If \(s_t\) is standard normal under normal operation, the per-sample false-alarm probability is</p>
+
+$$\alpha \;=\; \Pr(|s_t| > \tau) \;=\; 2\,\bigl(1 - \Phi(\tau)\bigr),$$
+
+<p>where \(\Phi\) is the standard-normal CDF. Invert it: \(\tau = \Phi^{-1}(1 - \alpha/2)\). Three sigma is \(\alpha \approx 0.0027\), which sounds tiny until you remember rate. At 100 Hz that is roughly one false alarm every four seconds per channel, a pager that never stops. The threshold is not really about sigmas; it is about how many false alarms per hour your operators will tolerate, a tradeoff we make explicit in <a class="cross-ref" href="section-12.7.html">Section 12.7</a>.</p>
+
+<p>Two robustness upgrades matter in the field. First, real residual tails are almost never exactly Gaussian, so a Gaussian \(\tau\) can be badly optimistic. When false alarms are expensive, set the threshold from an empirical high quantile of the healthy residuals, or model the tail directly with extreme value theory, rather than trusting the normal approximation out where it is weakest. Second, estimate the scale robustly. A single spike in the calibration window inflates \(\sigma_r\) and desensitizes the detector; using the median absolute deviation, \(\hat{\sigma} = 1.4826 \cdot \mathrm{MAD}\), keeps the scale honest in the presence of the very outliers you are hunting.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a wind-turbine gearbox that flags itself a week early</h3>
+<p>A utility monitors gearbox bearing temperature on hundreds of turbines. Absolute temperature is useless as an alarm: it tracks ambient weather and load, so a hot afternoon looks like a fault and a cold morning masks one. The team fits a normal-behavior model predicting bearing temperature from ambient, nacelle temperature, rotor speed, and power. The residual (measured minus predicted) is near zero and white on a healthy unit. They standardize it with a robust MAD scale computed over the last 30 healthy days, then threshold an EWMA of the standardized residual at a level chosen for one expected false alarm per turbine-month across the fleet. On one unit the smoothed residual creeps past the line and holds there for days while the raw temperature still looks normal for the season. The gap is the model saying "for these conditions this bearing runs two degrees too warm." Maintenance finds early-stage bearing wear and swaps it during a planned low-wind window instead of after a catastrophic seizure. Nothing here needs deep learning; it needs a good predictor and a properly calibrated threshold. Chapter 37 develops this condition-monitoring pattern at fleet scale in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Adaptive thresholds and residual smoothing</h2>
+
+<p>Two refinements separate a toy detector from a deployable one. A single large residual is often just sensor noise, whereas a fault produces a small bias that <em>persists</em>. Thresholding a smoothed residual, an exponentially weighted moving average, trades a little detection latency for a large drop in false alarms because it integrates evidence across samples instead of gambling on one. Second, normal behavior drifts: sensors age, seasons turn, a machine is re-commissioned. A fixed threshold slowly goes stale, so the scale estimate should be refreshed on a rolling window of recent healthy data, with the important guard that you never fold flagged samples back into the calibration statistics. The code below assembles these pieces: a one-step predictor, a robust standardized residual, an EWMA smoother, and a false-alarm-driven threshold.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def robust_scale(x):                 # MAD-based sigma, spike-resistant
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med)) + 1e-9
+
+def residual_detector(y, warmup=200, alpha=1e-3, lam=0.2):
+    yhat = np.empty_like(y)          # one-step "predict last value" model
+    yhat[0] = y[0]
+    yhat[1:] = y[:-1]                # replace with any real forecaster
+    r = y - yhat                     # the residual signal
+
+    mu, sigma = np.median(r[:warmup]), robust_scale(r[:warmup])
+    tau = np.sqrt(2) * erfinv_safe(1 - alpha)   # Gaussian false-alarm level
+
+    s_ewma, alarms = 0.0, []
+    for t in range(len(y)):
+        s = (r[t] - mu) / sigma      # standardized residual
+        s_ewma = lam * s + (1 - lam) * s_ewma    # smooth the evidence
+        alarms.append(abs(s_ewma) > tau)
+    return np.array(alarms), tau
+
+def erfinv_safe(p):                  # tau from a target false-alarm rate
+    from scipy.special import erfinv
+    return erfinv(p)
+
+rng = np.random.default_rng(0)
+y = np.r_[rng.normal(0, 1, 600), rng.normal(0, 1, 400) + 2.5]  # step fault
+alarms, tau = residual_detector(y)
+print(f"threshold={tau:.2f}  first alarm at t={np.argmax(alarms)}")</code></pre>
+<div class="code-caption">A complete residual-and-threshold detector. The predictor here is a trivial persistence forecaster (swap in an ARIMA, filter, or neural model); <code>robust_scale</code> resists calibration-window outliers; the EWMA integrates weak persistent evidence; and <code>tau</code> is derived from the target false-alarm rate <code>alpha</code>, not hand-picked. The injected step-bias fault at t=600 trips the smoothed detector shortly after onset.</div>
+
+<p>The detector above finds the step change because the EWMA lets a small persistent bias accumulate past a threshold that a single sample would never cross. That accumulation idea, turned into an optimal sequential test, is exactly the CUSUM procedure of the next section.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: filtering libraries hand you the whitened residual for free</h3>
+<p>If your predictor is a Kalman filter, you do not compute innovations and their covariance by hand. <code>filterpy.kalman.KalmanFilter</code> exposes <code>kf.y</code> (the innovation) and <code>kf.S</code> (its covariance) after every <code>update()</code> call, so the normalized innovation squared is a one-liner, <code>float(kf.y.T @ np.linalg.inv(kf.S) @ kf.y)</code>, that you compare against a chi-square quantile from <code>scipy.stats.chi2.ppf</code>. That is roughly three lines standing in for the twenty-plus lines of covariance propagation and matrix inversion you would otherwise maintain, and the filter guarantees the residual is already whitened by construction. See the filter setup in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the code above, (1) sweep <code>alpha</code> over \(\{10^{-2}, 10^{-3}, 10^{-4}\}\) on the healthy segment only and confirm the empirical false-alarm rate roughly matches the target; where it does not, explain why the Gaussian tail assumption is failing. (2) Replace the step fault with a slow linear drift of the mean and compare detection latency for three EWMA settings \(\lambda \in \{0.05, 0.2, 0.6\}\); characterize the latency-versus-false-alarm tradeoff you observe. (3) Contaminate the warmup window with three large spikes and show that swapping <code>robust_scale</code> for a plain standard deviation desensitizes the detector, then quantify by how much.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Why is detecting on the residual able to catch a contextual anomaly that thresholding the raw signal would miss, and what property must the healthy-state residual have for this to work?</li>
+<li>You want no more than one false alarm per hour on a 50 Hz channel with an approximately Gaussian standardized residual. Roughly what per-sample \(\alpha\), and therefore what threshold \(\tau\), does that imply?</li>
+<li>What goes wrong if you estimate the residual scale with the ordinary standard deviation over a window that happens to contain the fault you are trying to detect?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-12.4.html">Section 12.4</a>, we stop treating each smoothed residual as an independent test and ask a sharper question: given a running stream of residuals, what is the statistically optimal way to declare that their distribution has shifted? That is the change-point problem, and its two classic answers, the cumulative-sum (CUSUM) chart and Bayesian online change-point detection, turn the ad hoc EWMA of this section into a principled sequential decision.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

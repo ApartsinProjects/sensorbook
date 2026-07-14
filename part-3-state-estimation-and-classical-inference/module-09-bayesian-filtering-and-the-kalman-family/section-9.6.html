@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.6: Smoothing vs filtering. Building Sensory AI." name="description"/>
+<title>Section 9.6: Smoothing vs filtering | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Bayesian Filtering and the Kalman Family</a></div>
+<h1>Smoothing vs filtering</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I gave the analyst the same track the autopilot flew, and she found the wobble I never felt. She had one advantage I did not: she already knew how the flight ended."</p>
+<cite>A Hindsight-Rich AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds directly on the Kalman recursion of <a class="cross-ref" href="index.html">Section 9.3</a> and the recursive-Bayesian view of <a class="cross-ref" href="index.html">Section 9.2</a>, where the filtered estimate was defined as the posterior over the hidden state given every measurement up to now. It reuses the linear-Gaussian state-space model \(x_t = F x_{t-1} + w_t,\ y_t = H x_t + v_t\) with process covariance \(Q\) and measurement covariance \(R\) from <a class="cross-ref" href="index.html">Section 9.1</a>, and the conditional-probability and Gaussian-marginalization facts from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. The latency-versus-accuracy intuition first appeared for simple averages in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The same state, estimated with two different information sets</h3>
+<p>Everything in this chapter so far has been a <em>filter</em>: at time \(t\) it reports the best guess of the state using only measurements \(y_1,\dots,y_t\), because in a live system that is all you have. But sensor data is often analyzed after the fact, from a log, a flight recorder, or an overnight batch. When you already hold the whole record \(y_1,\dots,y_T\), estimating an earlier state \(x_t\) while ignoring everything that happened after it is leaving information on the table. A <em>smoother</em> uses the future to sharpen the past. This section defines the three smoothing problems, derives the workhorse backward pass that turns any Kalman filter into a smoother almost for free, and, most important for a deployed system, tells you when the future is worth waiting for and when it is not.</p>
+</div>
+
+<h2>Three questions, three information sets</h2>
+<p><strong>What</strong> separates filtering from smoothing is purely which measurements the estimate is allowed to see. Filtering computes the posterior \(p(x_t \mid y_{1:t})\), conditioned on the past and present. Smoothing computes \(p(x_t \mid y_{1:T})\) for some \(T > t\), conditioned on future measurements as well. There is also a third relative, <em>prediction</em>, \(p(x_{t+k}\mid y_{1:t})\), which conditions on strictly less than filtering and is what a filter does internally on every time-update step.</p>
+<p><strong>Why</strong> the extra conditioning helps is that a future measurement is an indirect observation of a past state. If the tracker sees an object at position \(y_{t+3}\), that reading constrains where \(x_t\) could plausibly have been three steps earlier, because the dynamics couple them. Bayes' rule lets that later evidence flow backward. The result is never worse and usually strictly better: the smoothed covariance satisfies \(P_{t\mid T} \preceq P_{t\mid t}\) in the positive-semidefinite ordering, so every state's uncertainty shrinks or stays equal once the future is folded in.</p>
+<p><strong>How</strong> smoothing is deployed depends on how much future you are willing to wait for, which gives three named variants:</p>
+<ul>
+<li><strong>Fixed-interval smoothing</strong>: you have the entire batch \(y_{1:T}\) and want the best estimate of every \(x_t\) for \(t = 1,\dots,T\). This is the offline, log-analysis case.</li>
+<li><strong>Fixed-lag smoothing</strong>: you run online but deliberately delay the output by \(L\) steps, always reporting \(p(x_{t-L}\mid y_{1:t})\). You trade \(L\) samples of latency for accuracy on a live stream.</li>
+<li><strong>Fixed-point smoothing</strong>: you care about one particular instant (the moment of an impact, a trigger, an event onset) and keep refining that single estimate as more data arrives.</li>
+</ul>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Smoothing spends latency to buy accuracy; that is the only trade</h3>
+<p>The filter is the smoother with zero lag. As you allow the estimate to see further into the future, uncertainty falls monotonically toward the fixed-interval limit, but so does your timeliness. A control loop that must act now cannot use future it does not have, so it filters. An analyst reconstructing what happened has all the future there is, so she smooths. Fixed-lag sits between them: pick the smallest \(L\) whose accuracy gain justifies the delay, because gains saturate quickly once \(L\) exceeds the system's correlation time. This is the same latency-versus-smoothness dial from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, now with a Bayesian meaning attached to the delay.</p>
+</div>
+
+<h2>The RTS smoother: one backward pass over the filter</h2>
+<p>The elegant fact that makes smoothing practical is that fixed-interval smoothing needs no new heavy machinery. You run the ordinary Kalman filter forward once, storing the filtered means \(\hat x_{t\mid t}\), the predicted means \(\hat x_{t+1\mid t}\), and both covariances at every step. Then a single backward sweep, the Rauch-Tung-Striebel (RTS) recursion, corrects each state using the smoothed estimate of the one after it. Starting from \(\hat x_{T\mid T}\) (the filter's last output already equals the smoothed value there) and running \(t = T-1\) down to \(1\):</p>
+$$C_t = P_{t\mid t}\,F^\top\,P_{t+1\mid t}^{-1},$$
+$$\hat x_{t\mid T} = \hat x_{t\mid t} + C_t\left(\hat x_{t+1\mid T} - \hat x_{t+1\mid t}\right),$$
+$$P_{t\mid T} = P_{t\mid t} + C_t\left(P_{t+1\mid T} - P_{t+1\mid t}\right)C_t^\top.$$
+<p>The smoother gain \(C_t\) weighs how much the future correction, the bracketed difference between the smoothed and predicted next state, should be pulled back onto \(x_t\). Where the dynamics are confident (small predicted covariance), little is changed; where the filter was uncertain, the future reshapes the estimate substantially. The whole backward pass is linear in \(T\) and touches only quantities the forward filter already produced, so smoothing a batch costs about twice a single filtering run.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def rts_smoother(xf, Pf, xp, Pp, F):
+    """Rauch-Tung-Striebel fixed-interval smoother.
+    xf, Pf: filtered means/covariances x_{t|t}, P_{t|t}   (length T)
+    xp, Pp: predicted means/covariances x_{t+1|t}, P_{t+1|t} (length T)
+    Returns smoothed means xs and covariances Ps."""
+    T = len(xf)
+    xs, Ps = xf.copy(), Pf.copy()
+    for t in range(T - 2, -1, -1):
+        C = Pf[t] @ F.T @ np.linalg.inv(Pp[t])     # smoother gain
+        xs[t] = xf[t] + C @ (xs[t + 1] - xp[t])     # correct with the future
+        Ps[t] = Pf[t] + C @ (Ps[t + 1] - Pp[t]) @ C.T
+    return xs, Ps
+</code></pre>
+<div class="code-caption">A complete fixed-interval RTS smoother in a dozen lines: it consumes the arrays a forward Kalman filter already stored and walks them backward, so the only new cost is one matrix inverse per step. This is the backward pass invoked in the wearable example below.</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Reconstructing a stride from a wrist, after the run</h3>
+<p>A running-watch team estimates foot-strike timing and stride length from a wrist inertial sensor. In real time the watch <em>filters</em>: it must buzz cadence feedback within a step, so it reports \(\hat x_{t\mid t}\) and accepts the jitter that comes with zero lag. But the nightly training summary is built after the run from the logged signal, and there the app <em>smooths</em>. Running the RTS pass over the recorded session pulls each stride estimate toward what the following strides revealed, cutting the stride-length variance by roughly a third and removing the phantom double-steps that the live filter emitted whenever the arm swing briefly desynchronized. Same sensor, same model, same \(Q\) and \(R\); the only difference is that the summary is allowed to know how the run continued. The activity-recognition stack that consumes these strides is developed in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The backward pass is one method call</h3>
+<p>The hand-rolled loop above is worth writing once for understanding, but in production you should not maintain the bookkeeping of four stored arrays and a matrix inverse. In <code>filterpy</code>, a fitted <code>KalmanFilter</code> exposes <code>rts_smoother(means, covariances)</code>, which runs the entire fixed-interval recursion from the filter's own <code>batch_filter</code> output. That collapses roughly 15 lines of index-careful backward looping (plus the storage plumbing) into a single call, and it handles time-varying \(F_t\) and \(Q_t\) that the snippet above assumes constant. For nonlinear models the same idea appears as the extended and unscented RTS smoothers you will meet in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>.</p>
+</div>
+
+<h2>Choosing filtering, fixed-lag, or full smoothing</h2>
+<p><strong>When</strong> to smooth is a systems decision, not a statistical one, because the accuracy gain is always real but is only usable if you can afford the latency. Filter when an actuator, alarm, or control law consumes the estimate immediately: an anti-lock braking controller or a balancing robot cannot wait for the future, so the filter is the only honest choice. Use fixed-lag smoothing when the consumer tolerates a bounded delay, such as a gesture recognizer that can hold its decision for 100 milliseconds, or a lidar tracker feeding a planner that already looks a few frames ahead; pick \(L\) around the state's autocorrelation time and stop, because further lag buys almost nothing. Use full fixed-interval smoothing for any offline product: flight-data forensics, sleep-stage scoring from an overnight recording, sensor-fusion ground truth, or building the clean labels that a downstream learner will train on. That last use is why smoothing recurs throughout this book: the smoothed trajectory is frequently the best available reference signal, and the batch-smoothing view generalizes into the factor-graph formulation of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>, where all timestamps are optimized jointly rather than in a forward-then-backward sweep.</p>
+<p>One caution carries over from <a class="cross-ref" href="index.html">Section 9.5</a>: smoothing sharpens estimates only when the model is right. If \(Q\) and \(R\) are mistuned or the dynamics are wrong, the backward pass will confidently propagate that error across the whole batch, producing a trajectory that looks beautifully consistent and is uniformly biased. Smoothing narrows the reported uncertainty, which makes a miscalibrated model more dangerous, not less. Validate the filter first; only a trustworthy forward pass earns a backward one.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: measure what the future is worth</h3>
+<p>Simulate a constant-velocity 1-D tracker (position and velocity state) with process noise \(Q\) and measurement noise \(R\), and run the Kalman filter to obtain \(P_{t\mid t}\). Then run the RTS smoother and record \(P_{t\mid T}\). (1) Plot the position-variance ratio \(P_{t\mid T}/P_{t\mid t}\) across \(t\); explain why the two curves meet at \(t=T\) and diverge most in the middle of the batch. (2) Implement fixed-lag smoothing by re-running the smoother over sliding windows of length \(L\), and plot final position error against \(L\) for \(L = 0,1,2,5,10,25\). At roughly what \(L\) does the curve flatten, and how does that knee relate to the ratio \(Q/R\)?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>State the exact difference between the information sets behind \(p(x_t\mid y_{1:t})\) and \(p(x_t\mid y_{1:T})\), and why the second can never have larger covariance.</li>
+<li>Which smoothing variant (fixed-interval, fixed-lag, fixed-point) fits each case: reconstructing a whole logged flight; estimating the instant of a bat-ball impact; a live tracker allowed a 50 ms delay?</li>
+<li>The RTS backward pass needs no new measurements. What four quantities from the forward filter must you store to run it, and why does a mistuned \(R\) make smoothing riskier than filtering?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-9.7.html">Section 9.7</a>, we close the chapter by turning the estimator on itself: the failure modes that a smoothed, confident-looking trajectory can hide, and the online diagnostics (innovation whiteness, normalized estimation-error squared, covariance-consistency tests) that tell you whether the filter you just built deserves to be trusted before you ever run a backward pass over it.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

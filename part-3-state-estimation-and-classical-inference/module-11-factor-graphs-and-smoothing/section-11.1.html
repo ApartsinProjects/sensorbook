@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.1: From filters to factor graphs. Building Sensory AI." name="description"/>
+<title>Section 11.1: From filters to factor graphs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>From filters to factor graphs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A filter remembers the present and forgets how it got there. A factor graph keeps the receipts. When a late measurement contradicts an old belief, only one of them can revise history."</p>
+<cite>A Retrospective AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the recursive predict-correct filter and its Gaussian belief from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and the nonlinear variants (EKF, UKF) from <a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>. It leans on Bayes' rule, the joint-versus-marginal distinction, the multivariate Gaussian, and the information (canonical) form of a Gaussian, all developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> and Appendix A. No graph theory beyond "nodes and edges" is required; the specific structure is built here.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every filter in <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and <a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a> shares one design choice: at each step it compresses everything the system has ever seen into a single current belief, then throws the raw past away. That is exactly what you want on a microcontroller streaming inertial data, and exactly what you cannot afford when a measurement arrives late, when a robot revisits a place it mapped ten minutes ago, or when a single bad linearization early in the trajectory quietly poisons everything downstream. A factor graph is the alternative representation: instead of one evolving belief, it holds the entire estimation problem as a graph of unknowns and the constraints that tie them together, and it estimates the whole trajectory at once. This section shows what a factor graph is, why the same posterior a filter computes recursively can be written as a product of local factors, and why keeping the graph (smoothing) rather than collapsing it (filtering) is the move that unlocks loop closure, re-linearization, and everything else in this chapter. The rest of Chapter 11 is machinery on top of this one idea.</p>
+</div>
+
+<h2>The cost of forgetting: filtering versus smoothing</h2>
+
+<p>A recursive filter answers one question: given all measurements up to and including now, what is the state <em>now</em>? Formally it tracks the filtering distribution \(p(\mathbf{x}_k \mid \mathbf{z}_{1:k})\). To stay recursive it marginalizes out \(\mathbf{x}_{k-1}\) the instant it moves to step \(k\), folding the old state into the process-noise-inflated prior for the new one. That marginalization is the source of both its speed and its amnesia. Once \(\mathbf{x}_{k-1}\) is gone, no future measurement can ever correct it, and no future evidence can revisit the linearization point that was used to fold it in.</p>
+
+<p>Smoothing asks the larger question: given all measurements over some window, what is the <em>entire</em> trajectory \(p(\mathbf{x}_{0:K} \mid \mathbf{z}_{1:K})\)? Here nothing is marginalized away during processing. Every state stays an explicit unknown, so a measurement at step \(K\) can and does sharpen the estimate of \(\mathbf{x}_5\), and every nonlinear term can be re-linearized around the improved estimate rather than the first guess. The price is that you now solve for many states jointly instead of one at a time. The factor graph is the data structure that makes that joint problem tractable, because the joint posterior is not a dense tangle: it factors.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Filtering and smoothing are not different algorithms so much as the same estimation problem read at two altitudes. A filter is a smoother that is forced to eliminate each variable the moment the next one appears. Whatever a filter marginalizes, a smoother keeps. Everything a factor graph lets you do that a Kalman filter cannot, correcting the distant past, re-linearizing, closing loops, absorbing out-of-order data, is a direct consequence of that one refusal to forget.</p>
+</div>
+
+<h2>The joint posterior factors into local terms</h2>
+
+<p>Why can we hope to solve for hundreds of states at once? Because the measurement model is <em>local</em>. Odometry couples only consecutive poses; a range reading couples one pose to one landmark; a prior touches one state. By Bayes' rule the posterior over the whole trajectory is proportional to the joint, and the joint splits into a product of these local pieces,</p>
+
+$$ p(\mathbf{X} \mid \mathbf{Z}) \;\propto\; \prod_{i} \phi_i(\mathbf{X}_i), $$
+
+<p>where \(\mathbf{X}\) collects all unknowns, each <em>factor</em> \(\phi_i\) is a nonnegative function of only the small subset \(\mathbf{X}_i\) of variables it actually constrains, and the constant of proportionality is the evidence we never need. A factor is nothing more mysterious than one term in this product: a prior, a motion constraint, or a sensor likelihood. For the Gaussian noise models of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, each factor is \(\phi_i(\mathbf{X}_i) \propto \exp\!\big(-\tfrac12 \lVert h_i(\mathbf{X}_i) - \mathbf{z}_i \rVert^2_{\Sigma_i}\big)\), so taking the negative logarithm turns the product into a sum of squared, noise-weighted residuals. That sum is the objective <a class="cross-ref" href="section-11.2.html">Section 11.2</a> minimizes; here we only need to see that it exists and is a sum of local pieces.</p>
+
+<h2>Anatomy of a factor graph</h2>
+
+<p>A factor graph is the bipartite graph of that factorization. It has two kinds of nodes. <em>Variable nodes</em> are the unknowns you want to estimate: robot poses, landmark positions, sensor biases, a clock offset. <em>Factor nodes</em> are the constraints, one per \(\phi_i\), and each factor node connects by an edge to exactly the variables in its argument \(\mathbf{X}_i\). There are no variable-to-variable or factor-to-factor edges. Reading the graph tells you everything about coupling: a variable's degree is how many measurements see it, and two variables share information only through a common factor. A dead-reckoning chain (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>) is a line of pose variables linked by odometry factors, with a prior factor pinning the first pose so the whole chain has an absolute reference.</p>
+
+<p>This sparsity is not cosmetic. The negative-log-posterior is quadratic (after linearization), and its Hessian, the information matrix \(\boldsymbol{\Lambda}\), has a nonzero block for two variables exactly when a factor connects them. A chain of poses linked only to their neighbors produces a block-tridiagonal \(\boldsymbol{\Lambda}\): almost entirely zeros. The graph <em>is</em> the sparsity pattern, and that is what lets a smoother scale to thousands of variables instead of choking on a dense inverse. The snippet below assembles the information matrix for a short pose chain and shows the structure directly.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Tiny pose chain: 4 scalar states, 1 anchor prior + 3 odometry factors.
+# Each factor contributes a rank-1 (or rank-2) block to the information matrix.
+n = 4
+Lambda = np.zeros((n, n))
+
+def add_prior(Lambda, i, info):          # prior on x_i: touches one variable
+    Lambda[i, i] += info
+
+def add_between(Lambda, i, j, info):     # constraint x_j - x_i = odom: touches two
+    J = np.zeros(n); J[i], J[j] = -1.0, 1.0
+    Lambda += info * np.outer(J, J)
+
+add_prior(Lambda, 0, 100.0)              # anchor the first pose strongly
+for k in range(n - 1):                   # odometry links consecutive poses
+    add_between(Lambda, k, k + 1, 10.0)
+
+print((Lambda != 0).astype(int))         # sparsity: block-tridiagonal</code></pre>
+<div class="code-caption">Building the information matrix of a four-pose chain from its factors. Each factor stamps a small block into <code>Lambda</code> at the rows and columns of the variables it touches; a prior hits one diagonal entry, an odometry factor hits a 2x2 neighbourhood. The printed pattern is tridiagonal, which is the graph's line topology showing up as matrix sparsity. This is the object a smoother solves and a filter would eliminate one variable at a time.</div>
+
+<p>Run it and the nonzero pattern is a narrow band hugging the diagonal, precisely mirroring the chain in the graph. Add one factor linking pose 3 back to pose 0 (a loop closure, the subject of <a class="cross-ref" href="section-11.4.html">Section 11.4</a>) and two off-diagonal corners light up: the graph edge and the matrix entry are the same fact stated twice.</p>
+
+<h2>Filtering is elimination on the same graph</h2>
+
+<p>The unifying payoff: a Kalman filter and a batch smoother operate on the identical factor graph. They differ only in the order and aggressiveness of variable elimination. Solving a linear-Gaussian factor graph means eliminating variables one at a time, and eliminating a variable marginalizes it out, which introduces a new factor coupling all of its former neighbours (this induced factor is called a fill-in). A filter eliminates variables in strict time order and, crucially, discards each eliminated variable's node the moment it is gone, so at any instant it stores only the frontier: one belief over the current state. That frontier belief is exactly the Kalman filter's mean and covariance. A smoother runs the same elimination but retains every variable, so it can eliminate in a cheaper order and, when new evidence arrives, un-eliminate and re-solve. The recursive filter you already know is thus a special-purpose graph solver that happens to keep only a moving window of size one.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a warehouse robot that could not un-see a lie</h3>
+<p>A logistics team ran an EKF fusing wheel odometry and ceiling-marker sightings for an autonomous forklift. Early in each run, before enough markers were in view, a single mislabeled marker injected a large, wrong correction. The EKF folded that correction into its covariance and marginalized the poses that would have revealed the error, so the filter walked the rest of the aisle with a confident, silently biased pose; the mistake was mathematically unrecoverable because the evidence had already been thrown away. Rebuilding the same problem as a factor graph and smoothing over a sliding window changed the outcome without changing a single sensor: the mislabeled marker became one factor among many, its large residual stood out against the consistent majority (later downweighted by the robust costs of <a class="cross-ref" href="section-11.5.html">Section 11.5</a>), and re-linearizing the retained early poses pulled the trajectory back onto the true aisle. Same measurements, same noise models; keeping the graph instead of collapsing it was the entire difference.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The right tool: declare the graph, not the linear algebra</h3>
+<p>Assembling the information matrix, choosing an elimination order, factorizing sparsely, and back-substituting is a few hundred lines of careful sparse-matrix code that is easy to get subtly wrong. A factor-graph library lets you <em>declare</em> the variables and factors and owns everything else. In GTSAM (the library this chapter builds toward in <a class="cross-ref" href="section-11.3.html">Section 11.3</a>), the pose chain above is a handful of lines.</p>
+<pre><code class="language-python">import gtsam
+from gtsam import Pose2, BetweenFactorPose2, PriorFactorPose2
+
+graph = gtsam.NonlinearFactorGraph()
+prior_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+odom_noise  = gtsam.noiseModel.Isotropic.Sigma(3, 0.2)
+
+graph.add(PriorFactorPose2(0, Pose2(0, 0, 0), prior_noise))   # anchor pose 0
+for k in range(3):                                            # odometry links
+    graph.add(BetweenFactorPose2(k, k + 1, Pose2(1, 0, 0), odom_noise))
+
+# graph now encodes the same factorization; solving is one call (Section 11.2)</code></pre>
+<div class="code-caption">The four-pose chain as a GTSAM factor graph. Compared with hand-rolling the information matrix, its sparse factorization, and the solve, this is roughly a 10-to-1 line reduction, and the library also handles the manifold structure of <code>Pose2</code> (rotations do not add like vectors), the elimination ordering, and incremental re-solving. You supply only the variables, the factors, and the noise models.</div>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: the graph as the common language of estimation</h3>
+<p>Factor graphs have become the shared substrate of modern back-end estimation. GTSAM with its incremental smoother iSAM2, Google's Ceres Solver, and the g2o library are the workhorses behind production visual-inertial odometry and SLAM systems such as ORB-SLAM3 and VINS-Fusion (<a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>). The active frontier pushes the representation two ways: symbolic-differentiation toolchains like SymForce generate fast, exact factor Jacobians from a high-level spec, and differentiable factor graphs embed the whole solve as a layer inside a neural network so learned front ends and the optimizer train end to end. In every case the factor graph, not the recursive filter, is the abstraction people reach for first.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the four-pose chain from the code above and treat it as a smoothing problem.</p>
+<ol>
+<li>Assemble the full information matrix \(\boldsymbol{\Lambda}\) and confirm by inspection that it is block-tridiagonal. Add a single "loop closure" factor between pose 3 and pose 0 and identify exactly which new entries become nonzero.</li>
+<li>Eliminate the variables in time order (0, then 1, then 2), and after each elimination note which remaining variables are now directly coupled. Explain where the fill-in comes from and why a pure filter never has to store it.</li>
+<li>Argue, in two or three sentences, why the loop-closure factor from part 1 makes the strict time-ordered elimination of a filter unable to benefit from that constraint without redoing past steps.</li>
+</ol>
+<details>
+<summary>Hint</summary>
+<p>Eliminating a variable marginalizes it and connects all of its former neighbours to each other. In a plain chain each interior pose has two neighbours, so eliminating it links that pair; the loop-closure edge gives pose 0 an extra neighbour far away in time, which is why it survives only if that variable was never thrown away.</p>
+</details>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>State the difference between the filtering distribution and the smoothing distribution in terms of which variables are marginalized and when.</li>
+<li>In a factor graph, what does an edge mean, and how does a variable's set of incident factors relate to a block of the information matrix?</li>
+<li>A colleague says "a Kalman filter and a factor-graph smoother are completely different methods." Correct them: in what precise sense are they the same computation performed differently?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-11.2.html">Section 11.2</a>, we turn the graph into an objective and solve it. Taking the negative logarithm of the product of Gaussian factors yields a sum of squared, noise-weighted residuals, and estimating the trajectory becomes a sparse nonlinear least-squares problem. We derive the maximum-a-posteriori estimate, linearize with the same Jacobians from <a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, and see why Gauss-Newton and Levenberg-Marquardt, running on the sparse structure this section exposed, solve for thousands of states faster than intuition suggests.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

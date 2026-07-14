@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.7: Why modern SLAM and VIO use this. Building Sensory AI." name="description"/>
+<title>Section 11.7: Why modern SLAM and VIO use this | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>Why modern SLAM and VIO use this</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I spent a decade forgetting my past one frame at a time, and it made me fast but wrong. Then someone taught me to keep the graph, and I was slower for a millisecond and correct for the rest of my life."</p>
+        <cite>A Reformed Filtering AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section is the synthesis of Chapter 11, so it assumes the pose-graph view of <a class="cross-ref" href="section-11.1.html">Section 11.1</a>, the MAP and nonlinear-least-squares formulation of <a class="cross-ref" href="section-11.2.html">Section 11.2</a>, the incremental smoother of <a class="cross-ref" href="section-11.3.html">Section 11.3</a>, loop closure and marginalization from <a class="cross-ref" href="section-11.4.html">Section 11.4</a>, robust kernels from <a class="cross-ref" href="section-11.5.html">Section 11.5</a>, and the information-matrix covariances of <a class="cross-ref" href="section-11.6.html">Section 11.6</a>. It contrasts throughout with the recursive filters of <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and <a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, and it uses the inertial-drift facts developed in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>For twenty years, real-time simultaneous localization and mapping (SLAM) and visual-inertial odometry (VIO) ran on filters, because filters were the only thing fast enough. Then the field pivoted, almost completely, to factor-graph smoothing, and today essentially every serious open-source and production system, ORB-SLAM3, VINS-Fusion, OpenVINS, Kimera, the tracker in a modern headset, is a smoother at its core. This was not fashion. It was the convergence of three facts: a well-designed graph is <em>sparse</em>, so smoothing over a whole trajectory can be as cheap per step as filtering; smoothing <em>relinearizes</em>, so it does not permanently bake in the linearization errors that make filters silently overconfident and eventually diverge; and a graph <em>keeps the past alive</em>, so a loop closure or a delayed measurement can reach back and repair history that a filter has already thrown away. This section explains those three facts as a single argument, and shows where the tradeoff still favors a filter.</p>
+    </div>
+
+    <h2>The filter's original sin: marginalize-as-you-go</h2>
+    <p>A Kalman filter, and every extended or unscented variant in <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, maintains only the current state and its covariance. Each new measurement is fused and the old state is discarded, which is exactly the marginalization operation of <a class="cross-ref" href="section-11.4.html">Section 11.4</a> applied relentlessly, once per step, forever. That is what makes a filter cheap and constant-time, and it is also its original sin. Marginalizing a variable is only exact for a linear-Gaussian model. In SLAM the measurement models are nonlinear (a camera projecting a 3D landmark, an inertial measurement unit integrating rotation), so every marginalization freezes a linearization made at a state estimate that later turns out to be wrong. The frozen Jacobians can never be corrected, because the states they were computed at no longer exist as variables. Errors of linearization therefore accumulate as spurious information: the filter's covariance shrinks faster than the true uncertainty, the estimate grows confidently wrong, and over a long run the estimator diverges even though every individual update looked healthy.</p>
+    <p>A factor-graph smoother refuses to commit. It stores measurements as factors and re-solves the whole trajectory, so at each iteration it can <strong>relinearize</strong> every factor at the current best estimate. A landmark first seen from a bad initial guess and later triangulated well contributes a Jacobian computed at the good estimate, not the bad one. This single difference, deferring linearization instead of freezing it, is the deepest reason smoothing is more accurate than filtering on the same data, and it is why benchmark after benchmark shows batch and incremental smoothers beating their filter counterparts in absolute trajectory error.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The filter-versus-smoother debate is really a debate about <em>when you are allowed to change your mind about the past</em>. A filter linearizes each measurement exactly once, at the state estimate it happened to hold at that instant, and lives with the consequences forever. A smoother keeps the raw measurements and relinearizes them every time the estimate improves. Nonlinear SLAM and VIO punish anyone who cannot change their mind, so the estimator that keeps its options open wins, provided it can be made fast enough. That last proviso is what sparsity delivers.</p>
+    </div>
+
+    <h2>Why smoothing is not slow: sparsity and incrementality</h2>
+    <p>The historical objection to smoothing was cost. Re-solving a trajectory of thousands of poses sounds hopelessly more expensive than a filter's constant-time update. Two facts dissolve the objection. First, the SLAM information matrix is <strong>sparse</strong>: a pose is connected only to its immediate odometry neighbors, to the handful of landmarks it directly observed, and to the rare loop closure. Sparse linear algebra solves such systems in time closer to linear than cubic in the number of variables, so a full nonlinear least-squares step over the graph is far cheaper than the dense \(O(n^3)\) intuition suggests. Second, and decisively, iSAM2 from <a class="cross-ref" href="section-11.3.html">Section 11.3</a> made the solve <em>incremental</em>: adding one new pose and its factors updates only the small subtree of the Bayes tree that actually changed, so the amortized per-step cost is bounded and real-time, right up until a large loop closure forces a wider re-solve, which is exactly the moment you want the extra work done. The upshot is that a modern smoother runs at camera frame rate on the same hardware that once could only afford a filter, while producing the more accurate, relinearized estimate.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a mixed-reality headset that never loses the room</h3>
+        <p>A standalone augmented-reality headset must anchor virtual objects to the physical room to within a few millimeters, using a pair of grayscale cameras and a consumer-grade inertial measurement unit, all on a battery-powered mobile chip. Early consumer AR shipped filter-based VIO and users learned its tells: turn your head quickly and the virtual sofa slides off the floor, because the extended Kalman filter's frozen linearization could not absorb the fast rotation and its covariance had already collapsed. The current generation runs a fixed-lag factor-graph smoother. Inertial pre-integration bundles the hundreds of IMU samples between two camera frames into a single relative-motion factor (see <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> for why raw IMU integration drifts so fast), visual factors tie poses to map points, and the smoother relinearizes the recent window every frame. When the wearer walks out of the room and back, a loop closure snaps the map into global consistency and the sofa stays welded to the floor. The graph is what lets a millimeter anchor survive a fast head turn.</p>
+    </div>
+
+    <h2>Fusing many sensors is just adding factors</h2>
+    <p>The other reason the field standardized on graphs is representational. A sensor-fusion architecture built on filters needs a bespoke measurement update for each modality, and adding a delayed or out-of-order measurement (GNSS that arrives half a second late, a wheel-odometry tick on its own clock) means surgery on the recursion. In a factor graph, every sensor is simply a factor type: an IMU pre-integration factor between consecutive poses, a reprojection factor from a camera, a range factor from a GNSS or ultra-wideband anchor, a scan-match factor from a lidar, a prior factor from a magnetometer heading. A late measurement is inserted at the pose whose timestamp it matches and the graph re-solves; there is no notion of "too late," because time is just graph topology, not the front of a recursion. This is why the same GTSAM or Ceres back end serves visual-inertial, lidar-inertial, and GNSS-fused systems with only the front-end factors swapped, and it is the concrete mechanism behind the probabilistic-fusion principles of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>. Listing 11.7 shows how little code it takes to fuse two modalities once the graph abstraction is in place.</p>
+
+    <pre class="language-python"><code class="language-python">import gtsam
+from gtsam import symbol_shorthand
+X = symbol_shorthand.X  # pose keys X(0), X(1), ...
+
+graph = gtsam.NonlinearFactorGraph()
+noise_odom = gtsam.noiseModel.Diagonal.Sigmas([0.05, 0.05, 0.02])   # x, y, theta
+noise_loop = gtsam.noiseModel.Diagonal.Sigmas([0.10, 0.10, 0.05])
+
+# A chain of odometry factors: one factor per sensor reading, any modality.
+for i in range(4):
+    graph.add(gtsam.BetweenFactorPose2(
+        X(i), X(i + 1), gtsam.Pose2(1.0, 0.0, 0.0), noise_odom))
+
+# A late-arriving loop closure between pose 0 and pose 4 (just another factor).
+graph.add(gtsam.BetweenFactorPose2(
+    X(0), X(4), gtsam.Pose2(0.0, 0.0, 0.0), noise_loop))
+graph.add(gtsam.PriorFactorPose2(
+    X(0), gtsam.Pose2(0, 0, 0), gtsam.noiseModel.Diagonal.Sigmas([1e-3]*3)))
+
+values = gtsam.Values()
+for i in range(5):
+    values.insert(X(i), gtsam.Pose2(i * 0.9, 0.0, 0.0))  # drifted initial guess
+
+result = gtsam.LevenbergMarquardtOptimizer(graph, values).optimize()
+print("optimized pose 4:", result.atPose2(X(4)))  # pulled back toward the start</code></pre>
+    <div class="code-caption"><strong>Listing 11.7.</strong> Fusing a motion chain with a loop closure in GTSAM. Every measurement, whatever sensor produced it, is added the same way, as a factor between keys; the optimizer relinearizes and distributes the loop-closure correction across the whole chain. Swapping in an IMU pre-integration factor or a GNSS range factor changes only the factor type, not the architecture.</div>
+
+    <p>As Listing 11.7 shows, the drifted pose 4 is pulled back toward the origin once the loop factor is added, and every pose in between shifts to absorb the correction: the relinearization-plus-reach behavior that a filter cannot reproduce, expressed in a dozen lines.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Rolling your own visual-inertial back end, the sparse Cholesky factorization, the Bayes-tree bookkeeping, IMU pre-integration with correct covariance propagation, and marginalization, is a multi-thousand-line effort that research groups have spent years hardening. GTSAM's <code>gtsam.ImuFactor</code> plus <code>PreintegratedImuMeasurements</code> collapses the entire inertial front end into roughly 20 lines, and iSAM2 gives incremental real-time solving through <code>ISAM2.update</code>. A from-scratch VIO smoother is commonly 3,000 to 5,000 lines; the library-backed equivalent is a few hundred, and the library handles the numerically delicate parts (manifold retraction, on-manifold covariance, ordering for minimal fill-in) that are the usual source of silent bugs.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The current state of the art is uniformly graph-based. ORB-SLAM3 (Campos et al., IEEE T-RO 2021) fuses visual and inertial data in a full smoother with a multi-map "Atlas" back end; VINS-Fusion and OpenVINS represent the sliding-window and MSCKF-style real-time end; Kimera adds metric-semantic mapping on the same factor-graph substrate. The live frontier is the seam between classical smoothing and learning: learned front ends (SuperPoint and SuperGlue features, NetVLAD and transformer place recognition) feed factors into a classical back end, and differentiable optimizers such as DROID-SLAM and Theseus (Facebook AI, NeurIPS 2022) embed the nonlinear least-squares solve inside a network so gradients flow through the smoother itself. The deeper reasons this chapter gives, relinearization, sparsity, and keeping the past alive, are exactly why even end-to-end learned SLAM keeps a factor-graph optimizer in the loop rather than replacing it. The full spatial-AI picture is developed in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+    </div>
+
+    <h2>When a filter still wins</h2>
+    <p>The honest engineer keeps a filter in the toolbox. On a microcontroller with kilobytes of RAM, a graph that grows without bound is a non-starter and a tightly tuned MSCKF or complementary filter is the right answer. When latency is measured in tens of microseconds (a flight-control inner loop reacting to gyro rates), a constant-time recursive update beats a solver that occasionally re-factorizes on loop closure. And when the model is genuinely close to linear-Gaussian over the horizon that matters, the smoother's relinearization advantage vanishes and you pay its overhead for nothing. The reason smoothing dominates <em>SLAM and VIO specifically</em> is that those problems combine three things that break filters and reward graphs: strong nonlinearity (rotations and projections), long time horizons where drift compounds (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>), and loop closures that must reach into the deep past. Change any of those and the balance can tip back. Smoothing is not universally superior; it is the correct answer to the particular shape of the SLAM problem.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the five-pose graph of Listing 11.7 and run two experiments. (a) Solve it once, record the estimate of pose 4, then <em>double</em> the loop-closure noise sigmas and re-solve; explain why pose 4 moves less toward the origin when the loop factor is trusted less, connecting your answer to the information-weighting of <a class="cross-ref" href="section-11.6.html">Section 11.6</a>. (b) Now start the optimizer from a far worse initial guess (multiply the initial pose offsets by five) and observe whether Levenberg-Marquardt still converges to the same solution. Write one sentence on why a filter, which linearizes only once at the arriving estimate, cannot recover from an equally bad starting point.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. State the single most important reason a factor-graph smoother is more accurate than an extended Kalman filter on the same nonlinear SLAM data, in terms of what each does with linearization.</p>
+        <p class="quiz-question">2. Smoothing over a whole trajectory sounds far more expensive than filtering. Name the two properties of the SLAM problem that make it real-time anyway.</p>
+        <p class="quiz-question">3. Give one concrete deployment scenario in which you would still choose a filter over a factor-graph smoother, and say which property of that scenario drives the choice.</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 11</h3>
+        <p>build a factor-graph pose estimator fusing odometry and landmark measurements with GTSAM.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+        <h2 class="bibliography-title">Bibliography</h2>
+
+        <p class="bib-category">Foundations of smoothing and factor graphs</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://www.cs.cmu.edu/~kaess/pub/Dellaert17fnt.pdf">Dellaert, F. and Kaess, M. (2017). Factor Graphs for Robot Perception. Foundations and Trends in Robotics.</a></p>
+            <p class="bib-annotation">The canonical monograph tying MAP inference, sparse linear algebra, and the Bayes tree together; the intellectual backbone of this entire chapter.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://journals.sagepub.com/doi/10.1177/0278364911430419">Kaess, M. et al. (2012). iSAM2: Incremental Smoothing and Mapping Using the Bayes Tree. International Journal of Robotics Research.</a></p>
+            <p class="bib-annotation">The algorithm that made full smoothing real-time by updating only the affected subtree, the reason smoothing displaced filtering in practice.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/5674828">Strasdat, H., Montiel, J.M.M. and Davison, A.J. (2010). Real-time Monocular SLAM: Why Filter? IEEE ICRA.</a></p>
+            <p class="bib-annotation">The influential empirical argument that bundle-adjustment-style optimization dominates filtering per unit of compute; the paper that framed the debate this section resolves.</p>
+        </div>
+
+        <p class="bib-category">Visual-inertial and modern SLAM systems</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/9440682">Campos, C. et al. (2021). ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial, and Multimap SLAM. IEEE Transactions on Robotics.</a></p>
+            <p class="bib-annotation">A production-grade smoother fusing vision and IMU with a multi-map back end; the reference system for graph-based SLAM today.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/8421746">Qin, T., Li, P. and Shen, S. (2018). VINS-Mono: A Robust and Versatile Monocular Visual-Inertial State Estimator. IEEE Transactions on Robotics.</a></p>
+            <p class="bib-annotation">A widely deployed sliding-window graph optimizer with IMU pre-integration; the practical template for real-time VIO on constrained hardware.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/7557075">Forster, C. et al. (2017). On-Manifold Preintegration for Real-Time Visual-Inertial Odometry. IEEE Transactions on Robotics.</a></p>
+            <p class="bib-annotation">Derives the IMU pre-integration factor that lets hundreds of inertial samples become one graph edge; the enabling trick for inertial factor graphs.</p>
+        </div>
+
+        <p class="bib-category">Differentiable and learned optimization</p>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.neurips.cc/paper_files/paper/2021/hash/89fcd07f20b6785b92134bd6c1d0fa42-Abstract.html">Teed, Z. and Deng, J. (2021). DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras. NeurIPS.</a></p>
+            <p class="bib-annotation">Embeds a differentiable bundle-adjustment layer inside a recurrent network, showing that even learned SLAM keeps a factor-graph solver in the loop.</p>
+        </div>
+        <div class="bib-entry-card">
+            <p class="bib-ref"><a href="https://proceedings.neurips.cc/paper_files/paper/2022/hash/185969291540b3cd86e70c51e8af5d08-Abstract-Conference.html">Pineda, L. et al. (2022). Theseus: A Library for Differentiable Nonlinear Optimization. NeurIPS.</a></p>
+            <p class="bib-annotation">A differentiable factor-graph optimizer that lets gradients flow through the smoother, bridging classical estimation and end-to-end learning.</p>
+        </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, we leave the world of estimating a state and turn to detecting when a signal has <em>changed</em>: point, contextual, and collective anomalies, statistical process control, and change-point detection. Where this chapter asked "what is the best trajectory given all the measurements," the next asks "which measurements no longer belong," and the residuals produced by the estimators you just built become the raw material for spotting a fault before it becomes a failure.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

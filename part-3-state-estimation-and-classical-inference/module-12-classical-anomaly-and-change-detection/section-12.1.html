@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.1: Point, contextual, and collective anomalies. Building Sensory AI." name="description"/>
+<title>Section 12.1: Point, contextual, and collective anomalies | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Classical Anomaly and Change Detection</a></div>
+<h1>Point, contextual, and collective anomalies</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me a reading of 41 degrees was an anomaly. I asked whether it was August or the inside of a running dishwasher. They looked at me strangely, then agreed I had a point."</p>
+<cite>A Context-Seeking AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the sampling and timestamp notation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (a stream indexed by \(k\), sampled every \(T_s\) seconds) and the probability vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>: densities, tails, standard scores, and what a low-probability event means. It leans on the physical failure modes catalogued in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> (saturation, stuck-at faults, drift) and the windowing and feature ideas of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>. No detector machinery is assumed yet; this section is the taxonomy that decides which detector the rest of the chapter should reach for. The notation table is Appendix J.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a taxonomy comes before any algorithm</h3>
+<p>The single most common way an anomaly-detection project fails is not a weak model; it is a mismatch between the <em>kind</em> of anomaly that matters and the kind the detector was built to catch. A threshold on raw amplitude will flag a heat wave and miss a heart that has stopped beating, because a flatline sits comfortably inside the normal amplitude range. Before you touch statistical process control in <a class="cross-ref" href="section-12.2.html">Section 12.2</a> or an Isolation Forest in <a class="cross-ref" href="section-12.5.html">Section 12.5</a>, you owe yourself one decision: is the thing you fear a single outlandish sample, a sample that is only wrong <em>given its context</em>, or a stretch of individually innocent samples that are damning <em>as a group</em>? These three cases, point, contextual, and collective, are the taxonomy of Chandola, Banerjee, and Kumar, and they map almost one-to-one onto three different detector families. Naming your anomaly is half of detecting it.</p>
+</div>
+
+<h2>Point anomalies: a single sample the data cannot explain</h2>
+<p><strong>What</strong> a point anomaly is: one observation \(x_k\) that lies far from the bulk of the data, judged against the distribution of all the other points with no further conditioning. This is the textbook outlier, the reading a naive person means when they say "anomaly." <strong>Why</strong> it is the easiest case: you only need a model of where the normal mass lives, then measure distance from it. For a roughly Gaussian channel the classic score is the standardized residual</p>
+$$z_k = \frac{x_k - \hat{\mu}}{\hat{\sigma}},$$
+<p>and you flag \(|z_k| > \tau\) for some threshold like \(\tau = 3\) or \(\tau = 4\). <strong>How</strong> it goes wrong in sensor data: a single accelerometer spike from a dropped phone, a lidar return of 0.02 m because a bug crawled across the lens, a thermocouple reading of \(-273\,^\circ\mathrm{C}\) because a wire came loose. <strong>When</strong> the point view suffices: when the fault mechanism produces values that are physically out of range or statistically extreme <em>in isolation</em>, so that no amount of surrounding context could rescue them. A temperature of 900 degrees on a wristband is a point anomaly; you do not need to know the season.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The same number can be all three, or none</h3>
+<p>Anomaly type is a property of the <em>question</em>, not of the value. A reading of 41 (degrees Celsius) is not intrinsically anomalous. As a bare number against a global distribution of human skin temperature it is a point anomaly. Measured on a forehead in a heat wave it is contextually normal. Measured on a forehead indoors at 3 a.m. it is a contextual anomaly worth a fever alert. And 41 repeated identically for six hours, with zero jitter, is a collective anomaly signalling a stuck sensor even though every single value is plausible. The taxonomy is not about the data alone; it is about what you condition on. Choosing the conditioning is the modeling act.</p>
+</div>
+
+<h2>Contextual anomalies: wrong only given the context</h2>
+<p><strong>What</strong> a contextual anomaly (also called a conditional anomaly) is: a sample whose value is perfectly normal in the global distribution but abnormal given a set of <em>contextual attributes</em> such as time of day, season, location, operating mode, or activity. The framework splits every observation into two roles: <em>contextual attributes</em> \(\mathbf{c}_k\) that situate the sample (timestamp, ambient conditions, which gear the transmission is in) and <em>behavioral attributes</em> \(\mathbf{b}_k\) that carry the measured value (the temperature, the vibration amplitude). A point is a contextual anomaly when \(\mathbf{b}_k\) is unremarkable in the marginal \(p(\mathbf{b})\) but improbable in the conditional \(p(\mathbf{b}\mid\mathbf{c})\).</p>
+<p><strong>Why</strong> sensor streams are riddled with them: almost every physical signal is non-stationary and seasonal. Building energy draw at 2 p.m. and at 2 a.m. share a range but not a distribution; an engine that idles cold and cruises hot has different normal vibration in each mode. A detector that ignores context will either drown you in false alarms during the high-baseline regime or sleep through faults during the low-baseline one. <strong>How</strong> to catch them: the honest cure is to model the expected value <em>as a function of context</em>, then score the residual against that conditional expectation, which is exactly the residuals-and-thresholds machinery of <a class="cross-ref" href="section-12.3.html">Section 12.3</a>. A seasonal-naive predictor (compare to the same hour last week), a per-mode mean, or a regression on \(\mathbf{c}_k\) all serve. <strong>When</strong> you must reach for it: whenever the normal operating envelope itself moves, which is nearly always for environmental, physiological, and industrial sensing.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">The freezer that was fine at 2 p.m. and failing at 2 a.m.</h3>
+<p>A supermarket cold-chain team monitored a walk-in freezer with a single temperature probe and a fixed high limit of \(-15\,^\circ\mathrm{C}\). During opening hours, staff traffic and restocking pushed the probe to \(-16\,^\circ\mathrm{C}\) routinely, well inside the limit, so nothing fired. One winter night a defrost heater stuck on. The temperature climbed to \(-17\,^\circ\mathrm{C}\) and held, a value that in daytime meant "a door was open" and at 3 a.m., with the store sealed and empty, meant "the compressor is losing the battle." The fixed threshold never tripped because the value was globally normal. Rebuilding the alarm as a contextual detector, expected temperature conditioned on hour-of-day and door-sensor state, the residual at 3 a.m. was six sigma and the alert fired ninety minutes before spoilage. The fix was not a better threshold; it was conditioning on context. This is the cold-chain flavour of the condition-monitoring problem developed in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>Collective anomalies: innocent samples, guilty as a group</h2>
+<p><strong>What</strong> a collective anomaly is: a contiguous subsequence \(x_{k}, x_{k+1}, \ldots, x_{k+m}\) that is anomalous <em>as a whole</em> even though no individual member is a point or contextual anomaly on its own. The signature lives in the <em>relationship</em> between samples, their order, their local shape, their variance, not in any single amplitude. <strong>Why</strong> this is the case classical outlier tests miss completely: every value passes a per-sample check, so a \(z\)-score detector scanning one point at a time sees nothing. <strong>How</strong> to expose them: you must score a <em>window</em>, not a point. Standard moves are to compute a feature over a sliding window (the running variance, a spectral band from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a>, an autocorrelation, a shape descriptor) and then apply point or contextual detection to that derived series, or to compare the subsequence against a library of normal patterns.</p>
+<p>Two collective patterns dominate sensor faults. The first is the <em>stuck-at</em> or flatline fault: the signal freezes at one value with near-zero variance. On an <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">ECG (Chapter 29)</a> a flat segment is not "a normal voltage repeated," it is asystole or a lead that fell off, and the diagnostic feature is the collapse of local variance, not the level. The second is a change in temporal <em>texture</em>: a bearing that develops a fault does not exceed any amplitude limit at first; it acquires a new periodicity, a rising kurtosis, a shifted spectral centroid across a window. Both are invisible to a per-sample rule and obvious to a windowed one.</p>
+
+<div class="callout note">
+<h3 class="callout-title">Collective anomaly versus change point</h3>
+<p>A collective anomaly is a bounded, transient episode that begins and then ends, after which the signal returns to its old normal. A <em>change point</em> is a persistent shift to a new normal that does not revert. The window machinery overlaps, but the intent differs: here we ask "is this stretch abnormal?", there we ask "did the generating process permanently change?" The dedicated tools for the persistent case, CUSUM and Bayesian online change-point detection, arrive in <a class="cross-ref" href="section-12.4.html">Section 12.4</a>. Deciding which question you are asking, again, precedes the algorithm.</p>
+</div>
+
+<p>The snippet below builds one synthetic sensor stream carrying all three anomaly types and shows why a single per-sample \(z\)-score catches only the first.</p>
+
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+n = 600
+t = np.arange(n)
+# Normal signal: a daily sinusoid (context) plus small noise.
+season = 5.0 * np.sin(2 * np.pi * t / 200.0)
+x = 20.0 + season + rng.normal(0, 0.4, n)
+
+# (1) POINT anomaly: one wild spike.
+x[100] += 12.0
+# (2) CONTEXTUAL anomaly: value ~26 is normal at a peak, abnormal in a trough.
+x[300] = 26.0                      # trough time, but a peak-level reading
+# (3) COLLECTIVE anomaly: a stuck-at flatline, each value individually plausible.
+x[440:470] = x[439]
+
+# Per-sample z-score against the GLOBAL distribution.
+z_global = (x - x.mean()) / x.std()
+print("point flagged? ", abs(z_global[100]) &gt; 3)     # True
+print("context flagged?", abs(z_global[300]) &gt; 3)     # False: 26 is globally ordinary
+# Contextual score: residual against expected value for this phase.
+expected = 20.0 + 5.0 * np.sin(2 * np.pi * t / 200.0)
+z_ctx = (x - expected) / 0.4
+print("context flagged (conditional)?", abs(z_ctx[300]) &gt; 3)  # True
+# Collective score: local variance over a sliding window.
+w = 10
+local_std = np.array([x[i:i+w].std() for i in range(n - w)])
+print("flatline flagged?", (local_std[440:460] &lt; 0.05).any())  # True
+</code></pre>
+<div class="code-caption">Code 12.1.1: One stream, three anomaly types, three different scores. The global \(z\)-score catches the point spike, is blind to the contextual reading (26 is unremarkable overall), and never sees the flatline (every frozen value is ordinary). Conditioning on phase exposes the contextual case; scoring a window's variance exposes the collective one.</div>
+
+<p>Code 12.1.1 is the whole argument in fifteen lines: the detector must be matched to the anomaly type. The global test at line <code>z_global[300]</code> returns <code>False</code> not because the detector is weak but because it is answering the wrong question, and the flatline is invisible to any per-point rule by construction.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: windowed features without the index gymnastics</h3>
+<p>The sliding-variance loop in Code 12.1.1 is where hand-rolled anomaly code accumulates off-by-one bugs. Libraries collapse it: <code>pandas</code> turns the entire collective-anomaly feature into <code>series.rolling(10).std()</code>, one line replacing the four-line comprehension and its fragile end index, and <code>numpy.lib.stride_tricks.sliding_window_view</code> vectorizes any windowed statistic without a Python loop at all. For the contextual case, <code>statsmodels</code> seasonal decomposition yields the <code>expected</code> baseline in a single call instead of a hand-written sinusoid. You still choose the window length and what to condition on; the library owns the boundary bookkeeping, which is exactly the part that silently corrupts results. Roughly a 4-to-1 line reduction, and the removed lines are the bug-prone ones.</p>
+</div>
+
+<h2>Choosing the frame before choosing the tool</h2>
+<p><strong>How</strong> to use the taxonomy in practice is a short interrogation of the failure you actually fear. Ask: can the fault be recognized from a single sample with nothing else known? Then it is a point anomaly and a threshold or a robust \(z\)-score (<a class="cross-ref" href="section-12.2.html">Section 12.2</a>) will do. Does the same value flip between normal and abnormal depending on time, mode, or environment? Then it is contextual, and you must model the conditional expectation and score its residual (<a class="cross-ref" href="section-12.3.html">Section 12.3</a>). Does the fault only reveal itself in the pattern across several samples, a flatline, a new texture, a burst? Then it is collective, and you must lift detection to a window feature. Many real deployments carry all three at once, which is why the strongest monitors run several detectors in parallel and fuse their verdicts rather than betting on one. Getting this frame right also governs how you can even <em>measure</em> success: point-adjusted scoring, dissected in <a class="cross-ref" href="section-12.6.html">Section 12.6</a>, quietly assumes a collective frame and inflates results when misapplied.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: classify five real faults</h3>
+<p>For each fault below, state whether it is best framed as a point, contextual, or collective anomaly, and name the one feature or conditioning variable a detector needs. (1) A car tyre-pressure sensor reports 0 psi for a single frame during a radio burst, then recovers. (2) A wearable heart-rate of 165 bpm, which is a fever-tier resting value but exactly normal mid-sprint. (3) A structural strain gauge whose reading holds at a fixed number to five decimal places for an hour. (4) A gas sensor whose baseline slowly walks upward over weeks. (5) A pump whose vibration amplitude is unchanged but whose spectrum grows a new peak at twice the shaft frequency. For the two that are hardest to catch with a single amplitude threshold, explain why, referencing the conditional or windowed view. The bearing-spectrum case connects to <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A reading of 26 degrees is flagged by a phase-conditioned detector but not by a global \(z\)-score. Which anomaly type is this, and what did the conditional detector know that the global one did not?</p>
+<p>2. Why is a per-sample outlier test guaranteed to miss a stuck-at flatline, and what minimal change to the detector fixes it?</p>
+<p>3. Give one sensor fault that is simultaneously a point anomaly under one question and a collective anomaly under another, and state the two questions.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-12.2.html">Section 12.2</a>, we turn the point-anomaly case into disciplined practice with statistical process control: control charts, the \(3\sigma\) and Western Electric rules, and the robust location and scale estimators that keep a threshold honest when the "normal" data is itself contaminated. It is the oldest and still one of the most deployed anomaly detectors on Earth, and it is the natural first tool once you have decided your anomaly is a point.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

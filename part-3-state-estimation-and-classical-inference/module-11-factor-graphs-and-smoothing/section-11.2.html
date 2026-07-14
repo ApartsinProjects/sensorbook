@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.2: MAP estimation and nonlinear least squares. Building Sensory AI." name="description"/>
+<title>Section 11.2: MAP estimation and nonlinear least squares | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>MAP estimation and nonlinear least squares</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You asked me for the most probable trajectory. I quietly turned that into a pile of squared residuals, because that is the only shape of problem I actually know how to minimize."</p><cite>A Pragmatic AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 11.1 drew the factor graph: variables for the states you want to estimate, factors for every constraint a sensor or a motion model imposes on them. A graph is a picture, not an answer. This section is where the picture becomes a number. The goal is the <strong>maximum a posteriori</strong> (MAP) estimate: the single configuration of all states that is most probable given every measurement at once. The decisive move, and the one idea to carry out of this section, is that maximizing a product of Gaussian factors is exactly the same as minimizing a sum of squared, noise-weighted residuals. That equivalence converts "find the most likely trajectory" into "solve a nonlinear least squares problem," and nonlinear least squares is a solved discipline with fast, sparse, well-understood algorithms. Every modern smoother, from the pose graph in a warehouse robot to the visual-inertial odometry in a headset, is running the loop you are about to build: linearize, solve a sparse linear system, step, repeat.</p>
+</div>
+
+<p>This section assumes you are comfortable with priors, likelihoods, and posteriors from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, with the measurement-model and sensor-noise language of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and with the factor-graph vocabulary of <a class="cross-ref" href="section-11.1.html">Section 11.1</a>. Unlike the recursive filters of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, which touch one state at a time, MAP estimation optimizes the whole trajectory jointly.</p>
+
+<h2>From posterior to a sum of squares</h2>
+
+<p>Collect every state into one stacked vector \(X = \{x_1, \dots, x_n\}\) and write \(Z\) for all measurements. The factor graph says the posterior factors into a product over the graph's factors,</p>
+
+$$p(X \mid Z) \;\propto\; \prod_{i} \phi_i(X_i),$$
+
+<p>where each \(\phi_i\) touches only its local subset of variables \(X_i\). The MAP estimate is the maximizer, \(X^\star = \arg\max_X \prod_i \phi_i(X_i)\). Products are awkward to optimize, so we take the negative logarithm, which turns the product into a sum and the maximization into a minimization. When each factor is Gaussian, \(\phi_i(X_i) \propto \exp\!\big(-\tfrac12 \lVert h_i(X_i) - z_i \rVert^2_{\Sigma_i}\big)\), the negative log of each factor is precisely a squared, covariance-weighted error term. The whole problem becomes</p>
+
+$$X^\star \;=\; \arg\min_X \; \sum_i \big\lVert h_i(X_i) - z_i \big\rVert^2_{\Sigma_i}, \qquad \lVert e \rVert^2_{\Sigma} = e^\top \Sigma^{-1} e.$$
+
+<p>Here \(h_i\) is the measurement function (what the sensor <em>would</em> read if the state were \(X_i\)), \(z_i\) is what it actually read, and the residual \(e_i = h_i(X_i) - z_i\) is the disagreement. The norm \(\lVert \cdot \rVert_\Sigma\) is the <strong>Mahalanobis</strong> distance: it divides each residual by its uncertainty, so a millimeter of disagreement from a precise lidar counts far more than a meter from a noisy GNSS fix. This is where sensor noise models from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> earn their keep: \(\Sigma_i\) is the currency in which competing sensors bid for influence.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>MAP estimation over a Gaussian factor graph <em>is</em> weighted nonlinear least squares. The two are not analogous; they are the same objective written in two notations. This is why the entire smoothing literature borrows its machinery, Gauss-Newton, Levenberg-Marquardt, sparse Cholesky, directly from numerical optimization rather than inventing anything probabilistic. A prior on a state (a belief before any measurement) is just one more factor and one more squared term; a maximum-likelihood estimate is the same objective with the prior removed. Nothing in the solver knows or cares which terms came from priors, motion models, or sensors.</p>
+</div>
+
+<h2>Linearize, solve, repeat: Gauss-Newton</h2>
+
+<p>The catch is that \(h_i\) is almost never linear. A range sensor involves a square root; a camera projection divides by depth; a rotation is trigonometric. Stack all residuals into one vector \(r(X)\), weighted so the objective is simply \(\tfrac12 \lVert r(X) \rVert^2\). We cannot minimize this in closed form, but we can linearize it around the current estimate \(X\). A first-order Taylor expansion replaces the residual with \(r(X + \Delta) \approx r(X) + J\,\Delta\), where \(J = \partial r / \partial X\) is the <strong>Jacobian</strong> stacking every factor's local derivative. Substituting and setting the gradient to zero gives the <strong>normal equations</strong>:</p>
+
+$$J^\top J \, \Delta \;=\; -\,J^\top r(X).$$
+
+<p>Solve this linear system for the update \(\Delta\), take the step \(X \leftarrow X + \Delta\), relinearize at the new point, and repeat until \(\Delta\) is negligible. That is <strong>Gauss-Newton</strong>. The matrix \(\Lambda = J^\top J\) is the <strong>information matrix</strong>, and its sparsity is the whole reason smoothing scales: because each factor touches only a few variables, \(\Lambda\) is mostly zeros with structure that mirrors the graph. A sparse Cholesky factorization solves a problem with thousands of poses in milliseconds. That same \(\Lambda\) also delivers the estimate's covariance, the topic of <a class="cross-ref" href="section-11.6.html">Section 11.6</a>.</p>
+
+<p>Gauss-Newton is fast near a good guess but can overshoot and diverge when the linearization is poor. <strong>Levenberg-Marquardt</strong> fixes this by adding a damping term, solving \((\Lambda + \lambda\,\mathrm{diag}(\Lambda))\,\Delta = -J^\top r\). Large \(\lambda\) shortens the step toward a cautious gradient-descent move; small \(\lambda\) recovers the aggressive Gauss-Newton step. The solver raises \(\lambda\) when a step makes the error worse and lowers it when a step succeeds, adapting its trust in the linear model automatically. This robustness is why it is the default in most practical solvers.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery robot squaring up its loop</h3>
+<p>A warehouse delivery robot drives a long loop and returns to a shelf it already mapped. Wheel odometry has drifted, so its raw trajectory does not close: the estimated end pose sits half a meter from the true start. In a factor-graph smoother, every odometry step is a between-factor and the recognized shelf is a loop-closure factor tying the last pose back to an early one. Individually these constraints conflict; jointly they define a MAP objective. Gauss-Newton spreads the half-meter of accumulated error backward across all the intermediate poses in proportion to each odometry step's covariance, so no single pose absorbs the whole correction. After three iterations the residuals stop shrinking and the loop closes cleanly. The robot did not re-drive anything; it re-optimized the whole trajectory at once, which is precisely what a filter processing one pose at a time cannot do. This is the computational heart of the SLAM systems in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<h2>Watching Gauss-Newton run</h2>
+
+<p>The mechanics are clearest on a problem small enough to print. Below, a static receiver at unknown 2D position estimates its location from noisy range measurements to four beacons at known coordinates, a stripped-down version of the positioning problem in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>. Each range is one nonlinear factor; we build the residual vector and its Jacobian by hand and iterate the normal equations.</p>
+
+<pre><code class="language-python">import numpy as np
+
+beacons = np.array([[0., 0.], [10., 0.], [0., 10.], [10., 10.]])
+true_xy = np.array([3.0, 4.0])
+rng = np.random.default_rng(0)
+sigma = 0.20                                     # range noise std (meters)
+z = np.linalg.norm(beacons - true_xy, axis=1) + rng.normal(0, sigma, 4)
+
+def residual_and_jacobian(x):
+    d = x - beacons                              # vectors from each beacon
+    rng_pred = np.linalg.norm(d, axis=1)         # predicted ranges h(x)
+    r = (rng_pred - z) / sigma                   # whitened residuals
+    J = (d / rng_pred[:, None]) / sigma          # d h / d x, also whitened
+    return r, J
+
+x = np.array([1.0, 1.0])                         # deliberately poor start
+for k in range(6):
+    r, J = residual_and_jacobian(x)
+    delta = np.linalg.solve(J.T @ J, -J.T @ r)   # normal equations
+    x = x + delta
+    print(f"iter {k}: x={x.round(3)}  cost={0.5*r@r:8.3f}  step={np.linalg.norm(delta):.4f}")
+print("estimate:", x.round(3), " truth:", true_xy)</code></pre>
+<div class="code-caption">Gauss-Newton for range-based positioning. Dividing the residual and Jacobian by <code>sigma</code> applies the Mahalanobis weighting: it is the whitening that turns MAP into ordinary least squares. Watch <code>cost</code> plunge and <code>step</code> shrink toward zero within a few iterations, even from a poor initial guess.</div>
+
+<p>The loop is the entire section in eight lines: form residuals, build the Jacobian, solve \(J^\top J\,\Delta = -J^\top r\), step. The information matrix \(J^\top J\) here is a dense \(2\times 2\) because every factor touches the one variable, but swap in a trajectory of a thousand poses and that matrix becomes banded and sparse, and only the solver call changes.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: let the optimizer own the loop</h3>
+<p>The hand-built loop above is for understanding, not production. <code>scipy.optimize.least_squares</code> collapses the whole iteration, damping schedule, convergence tests, and even a numerical Jacobian if you omit the analytic one, into a single call: pass a function returning the residual vector and get the optimum back. That is roughly fifteen lines of Gauss-Newton and Levenberg-Marquardt bookkeeping replaced by one function call, with a battle-tested trust-region step you did not have to tune. For factor graphs specifically, GTSAM and Ceres go further: you declare factors and variables, and the library discovers the sparsity, orders the elimination, and runs sparse Levenberg-Marquardt, which is the subject of <a class="cross-ref" href="section-11.3.html">Section 11.3</a>.</p>
+</div>
+
+<h2>What MAP gains, and what it costs</h2>
+
+<p>Why prefer this batch optimization to a recursive filter? Two reasons. First, <strong>relinearization</strong>: an extended Kalman filter linearizes each nonlinearity once, at the instant the measurement arrives, and can never revisit that choice; a smoother relinearizes every factor at every iteration around the improving estimate, so an early bad linearization gets corrected as later evidence arrives. This is why smoothing is markedly more accurate than filtering on strongly nonlinear problems, a limitation first met in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>. Second, <strong>joint consistency</strong>: MAP finds the trajectory that best explains all measurements simultaneously, so a loop closure can correct poses hundreds of steps in the past, which no forward filter can do.</p>
+
+<p>The costs are equally concrete. Solving over the whole trajectory is more expensive than a single filter update, which is why <a class="cross-ref" href="section-11.3.html">Section 11.3</a> introduces incremental smoothing to reuse work between solves. And least squares assumes Gaussian noise: a single gross outlier, a mismatched loop closure, a lidar return off a glass wall, enters as a squared term and can drag the entire estimate off. <a class="cross-ref" href="section-11.5.html">Section 11.5</a> replaces the squared cost with robust kernels to defend against exactly that. For now, hold the core equivalence: the most probable trajectory is the one that minimizes noise-weighted squared error, and you find it by linearizing and solving sparse linear systems until it stops moving.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Start from the range-positioning code. (1) Print the information matrix \(J^\top J\) at convergence and relate its two eigenvalues to the beacon geometry; then move all four beacons close together on one side and re-run, explaining why the estimate along the beacon-to-receiver direction becomes far less certain (this is geometric dilution of precision). (2) Corrupt one measurement by adding 5 meters to a single range and re-run; report how far the least squares estimate moves, and argue from the squared-cost structure why one bad factor can dominate. (3) Replace the analytic Jacobian with a finite-difference approximation and confirm the iterates match, then note what you lose in speed and precision.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Explain the exact step that turns "maximize the posterior" into "minimize a sum of squares." Which property of the factors makes the two identical rather than merely similar?</li>
+<li>In the normal equations \(J^\top J\,\Delta = -J^\top r\), what does the matrix \(J^\top J\) represent probabilistically, and why is its sparsity the reason smoothing scales to thousands of variables?</li>
+<li>Give one concrete advantage of batch MAP smoothing over an extended Kalman filter that comes specifically from relinearizing at every iteration, and one cost you pay for it.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-11.3.html">Section 11.3</a>, we make this loop incremental. Re-solving the entire trajectory from scratch every time a new measurement lands is wasteful when only a few variables actually change, so iSAM2 and the GTSAM library reuse the previous factorization, updating just the affected part of the sparse system. That turns the batch optimizer of this section into a smoother fast enough to run online, on a robot, in real time.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.3: Incremental smoothing (iSAM2) and GTSAM. Building Sensory AI." name="description"/>
+<title>Section 11.3: Incremental smoothing (iSAM2) and GTSAM | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>Incremental smoothing (iSAM2) and GTSAM</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You keep handing me one more measurement and asking me to re-solve the universe. I have started keeping my old work. Only the parts you disturbed get erased."</p><cite>A Thrifty AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p><a class="cross-ref" href="section-11.2.html">Section 11.2</a> turned a factor graph into a nonlinear least-squares problem and solved it by Gauss-Newton: linearize every factor, stack the Jacobians into one big sparse matrix, factorize it, take a step, repeat. That is <strong>batch smoothing</strong>, and for a fixed dataset it is exactly right. But a live perception system is not a fixed dataset. A visual-inertial odometry pipeline adds a new camera pose thirty times a second; a lidar SLAM front end appends a keyframe every meter. Re-solving the entire trajectory from scratch on every frame is work that grows without bound, and by the time your robot has driven for ten minutes the batch solve no longer fits inside a frame budget. This section is the fix. <strong>Incremental smoothing</strong>, embodied by the iSAM2 algorithm and the GTSAM library, keeps the matrix factorization from the last step and edits only the small part of it that the newest measurement actually touched. You get the accuracy of full smoothing at the cost of a filter. That single idea is why factor graphs, not Kalman filters, run inside modern SLAM and VIO.</p>
+</div>
+
+<p>This section assumes you are fluent in the MAP-as-least-squares formulation, the Gauss-Newton normal equations, and sparse factorization from <a class="cross-ref" href="section-11.2.html">Section 11.2</a>, and comfortable with the information-matrix view of a Gaussian from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. We build toward the loop-closure and marginalization mechanics of <a class="cross-ref" href="section-11.4.html">Section 11.4</a>, which lean directly on the data structure introduced here.</p>
+
+<h2>Why re-solving from scratch does not scale</h2>
+
+<p>Recall the linearized normal equations from batch smoothing. At each Gauss-Newton iteration we solve \(A^\top A \, \delta = A^\top b\), where \(A\) is the stacked, whitened Jacobian of every factor and \(\delta\) is the update to all state variables at once. The matrix \(\Lambda = A^\top A\) is the <strong>information matrix</strong>: sparse, symmetric, positive-definite. Solving means factorizing it, typically \(\Lambda = R^\top R\) by Cholesky or, working directly on \(A\), a QR factorization that yields the same upper-triangular <strong>square-root factor</strong> \(R\). Back-substitution on \(R\) then delivers \(\delta\).</p>
+
+<p>Here is the waste. When you append one new pose and one new odometry factor, almost every entry of \(R\) is identical to what it was a moment ago. The new measurement is local: it constrains the newest variable and a handful of its neighbors, nothing on the far side of the trajectory. Yet a naive batch solve rebuilds and refactorizes the whole matrix, an \(O(n^3)\) operation in the dense case and still superlinear for the sparse trajectories we care about. The question that defines this section is: can we reuse the old \(R\) and repair only the disturbed corner? The answer is yes, and the machinery that makes the "disturbed corner" precise is a data structure called the Bayes tree.</p>
+
+<h2>The Bayes tree: elimination you can edit</h2>
+
+<p>Factorizing \(\Lambda\) is variable elimination. You pick an ordering of the state variables, and eliminating each one in turn produces a row of \(R\) plus fill-in edges among that variable's remaining neighbors. The result of eliminating everything is a <strong>Bayes net</strong>: a directed, chordal graph whose conditional densities are exactly the rows of \(R\). The <strong>Bayes tree</strong>, introduced by Kaess and colleagues in 2011, is that Bayes net reorganized into a tree of <em>cliques</em>, where each clique groups variables eliminated together and each edge carries the separator they share with their parent. It is the square-root information matrix drawn as a junction tree.</p>
+
+<p>Why bother? Because a tree makes locality explicit. When a new factor arrives involving variable \(x_k\), only the cliques on the path from \(x_k\)'s clique up to the root are affected. Everything hanging off other branches is provably untouched: its rows of \(R\) are still valid, its stored densities still correct. Re-solving means detaching that top sub-tree, converting its cliques back into factors, adding the new factor, and re-eliminating just that small piece. The deeper, older branches are never reopened. This is the structural insight that converts "refactorize \(n\) variables" into "refactorize the few that the measurement could plausibly influence."</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The Bayes tree turns a matrix factorization into an editable object. In a Kalman filter, folding in a measurement means marginalizing away all past states, so information about the trajectory is smeared irrecoverably into a single covariance and you can never revisit an old pose. In the Bayes tree, past states are still there as cliques, and a new measurement edits only the branch it reaches. That is the whole difference between <em>filtering</em> (forget the past to stay cheap) and <em>smoothing</em> (keep the past but touch only what changed). Incremental smoothing refuses the false choice between accuracy and speed.</p>
+</div>
+
+<h2>iSAM2: fluid relinearization and partial back-substitution</h2>
+
+<p>The Bayes tree handles the linear reuse. iSAM2 adds two more economies that matter for nonlinear sensor problems. The first is <strong>fluid relinearization</strong>. A batch Gauss-Newton solve relinearizes every factor at every iteration, because a factor's Jacobian is only valid near the operating point it was computed at. But most variables barely move once the trajectory has settled. iSAM2 tracks, per variable, how far the current estimate has drifted from the point where its factors were last linearized, and relinearizes a factor only when that drift crosses a threshold (a few centimeters, a fraction of a degree). Variables that are not moving keep their old Jacobians for free. The second economy is <strong>partial back-substitution</strong>. After editing the tree, you must back-substitute to get the updated \(\delta\), but a local measurement typically nudges only nearby variables. iSAM2 propagates the update outward from the changed cliques and stops descending a branch as soon as the delta falls below a threshold, so distant, unaffected poses are never even read.</p>
+
+<p>Two more details make it robust in the long run. Elimination ordering controls fill-in, and a bad ordering can turn a sparse tree dense; iSAM2 periodically re-orders variables with a heuristic such as COLAMD, and constrains the newest variables to the end so they stay cheap to update. And because the whole thing is a repeated linearize-edit-solve loop, it inherits the trust-region option of <a class="cross-ref" href="section-11.2.html">Section 11.2</a>: iSAM2 can run its steps in a dogleg region to stay stable when a loop closure snaps the graph hard.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a delivery robot's visual-inertial backbone</h3>
+<p>Consider a sidewalk delivery robot running visual-inertial odometry. Its front end emits, per keyframe, a preintegrated IMU factor linking the new pose to the previous one and a batch of visual reprojection factors tying that pose to tracked landmarks. Feeding these into an ISAM2 back end, each keyframe costs a bounded <code>update</code>: the Bayes tree re-eliminates the top few cliques, fluid relinearization skips the landmarks the robot drove past ten seconds ago, and back-substitution stops before it reaches the start of the block. The robot maintains a full smoothed trajectory, not a filtered one, so when it finally rounds the corner and re-recognizes the mailbox it saw at the start, the loop-closure factor of <a class="cross-ref" href="section-11.4.html">Section 11.4</a> can correct the entire loop at once, something a marginalizing filter could never do because it long ago threw the early poses away. This same GTSAM back end is the estimation core we assemble into a full pipeline in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<h2>GTSAM in practice</h2>
+
+<p>GTSAM (Georgia Tech Smoothing And Mapping) is the reference implementation. You describe your problem as a <code>NonlinearFactorGraph</code> of typed factors over variables that live on manifolds (<code>Pose2</code> on \(SE(2)\), <code>Pose3</code> on \(SE(3)\), so updates compose correctly rather than adding blindly), hand batches of new factors to an <code>ISAM2</code> object, and read back a live estimate. The loop below runs a small incremental pose graph: a prior anchors the first pose, then each step adds one odometry <code>BetweenFactor</code> and calls <code>update</code>, which does exactly the Bayes-tree edit described above.</p>
+
+<pre><code class="language-python">import gtsam
+from gtsam import Pose2, ISAM2, NonlinearFactorGraph, Values
+from gtsam import BetweenFactorPose2, PriorFactorPose2
+from gtsam.symbol_shorthand import X          # X(k) names pose k
+
+prior_noise = gtsam.noiseModel.Diagonal.Sigmas([0.10, 0.10, 0.05])  # x, y, theta
+odom_noise  = gtsam.noiseModel.Diagonal.Sigmas([0.20, 0.20, 0.10])
+
+isam = ISAM2()                 # holds the Bayes tree across calls
+odom = Pose2(1.0, 0.0, 0.0)    # command: drive 1 m forward each step
+
+for k in range(5):
+    graph   = NonlinearFactorGraph()   # ONLY the new factors this step
+    initial = Values()                 # ONLY the new variable this step
+    if k == 0:
+        graph.add(PriorFactorPose2(X(0), Pose2(0, 0, 0), prior_noise))
+        initial.insert(X(0), Pose2(0, 0, 0))
+    else:
+        graph.add(BetweenFactorPose2(X(k - 1), X(k), odom, odom_noise))
+        prev = isam.calculateEstimate().atPose2(X(k - 1))
+        initial.insert(X(k), prev.compose(odom))   # warm start on the manifold
+    isam.update(graph, initial)        # incremental solve: edits, does not rebuild
+    est = isam.calculateEstimate()
+    print(k, est.atPose2(X(k)))
+</code></pre>
+<div class="code-caption">An incremental pose graph in GTSAM. Each iteration hands <code>ISAM2.update</code> only the <em>new</em> odometry factor and the <em>new</em> pose, warm-started by composing the previous estimate with the odometry on \(SE(2)\). The solver reuses its stored Bayes-tree factorization and re-eliminates only the disturbed cliques, so per-step cost stays bounded even as the trajectory grows.</div>
+
+<p>Notice what the loop never does: it never rebuilds the full graph and never re-solves the whole trajectory. It appends and calls <code>update</code>. That is incremental smoothing in three lines of body code.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: ISAM2 versus a hand-rolled incremental solver</h3>
+<p>Implementing the Bayes tree yourself, variable elimination with fill-reducing ordering, clique bookkeeping, fluid relinearization thresholds, partial back-substitution, incremental reordering, is on the order of a thousand lines of careful sparse-linear-algebra code, and it is precisely the code that is hardest to debug because the bug shows up as a slow accuracy drift, not a crash. GTSAM's <code>ISAM2</code> gives you all of it behind the roughly ten lines above. You supply typed factors and noise models; the library owns the factorization. The line-count reduction is easily 100-to-1, and more importantly it is a battle-tested factorization rather than your first attempt at one.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>iSAM2 (Kaess et al., 2012) remains the workhorse incremental smoother, and GTSAM its dominant open-source implementation, but the frontier has moved in two directions. First, GPU and parallel factor-graph solvers: NVIDIA's cuVSLAM and research systems that parallelize Bayes-tree updates push incremental smoothing to hundreds of hertz on embedded accelerators. Second, differentiable factor graphs: libraries such as Theseus and PyPose embed the nonlinear least-squares solve as a differentiable layer, so learned front ends (feature detectors, IMU bias models) can be trained end-to-end through the smoother. Ceres Solver and g2o remain popular batch alternatives, but for streaming SLAM and VIO the incremental Bayes-tree approach is still the one that hits real-time budgets.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Start from the GTSAM loop above. (1) Extend it to a longer trajectory (say 50 poses) and, after building it incrementally, also solve the same graph in one batch with <code>gtsam.LevenbergMarquardtOptimizer</code>; confirm the final estimates agree to numerical tolerance, so you trust that incremental is not approximate. (2) Add a loop-closure <code>BetweenFactor</code> tying <code>X(49)</code> back to <code>X(0)</code> and call one more <code>update</code>; inspect how much earlier poses move, and relate this to why a filter could not have made that correction. (3) Print <code>isam.calculateEstimate</code> timing per step with and without the loop closure, and explain which iSAM2 economy (fluid relinearization or partial back-substitution) the loop closure defeats.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Batch Gauss-Newton and iSAM2 solve the same MAP problem. What exactly does iSAM2 reuse between steps that batch smoothing throws away, and in what data structure is it stored?</li>
+<li>What is fluid relinearization deciding, on a per-variable basis, and why would relinearizing every factor every step be wasteful for a settled trajectory?</li>
+<li>Why can a smoother correct an entire loop when a closure is detected, while a Kalman filter cannot? Answer in terms of what each keeps versus marginalizes away.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-11.4.html">Section 11.4</a>, we confront the two operations that most stress an incremental smoother: <strong>loop closure</strong>, where recognizing a previously seen place adds a factor spanning far across the graph and forces the Bayes tree to re-eliminate a long branch, and <strong>marginalization</strong>, the disciplined way to drop old variables when even a smoother must bound its memory, turning the fixed-lag estimator that sits between a filter and a full smoother.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

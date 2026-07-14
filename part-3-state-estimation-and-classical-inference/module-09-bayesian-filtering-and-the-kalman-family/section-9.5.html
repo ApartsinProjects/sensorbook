@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.5: Observability and divergence. Building Sensory AI." name="description"/>
+<title>Section 9.5: Observability and divergence | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Bayesian Filtering and the Kalman Family</a></div>
+<h1>Observability and divergence</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"A filter that never doubts itself is not confident; it is lost, and proud of it."</p>
+        <cite>A Self-Aware AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The big picture</h3>
+        <p><a class="cross-ref" href="section-9.3.html">Section 9.3</a> gave you a working Kalman filter and <a class="cross-ref" href="section-9.4.html">Section 9.4</a> taught you to tune its noise covariances. Both assumed the measurements actually carry enough information to pin the state down, and that the filter's own confidence tracks reality. This section confronts the two ways that assumption breaks. <em>Observability</em> asks a structural question: given the model, can any sequence of measurements recover the hidden state at all, or are some directions invisible? <em>Divergence</em> is the failure that follows when they cannot: the filter reports a tiny covariance while its estimate drifts far from the truth, confidently wrong. You will learn to test observability before deployment, to watch the innovation stream for divergence at run time, and to apply the small set of fixes (process-noise inflation, fading memory, and numerically stable updates) that keep a filter honest. Get this right and your estimator degrades gracefully; get it wrong and it lies to every consumer downstream.</p>
+    </div>
+
+    <p>This section assumes the linear-Gaussian filter of <a class="cross-ref" href="section-9.3.html">Section 9.3</a> and the covariance intuition from <a class="cross-ref" href="section-9.4.html">Section 9.4</a>. It leans on basic linear algebra (matrix rank, positive-definiteness) and the chi-square distribution from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. Following the convention fixed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-01-what-is-sensory-ai/index.html">Chapter 1</a>, this chapter uses control notation: the hidden state is \(x_k\), the measurement is \(z_k\), the transition matrix is \(F\), and the measurement matrix is \(H\).</p>
+
+    <h2>Observability: can the measurements pin the state down?</h2>
+
+    <p><strong>What it is.</strong> A linear time-invariant system with transition \(F\) and measurement matrix \(H\) is <em>observable</em> if, from a finite run of noiseless measurements, you can reconstruct the full state \(x_0\). The test is algebraic. Stack the measurement map with its propagations through the dynamics into the observability matrix</p>
+
+    $$ \mathcal{O} = \begin{bmatrix} H \\ HF \\ HF^2 \\ \vdots \\ HF^{n-1} \end{bmatrix}, $$
+
+    <p>where \(n\) is the state dimension. The system is observable if and only if \(\mathcal{O}\) has full column rank \(n\). Each block adds one more time step of measurement seen through the dynamics; if after \(n\) steps some direction in state space has still produced zero measurement, that direction is invisible and no amount of data recovers it.</p>
+
+    <p><strong>Why it matters more than it looks.</strong> Rank is binary, but reality is graded. A system can be observable on paper yet <em>weakly</em> observable in practice, meaning \(\mathcal{O}\) is nearly rank-deficient and its smallest singular value is close to zero. Then the state is technically recoverable but only by amplifying measurement noise enormously, and the filter's covariance in that direction stays stubbornly large. Checking the rank tells you whether a state is knowable; checking the singular-value spectrum of \(\mathcal{O}\) tells you how expensively.</p>
+
+    <p><strong>How to read the failure.</strong> An unobservable direction is a null-space vector of \(\mathcal{O}\). Perturb the true state along it and the entire future measurement stream is unchanged, so the filter has no lever to correct an error there. The classic sensor example is bias: an accelerometer bias and a genuine acceleration produce identical outputs while motion is constant, so the two are unobservable until the platform maneuvers and breaks the tie. This is exactly why <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">orientation and dead-reckoning systems</a> need excitation to converge, and why a stationary inertial unit can never learn its own gyro bias.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key insight</h3>
+        <p>Observability is a property of the model, not the tuning. No choice of \(Q\) or \(R\) can make an unobservable state observable; the information simply is not in the measurements. Tuning changes how fast an observable state converges and how a weakly observable one trades noise for responsiveness, but a rank-deficient \(\mathcal{O}\) is a design defect you fix by adding a sensor, changing the motion, or removing the state, never by turning a knob.</p>
+    </div>
+
+    <h2>Divergence: the confidently wrong filter</h2>
+
+    <p><strong>What it is.</strong> A Kalman filter <em>diverges</em> when its estimate error grows while its reported covariance \(P_k\) shrinks or stays small. The two numbers that should move together, actual error and believed uncertainty, come apart. The estimate is not just wrong; it is wrong <em>and sure of it</em>, which is worse than a large honest error because every downstream consumer, from an alarm threshold to a fusion stage, treats the tight covariance as trustworthy.</p>
+
+    <p><strong>Why it happens.</strong> Three mechanisms dominate. First, <em>unobservable or weakly observable states</em>: with no measurement pressure on a direction, the update step never corrects it, yet the predict step keeps folding in process noise and, if \(Q\) is small there, \(P\) can collapse even as the true error drifts. Second, <em>model mismatch</em>: a constant-velocity filter tracking an accelerating target, or an \(R\) set smaller than the real measurement noise, makes the filter overtrust either its model or its sensor, and the Kalman gain drives the estimate into a systematic bias. Third, <em>numerical loss of positive-definiteness</em>: the standard covariance update \(P_k = (I - K_k H)P_k^-\) subtracts two matrices and, in finite precision, can produce a \(P\) that is asymmetric or has negative eigenvalues, at which point the filter is mathematically broken.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In practice: an automotive GNSS/IMU tracker enters a tunnel</h3>
+        <p>A lane-keeping stack fuses <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">GNSS position fixes</a> with wheel odometry and an inertial unit in a Kalman filter. On the open highway the GNSS updates keep position fully observable and \(P\) stays tight. Then the car enters a tunnel and the GNSS drops out for ninety seconds. Now position is observable only through dead reckoning, and any small scale error in the odometry or bias in the yaw rate integrates unchecked. The engineer who set \(Q\) too small for the tunnel case sees the filter keep reporting a two-meter position covariance while the true error grows past fifteen meters. When the car exits and a fresh GNSS fix arrives fifteen meters from the filter's confident estimate, the innovation is enormous, the gain over-corrects, and the track snaps sideways across a lane boundary. The fix is not a better sensor; it is a filter that inflates its own uncertainty during the outage so the returning fix is trusted, and that watches its innovations to notice the outage in the first place.</p>
+    </div>
+
+    <h2>Detecting divergence online: the innovation stream</h2>
+
+    <p><strong>What it is.</strong> You cannot compare against ground truth at run time, so you monitor the one quantity the filter produces that has a known distribution when everything is consistent: the innovation \(y_k = z_k - H\hat{x}_k^-\), the gap between the measurement and its prediction. If the filter's model and covariances are correct, the innovation is zero-mean with covariance \(S_k = H P_k^- H^\top + R\). The scalar summary is the <em>normalized innovation squared</em> (NIS),</p>
+
+    $$ \epsilon_k = y_k^\top S_k^{-1} y_k, $$
+
+    <p>which follows a chi-square distribution with degrees of freedom equal to the measurement dimension. A run of NIS values that consistently exceeds the chi-square upper bound means the innovations are larger than the filter believes possible: the model is wrong, the filter is overconfident, or it is diverging.</p>
+
+    <p><strong>Why NIS and not raw error.</strong> The innovation is available without truth and it is <em>self-normalizing</em>: dividing by \(S_k\) accounts for how confident the filter is at each step, so one threshold works across the whole trajectory. A raw residual of ten meters is fine when \(S_k\) is large and alarming when it is tiny; NIS folds that judgment in automatically. Averaging NIS over a window and comparing against the two-sided chi-square interval catches both overconfidence (NIS too high) and the rarer overcautious case (NIS too low, meaning \(Q\) or \(R\) is inflated and the filter is throwing away good measurements).</p>
+
+    <pre><code class="language-python">import numpy as np
+from scipy.stats import chi2
+
+# Constant-velocity filter tracking a target that secretly accelerates.
+dt = 1.0
+F = np.array([[1, dt], [0, 1]])          # state = [position, velocity]
+H = np.array([[1.0, 0.0]])               # we measure position only
+Q = np.diag([1e-4, 1e-4])                # process noise: too small on purpose
+R = np.array([[0.25]])                   # measurement variance
+
+x = np.array([0.0, 1.0]); P = np.eye(2)
+true = np.array([0.0, 1.0]); a = 0.05    # unmodeled acceleration
+dof = H.shape[0]
+hi = chi2.ppf(0.99, dof)                 # upper 99% bound on NIS
+
+for k in range(60):
+    true = F @ true + np.array([0.5 * a * dt**2, a * dt])   # real motion
+    z = H @ true + np.random.normal(0, np.sqrt(R[0, 0]))
+    x = F @ x; P = F @ P @ F.T + Q                          # predict
+    y = z - H @ x                                           # innovation
+    S = H @ P @ H.T + R
+    nis = float(y.T @ np.linalg.solve(S, y))               # normalized innov.
+    K = P @ H.T @ np.linalg.inv(S)                          # update
+    x = x + (K @ y).ravel(); P = (np.eye(2) - K @ H) @ P
+    if k > 5 and nis > hi:
+        print(f"step {k:2d}: NIS={nis:6.1f} &gt; {hi:.1f} : divergence flagged")</code></pre>
+    <div class="code-caption">A constant-velocity Kalman filter is fed a target with a small unmodeled acceleration and a deliberately tiny process noise \(Q\). The normalized innovation squared (NIS) is compared against the 99th-percentile chi-square bound for a one-dimensional measurement. As the position error accumulates and \(P\) stays small, NIS climbs past the bound and the loop prints a divergence flag well before any external check could. Referenced in prose above and below.</div>
+
+    <p>The code above is the whole diagnostic in twenty lines: run the ordinary filter, form NIS at each step, and raise a flag when it breaches the chi-square bound. In a real system that flag would trigger a fallback (reset the covariance, switch to a more conservative model, or drop the offending measurement), which is the subject of <a class="cross-ref" href="section-9.7.html">Section 9.7</a>.</p>
+
+    <h2>Keeping the filter honest: the standard fixes</h2>
+
+    <p>Once you can detect divergence, the remedies are few and well understood. <strong>Process-noise inflation</strong> is the blunt, reliable tool: raising \(Q\) prevents \(P\) from collapsing, so the filter never becomes overconfident about a poorly observed direction. The GNSS-tunnel filter above simply needed a larger \(Q\) on position during the outage. <strong>Fading memory</strong> generalizes this by multiplying the predicted covariance by a factor \(\alpha^2 > 1\), which exponentially discounts old data and keeps the filter responsive to model changes; it is process-noise inflation with a single interpretable knob. <strong>Numerically stable updates</strong> address the positive-definiteness failure. The <em>Joseph form</em> of the covariance update,</p>
+
+    $$ P_k = (I - K_k H)\,P_k^-\,(I - K_k H)^\top + K_k R\, K_k^\top, $$
+
+    <p>is algebraically identical to the short form but is a sum of two symmetric positive-semidefinite terms, so it preserves symmetry and positivity in finite precision. For long-running or high-dimensional filters, <em>square-root</em> and <em>UD-factorized</em> filters propagate a factor of \(P\) instead of \(P\) itself, guaranteeing a valid covariance at roughly double the arithmetic cost. These are the estimators of choice when a filter must run for hours without a reset, as in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">inertial dead reckoning</a>.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The right tool: observability and stable updates for free</h3>
+        <p>Hand-rolling an observability check plus a Joseph-form or square-root update is roughly thirty to forty lines of careful matrix code you must test against rank-deficient and ill-conditioned cases. Mature libraries collapse that to a few calls. Observability is a one-liner in <code>python-control</code>, and <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">FilterPy</a> ships numerically stable filters that manage the covariance factorization internally:</p>
+        <pre><code class="language-python">import numpy as np
+from control import obsv                 # observability matrix + rank
+O = obsv(F, H)
+assert np.linalg.matrix_rank(O) == F.shape[0], "state not observable"
+
+from filterpy.kalman import KalmanFilter, square_root   # stable update paths
+# KalmanFilter.update uses the Joseph form; SquareRootKalmanFilter
+# propagates a Cholesky factor so P can never lose positive-definiteness.</code></pre>
+        <div class="code-caption">Observability testing with <code>python-control</code>'s <code>obsv</code> and numerically stable filtering with FilterPy. The library handles the observability-matrix construction, the rank test, and the factorized covariance update (about forty lines of tested code) so you write three. Referenced in the fixes discussion above.</div>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the constant-velocity filter from the code block above.</p>
+        <ol>
+            <li>Set the unmodeled acceleration <code>a = 0.0</code> and confirm the NIS stays below the chi-square bound for the whole run. This is your consistent baseline.</li>
+            <li>Restore <code>a = 0.05</code> and sweep the process noise \(Q\) upward by factors of ten. Find the smallest \(Q\) at which the divergence flag stops firing, and explain what that \(Q\) is compensating for.</li>
+            <li>Build the observability matrix \(\mathcal{O} = [H;\ HF]\) for this system by hand and confirm it has rank 2. Then change \(H\) to measure velocity only (<code>H = [[0, 1]]</code>) and check whether position is still observable.</li>
+        </ol>
+        <details>
+            <summary>Hint</summary>
+            <p>For part 3, with \(H = [0,\ 1]\) the first block sees only velocity and the second block \(HF\) still sees only velocity, because position never feeds back into the velocity row of \(F\). The observability matrix loses rank, so absolute position becomes unobservable: you can know how fast you are going forever and never learn where you started.</p>
+        </details>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>A filter reports a shrinking covariance while its true error grows. Which of the three divergence mechanisms could explain this, and what single quantity would you monitor to catch it without ground truth?</li>
+            <li>Why can no choice of \(Q\) and \(R\) rescue an unobservable state, and what three design moves actually can?</li>
+            <li>The Joseph-form update gives the same answer as the short form in exact arithmetic. What does it buy you in finite precision, and why?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-9.6.html">Section 9.6</a>, we relax the filter's strict causality. A filter uses only past and present measurements to estimate the current state; a <em>smoother</em> is allowed to look at the whole record and revise past estimates in hindsight. That extra information sharpens accuracy and, as you will see, quietly repairs some of the weakly observable directions that trouble a forward-only filter, at the cost of latency you cannot always afford.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

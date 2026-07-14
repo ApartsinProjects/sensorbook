@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.6: Robust and adaptive filtering. Building Sensory AI." name="description"/>
+<title>Section 10.6: Robust and adaptive filtering | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Robust and adaptive filtering</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My filter trusted every measurement equally, so the day a satellite reflected off a glass tower, my careful centimeter-accurate position leapt forty meters into a river. I now assume that some of what I am told is a lie, and I have never drowned since."</p>
+<cite>A Skeptical AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the Kalman predict/update recursion and its noise matrices \(\mathbf{Q}\) and \(\mathbf{R}\) from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and the nonlinear variants (EKF, UKF, particle filter) built earlier in this chapter. The innovation and its covariance, introduced with the Kalman update, are the central object here. The idea that real sensors produce outliers, dropouts, and drifting noise levels was set up in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, and the probability tools (heavy-tailed distributions, the chi-square law, expectation-maximization) come from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">When the model on paper meets the sensor in the world</h3>
+<p>Every filter in this chapter rests on a fiction: that the noise really is Gaussian with the covariance you wrote down, and that it stays that way forever. Deployed sensors break both halves of that promise. A GNSS receiver in an urban canyon delivers clean fixes for minutes, then one multipath reflection lands twenty meters off. A wheel encoder reads faithfully until the wheel slips on ice. An IMU's noise floor doubles when the device warms up. A textbook Kalman filter, told nothing about any of this, weights that one poisoned measurement exactly as heavily as a good one and lets a single outlier wreck an estimate it took a thousand samples to build. <strong>Robust</strong> filtering makes the estimator distrust measurements that disagree too violently with its own prediction. <strong>Adaptive</strong> filtering makes the estimator re-learn \(\mathbf{Q}\) and \(\mathbf{R}\) online when the world stops matching the numbers you shipped. Together they are the difference between a filter that works in the notebook and one that survives a fleet.</p>
+</div>
+
+<h2>The innovation is your lie detector</h2>
+<p><strong>What</strong> makes robustness possible is that a filter always has a second opinion. Before it sees measurement \(\mathbf{z}_k\), it has already predicted what that measurement should be, \(\hat{\mathbf{z}}_{k}\), from the propagated state. The disagreement is the <em>innovation</em> (or residual):</p>
+$$\boldsymbol{\nu}_k = \mathbf{z}_k - \hat{\mathbf{z}}_k, \qquad \mathbf{S}_k = \mathbf{H}_k \mathbf{P}_{k}^{-}\mathbf{H}_k^{\top} + \mathbf{R}_k,$$
+<p>where \(\mathbf{S}_k\) is the innovation covariance, the filter's own estimate of how large \(\boldsymbol{\nu}_k\) should be if everything is behaving. <strong>Why</strong> this is the load-bearing quantity: if the model is correct, the normalized innovation squared (NIS),</p>
+$$\epsilon_k = \boldsymbol{\nu}_k^{\top} \mathbf{S}_k^{-1} \boldsymbol{\nu}_k,$$
+<p>follows a chi-square distribution with degrees of freedom equal to the measurement dimension. That gives a calibrated, unit-free alarm. A three-sigma gate rejects a scalar measurement whenever \(\epsilon_k > 9\); for a two-dimensional measurement the 99th-percentile gate sits near \(\epsilon_k > 9.2\). <strong>How</strong> you use it splits into two questions this section answers in turn: what to do with a single measurement that fails the test (robustness), and what to do when the test fails <em>too often</em>, because your covariances themselves are wrong (adaptation and consistency).</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Rejecting an outlier and re-learning noise are the same statistic seen two ways</h3>
+<p>The NIS is doing double duty. Read one sample at a time, a large \(\epsilon_k\) flags a probable outlier to gate or down-weight. Averaged over a window, its <em>mean</em> is a consistency check: if the running average of \(\epsilon_k\) sits far above its expected value (the measurement dimension), your filter is overconfident and its \(\mathbf{R}\) or \(\mathbf{Q}\) is too small; if it sits far below, the filter is sluggish and its noise is overstated. Robust filtering acts on the tail of this statistic, adaptive filtering acts on its average. One residual, two decisions.</p>
+</div>
+
+<h2>Robustness: gating, Huber, and heavy tails</h2>
+<p>The bluntest tool is the <strong>chi-square gate</strong>: compute \(\epsilon_k\), and if it exceeds a threshold, discard the measurement entirely and skip the update (the predict step still runs, so the state coasts on the motion model). This is standard in target tracking and GNSS. Gating is cheap and effective for rare, gross outliers, but it is brittle at the boundary: a measurement at \(\epsilon_k = 8.9\) is fully trusted and one at \(9.1\) is fully ignored, and a run of borderline-bad data can starve the filter of any correction at all.</p>
+<p>A gentler approach reshapes the update itself. The Kalman update is the solution to a weighted least-squares problem, and least squares is exactly what outliers exploit because the squared residual grows without bound. Replacing the quadratic loss with a <strong>Huber loss</strong>, quadratic for small normalized residuals and linear beyond a knee at \(c\) (typically \(c \approx 1.345\) standard deviations), caps the influence any one measurement can have. Concretely, you scale that measurement's effective information by a weight</p>
+$$w_k = \min\!\left(1,\ \frac{c}{\sqrt{\epsilon_k}}\right),$$
+<p>so good measurements pass through untouched while a wild one is pulled back toward unit leverage rather than thrown away. This degrades gracefully where the hard gate snaps. The distributional view of the same idea replaces the Gaussian measurement model with a heavy-tailed <strong>Student-t</strong>, whose fat tails assign non-trivial probability to large residuals; a t-distributed filter automatically down-weights outliers as a consequence of its likelihood, and reduces to the ordinary Kalman filter as the degrees of freedom grow. The particle filter of <a class="cross-ref" href="section-10.3.html">Section 10.3</a> gets robustness almost for free here: you simply use a heavy-tailed likelihood when computing weights.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A delivery robot crossing a plaza</h3>
+<p>A sidewalk delivery robot fuses wheel odometry and GNSS in an EKF to hold its lane. Crossing an open plaza it is fine, but along a glass-fronted shopping street every few seconds a multipath fix lands eight to fifteen meters sideways. With a naive filter the robot visibly lurches toward the storefronts and triggers its obstacle stop. The team adds a chi-square gate on the GNSS update with a 99.7-percent threshold, and switches the surviving updates to a Huber-weighted correction. Now the occasional reflected fix is rejected outright, a merely noisy fix is softened, and the odometry carries the pose smoothly through the bad stretch. The lurch disappears without the robot ever needing a better antenna. The cost is one design decision: the gate must be loose enough that a genuine turn, which also produces a large innovation, is not mistaken for an outlier, which is why the gate is tuned against logged real routes rather than a round number.</p>
+</div>
+
+<h2>Adaptation: re-learning Q and R online</h2>
+<p>Gating assumes your covariances are right and only the data is occasionally wrong. The opposite failure is a filter whose \(\mathbf{Q}\) and \(\mathbf{R}\) were correct in the lab and are wrong in the field: a warm IMU, a fouled pressure port, a maneuvering target that your constant-velocity \(\mathbf{Q}\) never anticipated. <strong>Adaptive filtering</strong> estimates the noise statistics from the data stream itself. The most practical family is <em>innovation-based</em> or covariance-matching adaptation. Over a sliding window of length \(N\) you form the empirical innovation covariance</p>
+$$\hat{\mathbf{C}}_k = \frac{1}{N}\sum_{j=k-N+1}^{k} \boldsymbol{\nu}_j \boldsymbol{\nu}_j^{\top},$$
+<p>and compare it to what the filter predicted, \(\mathbf{S}_k\). If \(\hat{\mathbf{C}}_k\) is persistently larger, the world is noisier than assumed, and you inflate \(\mathbf{R}\) (measurement noise) or \(\mathbf{Q}\) (process noise) to match; if it is smaller, you can tighten them. A common lightweight rule inflates process noise directly from the measured excess, \(\hat{\mathbf{Q}}_k = \mathbf{K}_k \hat{\mathbf{C}}_k \mathbf{K}_k^{\top}\), using the Kalman gain \(\mathbf{K}_k\). <strong>When</strong> you reach for the heavier machinery: full <em>maximum-likelihood</em> or expectation-maximization estimation of the noise matrices is more principled and is the right tool offline (calibrating a sensor from a recorded log), but online you almost always prefer the cheap windowed estimator because it reacts in real time and never stalls a hard deadline.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Robust and adaptive can fight each other</h3>
+<p>Stack the two carelessly and they form a doom loop. The adaptive rule sees large innovations and concludes the noise is high, so it inflates \(\mathbf{R}\); the larger \(\mathbf{R}\) widens the gate, so more genuine outliers slip through; those outliers enlarge the innovations further, so \(\mathbf{R}\) inflates again. The filter deafens itself. The fix is ordering and provenance: run the robust gate first and adapt the covariances <em>only from measurements that passed the gate</em>, so outliers never feed the noise estimate. Never let a rejected sample influence \(\mathbf{Q}\) or \(\mathbf{R}\).</p>
+</div>
+
+<h2>Consistency: the diagnostic that ties it together</h2>
+<p>You cannot tune robustness or adaptation blind, so you need a scoring rule for whether a filter's uncertainty is honest. A filter is <strong>consistent</strong> when its actual errors match its self-reported covariance: the estimate is unbiased and the true error lands inside the \(\pm\)one-sigma band about as often as a Gaussian says it should. The operational test is the averaged NIS (from measurements, needs no ground truth) and, when you have truth in a controlled log, the normalized estimation error squared (NEES). Averaged over a window, either statistic should sit inside a chi-square confidence interval around its degrees of freedom. Above the band means overconfident (the classic cause of divergence and a symptom that \(\mathbf{Q}\) is too small); below means conservative and wasteful. This links directly to the calibration and coverage machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: a filter that fails its NIS test is an uncalibrated probabilistic model, and every downstream fusion step in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a> that trusts its covariance will inherit the error.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import chi2
+
+def robust_adaptive_update(x_pred, P_pred, z, H, R, gate_p=0.997, win=None):
+    """One EKF-style measurement update with a chi-square gate,
+    Huber down-weighting, and windowed R adaptation."""
+    nu = z - H @ x_pred                      # innovation
+    S  = H @ P_pred @ H.T + R                # innovation covariance
+    nis = float(nu.T @ np.linalg.solve(S, nu))
+    dof = z.shape[0]
+
+    # 1. Robust gate: reject gross outliers outright.
+    if nis > chi2.ppf(gate_p, dof):
+        return x_pred, P_pred, nis, "rejected"
+
+    # 2. Huber weight: soften merely-noisy measurements (c = 1.345 sigma).
+    c = 1.345 * np.sqrt(dof)
+    w = min(1.0, c / np.sqrt(max(nis, 1e-9)))
+    R_eff = R / w                            # down-weight = inflate R
+
+    # 3. Standard update with the effective noise.
+    S_eff = H @ P_pred @ H.T + R_eff
+    K = P_pred @ H.T @ np.linalg.inv(S_eff)
+    x_upd = x_pred + K @ nu
+    P_upd = (np.eye(len(x_pred)) - K @ H) @ P_pred
+
+    # 4. Adapt R only from this accepted innovation (windowed outside).
+    if win is not None:
+        win.append(np.outer(nu, nu))         # feed the covariance matcher
+    return x_upd, P_upd, nis, "accepted"
+</code></pre>
+<div class="code-caption">A single measurement update that gates on the normalized innovation squared, applies a Huber weight to survivors, and exposes an innovation window for covariance-matching adaptation. The rejected branch never touches the adaptation window, enforcing the ordering rule from the warning above. The averaged <code>nis</code> returned each step is the consistency diagnostic you plot to tune the two thresholds.</div>
+
+<p>The snippet above shows why the three ideas belong in one update: gating, Huber weighting, and adaptation are all just different transforms of the same innovation, applied in a deliberate order.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Let the library carry the plumbing</h3>
+<p>Written from scratch, a robust-adaptive filter with gating, Huber weighting, a windowed covariance matcher, and NIS logging runs to roughly 150 lines with the matrix bookkeeping and edge cases. The <code>filterpy</code> package supplies the Kalman and EKF cores, residual and system-uncertainty (<code>S</code>) attributes, and a batch NEES/NIS helper, so your robust wrapper collapses to about 30 lines of policy on top: read <code>kf.y</code> and <code>kf.S</code>, decide accept or reject, scale <code>kf.R</code>. You write the roughly five lines of decision logic that are genuinely yours and let the library own the propagation, the Joseph-form covariance update, and the numerics. For heavy-tailed and fully adaptive variants, <code>stonesoup</code> ships Student-t and IMM components off the shelf.</p>
+</div>
+
+<h2>Switching models: when the dynamics change, not just the noise</h2>
+<p>Sometimes the mismatch is not a bad measurement or a wrong noise level but a wrong <em>model</em>: an aircraft that was cruising straight begins a hard turn, so your constant-velocity motion model is now structurally wrong for a few seconds. Inflating \(\mathbf{Q}\) is a crude patch. The principled answer is the <strong>Interacting Multiple Model (IMM)</strong> estimator, which runs a bank of filters (constant velocity, constant turn, constant acceleration), each with its own model, and maintains a probability that each model is currently active. A Markov transition matrix governs how those probabilities shift, and the fused estimate is a probability-weighted mix. IMM is the workhorse of air-traffic and automotive radar tracking precisely because it adapts the <em>structure</em> of the filter, not merely its scalars, and it hands you the model probabilities as an interpretable bonus (a rising "turn" probability is an early maneuver detector). It connects naturally to the change-detection methods of <a class="cross-ref" href="index.html">this part's</a> <a class="cross-ref" href="../module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, where the same regime shift is treated as a change point to be flagged rather than a mode to be tracked.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: break it, then armor it</h3>
+<p>Take the EKF you built earlier in this chapter for a tracked target. (1) Corrupt 5 percent of measurements by adding a large random offset, and plot how far the naive estimate is thrown. (2) Add a chi-square gate at the 99-percent level; report how many true outliers it catches and how many good measurements it wrongly rejects during a sharp turn. (3) Replace the hard gate with the Huber weight from the code above and compare tracking error through the turn. (4) Now hold the outliers fixed but double the true measurement noise halfway through the run without telling the filter; add windowed \(\mathbf{R}\) adaptation and plot the averaged NIS before and after, confirming it returns to its expected value once adaptation kicks in.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Your filter's averaged NIS sits well <em>above</em> its degrees of freedom for a whole run with no visible outliers. Is the filter overconfident or underconfident, and would you increase or decrease \(\mathbf{Q}\)?</p>
+<p>2. Why must an adaptive noise estimator be fed only measurements that survived the robust gate? Describe the failure mode if you skip that rule.</p>
+<p>3. A single measurement has NIS \(\epsilon_k = 20\) against a scalar sensor (one degree of freedom). Under a three-sigma gate, is it accepted or rejected? Under a Huber scheme with knee \(c = 1.345\), roughly what weight does it receive?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-10.7.html">Section 10.7</a>, we step back from individual tricks and ask the design question that governs this whole chapter: given a specific sensing problem, its nonlinearity, its dimensionality, its compute budget, and its failure modes, which estimator do you actually reach for? We turn the EKF, UKF, particle filter, Rao-Blackwellization, and the robust-adaptive machinery of this section into a decision guide.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

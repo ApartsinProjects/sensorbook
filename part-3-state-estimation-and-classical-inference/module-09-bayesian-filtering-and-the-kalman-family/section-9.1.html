@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.1: Hidden state and observation models. Building Sensory AI." name="description"/>
+<title>Section 9.1: Hidden state and observation models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Bayesian Filtering and the Kalman Family</a></div>
+<h1>Hidden state and observation models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me for the drone's velocity. My sensor measures acceleration and a noisy GPS fix. I confidently reported a number I had never once observed, and it was the right thing to do."</p>
+<cite>A State-Estimating AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the discrete-time sampling notation of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (a stream indexed by \(k\), one sample every \(T_s\) seconds), and the probability toolkit of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>: random vectors, Gaussian densities, covariance matrices, conditional probability, and the meaning of a likelihood. It also leans on the physical measurement models of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, where we saw that a sensor never returns the quantity you care about, only a transformed and corrupted proxy of it. Matrix and linear-algebra refreshers live in Appendix A; the notation table is Appendix J. No filtering machinery is assumed yet. This section builds the vocabulary; the recursion that consumes it arrives in <a class="cross-ref" href="section-9.2.html">Section 9.2</a>.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why a whole chapter starts with a definition</h3>
+<p>Every tracker, every navigation stack, every fusion engine in Part III and Part X rests on one modeling move: split the world into a <em>hidden state</em> you want but cannot see, and <em>observations</em> you can see but do not directly want. A car's controller needs position and velocity; the sensors deliver wheel ticks, a shaky GPS fix, and a drifting gyro. A ventilator needs lung compliance; it measures pressure and flow. Once you write down two functions, one saying how the hidden state evolves and one saying how it produces measurements, the entire Kalman family of <a class="cross-ref" href="section-9.3.html">Section 9.3</a>, the particle filters of <a class="cross-ref" href="../module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a>, and the smoothers of <a class="cross-ref" href="../module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a> become mechanical consequences. Get the two models right and the algorithm nearly writes itself; get them wrong and no amount of tuning will save you. This section is about getting them right.</p>
+</div>
+
+<h2>State and observation: the two things that are never the same</h2>
+<p><strong>What</strong> we mean by <em>state</em> is a vector \(\mathbf{x}_k\) that is <em>sufficient</em>: it packs everything about the system's past that matters for predicting its future. If you know \(\mathbf{x}_k\), no earlier history tells you anything more. For a moving object the natural state is position and velocity, \(\mathbf{x}_k = [p_x, p_y, v_x, v_y]^\top\), because Newton says tomorrow's position depends on today's position and velocity, not on where the object was last week. The state is <em>hidden</em> (also called latent): velocity, orientation, battery internal resistance, and lung compliance are all things you reason about but never read off a wire.</p>
+<p><strong>What</strong> we mean by an <em>observation</em> \(\mathbf{z}_k\) is whatever the sensors actually produce at time \(k\): a voltage, a pixel, a range, a GPS latitude. <strong>Why</strong> the distinction is not pedantic is that the observation is almost always a <em>lossy, transformed, noisy</em> shadow of the state. A GPS receiver reports position but says nothing direct about velocity. An accelerometer reports the second derivative of position but nothing about position itself. A camera reports a nonlinear projection of 3D geometry onto a 2D plane. In every case the map from state to measurement discards information and adds corruption, which is exactly why we cannot simply invert a sensor reading and read off the state.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">You estimate what you never measure</h3>
+<p>The whole point of state estimation is to report quantities that no sensor observed. A phone with only an accelerometer and a gyroscope can maintain a running estimate of heading and position, quantities neither chip reports, because the state model links what is measured to what is wanted. This is not a trick; it is the defining capability. If your target could be read directly off a sensor with acceptable noise, you would not need a filter, you would need a calibration curve from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Filtering earns its keep precisely when the state is hidden and only indirectly observed.</p>
+</div>
+
+<h2>The two models: process and measurement</h2>
+<p>A state-space model is exactly two equations. The <strong>process model</strong> (also transition or dynamics model) says how the hidden state evolves from one step to the next:</p>
+$$\mathbf{x}_k = f(\mathbf{x}_{k-1},\, \mathbf{u}_k) + \mathbf{w}_k, \qquad \mathbf{w}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{Q}_k).$$
+<p>Here \(f\) encodes the physics or the assumed behavior, \(\mathbf{u}_k\) is any known control input (a commanded motor torque, a throttle setting), and \(\mathbf{w}_k\) is <em>process noise</em>: the honest admission that your model of the world is incomplete. Gusts of wind, unmodeled friction, and a pedestrian who changes their mind all live inside \(\mathbf{w}_k\). Its covariance \(\mathbf{Q}_k\) is how loudly you say "my dynamics are only approximately right," and tuning it is the subject of <a class="cross-ref" href="section-9.4.html">Section 9.4</a>.</p>
+<p>The <strong>measurement model</strong> (or observation model) says how the current hidden state produces the sensor reading:</p>
+$$\mathbf{z}_k = h(\mathbf{x}_k) + \mathbf{v}_k, \qquad \mathbf{v}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{R}_k).$$
+<p>The function \(h\) is the sensor's forward map, the same physics you characterized in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: how a true position becomes a range return, how a true temperature becomes a thermistor voltage. The term \(\mathbf{v}_k\) is <em>measurement noise</em> with covariance \(\mathbf{R}_k\), the electrical and quantization jitter of the sensor itself. When \(f\) and \(h\) are linear, we write them as matrices \(\mathbf{F}\) and \(\mathbf{H}\), and the model becomes the linear-Gaussian system that the Kalman filter of <a class="cross-ref" href="section-9.3.html">Section 9.3</a> solves in closed form.</p>
+
+<div class="callout note">
+<h3 class="callout-title">Two noises, two very different jobs</h3>
+<p>Beginners conflate \(\mathbf{Q}\) and \(\mathbf{R}\); they answer opposite questions. \(\mathbf{R}\) asks "how much do I distrust this <em>sensor reading</em>?" and comes largely from the datasheet and a bench characterization. \(\mathbf{Q}\) asks "how much do I distrust my own <em>model of the dynamics</em>?" and has no datasheet at all. Their ratio sets the filter's personality: large \(\mathbf{R}\) relative to \(\mathbf{Q}\) makes the estimate trust the model and ignore twitchy measurements; the reverse makes it chase every reading. <a class="cross-ref" href="section-9.4.html">Section 9.4</a> is devoted to choosing them.</p>
+</div>
+
+<h2>The Markov assumption and why it buys you everything</h2>
+<p>The two equations above quietly encode a powerful assumption: the future depends on the past <em>only through the current state</em>. Formally, \(p(\mathbf{x}_k \mid \mathbf{x}_{k-1}, \mathbf{x}_{k-2}, \ldots) = p(\mathbf{x}_k \mid \mathbf{x}_{k-1})\), and each measurement depends only on the state at its own instant, \(p(\mathbf{z}_k \mid \mathbf{x}_{0:k}, \mathbf{z}_{0:k-1}) = p(\mathbf{z}_k \mid \mathbf{x}_k)\). This is the first-order <em>Markov property</em>, and it is what makes recursive estimation possible. Because all relevant history is compressed into \(\mathbf{x}_k\), a filter can summarize an entire sensor stream by a single evolving belief and update it one measurement at a time, never revisiting the raw archive. This is the hinge on which <a class="cross-ref" href="section-9.2.html">Section 9.2</a> turns.</p>
+<p><strong>When</strong> the assumption holds is a design responsibility, not a gift. If your dynamics genuinely depend on a quantity you left out of the state (a slowly drifting sensor bias, an unmodeled acceleration), the process becomes non-Markov in your chosen coordinates and the filter will be biased no matter how you tune it. The standard cure is <em>state augmentation</em>: fold the offending quantity (a gyro bias, a clock offset, a wind term) into \(\mathbf{x}_k\) so the Markov property is restored. This diagram summarizes the flow of dependence that the whole chapter exploits.</p>
+
+<figure>
+<svg viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A hidden Markov chain: states x connected left to right, each emitting a downward observation z.">
+<style>
+  .stnode { fill: var(--callout-key-insight-bg, #e8f0fe); stroke: var(--text-color, #333); stroke-width: 1.5; }
+  .obnode { fill: var(--callout-practical-bg, #eafaf1); stroke: var(--text-color, #333); stroke-width: 1.5; }
+  .lbl { fill: var(--text-color, #222); font-family: sans-serif; font-size: 15px; text-anchor: middle; }
+  .slbl { fill: var(--text-color, #222); font-family: sans-serif; font-size: 12px; text-anchor: middle; }
+  .edge { stroke: var(--text-color, #333); stroke-width: 1.6; fill: none; marker-end: url(#arr); }
+</style>
+<defs>
+<marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--text-color,#333)"/></marker>
+</defs>
+<circle class="stnode" cx="120" cy="60" r="30"/><text class="lbl" x="120" y="65">x<tspan dy="4" font-size="11">k-1</tspan></text>
+<circle class="stnode" cx="360" cy="60" r="30"/><text class="lbl" x="360" y="65">x<tspan dy="4" font-size="11">k</tspan></text>
+<circle class="stnode" cx="600" cy="60" r="30"/><text class="lbl" x="600" y="65">x<tspan dy="4" font-size="11">k+1</tspan></text>
+<line class="edge" x1="150" y1="60" x2="330" y2="60"/>
+<line class="edge" x1="390" y1="60" x2="570" y2="60"/>
+<text class="slbl" x="240" y="48">process f, Q</text>
+<text class="slbl" x="480" y="48">process f, Q</text>
+<rect class="obnode" x="90" y="150" width="60" height="40" rx="6"/><text class="lbl" x="120" y="175">z<tspan dy="4" font-size="11">k-1</tspan></text>
+<rect class="obnode" x="330" y="150" width="60" height="40" rx="6"/><text class="lbl" x="360" y="175">z<tspan dy="4" font-size="11">k</tspan></text>
+<rect class="obnode" x="570" y="150" width="60" height="40" rx="6"/><text class="lbl" x="600" y="175">z<tspan dy="4" font-size="11">k+1</tspan></text>
+<line class="edge" x1="120" y1="90" x2="120" y2="148"/>
+<line class="edge" x1="360" y1="90" x2="360" y2="148"/>
+<line class="edge" x1="600" y1="90" x2="600" y2="148"/>
+<text class="slbl" x="170" y="125">measure h, R</text>
+</svg>
+<figcaption>Figure 9.1.1: The hidden-state graph. Circles are latent states \(\mathbf{x}_k\) linked only to their immediate neighbor through the process model; rectangles are observations \(\mathbf{z}_k\), each emitted from its own state through the measurement model. Every arrow is a conditional dependence, and every missing arrow is a Markov independence the filter relies on.</figcaption>
+</figure>
+<p>Figure 9.1.1 makes the Markov structure literal: information flows left to right along the top chain and downward into the observations, and there are no long-range arrows. That absence is precisely what lets the recursion in the next section forget the past safely.</p>
+
+<h2>Building a model in practice: the constant-velocity template</h2>
+<p>The most-used starting point in all of tracking is the <em>constant-velocity</em> (CV) model. You do not believe objects truly move at constant velocity; you believe acceleration is small and unpredictable, and you shove it into \(\mathbf{Q}\). With state \(\mathbf{x} = [p, v]^\top\) in one dimension and step \(T_s\), the process is \(p_k = p_{k-1} + v_{k-1} T_s\) and \(v_k = v_{k-1}\), and a position-only sensor observes \(z_k = p_k + v_k^{\text{meas}}\). The snippet below assembles the four matrices \(\mathbf{F}, \mathbf{H}, \mathbf{Q}, \mathbf{R}\) that fully specify this linear-Gaussian model.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def constant_velocity_model(dt, q_accel, r_pos):
+    """Return (F, H, Q, R) for a 1-D constant-velocity state [position, velocity]."""
+    # Process model: position integrates velocity; velocity is held (random walk).
+    F = np.array([[1.0, dt],
+                  [0.0, 1.0]])
+    # Measurement model: we observe position only, never velocity.
+    H = np.array([[1.0, 0.0]])
+    # Process noise from an unknown constant-acceleration disturbance of PSD q_accel.
+    Q = q_accel * np.array([[dt**3 / 3, dt**2 / 2],
+                            [dt**2 / 2, dt      ]])
+    # Measurement noise: variance of the position sensor.
+    R = np.array([[r_pos]])
+    return F, H, Q, R
+
+F, H, Q, R = constant_velocity_model(dt=0.1, q_accel=2.0, r_pos=5.0)
+x = np.array([0.0, 12.0])            # start at 0 m, moving 12 m/s
+z_pred = H @ x                       # what the sensor should read
+print("state:", x, " predicted measurement:", z_pred)   # -> [ 0. 12.]  [0.]
+</code></pre>
+<div class="code-caption">Code 9.1.1: The constant-velocity template in four matrices. Note that \(\mathbf{H}\) has a zero in the velocity column: velocity is genuinely hidden, yet the filter of <a class="cross-ref" href="section-9.3.html">Section 9.3</a> will still recover it from a sequence of position-only readings, because \(\mathbf{F}\) couples position to velocity over time.</div>
+
+<p>Code 9.1.1 is the entire model. Everything downstream, prediction, update, tuning, is a manipulation of these four objects. The structure of \(\mathbf{Q}\) here is not arbitrary: it is the exact covariance you get by integrating a white-noise acceleration over one step, which is why it couples position and velocity off-diagonally rather than treating them as independent.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">A wrist tracker that estimates speed it cannot feel</h3>
+<p>A running-watch team wants to display pace during a GPS dropout under tree cover. The watch fuses a foot-mounted accelerometer with intermittent GPS. They model the runner as a 4-state constant-velocity system, position and velocity in two axes. The accelerometer feeds the process side (it informs the dynamics), while the GPS, when available, is the measurement \(h(\mathbf{x}) = \) position. When the runner passes under trees and GPS vanishes, the measurement model simply has no update to apply, so the filter <em>coasts</em> on the process model, integrating inertial data to keep velocity alive. The displayed pace, a quantity no single sensor ever measured, stays believable for the twenty seconds of dropout because the state carried velocity forward. Getting there required exactly one decision that this section is about: putting velocity in the state even though nothing observes it directly. Human activity context for such wearables is developed in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: declare the model, skip the bookkeeping</h3>
+<p>Hand-assembling \(\mathbf{F}, \mathbf{H}, \mathbf{Q}, \mathbf{R}\) and threading them through predict and update loops is a few dozen lines of index-careful code. The <code>filterpy</code> library collapses the model declaration to a handful of attribute assignments, and <code>Q_discrete_white_noise(dim=2, dt=0.1, var=2.0)</code> generates the exact process-noise matrix from Code 9.1.1 in one call, so the CV template drops from roughly fifteen lines to about four. The library owns the numerical bookkeeping (matrix shapes, symmetry, the Joseph-form covariance update of <a class="cross-ref" href="section-9.3.html">Section 9.3</a>); you own the modeling choices, which is where all the engineering judgment lives anyway. Build it once by hand to understand it, then let the library carry it in production.</p>
+</div>
+
+<h2>Choosing the state: the decision that decides everything</h2>
+<p><strong>How</strong> you pick the state vector is the highest-leverage decision in the whole pipeline, and it trades three pressures. Too <em>small</em> a state (position only, no velocity) violates sufficiency, breaks the Markov property, and biases the filter. Too <em>large</em> a state (every conceivable bias, every mode) is observable in principle but not in practice: some directions of it will never be pinned down by your sensors, and the filter will drift or diverge along them, a failure we dissect under observability in <a class="cross-ref" href="section-9.5.html">Section 9.5</a>. The craft is to include exactly the hidden quantities that (a) matter for prediction and (b) are recoverable from the measurement stream. A good rule: add a state variable when you can name the sensor evidence that will constrain it. If you cannot, you are adding a free parameter for the filter to drift along, not a state for it to estimate.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise: model an infusion pump</h3>
+<p>A clinical infusion pump should track the drug concentration in a patient's bloodstream, but the only sensors are the commanded pump rate (a known input \(\mathbf{u}_k\)) and an occasional, noisy blood-draw assay taken every few minutes. (1) Propose a two-element state vector and justify why concentration must be hidden rather than measured continuously. (2) Write the process model \(f\), treating drug clearance as first-order decay with rate \(\lambda\) and infusion as an input term. (3) Write the measurement model \(h\) for the blood assay, and explain why \(\mathbf{R}\) here is large and \(\mathbf{Q}\) captures metabolic variability. (4) The assay arrives once per minute while the pump updates every second: sketch how the Markov structure of Figure 9.1.1 lets the filter run predict-only steps between assays. Clinical validation context appears in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A colleague says "we do not need a state model, the GPS gives position directly, just low-pass filter it." Give one concrete quantity their approach can never report and explain why a state-space model can.</p>
+<p>2. Distinguish process noise \(\mathbf{Q}\) from measurement noise \(\mathbf{R}\) in one sentence each, and name where the numbers for each realistically come from.</p>
+<p>3. Your dynamics secretly depend on a slowly drifting sensor bias you left out of the state. Which assumption breaks, what symptom appears in the estimate, and what is the standard fix?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-9.2.html">Section 9.2</a>, we turn these two static equations into motion. Given the process and measurement models defined here, and the Markov structure of Figure 9.1.1, we derive <em>recursive Bayesian estimation</em>: the predict-then-update loop that maintains a probability distribution over the hidden state and folds in each new observation exactly once. That recursion is the abstract engine; the linear-Gaussian Kalman filter of <a class="cross-ref" href="section-9.3.html">Section 9.3</a> is its most famous closed-form instance.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.5: Isolation Forest, LOF, one-class SVM. Building Sensory AI." name="description"/>
+<title>Section 12.5: Isolation Forest, LOF, one-class SVM | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Classical Anomaly and Change Detection</a></div>
+<h1>Isolation Forest, LOF, one-class SVM</h1>
+</header>
+<main class="content" id="main-content">
+    <blockquote class="epigraph">
+        <p>"You spent a week teaching me what a fault looks like. I found it faster by learning only what normal looks like, and flinching at everything else."</p>
+        <cite>An Unsupervised AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>The earlier sections of this chapter assumed you could write down what an anomaly is: a residual past a threshold, a control chart out of limits, a change point in a mean. That works when you have a physics model or a stable univariate signal. Real sensor deployments rarely oblige. You get a 40-channel vibration-and-thermal feature vector from a compressor, no labeled faults, and a question posed the wrong way round: not "is this the known failure mode?" but "is this unlike anything I have seen this machine do while healthy?" This section covers the three workhorse unsupervised detectors that answer exactly that question, each from a different first principle: Isolation Forest (anomalies are easy to separate), Local Outlier Factor (anomalies sit in thinner neighborhoods than their neighbors), and one-class SVM (anomalies fall outside a learned boundary around normal). Knowing which principle matches your data is the difference between a detector that pages an engineer at 3 a.m. for real and one that cries wolf nightly.</p>
+    </div>
+
+    <p>These three methods share one framing: they are trained on data assumed to be mostly or entirely <em>normal</em>, and at inference they emit a continuous <em>anomaly score</em> rather than a hard label. You still need a threshold, and choosing it well is its own discipline covered in <a class="cross-ref" href="section-12.7.html">Section 12.7</a>. Throughout, \(x \in \mathbb{R}^d\) is a feature vector, usually the windowed statistical and spectral features of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, and the training set \(\{x_i\}_{i=1}^n\) is drawn from routine operation. Because all three learn "normal" from data, they inherit every leakage hazard of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: if a fault sneaks into the training window, the model learns to call it normal.</p>
+
+    <h2>Isolation Forest: anomalies are cheap to isolate</h2>
+    <p>Isolation Forest (Liu, Ting, and Zhou, 2008) inverts the usual density-estimation instinct. Instead of modeling where the data is dense, it asks how hard each point is to <em>isolate</em> by random partitioning. Build a tree by repeatedly picking a random feature and a random split value between that feature's current min and max, recursing until every point sits alone in a leaf. A point in a dense cluster needs many splits to be cornered; an outlier sitting far out on some axis gets carved off after only a few. The <em>path length</em> \(h(x)\), the number of edges from root to the leaf holding \(x\), is therefore short for anomalies and long for inliers. Average over an ensemble of such random trees and you get a stable estimate \(E[h(x)]\).</p>
+    <p>The score normalizes path length against \(c(n)\), the average path length of an unsuccessful search in a binary tree of \(n\) points, so that scores are comparable across sample sizes:</p>
+    $$s(x) = 2^{-\frac{E[h(x)]}{c(n)}}, \qquad c(n) = 2H(n-1) - \frac{2(n-1)}{n},$$
+    <p>where \(H(i)\) is the \(i\)-th harmonic number. A score near 1 means "isolated almost immediately," a strong anomaly; near 0.5 means "as hard to isolate as a typical point." The method's appeal for sensor fleets is practical: it is near-linear in \(n\), trivially parallel across trees, needs no distance metric or feature scaling (splits are axis-aligned and scale-invariant), and handles the high-dimensional feature vectors that vibration and current signatures produce without choking. Its blind spot is the flip side of axis-aligned splits: it struggles with anomalies defined only by a <em>correlation</em> between features rather than an extreme value on any single axis. The Extended Isolation Forest (Hariri et al., 2019) uses random-slope hyperplane cuts to soften that limitation.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Three principles, one score</h3>
+        <p>Isolation Forest scores <em>separability</em>, LOF scores <em>relative density</em>, one-class SVM scores <em>distance to a learned boundary</em>. They disagree most exactly where it matters: a point that is globally rare but locally consistent (a whole machine running hot uniformly) versus a point that is globally ordinary but locally out of place (one bearing warmer than its identical neighbors). Pick the principle whose notion of "weird" matches your failure physics, or ensemble all three and let disagreement itself become a signal.</p>
+    </div>
+
+    <h2>Local Outlier Factor: weird relative to your neighbors</h2>
+    <p>Isolation Forest and most statistical detectors judge a point against the <em>global</em> distribution. That fails when normal operation has regions of genuinely different density: an HVAC chiller idling, ramping, and running at full load produce three legitimate clusters of very different tightness. A point on the sparse edge of the idle cluster might be perfectly healthy, while a point of identical global rarity inside the dense full-load cluster is a real fault. Local Outlier Factor (Breunig et al., 2000) makes rarity <em>local</em>. For each point it finds the \(k\) nearest neighbors, defines a smoothed <em>local reachability density</em> \(\mathrm{lrd}_k(x)\) (roughly the inverse of the average distance to those neighbors), and compares your density to theirs:</p>
+    $$\mathrm{LOF}_k(x) = \frac{1}{|N_k(x)|} \sum_{o \in N_k(x)} \frac{\mathrm{lrd}_k(o)}{\mathrm{lrd}_k(x)}.$$
+    <p>An \(\mathrm{LOF}\) near 1 means you are about as dense as your neighbors: an inlier. Substantially above 1 means your neighborhood is much denser than you are, so you sit in a relative void: an outlier. Because the comparison is only ever against nearby points, LOF adapts to varying density automatically, which is its whole reason to exist. The costs are equally characteristic. It is distance-based, so it demands careful feature scaling (a feature in millivolts will drown one in kilohertz) and it degrades in high dimensions where distances concentrate, both pushing you toward the dimensionality reduction of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> first. Naive LOF is also \(O(n^2)\) to score all points, and the choice of \(k\) matters: too small and it chases noise, too large and local structure washes out.</p>
+
+    <h2>One-class SVM: draw a boundary around normal</h2>
+    <p>The third principle is geometric. A one-class SVM (Sch&ouml;lkopf et al., 2001) maps the data into a high-dimensional feature space through a kernel, usually the radial basis function \(k(x, x') = \exp(-\gamma \lVert x - x' \rVert^2)\), and finds the hyperplane that separates the data from the origin with maximum margin. Points falling on the origin side score as anomalies. An equivalent and often more intuitive formulation, Support Vector Data Description (Tax and Duin, 2004), fits the smallest hypersphere enclosing the normal data; anything outside is anomalous. The key knob is \(\nu \in (0, 1]\), which simultaneously upper-bounds the fraction of training points allowed outside the boundary and lower-bounds the fraction of support vectors. Set \(\nu = 0.05\) and you are asserting that at most about 5 percent of training data are contaminants, a direct handle on your assumed anomaly rate.</p>
+    <p>One-class SVM shines when normal operation occupies a compact, curved region that a good kernel can wrap tightly, and it produces a genuine decision boundary you can reason about. Its weaknesses are real: the RBF bandwidth \(\gamma\) is finicky and interacts with \(\nu\), training scales poorly past tens of thousands of points, and it is sensitive to feature scaling and to any contamination in the training set. On messy, high-volume fleet telemetry it is frequently the least robust of the three out of the box, which is why it is often kept as a boundary-aware complement rather than the primary detector.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">A refrigeration compressor fleet that only knew "healthy"</h3>
+        <p>A cold-chain logistics operator instrumented 300 rooftop refrigeration compressors with suction/discharge pressure, motor current, and a case-mounted accelerometer, and wanted early warning of failing valves and low refrigerant. They had zero labeled failures at launch, so supervised classification was off the table. The team built 28 features per 10-minute window (band powers, current crest factor, pressure-ratio statistics) and trained an Isolation Forest per compressor on the first three weeks of each unit's data, assumed healthy. It caught gross faults, a seized fan, a flooded start, within days. But it missed a subtler mode: one compressor running slightly hot and rough in a way that was globally unremarkable across the fleet yet clearly abnormal for <em>that</em> unit's own recent history. Adding LOF over a sliding reference window flagged it, because LOF judged the point against its local neighborhood rather than the fleet. The one-class SVM, trained on the same features, agreed on the gross faults but false-alarmed whenever ambient temperature swung, until the team added an outdoor-temperature feature so the boundary stopped treating a hot afternoon as novel. The shipped system scored all three and alerted only when at least two agreed, halving nuisance pages. This condition-monitoring pattern is the backbone of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+    </div>
+
+    <p>The comparison code below fits all three on the same feature matrix and lines up their scores, which is exactly how you should start any new deployment: run all three, look at where they agree and disagree, and let that structure the investigation.</p>
+
+    <pre><code class="language-python">import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+
+# X_train: healthy windows (n, d).  X_test: recent windows to score.
+scaler = StandardScaler().fit(X_train)          # matters for LOF and OCSVM
+Xtr, Xte = scaler.transform(X_train), scaler.transform(X_test)
+
+iforest = IsolationForest(n_estimators=200, contamination=0.02,
+                          random_state=0).fit(Xtr)
+ocsvm   = OneClassSVM(kernel="rbf", gamma="scale", nu=0.02).fit(Xtr)
+lof     = LocalOutlierFactor(n_neighbors=20, novelty=True).fit(Xtr)
+
+# Higher = more anomalous for all three (sign-flipped so they align).
+scores = {
+    "iforest": -iforest.score_samples(Xte),
+    "ocsvm":   -ocsvm.score_samples(Xte),
+    "lof":     -lof.score_samples(Xte),
+}
+consensus = np.mean([(s > np.quantile(s, 0.98)) for s in scores.values()], axis=0)
+flagged = np.where(consensus >= 2/3)[0]          # >=2 of 3 detectors agree</code></pre>
+    <div class="code-caption">Fitting Isolation Forest, one-class SVM, and LOF (in <code>novelty=True</code> mode so it scores unseen points) on the same standardized healthy features, then flagging test windows where at least two of the three exceed their 98th-percentile score. Note that only LOF and the SVM need the <code>StandardScaler</code>; the forest is scale-invariant.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">scikit-learn collapses each detector to two lines</h3>
+        <p>A from-scratch Isolation Forest (random split trees, path-length averaging, the \(c(n)\) normalization) is roughly 120 lines; a correct LOF with a k-d tree neighbor search and reachability-distance smoothing is 80 or more; a one-class SVM needs a full quadratic-program solver. scikit-learn's <code>IsolationForest</code>, <code>LocalOutlierFactor</code>, and <code>OneClassSVM</code> each reduce to a <code>fit</code> plus a <code>score_samples</code> call, sharing one estimator API, so the two lines above replace several hundred and hand you validated neighbor structures, tree ensembles, and QP solvers for free. Spend the saved effort on features and thresholds, which is where sensor-anomaly performance actually lives.</p>
+    </div>
+
+    <div class="callout note">
+        <h3 class="callout-title">Which one, when</h3>
+        <p>Reach for <strong>Isolation Forest</strong> first on high-dimensional fleet telemetry: it is fast, scale-free, and needs almost no tuning. Add <strong>LOF</strong> when normal operation has multiple regimes of differing density and you care about per-unit or per-context rarity. Keep <strong>one-class SVM</strong> for lower-dimensional, well-scaled features where a tight curved boundary is meaningful and training volume is modest. None of them dates itself with a calibrated probability, so pair any of them with the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> when you need a controllable false-alarm rate rather than an arbitrary score cutoff.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: build the failure each detector cannot see</h3>
+        <p>Synthesize a 2-D normal set as two Gaussian blobs of very different variance (a tight cluster at the origin, a diffuse cluster at \((6,6)\)). Now craft three test points: (a) a point far out on one axis from both blobs; (b) a point of low <em>global</em> density sitting just outside the tight cluster but at a distance that is ordinary for the diffuse cluster; (c) a point that is only anomalous because it violates the positive correlation within a blob. Score all three points with Isolation Forest, LOF, and one-class SVM. Predict beforehand which detector misses which point and why, then confirm it. Which single detector, if any, catches all three, and what does that tell you about ensembling?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>Isolation Forest needs no feature scaling but LOF and one-class SVM do. What property of each algorithm causes that difference?</li>
+            <li>You set \(\nu = 0.05\) on a one-class SVM but your training window secretly contains 15 percent faulty samples. What happens to the learned boundary, and how does this connect to the leakage warnings of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>?</li>
+            <li>Give a concrete sensor scenario where a point has ordinary global density but a high LOF, and explain why a global detector would wave it through.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-12.6.html">Section 12.6</a>, we confront the uncomfortable truth lurking under every score in this section: with few or no labels, how do you even know your detector is any good? We will build honest evaluation protocols for partially labeled anomaly data and dismantle the point-adjust trap, a scoring convention that has quietly inflated a decade of time-series anomaly-detection results.</p>
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

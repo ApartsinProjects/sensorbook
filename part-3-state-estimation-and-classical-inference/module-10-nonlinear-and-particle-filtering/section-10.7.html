@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.7: Choosing an estimator. Building Sensory AI." name="description"/>
+<title>Section 10.7: Choosing an estimator | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Choosing an estimator</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every filter is a bet about the shape of your uncertainty. The engineer who wins is not the one with the fanciest filter, but the one who knows which bet they are making."</p>
+<cite>A Decisive AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section is a synthesis, so it assumes the whole chapter: the Extended Kalman filter of Section 10.1, the Unscented Kalman filter and sigma points of Section 10.2, the particle filter and importance sampling of Section 10.3, the resampling and degeneracy fixes of Section 10.4, the Rao-Blackwellization of Section 10.5, and the robust and adaptive tricks of Section 10.6. It builds on the linear Kalman filter of <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and the notions of posterior, mode, and mean from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. No new mathematics is introduced; the work here is judgment.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>You now own a toolbox: linear Kalman, EKF, UKF, particle filter, Rao-Blackwellized particle filter, plus the robust and adaptive layers that harden any of them. Owning the toolbox is not the skill. The skill is walking up to a new sensing problem, spending five minutes characterizing it, and reaching for the cheapest estimator that will not fail. Almost every engineer over-reaches here. They see the word "nonlinear" and jump to a particle filter with ten thousand samples, then ship a system that burns a battery to solve a problem a UKF would have handled in a hundredth of the compute. Conversely, the engineer who forces a stubborn multimodal problem through an EKF gets a filter that reports a tight, confident covariance around entirely the wrong answer. This section gives you a decision procedure grounded in four questions, a comparison table you can keep next to your keyboard, and a runnable experiment that measures the accuracy-versus-cost tradeoff so you stop guessing and start measuring.</p>
+</div>
+
+<h2>The four questions that pick the filter</h2>
+
+<p>Before comparing filters, characterize the problem. Four questions settle most decisions, and you can answer all four from the measurement model and a few minutes of thought about the physics, exactly the physics developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>.</p>
+
+<p><strong>1. How nonlinear are the dynamics and the measurement?</strong> A GNSS pseudorange is mildly nonlinear over a one-second step; a bearing-only measurement of a nearby target is violently nonlinear. The relevant quantity is not the function itself but how much it curves across one standard deviation of your state uncertainty. If a first-order Taylor expansion is accurate over that spread, an EKF suffices. If the curvature matters but the posterior stays roughly bell-shaped, a UKF captures it. The linearization error of the EKF grows with the second derivative of \(f\) and \(h\); the UKF's sigma points sample the function directly and capture curvature to second order with no Jacobian at all.</p>
+
+<p><strong>2. Is the posterior unimodal or multimodal?</strong> This is the decisive question, and it is independent of nonlinearity. A unimodal posterior, a single blob of probability, can be summarized by a mean and covariance, which is precisely what the Kalman family stores. A multimodal posterior, arising in global localization ("am I in room A or the identical room B?"), data association ("which of three targets produced this blip?"), or the wrapped-angle ambiguities common in RF sensing, cannot be summarized by one Gaussian. No amount of tuning rescues a Gaussian filter here; it will collapse onto one mode and discard the others. Multimodality forces a particle filter or a Gaussian mixture.</p>
+
+<p><strong>3. What is your compute and latency budget?</strong> An EKF and a UKF cost on the order of \(O(n^3)\) per step in the state dimension \(n\), dominated by the covariance update, and both run comfortably in microseconds for a modest state. A particle filter costs \(O(N\,n)\) for \(N\) particles plus the per-particle likelihood evaluation, and \(N\) often needs to be thousands. On a microcontroller (revisit <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>) that gap is the difference between shipping and not shipping.</p>
+
+<p><strong>4. Can you evaluate a likelihood, or only sample?</strong> Particle filters need to score how well each particle explains the measurement. If your measurement model is a clean probability density this is trivial; if it is a black-box renderer or a neural network, you may need an approximate likelihood, which weakens the filter.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Nonlinearity and multimodality are different axes, and people conflate them. Nonlinearity asks whether a straight-line approximation of the sensor is good enough; multimodality asks whether one blob of probability can describe your belief at all. A problem can be highly nonlinear yet unimodal (satellite ranging), in which case a UKF is ideal, or nearly linear yet multimodal (a symmetric building for indoor positioning), in which case even a linear-measurement particle filter beats the finest Kalman variant. Pick the axis that is actually hurting you before you pick the filter.</p>
+</div>
+
+<h2>A comparison you can keep on your desk</h2>
+
+<p>The table below compresses the chapter into one glance. Read it as a ladder: start at the top and descend only when a question above forces you down. Each row costs materially more than the one above it, so every downward step should be justified by a failure of the cheaper filter, not by ambition.</p>
+
+<table>
+<thead>
+<tr><th>Estimator</th><th>Handles nonlinearity</th><th>Handles multimodality</th><th>Relative cost</th><th>Reach for it when</th></tr>
+</thead>
+<tbody>
+<tr><td>Linear Kalman (Ch 9)</td><td>No</td><td>No</td><td>1x</td><td>Dynamics and measurement are linear or nearly so.</td></tr>
+<tr><td>EKF (10.1)</td><td>Mild, first order</td><td>No</td><td>1-2x</td><td>Smooth nonlinearity, good initial guess, Jacobians available.</td></tr>
+<tr><td>UKF (10.2)</td><td>Moderate, second order</td><td>No</td><td>2-4x</td><td>Stronger curvature, no clean Jacobian, still one mode.</td></tr>
+<tr><td>Particle filter (10.3-10.4)</td><td>Arbitrary</td><td>Yes</td><td>100-10000x</td><td>Multimodal belief, non-Gaussian noise, hard nonlinearity.</td></tr>
+<tr><td>Rao-Blackwellized PF (10.5)</td><td>Arbitrary in the sampled part</td><td>Yes, in the sampled part</td><td>10-1000x</td><td>Some states are conditionally linear-Gaussian; sample the rest.</td></tr>
+</tbody>
+</table>
+
+<p>Two refinements sit outside the ladder because they compose with any row. The robust and adaptive layer of Section 10.6 (outlier gating, adaptive noise estimation) should wrap whichever filter you chose; it fixes fragility, not the wrong choice of representation. And Rao-Blackwellization is a scalpel, not a default: it pays off dramatically only when a genuine linear-Gaussian substructure exists, such as landmark positions conditioned on a robot trajectory.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a warehouse robot that picked the wrong filter twice</h3>
+<p>A team building an autonomous forklift for an automotive-parts warehouse started with an EKF fusing wheel odometry and a lidar scan match. It worked beautifully in testing and failed on day one in the real aisle. The aisles were identical, so on startup the robot's belief was genuinely bimodal: it could be at either end. The EKF averaged the two modes and confidently parked the forklift in the middle of the floor, halfway between two valid poses, reporting a small covariance the whole time. The fix was not a better Jacobian; it was switching global localization to a particle filter that held both hypotheses until a unique aisle marker collapsed them. Once localized, the team switched back: they Rao-Blackwellized the problem so the continuous pose ran in an efficient Gaussian sub-filter while only the discrete "which aisle" hypothesis carried particles. The particle count dropped from twelve thousand to eighty, and the estimator fit back inside the robot's real-time budget. The lesson is the ladder: they climbed down for the one phase that needed it and climbed back up the moment they could.</p>
+</div>
+
+<h2>Measure the tradeoff, do not guess it</h2>
+
+<p>Intuition about accuracy-versus-cost is unreliable; the honest move is to run all the candidates on the same trajectory and plot error against wall-clock, on a leakage-safe split so the noise realizations in your test are not the ones you tuned on (the discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The snippet below tracks a classic nonlinear benchmark, a range-and-bearing target, with an EKF, a UKF, and a bootstrap particle filter, then reports root-mean-square error and per-step time. It is the miniature of Lab 10.</p>
+
+<pre><code class="language-python">import numpy as np
+from filterpy.kalman import ExtendedKalmanFilter, UnscentedKalmanFilter, MerweScaledSigmaPoints
+from filterpy.monte_carlo import systematic_resample
+import time
+
+def run_particle_filter(zs, N=2000):
+    # bootstrap PF: predict via dynamics, weight by measurement likelihood
+    parts = np.random.randn(N, 4) * 5.0          # [x, vx, y, vy]
+    w = np.full(N, 1.0 / N)
+    est = []
+    for z in zs:
+        parts[:, 0] += parts[:, 1]; parts[:, 2] += parts[:, 3]   # constant velocity
+        parts[:, [1, 3]] += np.random.randn(N, 2) * 0.1          # process noise
+        rng = np.hypot(parts[:, 0], parts[:, 2])
+        brg = np.arctan2(parts[:, 2], parts[:, 0])
+        resid = np.array([z[0] - rng, z[1] - brg]).T
+        w *= np.exp(-0.5 * (resid**2 / np.array([1.0, 0.02])).sum(1))
+        w += 1e-300; w /= w.sum()
+        if 1.0 / np.sum(w**2) &lt; N / 2:            # resample on degeneracy (10.4)
+            idx = systematic_resample(w); parts = parts[idx]; w.fill(1.0 / N)
+        est.append(np.average(parts, axis=0, weights=w))
+    return np.array(est)
+
+# ... EKF and UKF set up with the same f, h, Q, R (elided for space) ...
+for name, fn in [("PF", run_particle_filter)]:
+    t0 = time.perf_counter(); xhat = fn(measurements)
+    dt = (time.perf_counter() - t0) / len(measurements)
+    rmse = np.sqrt(np.mean((xhat[:, [0, 2]] - truth[:, [0, 2]])**2))
+    print(f"{name}: RMSE={rmse:.3f}  time/step={dt*1e6:.1f} us")
+</code></pre>
+<div class="code-caption">A bootstrap particle filter for range-and-bearing tracking, with systematic resampling triggered by the effective-sample-size test from Section 10.4. Running it beside an EKF and UKF on identical measurements turns the "which filter" argument into two numbers per candidate: RMSE and microseconds per step. The full three-filter harness is Lab 10.</div>
+
+<p>When you run the complete harness, the pattern is remarkably stable across problems. On a mildly nonlinear leg the EKF and UKF tie the particle filter on accuracy while running orders of magnitude faster, so the particle filter is pure waste. On a leg where the target passes close to the sensor, where bearing becomes violently nonlinear, the EKF's RMSE blows up while the UKF and particle filter hold, and that single leg is your evidence for climbing one rung down the ladder.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut</h3>
+<p>You do not hand-code three filters to compare them. <code>filterpy</code> gives you <code>ExtendedKalmanFilter</code>, <code>UnscentedKalmanFilter</code>, and Monte-Carlo resampling helpers behind a shared interface, so a full EKF-versus-UKF-versus-PF bakeoff is roughly forty lines instead of the four hundred-plus a from-scratch implementation of all three would take, including sigma-point weights, Jacobian bookkeeping, and a numerically safe resampler. The library handles covariance-update numerics and the systematic-resample loop; you supply only \(f\), \(h\), \(\mathbf{Q}\), and \(\mathbf{R}\). Use it to <em>choose</em>, then hand-tune only the winner.</p>
+</div>
+
+<h2>When the answer is "none of the above"</h2>
+
+<p>Three exits from this chapter are worth naming so you recognize them. First, if you can afford to wait and want the smoothed trajectory rather than the causal filtered estimate, stop filtering and formulate the problem as a factor graph, which is the entire subject of <a class="cross-ref" href="../module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>; smoothing over a window beats any filter when latency is not sacred. Second, if your measurement model is a learned function with no analytic form, a differentiable or neural filter that learns the dynamics may outperform any hand-built one, a thread picked up in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>. Third, if the real difficulty is not the estimator but knowing whether to trust its output, the calibration and conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> is the missing piece, because a filter that reports a covariance is not the same as a filter whose covariance is honest.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a clinical wearable that estimates respiration rate from a chest-strap accelerometer. Motion artifacts occasionally make the measurement bimodal (true breathing frequency versus a walking-cadence harmonic). Walk the four questions for this problem and state which estimator you would ship, then state what changes if the device must run for a week on a coin cell. Justify each answer in one sentence tied to a specific question.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A colleague says "the problem is very nonlinear, so we need a particle filter." What single follow-up question tells you whether they are right, and why is nonlinearity alone insufficient justification?</p>
+<p>2. Why does an EKF report a small, confident covariance even when it has converged to the wrong mode of a bimodal posterior, and why is this failure mode more dangerous than a large reported covariance?</p>
+<p>3. You benchmark EKF, UKF, and PF and find the UKF matches the PF's accuracy at a hundredth of the cost. What does that tell you about the shape of the true posterior on this trajectory?</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 10</h3>
+<p>track a nonlinear system with EKF, UKF, and a particle filter; compare accuracy and cost.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Foundational surveys and comparisons</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/978374">Arulampalam, Maskell, Gordon, and Clapp (2002). A Tutorial on Particle Filters for Online Nonlinear/Non-Gaussian Bayesian Tracking. IEEE Transactions on Signal Processing.</a></p>
+<p class="bib-annotation">The canonical side-by-side of Kalman-family and particle methods; its framing of when each representation is appropriate is the backbone of this section's decision procedure.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.cambridge.org/core/books/bayesian-filtering-and-smoothing/C372FB31C5D9A100F8476C1B23721A67">Sarkka (2013). Bayesian Filtering and Smoothing. Cambridge University Press.</a></p>
+<p class="bib-annotation">A unified treatment that derives EKF, UKF, and particle filters from one Bayesian recursion, making the cost-versus-fidelity ladder explicit and rigorous.</p>
+</div>
+
+<p class="bib-category">The individual estimators</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/1271397">Julier and Uhlmann (2004). Unscented Filtering and Nonlinear Estimation. Proceedings of the IEEE.</a></p>
+<p class="bib-annotation">The definitive statement of why sigma-point propagation beats Jacobian linearization, and the practical regime where a UKF is the right rung of the ladder.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.jstor.org/stable/2984875">Gordon, Salmond, and Smith (1993). Novel Approach to Nonlinear/Non-Gaussian Bayesian State Estimation. IEE Proceedings F.</a></p>
+<p class="bib-annotation">The bootstrap particle filter that made sequential Monte Carlo practical; read it to understand exactly which problems justify paying the particle-filter cost.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.ri.cmu.edu/pub_files/pub1/thrun_sebastian_2005_1/thrun_sebastian_2005_1.pdf">Thrun, Burgard, and Fox (2005). Probabilistic Robotics. MIT Press.</a></p>
+<p class="bib-annotation">The definitive account of estimator choice in robotics, including the identical-corridor multimodality problem and Rao-Blackwellized filtering for SLAM.</p>
+</div>
+
+<p class="bib-category">Software and reproducibility</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python">Labbe (2020). Kalman and Bayesian Filters in Python (and the filterpy library).</a></p>
+<p class="bib-annotation">The open textbook and library behind the code in this section; its shared interface across EKF, UKF, and particle filters is what makes a real bakeoff cheap.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://ieeexplore.ieee.org/document/4378142">Doucet and Johansen (2009). A Tutorial on Particle Filtering and Smoothing: Fifteen Years Later. Handbook of Nonlinear Filtering.</a></p>
+<p class="bib-annotation">A rigorous retrospective on when sequential Monte Carlo pays off and when cheaper Gaussian approximations suffice, sharpening the cost side of the tradeoff.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>, we take the most important exit from the filtering ladder. When latency is not sacred and you want the best estimate of the whole trajectory rather than the causal one, the problem stops being a recursive filter and becomes a large optimization over a factor graph. That reframing powers modern SLAM and visual-inertial odometry, and it turns the question "which filter?" into the question "how do I solve one big nonlinear least-squares problem efficiently?"</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.4: Loop closure and marginalization. Building Sensory AI." name="description"/>
+<title>Section 11.4: Loop closure and marginalization | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Factor Graphs and Smoothing</a></div>
+<h1>Loop closure and marginalization</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I walked in a circle for an hour, then recognized my own front door, and in a single instant an hour of accumulated lies unwound itself. That door was the most honest thing I met all day."</p>
+        <cite>A Well-Travelled AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the factor-graph and least-squares machinery of <a class="cross-ref" href="section-11.1.html">Section 11.1</a> and <a class="cross-ref" href="section-11.2.html">Section 11.2</a>, and on the incremental smoother of <a class="cross-ref" href="section-11.3.html">Section 11.3</a>. It also leans on the information (inverse-covariance) form of Gaussian estimation from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, and on why dead-reckoned trajectories drift, developed in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>. Linear algebra (block matrices, Schur complements) is reviewed in Appendix A.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A robot that only ever integrates its own motion is doomed to drift: every step adds a little error, and the errors compound into meters of divergence over a long trajectory. Two operations rescue it, and they pull in opposite directions. <strong>Loop closure</strong> adds information: when the machine recognizes a place it has been before, it drops a single factor that ties two far-apart poses together, and the smoothing back-end spreads that one constraint backward across the entire loop, erasing hours of drift at once. <strong>Marginalization</strong> removes variables: to keep the graph small enough to solve in real time, you algebraically fold old states out of the problem, converting their evidence into a compact prior on whatever remains. Loop closure is why factor-graph SLAM produces globally consistent maps; marginalization is why it can run on a battery-powered device forever. This section is about doing both correctly, and about the sharp failure modes waiting on each side.</p>
+    </div>
+
+    <h2>A loop closure is one factor that repays a long debt</h2>
+    <p>Recall the pose graph from <a class="cross-ref" href="section-11.1.html">Section 11.1</a>: each variable \(x_i \in SE(2)\) or \(SE(3)\) is a robot pose, and consecutive poses are tied by odometry factors, each encoding a measured relative motion \(z_{i,i+1}\) with covariance \(\Sigma\). Odometry is a chain, and a chain has a fatal property: error is <em>cumulative</em>. If each relative-pose measurement is off by a fraction of a degree in heading, those fractions integrate, and after a hundred meters the estimated trajectory can be meters away from the truth with no factor anywhere in the graph objecting, because every local constraint is still perfectly satisfied.</p>
+    <p>A <strong>loop-closure factor</strong> is what breaks the chain into a network. When place recognition (visual bag-of-words, lidar scan matching, or a learned descriptor) decides that the current pose \(x_j\) sits at a location the robot already visited as \(x_i\), the front end produces a relative-pose measurement \(z_{ij}\) between two poses that may be thousands of frames apart in time. Added to the graph, it contributes exactly the same kind of nonlinear least-squares term as any other between-factor:</p>
+    \[ f_{ij}(x_i, x_j) = \big\lVert h(x_i, x_j) \ominus z_{ij} \big\rVert^2_{\Sigma_{ij}}, \]
+    <p>where \(h\) predicts the relative transform between the two poses and \(\ominus\) is the manifold difference on \(SE(n)\). What makes this factor special is not its form but its <em>reach</em>: it connects two variables that share no short path in the graph, so the only way for the optimizer to satisfy it is to deform the long chain between them.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Loop closure is the one moment where a smoother categorically beats a filter. A Kalman filter (<a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) has already marginalized away every past pose into its current estimate; when new evidence says "you are back where you started," it has nothing left to correct, because the past states it would need to fix no longer exist as variables. A factor graph keeps those poses alive, so a single late-arriving constraint can reach back and rewrite the whole trajectory. The cost of that power is that the state never stops growing, which is precisely the problem marginalization solves.</p>
+    </div>
+
+    <h2>How one constraint corrects an entire trajectory</h2>
+    <p>The mechanism is worth seeing concretely, because it explains why people call this "smoothing." Before the loop closes, the maximum-a-posteriori (MAP) trajectory that <a class="cross-ref" href="section-11.2.html">Section 11.2</a> defines satisfies only the odometry chain, so it is free to drift. The loop-closure factor introduces a contradiction: the chain says pose \(x_j\) is two meters northeast of the start, and the loop factor says it is essentially <em>at</em> the start. The optimizer cannot honor both exactly, so it finds the configuration that minimizes total squared error, and the correction it applies is not dumped entirely onto \(x_j\). It is distributed across every pose in the loop in proportion to how uncertain each odometry edge was, because a large correction concentrated at one joint would blow up that edge's residual far more than many small corrections spread over many joints.</p>
+    <p>The result is that closing one loop visibly straightens the entire map: a corridor that had bent away from its true shape snaps back, and landmarks observed early in the run shift to agree with landmarks observed at the end. This is the informational opposite of drift. Drift injects a little error at every edge and lets it accumulate in one direction; loop closure injects a little correction at every edge and lets it accumulate the other way. Because the correction propagates through the graph's connectivity, poses that were never directly involved in the loop still move, which is exactly the behavior you want from a globally consistent estimator and exactly the behavior a recursive filter cannot produce.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a warehouse AMR closing the aisle</h3>
+        <p>An autonomous mobile robot (AMR) ferries totes across a distribution center, navigating by wheel odometry fused with a 2D lidar. Running one long perimeter lap of the floor, its dead-reckoned pose accumulates roughly 1.5 m of lateral drift by the time it returns to the loading dock, enough that the map's two ends of the same aisle appear as two parallel aisles 1.5 m apart, a ghost that would route the robot into a rack. When the lidar scan matcher recognizes the dock's distinctive dock-door pattern and emits a loop-closure factor between the final pose and the first, the back end (running iSAM2 from <a class="cross-ref" href="section-11.3.html">Section 11.3</a>) re-solves in a few milliseconds. The two ghost aisles collapse into one, and every pose along the perimeter shifts a few centimeters to absorb the correction. The fleet operator sees the map "click" into consistency. That single factor did what no amount of better odometry could: it removed error that had already happened.</p>
+    </div>
+
+    <h2>False loops and the price of a wrong constraint</h2>
+    <p>Loop closure is powerful precisely because one factor moves the whole graph, which is also why a <em>wrong</em> loop closure is catastrophic. If place recognition suffers <strong>perceptual aliasing</strong>, two genuinely different locations that look alike (identical office corridors, repetitive warehouse racking, symmetric building facades), it emits a factor asserting that two distinct poses coincide. The optimizer, trusting that factor, folds the map onto itself and produces a confidently wrong, globally corrupted trajectory. Unlike a noisy odometry edge, whose damage is local, a false loop closure can destroy an otherwise perfect map in one iteration.</p>
+    <p>The first line of defense is a consistency gate before the factor ever enters the graph. A common test computes the Mahalanobis distance of the candidate relative measurement against what the current estimate predicts, and rejects candidates whose residual is too large to be explained by the stated covariance. Geometric verification (RANSAC on feature correspondences, or checking that a scan match has enough inliers with low residual) filters most aliasing before it reaches the smoother. The deeper defense lives inside the cost function itself: instead of a pure quadratic that trusts every factor absolutely, robust kernels down-weight factors whose residuals are implausibly large, so a lone bad loop closure is quietly discounted rather than obeyed. That machinery is the subject of the next section, so treat this as motivation for it.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Loop closure and outlier rejection are the same coin. The value of a loop closure comes from its long reach through the graph; the danger of a false one comes from the identical reach. You cannot have global consistency without exposing yourself to global corruption, so a production SLAM system is never "add loop closures" alone: it is "add loop closures, gate them geometrically, and wrap the cost in a robust kernel so the survivors that are still wrong do limited damage."</p>
+    </div>
+
+    <h2>Marginalization: forgetting states without discarding their evidence</h2>
+    <p>Loop closure keeps every pose alive, which is unaffordable on a robot that runs for hours. <strong>Marginalization</strong> is the disciplined way to shrink the graph: remove a variable while preserving the information it carried about the variables that remain. The tool is the information form. Recall that the linearized MAP problem of <a class="cross-ref" href="section-11.2.html">Section 11.2</a> has a Gaussian objective whose Hessian is the information matrix \(\Lambda\). Partition the variables into those you keep, \(x_k\), and those you drop, \(x_m\):</p>
+    \[ \Lambda = \begin{bmatrix} \Lambda_{kk} & \Lambda_{km} \\ \Lambda_{mk} & \Lambda_{mm} \end{bmatrix}. \]
+    <p>Marginalizing out \(x_m\) (integrating it away, which for a Gaussian is exact) leaves a distribution over \(x_k\) whose information matrix is the <strong>Schur complement</strong></p>
+    \[ \Lambda_{kk}' = \Lambda_{kk} - \Lambda_{km}\,\Lambda_{mm}^{-1}\,\Lambda_{mk}. \]
+    <p>This is not an approximation; it is the exact marginal, and it is why fixed-lag smoothers can bound their compute without simply throwing evidence in the trash. The subtracted term is a summary of everything the removed poses told us, repackaged as a single dense <em>prior factor</em> on the surviving variables. When you cannot afford the whole trajectory, you keep a sliding window of recent poses and marginalize the oldest one every step, and this Schur complement is what keeps the window's estimate consistent with the history you can no longer see. Listing 11.4 makes the operation concrete.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+# Information matrix of a tiny 3-pose chain (each pose is 1-D here for clarity).
+# Poses x0, x1, x2 tied by two odometry factors -> tridiagonal Lambda.
+Lam = np.array([
+    [ 2.0, -1.0,  0.0],
+    [-1.0,  2.0, -1.0],
+    [ 0.0, -1.0,  1.0],
+])
+
+# Marginalize out the oldest pose x0 (index 0), keeping x1, x2.
+keep, drop = [1, 2], [0]
+Lkk = Lam[np.ix_(keep, keep)]
+Lkm = Lam[np.ix_(keep, drop)]
+Lmm = Lam[np.ix_(drop, drop)]
+Lmk = Lam[np.ix_(drop, keep)]
+
+Lam_marg = Lkk - Lkm @ np.linalg.inv(Lmm) @ Lmk
+print("kept info matrix after marginalizing x0:\n", Lam_marg)
+# x1 and x2 were NOT directly linked to each other through x0's removal here,
+# but in a 3-D pose graph the Schur complement fills in off-diagonal blocks:
+# marginalization DENSIFIES the graph (loss of sparsity = "fill-in").</code></pre>
+    <div class="code-caption"><strong>Listing 11.4.</strong> The Schur complement \(\Lambda_{kk} - \Lambda_{km}\Lambda_{mm}^{-1}\Lambda_{mk}\) marginalizes the oldest pose out of a chain's information matrix. In a realistic pose graph the removed variable is connected to several neighbors, and the subtracted term creates new off-diagonal entries linking all of them: this is <em>fill-in</em>, the reason marginalization must be applied sparingly.</div>
+
+    <p>As Listing 11.4 warns, marginalization has a cost that loop closure does not: it destroys sparsity. Whenever the removed variable touched several neighbors (an old pose connected to odometry, a loop closure, and a handful of landmarks), the Schur complement links every one of those neighbors to every other with a new dense factor, even though they were never directly measured together. This <strong>fill-in</strong> is why you cannot simply marginalize everything to stay small: past a point, the dense priors cost more to factorize than the sparse variables you removed. It is also why iSAM2 (<a class="cross-ref" href="section-11.3.html">Section 11.3</a>) prefers to keep variables and reorder them rather than aggressively marginalize, while fixed-lag and sliding-window estimators used in visual-inertial odometry accept the fill-in as the price of hard real-time bounds.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Building a correct marginalization by hand means tracking which factors touch the removed variable, forming the Schur complement, and re-inserting the resulting dense prior with the right Jacobians and information, roughly 150 to 250 lines of bookkeeping that is easy to get subtly wrong (a dropped cross-term silently makes the filter overconfident). GTSAM exposes it as one call on the incremental smoother:</p>
+        <pre class="language-python"><code class="language-python">from gtsam import ISAM2, ISAM2Params
+# ... build graph, insert factors and values ...
+isam = ISAM2(ISAM2Params())
+isam.update(new_factors, new_values)
+# Fixed-lag behavior: marginalize poses older than the window in one call.
+isam.marginalizeLeaves(keys_to_drop)   # forms Schur complements internally</code></pre>
+        <div class="code-caption"><strong>Listing 11.4b.</strong> <code>ISAM2.marginalizeLeaves</code> forms the Schur complement, produces the dense prior, and updates the internal Bayes tree in one call. The library handles the fill-in bookkeeping and Jacobian recomputation, collapsing a couple hundred lines of error-prone linear algebra into a single method.</div>
+        <p>The <code>marginalizeLeaves</code> call in Listing 11.4b is what turns the full smoother of Section 11.3 into a bounded-memory fixed-lag smoother suitable for an embedded target.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>State-of-the-art visual-inertial systems live on the tension this section describes. OpenVINS and the MSCKF-family estimators keep a sliding window and marginalize aggressively for tight real-time bounds, while ORB-SLAM3 (Campos et al., IEEE T-RO 2021) keeps a full pose graph and leans on loop closure plus its "Atlas" multi-map back end for global consistency, marginalizing only what it must. A recurring frontier problem is <em>consistent marginalization</em>: naive first-estimates linearization during marginalization injects spurious information and makes the estimator overconfident, so First-Estimates Jacobian (FEJ) techniques fix the linearization point of marginalized states to preserve the system's observability properties. Learned place recognition (NetVLAD-style global descriptors and, more recently, transformer retrieval) keeps pushing loop-closure recall up while geometric verification holds precision, because the asymmetric cost of a false loop closure never goes away.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the tridiagonal information matrix in Listing 11.4 and extend it to five poses \(x_0 \dots x_4\) forming an odometry chain, then add a loop-closure factor linking \(x_0\) and \(x_4\) (add a small positive coupling to the \((0,4)\) and \((4,0)\) entries and increase the diagonals accordingly). (a) Confirm the matrix is no longer tridiagonal: the loop created a new nonzero far from the diagonal. (b) Now marginalize out \(x_2\) via the Schur complement and report which previously-zero off-diagonal entries became nonzero. (c) In one sentence, explain why part (b) demonstrates that both loop closure and marginalization densify the graph, but for opposite reasons.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why can a factor-graph smoother benefit from a loop closure discovered late in a run, while a Kalman filter over the same trajectory cannot?</p>
+        <p class="quiz-question">2. What is the exact operation that marginalizes a variable out of the information matrix, and why is it called "exact" rather than an approximation?</p>
+        <p class="quiz-question">3. Give one concrete reason you would <em>not</em> marginalize old poses even when memory allows keeping them, and one reason you must despite that cost.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-11.5.html">Section 11.5</a>, we confront the failure mode this section kept deferring: a single false loop closure can wreck a perfect map because a plain quadratic cost trusts every factor without question. Robust cost functions (Huber, Cauchy, and switchable constraints) let the optimizer down-weight the outliers it cannot gate out in advance, turning "one bad factor ruins everything" into "one bad factor is quietly ignored."</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

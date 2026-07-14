@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.3: Particle filters and importance sampling. Building Sensory AI." name="description"/>
+<title>Section 10.3: Particle filters and importance sampling | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Particle filters and importance sampling</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"When the math refuses to give me an integral, I hire a thousand tiny guesses and let the data pay whichever ones were right."</p><cite>A Resourceful AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The extended and unscented Kalman filters of the previous two sections both cling to one assumption: that the belief about the state, however nonlinear the dynamics, can be squeezed back into a single Gaussian after every step. That assumption fails the moment the posterior grows a second peak. A robot that could be in either of two identical corridors, a heartbeat model that admits two plausible phases, a target that might have turned left or right behind an occluder: none of these are one bump with a covariance. The particle filter throws out the parametric belief entirely and represents the posterior as a swarm of weighted samples, each one a complete hypothesis about the state. It approximates the very integrals that classical filtering cannot solve, using nothing but random draws and a scoring rule called importance sampling. In exchange for computation it buys the freedom to represent any distribution at all, including the multimodal and heavy-tailed ones a Gaussian filter cannot even write down.</p>
+</div>
+
+<p>This section builds directly on the recursive Bayesian predict-update recursion from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and on the notions of a proposal distribution, expectation, and Monte Carlo estimation from the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">probability and estimation primer in Chapter 4</a>. If sampling from a distribution and taking a weighted average feel routine, you have everything you need. We develop importance sampling first, make it sequential, and arrive at the bootstrap particle filter you can run on real sensor data.</p>
+
+<h2>Importance sampling: paying for the distribution you cannot draw from</h2>
+
+<p>Filtering ultimately asks for expectations under the posterior, quantities like the mean state \(\mathbb{E}[x_k \mid z_{1:k}]\). An expectation is an integral, and Monte Carlo estimates any integral by averaging a function over samples drawn from the distribution. The catch: we cannot draw from the posterior directly, because we do not have it in closed form. Importance sampling is the workaround. Draw instead from a convenient <em>proposal</em> distribution \(q(x)\) that we can sample, then correct for having used the wrong distribution by reweighting each sample:</p>
+
+$$\mathbb{E}_{p}[f(x)] = \int f(x)\, p(x)\, dx = \int f(x)\, \frac{p(x)}{q(x)}\, q(x)\, dx \approx \frac{1}{N}\sum_{i=1}^{N} f(x^{i})\, \frac{p(x^{i})}{q(x^{i})}, \qquad x^{i} \sim q.$$
+
+<p>The ratio \(w^{i} = p(x^{i})/q(x^{i})\) is the <em>importance weight</em>. It measures how much the proposal over- or under-represented the region where sample \(x^{i}\) landed. A sample drawn from a part of space the true distribution loves but the proposal neglected gets a large weight; a sample the proposal over-visited gets a small one. The weighted set of samples is a discrete stand-in for a continuous distribution we could never write down. That single idea, sample from what is easy and reweight toward what is true, is the entire mathematical engine of the particle filter.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A particle filter never represents the posterior as a formula. It represents it as \(N\) pairs \(\{x^{i}, w^{i}\}\) of a state hypothesis and its weight, and the density at any point is the weighted count of nearby particles. This is why it can carry beliefs a Kalman filter cannot: two clusters of particles are a genuine bimodal posterior, and a long tail of low-weight particles is a genuine heavy tail. The price is that accuracy scales with the number of particles, not with a fixed covariance matrix, so the filter trades algebra for compute in a way you control directly.</p>
+</div>
+
+<h2>Making it sequential: the filtering recursion in particles</h2>
+
+<p>A one-shot importance sampler is not yet a filter. A filter must fold in one measurement at a time and carry its belief forward without redoing the whole history. Sequential importance sampling achieves this by propagating each particle through the dynamics and updating its weight incrementally. If we take the transition prior \(p(x_k \mid x_{k-1}^{i})\) as the proposal, which means we simply push each particle forward through the process model, the weight update collapses to something beautifully simple: multiply the old weight by the measurement likelihood of where the particle landed.</p>
+
+$$x_k^{i} \sim p(x_k \mid x_{k-1}^{i}), \qquad \tilde{w}_k^{i} = w_{k-1}^{i}\; p(z_k \mid x_k^{i}), \qquad w_k^{i} = \frac{\tilde{w}_k^{i}}{\sum_{j} \tilde{w}_k^{j}}.$$
+
+<p>Read the three steps as a story. First each particle takes a random step according to the physics, spreading the swarm out exactly as the predict stage of a Kalman filter inflates the covariance. Then every particle is scored by how well the actual sensor reading agrees with the reading that particle would have produced: this is the likelihood \(p(z_k \mid x_k^{i})\), which is where the sensor's <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">measurement model from Chapter 2</a> enters. Finally the weights are normalized so they sum to one and again describe a probability distribution. Particles that predicted the measurement well gain weight; particles that predicted it poorly fade. This choice of proposal defines the <em>bootstrap particle filter</em>, and it is the one to reach for first because it needs only the ability to simulate the dynamics and evaluate the likelihood, never to invert either.</p>
+
+<h2>A bootstrap particle filter you can run</h2>
+
+<p>The code below tracks a scalar state under a genuinely nonlinear measurement, \(z = x^2/20 + \text{noise}\), a textbook stress case because the sign of \(x\) is ambiguous from a single reading: a positive and a negative state produce the same squared measurement. A Kalman-family filter collapses this to one Gaussian and picks a side; the particle filter keeps both hypotheses alive as two clusters until the dynamics break the tie.</p>
+
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+N = 2000
+x = rng.normal(0, 2, size=N)          # particle cloud, initial state
+w = np.full(N, 1.0 / N)               # uniform starting weights
+true_x = 0.5
+
+for k in range(1, 26):
+    true_x = 0.5 * true_x + 25 * true_x / (1 + true_x**2) + rng.normal(0, 1)
+    z = true_x**2 / 20 + rng.normal(0, 1)          # nonlinear, sign-ambiguous
+    # predict: push each particle through the same dynamics
+    x = 0.5 * x + 25 * x / (1 + x**2) + rng.normal(0, np.sqrt(1.0), size=N)
+    # update: weight by measurement likelihood
+    z_pred = x**2 / 20
+    w *= np.exp(-0.5 * (z - z_pred)**2 / 1.0)      # Gaussian likelihood
+    w += 1e-300                                    # guard against underflow
+    w /= w.sum()                                   # normalize
+    est = np.sum(w * x)                            # posterior mean estimate
+
+n_eff = 1.0 / np.sum(w**2)             # effective sample size
+print(f"est={est:.2f}  true={true_x:.2f}  N_eff={n_eff:.0f} of {N}")
+</code></pre>
+<div class="code-caption">A bootstrap particle filter for a scalar nonlinear system. The predict line simulates the dynamics per particle; the update line scores each particle by the Gaussian likelihood of the observed measurement. The final <code>N_eff</code> is the effective sample size, a diagnostic we return to below and treat in full in Section 10.4.</div>
+
+<p>Notice what the two working lines correspond to: the predict line is the transition-prior proposal, and the update line is the incremental weight \(p(z_k \mid x_k^{i})\). Everything else is bookkeeping. Run it and the posterior mean tracks the true state through swings no single Gaussian could follow, because the weighted cloud bends into whatever shape the data demands. The one number to watch is <code>N_eff</code>, the effective sample size \(1/\sum_i (w^i)^2\). It starts near \(N\) and, if left alone, collapses toward one as a single particle hoards all the weight. That collapse is the central pathology of sequential importance sampling, and repairing it is exactly the job of <a class="cross-ref" href="section-10.4.html">Section 10.4</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Warehouse robot in a symmetric aisle</h3>
+<p>A wheeled robot navigates a warehouse whose aisles are visually near-identical. Its wheel odometry says it has moved four meters forward, and a laser range finder reports the distance to the nearest shelf, but that distance is consistent with three different aisles at once. An extended Kalman filter, forced to commit to one Gaussian, will confidently center itself on the wrong aisle and never recover. A particle filter seeds a few thousand pose hypotheses across the floor, pushes each through the odometry model at every wheel tick, and reweights them against each laser scan. For several meters three particle clusters survive, one per candidate aisle, and the robot's belief is correctly, faithfully multimodal. When the robot finally reaches a junction whose geometry only one aisle could explain, the likelihood annihilates the two wrong clusters and the belief snaps to a single mode. This is Monte Carlo localization, and it works precisely because the filter was allowed to stay uncertain in a way no Kalman variant permits. The full SLAM version appears in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+</div>
+
+<h2>Choosing the proposal, and why it decides everything</h2>
+
+<p>The bootstrap filter's proposal, the transition prior, is convenient but blind: it moves particles without ever consulting the measurement it is about to be scored against. When the sensor is very precise relative to the process noise, this is wasteful. The dynamics scatter particles across a wide region, then the sharp likelihood kills almost all of them because only a sliver of that region is consistent with the reading. Few particles survive, <code>N_eff</code> craters, and the estimate degrades. The cure is a smarter proposal that peeks at \(z_k\) before proposing, nudging particles toward states the measurement already favors. The <em>optimal proposal</em> \(p(x_k \mid x_{k-1}^{i}, z_k)\) minimizes the variance of the weights, and much of the particle-filtering literature is the art of approximating it, often by running a local Kalman update per particle to build a measurement-aware Gaussian to sample from. The general principle is worth memorizing: a proposal that ignores the data wastes particles, and the closer the proposal sits to the true posterior, the fewer particles you need to reach a target accuracy.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: FilterPy and particles</h3>
+<p>The hand-written loop above is about fifteen lines and hides two easy mistakes: forgetting to renormalize the weights, and letting them underflow to zero. In practice you would use <code>filterpy.monte_carlo</code> for the resampling primitives or the dedicated <code>particles</code> library, where a full bootstrap or guided filter with automatic resampling, multiple proposal choices, and built-in effective-sample-size monitoring is a handful of lines, roughly a 5x reduction over a hand-rolled filter with the same safeguards. The library also supplies the systematic and stratified resamplers and the Rao-Blackwellized structure we meet in <a class="cross-ref" href="section-10.5.html">Section 10.5</a>, so you never re-implement the numerically delicate parts. Use the from-scratch version to internalize the weight update; use the library so a missing normalization never becomes a silent divergence.</p>
+</div>
+
+<h2>When to reach for a particle filter</h2>
+
+<p>Particle filters earn their compute cost in three situations. The first is a genuinely multimodal posterior, where several distinct hypotheses are simultaneously plausible and collapsing them to one mean would be a lie, as in the warehouse robot. The second is a strongly nonlinear or non-Gaussian measurement or process model that a first-order or sigma-point linearization cannot faithfully capture, the regime where the <a class="cross-ref" href="section-10.1.html">extended Kalman filter of Section 10.1</a> starts to diverge. The third is a state space low enough in dimension that a few thousand particles can cover it, typically single digits, because the number of particles needed to maintain accuracy grows steeply with dimension. When the belief really is a single well-behaved bump, or when the state has dozens of dimensions, a Kalman-family filter is faster and just as accurate, and Section 10.7 lays out that decision explicitly. The particle filter is the tool you reach for when the shape of your uncertainty, not just its width, is the thing you cannot afford to get wrong.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Run the code and print the posterior mean alongside the median of the particle cloud at each step. Then modify the estimate to also report, at each step, the fraction of particles with <code>x &gt; 0</code>. Predict first, then confirm: in the early steps, before the dynamics break the sign ambiguity, what does that fraction reveal about the shape of the belief that the single posterior-mean number completely hides? Now cut <code>N</code> from 2000 to 50 and rerun several times with different seeds. Explain, in terms of Monte Carlo variance, why the estimate becomes erratic.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Importance sampling lets you estimate an expectation under a distribution you cannot sample from. State the one-line role of the proposal distribution and the one-line role of the weight.</li>
+<li>In the bootstrap particle filter, which line of the recursion corresponds to the Kalman predict step, and which corresponds to the Kalman update step? Why does the weight update reduce to just the measurement likelihood?</li>
+<li>Two engineers debate why a Kalman filter fails to localize the warehouse robot but a particle filter succeeds. Give the single-sentence reason, phrased in terms of what shape of posterior each filter can represent.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-10.4.html">Section 10.4</a>, we confront the collapse we saw looming in the effective sample size: left alone, sequential importance weights concentrate on a single particle until the filter represents its rich posterior with one lonely sample. That is weight degeneracy, and the fix is resampling, the step that discards impoverished particles and clones promising ones. We will see why naive resampling introduces its own problem, sample impoverishment, and how systematic and stratified schemes keep the swarm both diverse and faithful.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

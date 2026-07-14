@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.3: The linear Kalman filter. Building Sensory AI." name="description"/>
+<title>Section 9.3: The linear Kalman filter | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Bayesian Filtering and the Kalman Family</a></div>
+<h1>The linear Kalman filter</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me a linear model and Gaussian noise, and I will hand you the optimal estimate before you finish sampling the next reading."</p><cite>An Overconfident AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The previous section laid out recursive Bayesian estimation as a two-step ritual: predict the state forward, then correct it with a measurement. That ritual is exact but usually intractable, because propagating a full probability distribution through arbitrary dynamics requires integrals nobody can solve in closed form. The linear Kalman filter is the one place where the integrals collapse into arithmetic. When the dynamics are linear and every noise source is Gaussian, the posterior stays Gaussian forever, so the entire belief is carried by a mean vector and a covariance matrix. The filter that results is not a heuristic or an approximation; it is the provably optimal minimum-mean-square-error estimator, and it runs in a handful of matrix operations per sample. Almost every state estimator you will meet in sensing, from a step counter on a wrist to a lidar tracker on a highway, is either this filter or a controlled bend of it.</p>
+</div>
+
+<p>This section assumes you are comfortable with the hidden-state and observation models from <a class="cross-ref" href="section-9.1.html">Section 9.1</a> and the predict-update recursion from <a class="cross-ref" href="section-9.2.html">Section 9.2</a>. It also leans on Gaussian algebra and the notion of an estimator's covariance from the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">probability and estimation primer in Chapter 4</a>. If the phrase "conditional covariance of a joint Gaussian" makes you uneasy, revisit that chapter first. Here we make the recursion concrete and turn it into code you can run.</p>
+
+<h2>The linear-Gaussian model and why it is special</h2>
+
+<p>The Kalman filter estimates a state vector \(x_k \in \mathbb{R}^n\) that evolves under a linear dynamics model and is observed through a linear measurement model:</p>
+
+$$x_k = F_k x_{k-1} + B_k u_k + w_k, \qquad w_k \sim \mathcal{N}(0, Q_k)$$
+$$z_k = H_k x_k + v_k, \qquad v_k \sim \mathcal{N}(0, R_k)$$
+
+<p>Here \(F_k\) is the state-transition matrix (how the world moves in one time step), \(B_k u_k\) is a known control or actuation input, \(H_k\) maps the state into the measurement space (what the sensor actually reports), and \(w_k, v_k\) are the process and measurement noise. The matrices \(Q_k\) and \(R_k\) are the covariances of those two noise sources, and choosing them well is the subject of <a class="cross-ref" href="section-9.4.html">Section 9.4</a>. A classic sensing instance: track a moving object where \(x = [\text{position}, \text{velocity}]^\top\), \(F\) advances position by velocity times the sample interval, and \(H = [1, 0]\) because the sensor sees position but not velocity directly.</p>
+
+<p>What makes this model special is closure. A Gaussian pushed through a linear map is still Gaussian; a Gaussian multiplied by another Gaussian (the measurement likelihood) is still Gaussian after normalization. So if the belief starts Gaussian, it stays Gaussian at every step, and the intractable integrals of general Bayesian filtering reduce to updates of a mean \(\hat{x}\) and a covariance \(P\). That is the whole trick, and it is why the filter is exact rather than approximate in this regime.</p>
+
+<h2>The five equations, and what each one is doing</h2>
+
+<p>The recursion splits into a <em>predict</em> stage that runs the model forward and a <em>update</em> stage that folds in the new measurement. The predict stage advances the mean and inflates the covariance to reflect growing uncertainty:</p>
+
+$$\hat{x}_{k|k-1} = F_k \hat{x}_{k-1|k-1} + B_k u_k$$
+$$P_{k|k-1} = F_k P_{k-1|k-1} F_k^\top + Q_k$$
+
+<p>The notation \(k|k-1\) reads "our estimate for time \(k\) given data through \(k-1\)". Notice that prediction always grows uncertainty: \(P\) is stretched by the dynamics and then padded by \(Q_k\). Without measurements, the filter's confidence decays exactly as fast as the process noise says it should.</p>
+
+<p>The update stage computes the <em>innovation</em> (the surprise in the measurement), weighs it, and pulls the estimate toward the reading:</p>
+
+$$y_k = z_k - H_k \hat{x}_{k|k-1}, \qquad S_k = H_k P_{k|k-1} H_k^\top + R_k$$
+$$K_k = P_{k|k-1} H_k^\top S_k^{-1}$$
+$$\hat{x}_{k|k} = \hat{x}_{k|k-1} + K_k y_k, \qquad P_{k|k} = (I - K_k H_k) P_{k|k-1}$$
+
+<p>The matrix \(K_k\) is the Kalman gain, and it is the heart of the method. It answers a single question at every step: how much should I trust this new measurement versus my own prediction? Read the gain as a ratio of uncertainties. When the prediction is shaky (large \(P_{k|k-1}\)) and the sensor is precise (small \(R_k\)), the gain is near one and the filter snaps to the measurement. When the prediction is confident and the sensor is noisy, the gain is near zero and the filter mostly ignores the reading. The filter never has to be told which regime it is in; it derives the optimal blend from the covariances themselves.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The Kalman gain is not a tuning knob you set by hand. It is computed fresh at every step from the current covariances, which means the filter automatically down-weights measurements when its own model is trustworthy and up-weights them when it is lost. This is why a well-specified Kalman filter behaves like a low-pass filter during smooth motion but reacts fast to genuine maneuvers: the gain adapts to the innovation statistics rather than to a fixed cutoff frequency, unlike the fixed-response smoothers of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>.</p>
+</div>
+
+<h2>A worked filter you can run</h2>
+
+<p>The code below tracks the one-dimensional position and velocity of an object from noisy position-only measurements, a constant-velocity model that shows up everywhere from pedestrian dead reckoning to radar tracking. It implements the five equations verbatim so you can see there is no hidden magic.</p>
+
+<pre><code class="language-python">import numpy as np
+
+dt = 0.1
+F = np.array([[1, dt], [0, 1]])      # constant-velocity dynamics
+H = np.array([[1.0, 0.0]])           # sensor sees position only
+Q = np.array([[1e-4, 0], [0, 1e-3]]) # process noise covariance
+R = np.array([[0.25]])               # measurement noise variance
+
+x = np.array([0.0, 1.0])             # initial state: pos=0, vel=1
+P = np.eye(2) * 1.0                  # initial uncertainty
+
+true_v = 1.0
+np.random.seed(0)
+for k in range(1, 101):
+    z = np.array([true_v * k * dt + np.random.normal(0, 0.5)])  # noisy reading
+    # predict
+    x = F @ x
+    P = F @ P @ F.T + Q
+    # update
+    y = z - H @ x                    # innovation
+    S = H @ P @ H.T + R
+    K = P @ H.T @ np.linalg.inv(S)   # Kalman gain
+    x = x + K @ y
+    P = (np.eye(2) - K @ H) @ P
+
+print(f"est pos={x[0]:.3f}  est vel={x[1]:.3f}  vel std={np.sqrt(P[1,1]):.3f}")
+</code></pre>
+<div class="code-caption">A complete linear Kalman filter for a constant-velocity target. The filter is never told the true velocity of 1.0; it recovers it from position-only measurements because the dynamics couple velocity to the position it can observe. Watch <code>P[1,1]</code>, the velocity variance, shrink even though velocity is never measured directly.</div>
+
+<p>The instructive part is the last line. The sensor never reports velocity, yet the filter estimates it and reports a tightening confidence bound on it. This is <em>observability</em> at work: because velocity drives the position that is measured, information leaks from the observed channel into the hidden one through the off-diagonal terms of \(P\). That leakage is exactly what separates a filter from a plain smoother, and it is why the Kalman filter can reconstruct quantities no sensor in the system ever touches. Section 9.5 makes the observability condition precise and shows what happens when it fails.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: Automotive radar tracking</h3>
+<p>An automotive forward-collision radar reports the range to the vehicle ahead every 50 milliseconds, but the safety controller needs closing velocity to decide whether to pre-charge the brakes. Range readings are noisy at long distance and drop out entirely when the target passes behind a truck. A two-state Kalman filter (range and range-rate) run per radar track solves both problems at once. Between valid returns the predict step coasts the estimate forward on the last known range-rate, so a one-frame dropout produces no glitch. When a clean return arrives, the innovation corrects any drift, and the gain naturally shrinks as the track matures and \(P\) settles. The same two-state filter that a student writes in fifteen lines is, in production, the core of the tracker feeding the collision-avoidance logic, wrapped in gating and track management from <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>.</p>
+</div>
+
+<h2>Optimality, and the fine print behind it</h2>
+
+<p>The Kalman filter carries a strong guarantee: among all estimators, linear or not, it produces the minimum-mean-square-error estimate of the state whenever the model is linear and the noise is Gaussian. Drop the Gaussian assumption and a weaker but still useful claim survives: it remains the best <em>linear</em> unbiased estimator, the one no linear combination of past measurements can beat in mean-square error. This is why the filter is a default rather than a candidate. When its assumptions hold, reaching for anything more elaborate is wasted effort.</p>
+
+<p>The fine print matters, though. The optimality is conditional on the model being correct. If \(F\) misdescribes the dynamics, or \(Q\) and \(R\) are set to fictional values, the filter is still optimal for the wrong problem, which in practice means it can be confidently wrong. A filter whose \(R\) is too small will trust noisy sensors too much and jitter; one whose \(Q\) is too small will trust its stale model too much and lag behind real maneuvers, sometimes so badly that the covariance collapses and the filter stops listening to data at all. Those failure modes, and how to catch them from the innovation sequence, are the subject of Section 9.4 and <a class="cross-ref" href="section-9.7.html">Section 9.7</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: FilterPy</h3>
+<p>The teaching implementation above is about 20 lines of hand-managed matrix algebra, and every one of them is a place to fat-finger a transpose. In production you would write it with <code>filterpy.kalman.KalmanFilter</code>: instantiate with the state and measurement dimensions, assign <code>F</code>, <code>H</code>, <code>Q</code>, <code>R</code>, then call <code>kf.predict()</code> and <code>kf.update(z)</code> in a loop. That collapses the loop body to two lines and about a 10x reduction in filter code, and the library handles numerically stable covariance updates (the Joseph form), batch filtering, and built-in Rauch-Tung-Striebel smoothing for free. Use the from-scratch version to understand the gain; use the library so a stray <code>.T</code> never becomes a silent tracking bug.</p>
+</div>
+
+<h2>When the linear filter is the right tool</h2>
+
+<p>Reach for the linear Kalman filter when three conditions hold: the state evolves approximately linearly over one sample interval, the sensor maps into the state space linearly, and the noise is roughly Gaussian and zero-mean. A surprising range of sensing problems fit after modest engineering. Constant-velocity and constant-acceleration motion models are linear. Sensor bias and drift can be appended to the state and estimated online. Even mildly nonlinear systems are often linear enough within a single 10-millisecond step that the plain filter tracks them fine.</p>
+
+<p>The filter breaks when the map from state to measurement is genuinely nonlinear, as when a range-and-bearing sensor observes a target described in Cartesian coordinates, or when the state distribution goes multimodal because two hypotheses are equally plausible. A single Gaussian cannot represent "the target is either left or right", and no choice of gain rescues it. Those cases are precisely where <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a> picks up, with the extended and unscented Kalman filters for smooth nonlinearities and particle filters for multimodal beliefs. Knowing where the linear filter's optimality ends is as important as knowing that it exists.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the code above and set <code>R</code> to a very large value, say <code>[[100.0]]</code>, then rerun it. Predict first, then confirm: what happens to the Kalman gain, and how does the velocity estimate at step 100 differ from the well-tuned run? Now instead shrink <code>Q</code> by a factor of 1000 and introduce a genuine velocity change halfway through the run (make <code>true_v</code> jump from 1.0 to 2.0 at k=50). Explain, from the gain equation, why the filter lags behind the maneuver and how long it takes to catch up.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>In the predict step the covariance always grows, but in the update step it always shrinks. State the one-line reason for each, in terms of information.</li>
+<li>The sensor in the worked example never measures velocity. Explain the mechanism by which the filter still estimates it and reports a shrinking velocity variance.</li>
+<li>Two engineers disagree: one says the Kalman gain is a hyperparameter to tune, the other says it is computed. Who is right, and what <em>is</em> the pair of quantities you actually tune?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-9.4.html">Section 9.4</a>, we confront the two matrices we treated as given here: the process noise \(Q\) and the measurement noise \(R\). Tuning them is where most real filters live or die, and we will use the innovation sequence as a diagnostic to tell an over-trusting filter from an under-trusting one and to set the noise covariances from data rather than from guesswork.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

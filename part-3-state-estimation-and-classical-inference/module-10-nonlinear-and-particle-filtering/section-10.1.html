@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.1: Extended Kalman filter. Building Sensory AI." name="description"/>
+<title>Section 10.1: Extended Kalman filter | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Nonlinear and Particle Filtering</a></div>
+<h1>Extended Kalman filter</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The Extended Kalman filter's entire career rests on one hopeful assumption: that the world, viewed closely enough, is a straight line. It usually is. The interesting failures are when it is not."</p>
+<cite>A Pragmatic AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the linear Kalman filter and its predict-correct structure from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, including what the process noise \(\mathbf{Q}\) and measurement noise \(\mathbf{R}\) represent. It also assumes the Gaussian, covariance propagation, and first-order Taylor expansion, all developed in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> and Appendix A. If the Jacobian of a vector-valued function is unfamiliar, review the multivariable-calculus notes in Appendix A before continuing.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>The linear Kalman filter of <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> is exact, but it earns that exactness by assuming both the dynamics and the measurement are linear in the state. Real sensors rarely oblige. A radar reports range and bearing, which are square roots and arctangents of position. A GNSS receiver relates pseudorange to position through a nonlinear distance. A robot's heading rotates its velocity through sines and cosines. Feed any of these to a linear filter and the Gaussian machinery collapses, because a Gaussian pushed through a nonlinear function is no longer Gaussian. The Extended Kalman filter (EKF) is the oldest and still the most deployed answer: linearize the nonlinear functions around the current estimate with a first-order Taylor expansion, then run the ordinary Kalman equations on that local linear approximation. This section explains what gets linearized and how, why the Jacobian replaces the constant matrices \(\mathbf{F}\) and \(\mathbf{H}\), when the approximation is trustworthy, and the specific ways it silently diverges so you can catch it before it drives a system off the road.</p>
+</div>
+
+<h2>Why a linear filter cannot survive a nonlinear world</h2>
+
+<p>Keep the state as \(\mathbf{x}\) and the measurement as \(\mathbf{z}\), following <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. The generalization is to let both the dynamics and the measurement be arbitrary nonlinear functions,</p>
+
+$$ \mathbf{x}_k = f(\mathbf{x}_{k-1}, \mathbf{u}_k) + \mathbf{w}_k, \qquad \mathbf{z}_k = h(\mathbf{x}_k) + \mathbf{v}_k, $$
+
+<p>with process noise \(\mathbf{w}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{Q})\) and measurement noise \(\mathbf{v}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{R})\). The linear filter is the special case \(f(\mathbf{x}) = \mathbf{F}\mathbf{x}\) and \(h(\mathbf{x}) = \mathbf{H}\mathbf{x}\). The trouble is that the Kalman filter tracks a state estimate and a covariance, that is, a Gaussian, and it only stays Gaussian under linear maps. Push a Gaussian through \(h(\mathbf{x}) = \sqrt{x^2 + y^2}\) and the result is skewed and heavy on one side; no mean-and-covariance pair describes it faithfully. So we cannot propagate the true posterior in closed form. We can only approximate it, and the EKF's approximation is the cheapest one that exists: pretend each nonlinear function is linear over the small region where the state probably lives.</p>
+
+<h2>Linearize with the Jacobian</h2>
+
+<p>A differentiable function looks linear if you zoom in far enough. Expand \(f\) and \(h\) to first order around the current best estimate and the correction terms are the <em>Jacobians</em>, the matrices of partial derivatives</p>
+
+$$ \mathbf{F}_k = \left.\frac{\partial f}{\partial \mathbf{x}}\right|_{\hat{\mathbf{x}}_{k-1}}, \qquad \mathbf{H}_k = \left.\frac{\partial h}{\partial \mathbf{x}}\right|_{\hat{\mathbf{x}}_k^-}. $$
+
+<p>These play exactly the roles that the constant \(\mathbf{F}\) and \(\mathbf{H}\) played in the linear filter, with one crucial difference: they are recomputed at every step, evaluated at the latest estimate. The state itself is still propagated through the <em>true</em> nonlinear functions; only the covariance is propagated through the linearized ones. That split is the whole idea of the EKF. Writing it out, the predict step becomes</p>
+
+$$ \hat{\mathbf{x}}_k^- = f(\hat{\mathbf{x}}_{k-1}, \mathbf{u}_k), \qquad \mathbf{P}_k^- = \mathbf{F}_k \mathbf{P}_{k-1} \mathbf{F}_k^\top + \mathbf{Q}, $$
+
+<p>and the correct step, using the innovation \(\boldsymbol{\nu}_k = \mathbf{z}_k - h(\hat{\mathbf{x}}_k^-)\), becomes</p>
+
+$$ \mathbf{K}_k = \mathbf{P}_k^- \mathbf{H}_k^\top \left(\mathbf{H}_k \mathbf{P}_k^- \mathbf{H}_k^\top + \mathbf{R}\right)^{-1}, \quad \hat{\mathbf{x}}_k = \hat{\mathbf{x}}_k^- + \mathbf{K}_k \boldsymbol{\nu}_k, \quad \mathbf{P}_k = (\mathbf{I} - \mathbf{K}_k \mathbf{H}_k)\mathbf{P}_k^-. $$
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The EKF propagates the mean through the exact nonlinear function but propagates the uncertainty through a linear approximation of it. Every EKF error traces back to that mismatch. The estimate is honest about where the state is; the covariance is only as honest as the linearization is accurate over the current uncertainty ellipse. When the function curves sharply relative to the width of that ellipse, the reported covariance becomes a fiction, and because the filter never checks its own Taylor expansion, it reports that fiction with total confidence.</p>
+</div>
+
+<h2>A worked example: tracking with range and bearing</h2>
+
+<p>Consider a sensor at the origin tracking a target with planar state \(\mathbf{x} = [p_x, v_x, p_y, v_y]^\top\). The motion is linear (constant velocity), so \(f\) uses a constant \(\mathbf{F}\), but the sensor reports range \(r = \sqrt{p_x^2 + p_y^2}\) and bearing \(\theta = \operatorname{atan2}(p_y, p_x)\), which are thoroughly nonlinear. The measurement Jacobian \(\mathbf{H}_k = \partial h / \partial \mathbf{x}\) is where the geometry enters: the range row grows as \(p_x/r\) and \(p_y/r\), and the bearing row scales as \(1/r\), which already warns us that bearing information degrades far from the sensor. This range-bearing model is the backbone of radar tracking (<a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-44-radar-ai/index.html">Chapter 44</a>) and of the landmark measurements in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def h(x):                        # nonlinear measurement: range, bearing
+    px, py = x[0], x[2]
+    r = np.hypot(px, py)
+    return np.array([r, np.arctan2(py, px)])
+
+def H_jacobian(x):               # d h / d x, evaluated at the current estimate
+    px, py = x[0], x[2]
+    r2 = px**2 + py**2
+    r = np.sqrt(r2)
+    return np.array([[ px/r,  0.0,  py/r,  0.0],      # d range / d state
+                     [-py/r2, 0.0,  px/r2, 0.0]])     # d bearing / d state
+
+def ekf_update(x, P, z, R):
+    Hk = H_jacobian(x)
+    nu = z - h(x)                                     # innovation
+    nu[1] = (nu[1] + np.pi) % (2*np.pi) - np.pi       # wrap bearing to [-pi, pi]
+    S = Hk @ P @ Hk.T + R
+    K = P @ Hk.T @ np.linalg.inv(S)
+    x = x + K @ nu
+    P = (np.eye(len(x)) - K @ Hk) @ P
+    return x, P</code></pre>
+<div class="code-caption">One EKF measurement update for range-bearing tracking. The Jacobian <code>H_jacobian</code> is recomputed at the current estimate <code>x</code> every call, which is the only structural change from the linear update in Chapter 9. The bearing-wrap line is not optional decoration: an innovation of \(+359^\circ\) must be read as \(-1^\circ\), and forgetting the wrap is the single most common EKF bug in angular measurements.</div>
+
+<p>Notice what the code makes concrete. The innovation \(\boldsymbol{\nu}\) uses the true nonlinear \(h\), while \(\mathbf{S}\) and \(\mathbf{K}\) use the Jacobian \(\mathbf{H}_k\). And the bearing residual must be wrapped into \([-\pi, \pi]\), because angles live on a circle and naive subtraction produces a spurious near-\(2\pi\) innovation that yanks the estimate violently. This wrap-around trap recurs everywhere orientation is estimated, which is why <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a> abandons raw angle subtraction for quaternion error states.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: an automotive radar that lost a cut-in car</h3>
+<p>An automotive perception team ran an EKF per tracked vehicle, fusing radar range-bearing returns into constant-velocity state estimates for adaptive cruise control. On highway following it tracked flawlessly. The failure showed up when a car cut in sharply from an adjacent lane at close range. At three meters the bearing Jacobian scales as \(1/r\), so a tiny lateral motion produced a large bearing change that the linearization, anchored at the previous frame's estimate, badly under-predicted. The innovation blew past what \(\mathbf{S}\) said was plausible, the gate rejected the return as an outlier, and the track coasted straight through the cut-in on stale velocity for several frames. The linear algebra was flawless; the Taylor expansion simply was not valid over a maneuver that large at that range. The fix combined a fatter \(\mathbf{Q}\) to keep the covariance from collapsing, a re-linearization within the update (the iterated EKF), and ultimately the sigma-point method of the next section for the close-range regime.</p>
+</div>
+
+<h2>When the EKF works, and the three ways it breaks</h2>
+
+<p><strong>When it works.</strong> The EKF is trustworthy when the nonlinearity is mild over the region the state occupies, meaning the function is nearly straight across roughly one standard deviation of uncertainty. That covers a large fraction of real systems: GNSS positioning (<a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>), attitude and heading estimation, and most well-conditioned tracking. Its cost is modest, a couple of Jacobian evaluations per step, so it runs comfortably on a microcontroller, which is why it has flown on spacecraft since Apollo and still dominates embedded sensor fusion.</p>
+
+<p><strong>How it breaks.</strong> Three failure modes recur. First, <em>strong curvature</em>: when the function bends sharply across the uncertainty ellipse, the first-order term discards the curvature that actually matters, and the propagated covariance is wrong. Second, <em>overconfidence and divergence</em>: because the linearized \(\mathbf{P}\) systematically ignores the extra spread that nonlinearity injects, the covariance shrinks too fast, the gain goes toward zero, the filter stops listening to measurements, and the estimate drifts away from a truth it now considers implausible. This is the same going-deaf pathology from Chapter 9's tuning discussion, but here the mistuning is structural rather than a bad \(\mathbf{Q}\). Third, <em>bad Jacobians</em>: a hand-derived analytic Jacobian with a sign error or a wrong partial will not crash; it will quietly bias the filter, which is why numerically checking every Jacobian against a finite-difference reference is standard practice.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The right tool: EKF without the boilerplate</h3>
+<p>Hand-writing the predict-correct loop, the covariance bookkeeping, the Joseph-form update for numerical stability, and the innovation gating adds up to roughly fifty lines you can get subtly wrong. The <code>filterpy</code> library's <code>ExtendedKalmanFilter</code> reduces the per-step logic to about ten, and you supply only the two things that are genuinely yours: the measurement function and its Jacobian.</p>
+<pre><code class="language-python">from filterpy.kalman import ExtendedKalmanFilter
+import numpy as np
+
+ekf = ExtendedKalmanFilter(dim_x=4, dim_z=2)
+ekf.F = F_const_velocity(dt)          # linear dynamics
+ekf.Q, ekf.R = Q, R                   # noise from your tuning
+ekf.x, ekf.P = x0, P0
+
+for z in measurements:
+    ekf.predict()
+    ekf.update(z, HJacobian=H_jacobian, Hx=h,
+               residual=wrap_bearing_residual)   # handles the update, gain, covariance</code></pre>
+<div class="code-caption">The same range-bearing EKF using <code>filterpy.kalman.ExtendedKalmanFilter</code>. You pass the Jacobian function and the nonlinear measurement function directly to <code>update</code>; the library owns the gain, the covariance update, and (via the <code>residual</code> hook) the angle wrapping. Fifty lines of careful matrix code become about ten, and you still verify your <code>H_jacobian</code> against finite differences yourself.</div>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: learned and invariant extensions</h3>
+<p>The EKF is sixty years old and still evolving. The <em>invariant EKF</em> (InEKF), now standard in legged-robot and visual-inertial state estimation, exploits the geometric symmetry of the state (rotations live on the Lie group \(SO(3)\)) so that the linearization error is independent of the estimate, giving provable convergence where the naive EKF diverges. Separately, <em>differentiable Kalman filters</em> embed the EKF equations as a layer inside a neural network, learning the noise models \(\mathbf{Q}\) and \(\mathbf{R}\), or even the dynamics, end to end from data; the KalmanNet architecture is the widely cited example, and it connects the classical machinery here to the neural state-space models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>. Both keep the EKF's recursive, interpretable skeleton while repairing its two chronic weaknesses: linearization error and hand-tuned noise.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Implement the range-bearing EKF above for a target that moves in a straight line past the sensor, passing within one meter of the origin at closest approach.</p>
+<ol>
+<li>Log the average normalized innovation squared (NIS, from <a class="cross-ref" href="../module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) over the whole run, then again restricted to the twenty steps around closest approach. Explain why the two numbers differ.</li>
+<li>Remove the bearing-wrap line and re-run. Describe exactly what the estimate does the first time the true bearing crosses \(\pm\pi\).</li>
+<li>Replace your analytic <code>H_jacobian</code> with a finite-difference Jacobian and confirm they agree to five decimal places. Then inject a sign error into one partial and report how the tracking degrades without any crash.</li>
+</ol>
+<details>
+<summary>Hint</summary>
+<p>At closest approach \(r\) is smallest, so the \(1/r\) and \(1/r^2\) terms in the bearing Jacobian are largest and the linearization is worst exactly where the geometry changes fastest. That is where a valid-on-average NIS goes bad, and it is the concrete motivation for the sigma-point filter you meet next.</p>
+</details>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>The EKF pushes the state mean through \(f\) and \(h\) but the covariance through their Jacobians. Why this asymmetry, and which of the two is the approximation?</li>
+<li>Give a concrete geometric condition under which the EKF's linearization is trustworthy, stated in terms of the function and the uncertainty ellipse.</li>
+<li>A colleague reports that their EKF's covariance keeps shrinking while the estimate visibly drifts from ground truth. Name the failure mode and one structural fix that does not touch the code's linear algebra.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-10.2.html">Section 10.2</a>, we confront the EKF's core weakness head-on. Instead of differentiating the nonlinear function, the unscented Kalman filter samples it: a small, deterministic set of sigma points is pushed through the true \(f\) and \(h\), and the transformed points reconstruct the mean and covariance directly. No Jacobians, no discarded curvature, and derivative-free accuracy that holds where the EKF's Taylor expansion falls apart.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

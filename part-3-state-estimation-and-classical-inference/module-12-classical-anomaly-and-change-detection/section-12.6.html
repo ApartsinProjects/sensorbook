@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.6: Evaluation without complete labels (and the point-adjust trap). Building Sensory AI." name="description"/>
+<title>Section 12.6: Evaluation without complete labels (and the point-adjust trap) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: State Estimation and Classical Inference</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Classical Anomaly and Change Detection</a></div>
+<h1>Evaluation without complete labels (and the point-adjust trap)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Give me the right scoring rule and I will make a coin flip look like a genius. That is not a boast. It is a warning about your metric."</p><cite>A Skeptical AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every detector in this chapter produces the same output: a stream of scores, and, after a threshold, a stream of alarms. The hard part is not building the detector. It is deciding whether the detector is any good when you almost never have a clean, complete answer key to grade it against. Real sensor logs are labeled sparsely, late, and fuzzily: an operator marks the hour a pump failed, not the exact sample where the bearing first whispered; a clinician annotates the arrhythmia, not the ambiguous beats on either side. Into this vacuum the field poured a scoring convention called <strong>point adjust</strong> that looked reasonable and quietly broke evaluation for years, to the point where a random number generator could outscore carefully engineered models on published benchmarks. This section does two things. First, it dissects the point-adjust trap so you can recognize inflated results on sight. Second, it gives you an evaluation toolkit that survives incomplete labels: range-aware metrics, threshold-free curves that respect the extreme class imbalance, detection-delay accounting, and label-light protocols built on injected faults. Getting the metric right is not bookkeeping. A wrong metric silently selects the wrong model, and you ship it.</p>
+</div>
+
+<p>This section assumes the precision, recall, and threshold vocabulary from the residual view of <a class="cross-ref" href="section-12.3.html">Section 12.3</a>, the base-rate reasoning of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The full benchmarking protocol it feeds into is developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+
+<h2>Why complete labels almost never exist</h2>
+
+<p>Point-wise anomaly labels for a long sensor stream are a fiction we rarely get to enjoy. Three structural reasons keep them incomplete. First, <strong>boundaries are ambiguous</strong>: an anomaly is a temporal event with a soft onset and offset, so no two annotators agree on the exact first and last anomalous sample, and asking them to is asking for noise. Second, <strong>anomalies are rare</strong>: a healthy machine may run for months between events, so the positive class is a fraction of a percent of samples, and a single mislabeled segment swings the score. Third, <strong>discovery is retrospective</strong>: you learn a fault occurred from a maintenance ticket or a patient outcome, timestamped to the shift or the day, not to the millisecond your detector cares about. The consequence is that we grade detectors against labels that mark <em>events</em>, coarse intervals of "something was wrong here", while the detector emits per-sample decisions. Any honest metric must bridge that granularity gap, and the way it bridges it is exactly where evaluation goes right or wrong.</p>
+
+<h2>The point-adjust trap</h2>
+
+<p>Point adjust was introduced with good intentions. The reasoning went: if a ground-truth anomaly spans samples \(t_0\) through \(t_1\), and the detector fires on even one sample inside that window, then in practice a human would have caught the whole event, so we should credit the detector for the entire segment. Concretely, before scoring, you rewrite the prediction: for each labeled anomaly segment, if <em>any</em> point in it is flagged, mark <em>every</em> point in it as flagged. Then compute ordinary point-wise precision, recall, and \(F_1\). It sounds humane. It is a disaster.</p>
+
+<p>The problem is that segments are long and the adjustment is a giant credit multiplier. Suppose the labeled anomalies occupy contiguous runs averaging \(L\) samples each, and a detector flags points independently with probability \(p\). The chance it touches a given segment, and therefore harvests all \(L\) points of true-positive credit, is</p>
+
+$$\Pr(\text{segment hit}) \;=\; 1 - (1-p)^{L}.$$
+
+<p>For \(L = 100\) and a trivial flag rate of \(p = 0.02\), that probability is already about \(0.87\). A detector that flags two percent of samples uniformly at random, with zero signal, sweeps up almost all of the recall while its false positives stay diffuse and cheap. The recovered recall is near one, precision looks respectable because the denominator is dominated by the credited segment points, and the resulting point-adjust \(F_1\) rivals or beats genuinely engineered detectors. This is not a hypothetical: the critique that a randomized score outperforms state-of-the-art models under point adjust is what forced the anomaly-detection community to abandon the protocol for headline numbers. The code below reproduces the effect in a dozen lines.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def f1(pred, label):
+    tp = np.sum(pred & label); fp = np.sum(pred & ~label); fn = np.sum(~pred & label)
+    p = tp / (tp + fp + 1e-9); r = tp / (tp + fn + 1e-9)
+    return 2 * p * r / (p + r + 1e-9)
+
+def point_adjust(pred, label):          # the trap: any hit credits the whole segment
+    pred = pred.copy(); i = 0
+    while i < len(label):
+        if label[i]:
+            j = i
+            while j < len(label) and label[j]: j += 1
+            if pred[i:j].any(): pred[i:j] = True   # inflate to full segment
+            i = j
+        else:
+            i += 1
+    return pred
+
+rng = np.random.default_rng(0)
+n = 20000
+label = np.zeros(n, dtype=bool)
+for s in rng.integers(0, n - 100, size=25):   # 25 anomaly events, ~100 samples each
+    label[s:s + 100] = True
+
+pred = rng.random(n) < 0.02              # a PURELY RANDOM detector, no signal at all
+print("point-wise  F1 :", round(f1(pred, label), 3))
+print("point-adjust F1:", round(f1(point_adjust(pred, label), label), 3))</code></pre>
+<div class="code-caption">Reproducing the point-adjust trap. The predictions are pure noise (a 2 percent random flag), so the honest point-wise \(F_1\) sits near the base rate. After the point-adjust rewrite, the same noise scores a high \(F_1\) that would look competitive on a leaderboard. Any metric a coin flip can win is not measuring detection skill.</div>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A benchmark number is only meaningful relative to what a trivial baseline scores on it. Before you trust any anomaly metric, run two null detectors through it: uniform random flagging at your operating rate, and an "all-anomaly" detector that flags everything. If either scores well, the metric is inflated and your model comparisons are noise dressed as progress. This "beat the coin flip" audit costs three lines and has saved more anomaly-detection papers from embarrassment than any clever architecture. The failure of point adjust is not that segment-level credit is wrong in principle; it is that crediting the <em>full</em> segment for a <em>single</em> touch decouples the score from how well the detector actually localizes the event.</p>
+</div>
+
+<h2>Metrics that survive incomplete labels</h2>
+
+<p>If segment credit is the right instinct but full-segment credit is the trap, the fix is to make credit <em>proportional and localized</em>. Several families do this correctly. <strong>Range-based precision and recall</strong> (Tatbul and colleagues) generalize the point definitions to intervals, splitting recall into an existence term (did you detect the event at all) and an overlap term (how much of it), with a tunable bias for early or positional detection. <strong>Affiliation metrics</strong> (Huet and colleagues) score each prediction by its temporal distance to the nearest true anomaly and normalize against what a random baseline would achieve, so a coin flip scores zero by construction. For threshold-free comparison, the <strong>volume under the surface</strong> (VUS) family generalizes ROC and precision-recall area to anomaly ranges with a tolerance buffer, removing both the arbitrary threshold and the razor-edge boundary sensitivity in one move.</p>
+
+<p>Two workhorse cautions apply to the classic curves you will reach for first. Prefer the area under the precision-recall curve over the area under the ROC curve, because ROC is seduced by the enormous true-negative count under extreme class imbalance and can look excellent while precision is dismal. And never report "best \(F_1\)", the \(F_1\) at the single threshold that maximizes it on the test set, as your result: choosing the threshold with the answer key in hand is threshold leakage, an optimistic peek that will not survive contact with a production stream where you must fix the threshold in advance. Set the threshold on a validation split or from a false-alarm budget, exactly as in <a class="cross-ref" href="section-12.3.html">Section 12.3</a>, then report performance at <em>that</em> threshold.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a cloud-telemetry team unlearns its leaderboard</h3>
+<p>An infrastructure team monitors thousands of server key-performance-indicator streams (latency, error rate, queue depth) and had been ranking detector candidates by point-adjust \(F_1\) on a hand-labeled incident set. A new "detector" submitted as a joke, a fixed-period square wave ignoring the data entirely, landed second on the board. That triggered an audit. Rescored with affiliation precision-recall and a VUS-style threshold-free area, the joke submission collapsed to near the random floor, and the ranking of the real models reshuffled: the previous leader had been winning on segment-credit luck, not localization. The team adopted three rules. Report the random and all-positive baselines alongside every model. Fix thresholds on a time-ordered validation window, never on the test set. Track detection delay explicitly, because for their pager an alarm 40 minutes into an outage is nearly worthless even if it earns full segment credit. The reshuffle changed which model shipped. The fleet-scale version of this discipline is the subject of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+</div>
+
+<h2>Evaluating with few labels, or none</h2>
+
+<p>When labels are scarce you still have levers. The most reliable is <strong>controlled fault injection</strong>: take verified-healthy data and synthesize anomalies with known onset, offset, and magnitude (spikes, level shifts, variance bursts, frozen sensors), then score against a label you authored precisely. This is the leakage-safe evaluation thread of this book applied to detection; the synthetic-data machinery is developed further in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-55-digital-twins-synthetic-data-and-physics/index.html">Chapter 55</a>. Complement it with <strong>label-free operating characteristics</strong>: on healthy-only data you can measure the empirical false-alarm rate and mean time between false alarms directly, no anomaly labels required, which pins down half of the tradeoff by itself. For the detection half, weak or delayed labels (a maintenance ticket dated to the day) support event-level recall and <strong>detection delay</strong>, the lag from true onset to first alarm, which is often the metric operators care about most and which no amount of segment credit can fake. Finally, when scores carry calibrated uncertainty you can evaluate coverage rather than hard hits, connecting to the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: range-aware metrics you should not hand-roll</h3>
+<p>Range-based and threshold-free anomaly metrics are fiddly to implement correctly (segment matching, buffered overlap, baseline normalization), and a subtle off-by-one in your segment loop is exactly how bad numbers get published. Libraries such as <code>prts</code> (range-based precision and recall) and the <code>TSB-UAD</code> evaluation suite (VUS and range-AUC) give you these as one-call functions: <code>ts_precision(label, pred, alpha=0, ...)</code> replaces roughly forty lines of interval bookkeeping with one, and the VUS routines hand back a threshold-free score directly from the raw anomaly scores. Let the library own the boundary arithmetic, and spend your attention on picking the metric and its bias parameters to match your operational cost, not on debugging overlap loops.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code above. (1) Sweep the random flag rate \(p\) over \(\{0.005, 0.01, 0.02, 0.05\}\) and plot point-adjust \(F_1\) against \(p\); overlay the theoretical segment-hit probability \(1-(1-p)^L\) and confirm the inflation tracks it. (2) Implement event-level recall (a segment counts as detected only if flagged) and detection delay (samples from segment start to first flag), and show that a real residual detector from <a class="cross-ref" href="section-12.3.html">Section 12.3</a> beats the random baseline on delay even where point-adjust \(F_1\) cannot tell them apart. (3) Compute area under the precision-recall curve and area under the ROC curve on the same imbalanced stream and explain, from the base rate, why ROC looks far more flattering.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ol>
+<li>Explain in one sentence why a purely random detector can achieve a high point-adjust \(F_1\), and identify the exact step in the protocol responsible.</li>
+<li>Why is reporting the "best \(F_1\)" chosen on the test set a form of leakage, and what should you report instead?</li>
+<li>You have healthy data in abundance but only three roughly dated fault events. Name two quantities you can still evaluate rigorously and one you cannot trust.</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-12.7.html">Section 12.7</a>, we turn the evaluation lens toward the human on the other end of the alarm. A detector with a beautiful precision-recall curve can still be operationally useless if it pages an engineer every ten minutes, so we make the false-alarm budget a first-class economic quantity: how alert fatigue is measured, how a threshold trades detection against operator trust, and how to price an alarm so the system stays worth listening to.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
