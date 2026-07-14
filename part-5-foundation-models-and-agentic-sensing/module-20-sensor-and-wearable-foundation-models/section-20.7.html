@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.7: Compute, privacy, and on-device constraints. Building Sensory AI." name="description"/>
+<title>Section 20.7: Compute, privacy, and on-device constraints | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Sensor and Wearable Foundation Models</a></div>
+<h1>Compute, privacy, and on-device constraints</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I was pretrained on a rack of accelerators and asked to live inside a watch that naps between heartbeats. My weights weigh more than the battery can afford, and every byte I ship off-body is somebody's pulse."</p>
+<cite>A Weight-Conscious AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the pretrained sensor and wearable foundation models of <a class="cross-ref" href="section-20.3.html">Sections 20.3</a> and <a class="cross-ref" href="section-20.6.html">20.6</a>, and it previews (without duplicating) the deployment machinery developed in Part XII. The model-optimization toolkit, quantization, pruning, and distillation, is treated in depth in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>; federated and privacy-preserving training in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>; and the regulatory and biometric-privacy frame in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>. Here we ask the narrower question those chapters do not: what changes when the model you must fit and protect is a <em>foundation</em> model, pretrained to be large and general, now asked to run on a battery.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A sensor foundation model is born on a cluster and expected to serve on a wrist. Those two worlds impose opposite pressures. Pretraining rewards scale: more parameters, longer context, richer multi-sensor fusion. Deployment punishes it: a smartwatch offers tens of megabytes of usable RAM, a milliwatt power envelope for always-on inference, and a latency budget measured against a heartbeat. Worse, the very data that makes wearable models valuable, photoplethysmography, ECG, gait, sleep, is biometric and often health-derived, so shipping raw signal to a server for a big model to chew on is both a bandwidth cost and a privacy liability. This section treats compute and privacy as a single joint constraint rather than two afterthoughts. The design question is not "how accurate can the model be?" but "what is the most capable model that fits the energy budget <em>and</em> keeps the signal on-body?" We work through the wearable compute budget, the compression toolkit that brings a pretrained encoder into that budget, and the on-device and federated patterns that let a foundation model learn from a fleet without ever pooling raw biometric data.</p>
+</div>
+
+<h2>The wearable compute budget is measured in joules, not FLOPs</h2>
+<p><strong>What the budget is.</strong> Server benchmarks quote throughput; wearables quote endurance. The binding constraints on a watch or ring are four: model footprint (weights plus activations must fit in on-chip SRAM or a few tens of megabytes of RAM, with no swap), energy per inference (an always-on model that samples once per second runs 86,400 times a day and must not visibly move the battery curve), latency (a gesture or arrhythmia alert is useless if it lags the event), and thermal headroom (a device against skin cannot dissipate sustained compute). A pretrained sensor transformer with 50 to 300 million parameters in float32 needs 200 MB to 1.2 GB just for weights, which is a non-starter on the microcontroller-class silicon inside most wearables.</p>
+<p><strong>Why energy, not FLOP count, is the right currency.</strong> On mobile silicon, moving data dominates arithmetic: a DRAM access costs on the order of a hundred times the energy of a multiply-accumulate, so a model that barely fits and thrashes memory can burn more joules than a larger model that stays resident in SRAM. This inverts intuitions carried over from GPU training. The practical implication is that reducing <em>memory traffic</em>, through quantization to 8-bit or 4-bit weights, activation sparsity, and keeping the working set on-chip, often buys more battery life than shaving multiply-accumulates. Estimate the daily energy of an always-on model as</p>
+$$E_{\text{day}} \;=\; f \cdot \big(E_{\text{compute}} + E_{\text{memory}}\big) \cdot 86{,}400,$$
+<p>where \(f\) is inferences per second and the memory term, not the compute term, is usually the one you can move. A model that respects this budget earns the right to run continuously; one that ignores it gets relegated to an occasional cloud call, forfeiting the always-on sensing that justified the wearable.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The scarce resource on a wearable is joules per day, and joules are spent mostly on moving bytes, not on arithmetic. A sensor foundation model earns its place on-device by shrinking its <em>resident memory footprint</em> and its <em>off-body radio traffic</em>, in that order, before anyone counts FLOPs. Quantizing weights from 32-bit to 8-bit is not merely a fourfold size win; it is a proportional cut in the dominant energy term, which is often the difference between an always-on model and a model that must phone home.</p>
+</div>
+
+<h2>Shrinking a pretrained encoder into the budget</h2>
+<p><strong>What the toolkit is.</strong> Three complementary techniques bring a large pretrained sensor encoder into a wearable envelope, each detailed in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>. <em>Quantization</em> stores weights and runs arithmetic in 8-bit or 4-bit integers instead of float32, cutting footprint and memory energy roughly proportionally with little accuracy loss when done with per-channel scales and a short calibration pass. <em>Distillation</em> trains a small student encoder to match the representations of the large pretrained teacher, transferring most of the teacher's cross-user generalization into a fraction of the parameters. <em>Pruning</em> removes weights or whole attention heads that contribute little, exploiting the redundancy that overparameterized pretraining leaves behind.</p>
+<p><strong>Why distillation is the natural fit for sensor foundation models.</strong> The whole value proposition of a pretrained sensor model (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) is a rich, general representation learned from oceans of unlabeled signal. Distillation lets you keep that representation while discarding the parameters that stored it inefficiently: you freeze the big teacher, run it on unlabeled wearable streams you already have, and train a compact student to reproduce its embeddings. Because the supervision is the teacher's own output, distillation needs no labels, which matches the label-scarce reality of wearables. The common deployment shape is a <em>split</em>: a distilled, quantized encoder runs on-device to turn raw signal into a compact embedding, and only that embedding (never the raw biometric trace) is ever considered for any off-body step. This directly serves the privacy goal of the next subsection.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a continuous atrial-fibrillation screen on a smartwatch</h3>
+<p>A wearables team has a 120-million-parameter PPG and accelerometer foundation model pretrained across millions of wearer-days, and a watch with roughly 40 MB of usable RAM and a strict always-on power budget. The float32 model is 480 MB, an order of magnitude too large. They distill it into a 6-million-parameter student that matches the teacher's embeddings on unlabeled data, then apply 8-bit post-training quantization with per-channel scales, landing at about 6 MB and a per-inference cost the battery can absorb once per few seconds. The student encoder runs on-device and emits a rhythm embedding; a tiny classifier flags candidate atrial-fibrillation episodes locally, and only a flagged, consented snippet is ever offered for clinician review. Raw PPG never leaves the wrist. Accuracy on a held-out <em>subject</em> split (see the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>) drops by a small margin against the teacher, a trade the team accepts for continuous, private, on-body screening that a cloud-only design could never sustain. The cardiovascular-sensing specifics of such a screen are developed in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>.</p>
+</div>
+
+<h2>Privacy is a system property, so keep the signal on-body</h2>
+<p><strong>Why sensor foundation models sharpen the privacy problem.</strong> Wearable signals are among the most sensitive data a person emits. PPG and ECG reveal cardiovascular condition; gait and accelerometry can re-identify an individual and infer activity, mood, even gait-linked neurological state. A foundation model is attractive precisely because it extracts more from that signal, which means both that its <em>embeddings</em> can themselves be re-identifying and that centralizing raw traces to feed a big model concentrates risk. The regulatory weight of this (biometric identifiers, health-data statutes) is the subject of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>; here the engineering stance is simpler: the most private byte is the one that never leaves the device.</p>
+<p><strong>How to train from a fleet without pooling raw data.</strong> Three mechanisms, developed fully in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-64-federated-and-privacy-preserving-sensor-ai/index.html">Chapter 64</a>, compose cleanly with a pretrained sensor model. <em>On-device inference</em> keeps raw signal local and ships at most a task result or a compact embedding. <em>Federated learning</em> adapts or fine-tunes the model by sending gradient or weight updates from each device to a server that averages them, so raw signal stays on-body; this is the natural way to personalize a pretrained encoder across a fleet (<a class="cross-ref" href="section-20.6.html">Section 20.6</a>) without a central biometric lake. <em>Differential privacy</em> adds calibrated noise to those updates so that no single wearer's data measurably changes the trained model, bounding the worst-case leakage with a privacy budget \(\varepsilon\). The three stack: a distilled on-device encoder, federated updates for personalization, and a differential-privacy noise mechanism on the aggregate.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Embeddings Are Not Anonymous</h3>
+<p>It is tempting to treat "we only send embeddings, not raw PPG" as sufficient privacy. It is not. A learned sensor embedding can be highly re-identifying and can leak reconstructable attributes; gradient updates in naive federated learning can also leak training samples through inversion attacks. Sending an embedding off-body is a data release and must be governed like one: consented, minimized, and, where the threat model demands it, protected with a differential-privacy or secure-aggregation mechanism rather than trusted on the folk assumption that a vector of floats is anonymous. Treat the embedding boundary with the same leakage suspicion the split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applies to evaluation splits.</p>
+</div>
+
+<h2>A deployment recipe: distill, quantize, measure the budget</h2>
+<p>The pieces combine into a short, testable pipeline: distill the pretrained teacher into a small student, quantize the student to 8-bit, and check that the result actually fits the wearable's memory and per-inference energy budget before shipping. The snippet below sketches the distillation loss and a footprint check; the energy figure is an estimate the deployment team calibrates against on-device measurement.</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def distill_step(teacher, student, x, opt, tau=2.0):
+    # x: (B, T, C) raw wearable window; teacher is frozen and pretrained
+    with torch.no_grad():
+        z_t = teacher(x)                     # teacher embedding, no labels needed
+    z_s = student(x)                         # small student embedding
+    # match embeddings (cosine) + soften any logits the teacher exposes
+    loss = 1 - F.cosine_similarity(z_s, z_t, dim=-1).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+def fits_budget(model, ram_mb, bytes_per_param=1):   # 1 byte => int8 weights
+    n = sum(p.numel() for p in model.parameters())
+    footprint_mb = n * bytes_per_param / 1e6
+    return footprint_mb, footprint_mb <= ram_mb
+
+def daily_energy_mj(inf_per_s, e_compute_uj, e_memory_uj):
+    # memory term usually dominates on wearable silicon
+    return inf_per_s * (e_compute_uj + e_memory_uj) * 86_400 / 1e3
+</code></pre>
+<div class="code-caption">Label-free distillation of a frozen pretrained teacher into a compact student, plus two budget checks. <code>distill_step</code> supervises the student to reproduce the teacher's embedding (cosine match), so no labels are required. <code>fits_budget</code> converts the int8-quantized parameter count to a megabyte footprint and tests it against the device's RAM; <code>daily_energy_mj</code> estimates all-day cost, with the memory term as the lever to pull first.</div>
+
+<p>The <code>daily_energy_mj</code> estimate is what turns "the model is accurate" into "the model is deployable": a student that passes <code>fits_budget</code> but blows the energy line still forces a cloud fallback and gives up always-on sensing. Measuring both, on the target silicon, is the difference between a demo and a shipped feature.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Hand-writing a static-quantization flow, inserting observers, running a calibration pass, fusing convolution-batchnorm-activation blocks, folding per-channel scales, and exporting an integer graph, is roughly 150 to 250 lines of fiddly, easy-to-break code. PyTorch's <code>torch.ao.quantization</code> (prepare, calibrate, convert) and export paths such as ExecuTorch or LiteRT reduce int8 post-training quantization to a handful of calls plus a calibration loop over representative windows. The library owns observer placement, scale computation, and the integer-graph export; you own the two decisions it cannot make: which layers to keep in higher precision and what data to calibrate on. Reach for it rather than a bespoke quantizer.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Compressing sensor foundation models without forfeiting their generalization is unsettled. Google's LSM and LSM-2 (<a class="cross-ref" href="section-20.2.html">Section 20.2</a>) establish that large models trained on incomplete wearable data at scale carry rich, transferable structure; open questions are how much of that structure survives aggressive 4-bit quantization and student distillation, and whether a distilled on-device encoder retains the cross-user robustness the teacher earned. Apple's work on wearable behavioral foundation models pushes the on-device angle, motivating encoders small and private enough to run continuously. On the privacy side, the frontier is composing differential privacy with federated fine-tuning of a pretrained sensor model while keeping the privacy budget \(\varepsilon\) tight enough to matter and the utility high enough to ship, alongside defenses against embedding-inversion and gradient-leakage attacks. The state of the art is a moving target measured on wearable benchmarks that report accuracy, footprint, energy, and a privacy bound together, rather than accuracy alone.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a pretrained (or well-trained) sensor encoder and a wearable dataset. (1) Distill it into a student roughly 10 to 20 times smaller using the label-free cosine objective above; report the student's accuracy on a held-out <em>subject</em> split against the teacher. (2) Apply 8-bit post-training quantization with per-channel scales and a calibration pass; record the footprint reduction and any accuracy change. (3) Estimate daily energy at your target inference rate, separating the compute and memory terms, and identify which term dominates. (4) Simulate a federated round: split the training subjects across simulated devices, average their weight updates instead of pooling data, and compare the federated model's accuracy to the centrally trained one. (5) Add Gaussian noise to the aggregated update to approximate a differential-privacy mechanism and plot the accuracy-versus-\(\varepsilon\) trade.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why is energy per inference, dominated by memory traffic, a better deployment currency for an always-on wearable model than raw FLOP count? Give the consequence for how you would first shrink a model.</p>
+<p class="quiz-question">2. Explain why distillation is an especially natural compression method for a self-supervised sensor foundation model, and why it does not require labels.</p>
+<p class="quiz-question">3. A teammate argues that sending only learned embeddings off-device makes the system private by construction. Give two reasons this is unsafe and name a mechanism that would actually bound the leakage.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 20</h3>
+<p>fine-tune a pretrained sensor encoder for a new wearable task with limited labels; evaluate cross-user generalization.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Sensor and wearable foundation models</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.04852">Narayanswamy, G. et al. (2024). Scaling Wearable Foundation Models (LSM). arXiv:2402.04852.</a></p>
+<p class="bib-annotation">Google's Large Sensor Model demonstrates that a foundation model trained across millions of wearer-days learns transferable structure from incomplete multi-sensor data; the reference point for what compression must preserve.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2506.05321">Narayanswamy, G. et al. (2025). LSM-2: Learning from Incomplete Wearable Sensor Data. arXiv:2506.05321.</a></p>
+<p class="bib-annotation">Introduces adaptive and inherited masking so the model expects missingness at scale; its robustness to sensor dropout is exactly the property distillation and quantization must not destroy.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami, M. et al. (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p>
+<p class="bib-annotation">An open time-series foundation family whose encoder-only variants illustrate the size-versus-generalization trade a wearable deployment must navigate.</p>
+</div>
+
+<p class="bib-category">Model compression for edge deployment</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1503.02531">Hinton, G., Vinyals, O., and Dean, J. (2015). Distilling the Knowledge in a Neural Network. NeurIPS Deep Learning Workshop.</a></p>
+<p class="bib-annotation">The founding statement of knowledge distillation: train a compact student to match a large teacher's soft outputs, the label-free path to shrinking a pretrained sensor encoder.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1712.05877">Jacob, B. et al. (2018). Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference. CVPR.</a></p>
+<p class="bib-annotation">Establishes 8-bit integer inference with per-channel scales and calibration, the workhorse that cuts both footprint and the dominant memory-energy term on wearable silicon.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2003.03033">Banbury, C. et al. (2021). MLPerf Tiny Benchmark. NeurIPS Datasets and Benchmarks.</a></p>
+<p class="bib-annotation">A standardized benchmark for microcontroller-class inference that reports accuracy alongside latency and energy, the multi-axis scorecard a deployable wearable model must satisfy.</p>
+</div>
+
+<p class="bib-category">Privacy-preserving on-device learning</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1602.05629">McMahan, B. et al. (2017). Communication-Efficient Learning of Deep Networks from Decentralized Data (Federated Averaging). AISTATS.</a></p>
+<p class="bib-annotation">Defines federated averaging: train from a fleet by aggregating on-device updates instead of pooling raw data, the natural fabric for personalizing a wearable foundation model privately.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/1607.00133">Abadi, M. et al. (2016). Deep Learning with Differential Privacy. ACM CCS.</a></p>
+<p class="bib-annotation">The DP-SGD mechanism that bounds per-example leakage with a privacy budget, the tool that makes federated updates from biometric signals defensible rather than merely local.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>We have now built, adapted, and squeezed a sensor foundation model until it fits on-body and keeps its signal private. What it still cannot do is <em>explain itself</em> in words or answer a question a clinician or operator might actually ask. In <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, we align these sensor representations with language: captioning signals, answering natural-language questions over sensor streams, and grounding a language model's reasoning in physical measurement, so that the compact embeddings this chapter produced become something a person can interrogate and trust.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

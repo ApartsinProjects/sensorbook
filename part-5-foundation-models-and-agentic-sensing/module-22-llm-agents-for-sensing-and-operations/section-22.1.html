@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.1: From single-shot inference to agentic sensing loops. Building Sensory AI." name="description"/>
+<title>Section 22.1: From single-shot inference to agentic sensing loops | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>From single-shot inference to agentic sensing loops</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"You asked me once what the vibration meant. I answered once. Then the bearing kept spinning, and nobody asked again. That is not perception; that is a photograph."</p>
+        <cite>A Looping AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds on the sensor-language bridge of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>, which lets a language model read a window of signal at all, and on the recursive estimate-then-update structure of Bayesian filtering from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, whose loop we will deliberately echo. You should be comfortable with the idea of a streaming sensor pipeline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> and with detectors that fire on change (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>). No familiarity with agent frameworks is assumed; the vocabulary is introduced here. Notation lives in Appendix J.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Every model you have built so far in this book answers a question once: hand it a window of signal, it returns a label, a forecast, a state estimate. That is <em>single-shot inference</em>, and it is the right shape for a classifier or a filter. It is the wrong shape for an operator. A human on a control-room shift does not classify one window and go home; they watch, form a hypothesis, pull up a second reading to test it, wait, and revise. An <em>agentic sensing loop</em> is a language model wired into exactly that cycle: it perceives, reasons about what it perceived, decides to gather more evidence or act, and then perceives again, carrying memory across the turns. This section draws the line between the two paradigms, shows why continuous physical processes demand a loop rather than a call, and lays out the anatomy of the loop that the rest of the chapter fills in with tools (<a class="cross-ref" href="section-22.4.html">Section 22.4</a>), guardrails (<a class="cross-ref" href="section-22.6.html">Section 22.6</a>), and a cost budget (<a class="cross-ref" href="section-22.7.html">Section 22.7</a>).</p>
+    </div>
+
+    <p>The distinction is not cosmetic. A single-shot call has a fixed information budget: whatever you managed to stuff into the prompt is all the model will ever see before it commits to an answer. For a photograph or a sentence that can be enough. For a bearing that is beginning to spall, a patient whose rhythm is drifting, or a substation whose load is climbing, the decisive evidence often arrives <em>after</em> the first look, or lives in a second sensor the first prompt never mentioned. The loop exists to let the model go get that evidence.</p>
+
+    <h2>The single-shot ceiling</h2>
+
+    <p><strong>What</strong> single-shot inference is: one forward pass, \(\hat{y} = f(x)\), where the input \(x\) is frozen at call time and the model has no way to request more. <strong>Why</strong> it hits a ceiling on sensor problems is threefold. First, <em>the evidence is incomplete by construction</em>: a fault signature may span three sensors, but you cannot pre-load every sensor into every prompt without drowning the model and the budget. Second, <em>the world keeps moving</em>: by the time the answer is generated the process has advanced, so a static answer describes a past that no longer holds. Third, <em>the right next question depends on the current answer</em>: if the vibration spectrum looks like an imbalance you check the mounting; if it looks like a bearing you check the lubrication temperature. A single shot cannot branch, because branching requires seeing your own intermediate conclusion. <strong>When</strong> single-shot is nonetheless correct: when the decision is genuinely local and terminal, such as tagging one already-captured window. Do not reach for an agent when a classifier will do; the loop earns its cost only when evidence-gathering is part of the task.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A single-shot model is a function; an agentic loop is a <em>policy</em>. The function maps a fixed input to an output. The policy chooses, at each step, either to act on the world (call a detector, fetch another channel, raise an alert) or to conclude, and it makes that choice conditioned on everything it has observed so far. The intelligence added by "agentic" is not a smarter forward pass. It is the closed feedback edge, the arrow from the model's own output back into its next input, that turns a one-shot answer into an investigation.</p>
+    </div>
+
+    <h2>Anatomy of a sensing loop</h2>
+
+    <p>Strip away the framework marketing and every agentic sensing loop has the same four organs, iterated until a stop condition fires. <strong>Perception</strong> turns raw or lightly processed signal into something the language model can reason over, typically a compact textual or tokenized summary of the latest window (the bridge of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a> is what makes this possible). <strong>Reasoning</strong> is the LLM step: given the perception and the accumulated memory, produce a thought and choose a next action. <strong>Action</strong> executes that choice against the outside world, most often by calling a tool (a spectral detector, a Kalman filter, a database query, a forecaster) whose result becomes new evidence. <strong>Memory</strong> is the running state that survives across turns: the hypothesis so far, which sensors have been checked, what the detectors returned. The loop closes when the model emits a terminal action (an explained alert, a "nominal" verdict) or a budget guard trips.</p>
+
+    <p>This interleaving of a <em>reasoning</em> trace with <em>acting</em> steps, each action's observation fed back before the next thought, is the pattern the literature calls ReAct (Yao et al., 2023). Its value for sensing is that the model's chain of reasoning is grounded at every step in a fresh measurement rather than spun from the prompt alone, which is precisely the antidote to the confident-nonsense failure mode that plagues a language model asked to reason about signals it cannot re-check.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: A Gearbox That Answered Back</h3>
+        <p>On a wind farm, a nacelle vibration channel crossed a soft threshold at 03:12. A single-shot system would have emitted one line: "vibration elevated on turbine 14." The agentic monitor did more. Perception summarized the window as "broadband rise, 20 to 200 Hz, no dominant tone." Reasoning noted that broadband energy without a clear tone is ambiguous between a genuine bearing defect and simple aerodynamic loading in high wind, and chose an action: query the SCADA channel for wind speed over the same interval. The tool returned a gust to 22 m/s. The model revised: broadband rise coincident with a gust is likely benign, but it is worth one more check, so it called a bearing-envelope detector on the high-frequency band. That detector came back clean. Only then did the loop terminate, with a low-severity, self-explaining note: "elevated vibration attributable to gust loading; bearing envelope nominal; no action." Three turns, two tool calls, one avoided false alarm. The single shot could not have asked the second question, because it did not yet know the first answer.</p>
+    </div>
+
+    <h2>The loop is a controller you already know</h2>
+
+    <p>The agentic loop is not a new idea dropped in from natural language processing; it is the observe-decide-act cycle that runs through this entire book, with a language model sitting in the decision seat. <strong>Why</strong> the framing helps: it tells you what to import from control and estimation theory. A Kalman filter (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>) also loops forever, alternating a predict step with a measurement update, carrying a belief state \(x_t\) between iterations. Write the two side by side and the correspondence is exact:</p>
+
+    $$ \underbrace{x_{t} = g\!\left(x_{t-1},\, z_{t}\right)}_{\text{filter: update belief from measurement}} \qquad\longleftrightarrow\qquad \underbrace{m_{t} = \text{LLM}\!\left(m_{t-1},\, o_{t}\right)}_{\text{agent: update memory from observation}} $$
+
+    <p>Here \(z_t\) is a numeric measurement and \(o_t\) is an observation the agent chose to gather (a tool result, another channel), while \(g\) is a fixed algebraic update and the LLM is a learned, flexible one. The differences are as instructive as the parallel. A Kalman filter's measurement schedule is fixed in advance; the agent <em>chooses</em> what to measure next, which is its whole reason for existing. A filter's state is a calibrated probability distribution; the agent's memory is text, so it needs a bolted-on notion of uncertainty (the calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, which <a class="cross-ref" href="section-22.6.html">Section 22.6</a> wires in). <strong>When</strong> this matters: any time you are tempted to think an agent replaces your estimator, remember it more often <em>wraps</em> one, deciding when to run the filter and how to read its output, not reimplementing it.</p>
+
+    <p>The listing below is the whole idea in fewer than thirty lines: a loop that perceives a window, lets the model choose one action, executes it, folds the result into memory, and repeats until the model concludes. It is deliberately skeletal so the four organs stay visible; the detector and summarizer are the pluggable tools of <a class="cross-ref" href="section-22.4.html">Section 22.4</a>.</p>
+
+    <pre><code class="language-python">def sensing_loop(stream, llm, tools, max_turns=6):
+    """Observe -> reason -> act -> remember, until the model concludes."""
+    memory = []                                  # running state across turns
+    window = next(stream)                         # latest slice of signal
+    for turn in range(max_turns):
+        obs = summarize_window(window)            # perception: signal -> text
+        step = llm.decide(memory, obs)            # reasoning: pick ONE action
+        memory.append((obs, step))                # remember what we saw + chose
+        if step.action == "conclude":
+            return step.verdict                   # terminal: explained alert / nominal
+        result = tools[step.action](step.args)    # action: run a detector / fetch a channel
+        memory.append(("tool_result", result))    # fold evidence back in
+        window = next(stream)                      # world has moved; look again
+    return {"verdict": "inconclusive", "reason": "turn budget exhausted"}
+</code></pre>
+    <div class="code-caption"><strong>Listing 1.</strong> A minimal agentic sensing loop. The four organs are labeled inline: perception (<code>summarize_window</code>), reasoning (<code>llm.decide</code>), action (the <code>tools</code> dispatch), and memory (the growing <code>memory</code> list). The <code>max_turns</code> guard is the crudest form of the budget control that <a class="cross-ref" href="section-22.7.html">Section 22.7</a> makes rigorous.</div>
+
+    <p>Listing 1 makes one thing concrete that prose blurs: the model does not act on the world directly. It emits a <em>choice</em>, and ordinary code executes it, which is exactly where guardrails will later intercept. That separation between deciding and acting is what keeps an agent auditable, and it is why the loop, not the model, is the unit of engineering.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool</h3>
+        <p>You rarely hand-roll the turn management, tool dispatch, retry logic, and message bookkeeping of Listing 1 in production. An agent framework supplies the loop and lets you register tools declaratively:</p>
+        <pre><code class="language-python">from langgraph.prebuilt import create_react_agent
+# tools are plain functions with type hints and docstrings
+agent = create_react_agent(model="anthropic:claude-sonnet-4-5",
+                           tools=[bearing_envelope, fetch_scada, forecast])
+agent.invoke({"messages": [("user", summarize_window(window))]})
+</code></pre>
+        <div class="code-caption"><strong>Listing 2.</strong> The ReAct loop, tool-call parsing, and observation feedback come prebuilt; you register three sensor tools and the framework runs the cycle.</div>
+        <p>Adopting a prebuilt ReAct agent replaces roughly 200 lines of turn orchestration, tool-schema parsing, and error-recovery plumbing with a single constructor call. The framework handles the loop mechanics and message state; what it does not handle is the sensing judgment, which detectors to expose, how to summarize a window faithfully, and when to trust a tool result, which is the content of the rest of this chapter.</p>
+    </div>
+
+    <h2>When to loop, and when not to</h2>
+
+    <p>The loop is powerful and it is not free: every turn is a full model call plus a tool call, so latency and cost scale with the number of turns (the subject of <a class="cross-ref" href="section-22.7.html">Section 22.7</a>). The design question is therefore sharp. <strong>Reach for a loop</strong> when the task requires <em>sequential evidence-gathering</em>: when the right next observation depends on the current finding, when evidence is spread across sources too numerous to pre-load, or when a hypothesis must be actively tested rather than read off. <strong>Stay single-shot</strong> when the decision is local and the input is complete: a fixed-window classifier on the edge (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>) has no business becoming an agent, and dressing it as one only adds latency, tokens, and new failure modes. A good rule: if you cannot name a second question the agent might ask, you do not need the loop. Root-cause investigation, where each answer narrows the next probe, is the canonical case that does need it, which is why <a class="cross-ref" href="section-22.2.html">Section 22.2</a> opens the chapter's real work there.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>Turning general agent scaffolds into reliable operators over live telemetry is an active frontier. The ReAct pattern (Yao et al., 2023) and Reflexion (Shinn et al., 2023), which adds a self-critique step so an agent can learn from a failed turn within an episode, are the two load-bearing primitives, but neither was designed for the hard-real-time, high-stakes regime of industrial and clinical sensing. Open problems include bounding the number of turns under a latency budget without truncating a live investigation, giving the text-based memory a <em>calibrated</em> confidence rather than a vibe, and preventing an agent from looping on a sensor that is itself faulty. Industrial copilots such as Argos, AgentFM, and CALM (<a class="cross-ref" href="section-22.3.html">Section 22.3</a>) are early attempts to answer these questions at fleet scale, and the reliability numbers that decide whether such systems ship are the concern of <a class="cross-ref" href="section-22.7.html">Section 22.7</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Start from Listing 1. (1) Add a <code>confidence</code> field to each reasoning step and a stop rule that concludes early once confidence exceeds a threshold; describe how this changes the average turn count and what could go wrong if the confidence is uncalibrated. (2) The current loop looks at a fresh window every turn. Modify it so the agent can instead re-examine an <em>earlier</em> window it has in memory, and give one sensing scenario where re-examination beats advancing. (3) Write the predict-update equations of a Kalman filter next to the perceive-remember lines of the loop and label, for a concrete fault-detection task, which quantity plays the role of the measurement \(z_t\) and which plays the belief state \(x_t\).</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In one sentence each, state what a single-shot model and an agentic loop <em>are</em> (function versus policy) and name the feature the loop adds.</p>
+        <p class="quiz-question">2. Name the four organs of a sensing loop and say which one the sensor-language bridge of Chapter 21 supplies.</p>
+        <p class="quiz-question">3. Give a sensing task for which turning a single-shot classifier into an agent would be a mistake, and justify it in terms of cost and the "second question" test.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-22.2.html">Section 22.2</a>, we put the loop to work on the task it was built for: when a detector fires, an agent does not just repeat the alarm, it reasons backward through the evidence to explain <em>why</em> the anomaly happened, gathering the corroborating readings a root-cause story needs and assembling them into an account an operator can act on.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

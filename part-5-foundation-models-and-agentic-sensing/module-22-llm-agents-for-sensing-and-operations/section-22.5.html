@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.5: Multi-agent recursion-of-thought for RCA. Building Sensory AI." name="description"/>
+<title>Section 22.5: Multi-agent recursion-of-thought for RCA | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>Multi-agent recursion-of-thought for RCA</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"One diligent agent asked me the same question for forty thousand tokens and then apologized. A tree of five agents split the fault, argued for a while, and handed me the cracked bearing race. I know which meeting I would rather attend."</p>
+        <cite>A Delegating AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the single-agent explanation loop of <a class="cross-ref" href="section-22.2.html">Section 22.2</a> and the tool-calling agents of <a class="cross-ref" href="section-22.4.html">Section 22.4</a>, because the recursion here is built out of exactly those two primitives: an agent that reasons, and an agent that can call a detector or forecaster. It draws on the causal-attribution and fault-tree machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, and it treats the plant as a graph of coupled subsystems, so the sensor-network view of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-54-graph-neural-networks-for-sensor-networks/index.html">Chapter 54</a> is useful background.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Root-cause analysis on a real machine is not one question, it is a tree of questions. "Why did the gearbox vibration spike?" fans out into "was it the input shaft, the bearings, or the load?", and each of those fans out again. A single agent reasoning in one long chain-of-thought tries to hold that entire tree in one context window. It runs out of room, loses track of which branch it was on, and, worse, commits early to the first fluent story and then rationalizes the rest of the evidence to fit it. <strong>Recursion-of-thought</strong> attacks the problem the way a good engineer does: decompose the failure into sub-hypotheses, spend a fresh reasoning budget investigating each one in isolation, and combine the verdicts. <strong>Multi-agent</strong> means the roles that a lone reasoner does badly in sequence (generating hypotheses, gathering evidence, and criticizing conclusions) become separate agents that do them well in parallel. This section is about wiring those two ideas into a diagnosis engine that stays grounded on deep, cross-subsystem faults.</p>
+    </div>
+
+    <h2>Why one chain of thought is not enough</h2>
+    <p>Chain-of-thought reasoning is linear: the model writes one token stream from problem to answer. For a shallow, single-sensor fault that is perfectly adequate, and you should not reach for anything heavier. But industrial root causes are rarely shallow. The causal structure is a directed graph, often a fault tree, in which a top-level symptom (excess vibration, a temperature excursion, a yield drop) is reachable through many paths, and the right diagnosis is a specific path through that graph backed by specific evidence. Three pathologies make a single chain fail on such problems. The context degrades: as the transcript grows, the model attends less reliably to facts stated thousands of tokens earlier, so evidence gathered on branch one is forgotten by the time branch three is under discussion. The reasoning anchors: having proposed a plausible cause, the model preferentially reads later evidence as confirming it, the machine analogue of confirmation bias. And the budget is shared: every hypothesis competes for the same finite window, so a wide fault tree gets a shallow, hurried look at each branch.</p>
+    <p>Recursion-of-thought removes all three by making each sub-question a fresh, bounded reasoning context. When the orchestrator decides that "bearing fault" is worth investigating, it spawns a child reasoning call whose entire context is that one hypothesis plus its relevant evidence. The child cannot be distracted by the load-torque branch because it never sees it. It returns a compact verdict, and only that verdict, not its scratch work, propagates back up. The parent's context therefore grows with the number of hypotheses, not with the total reasoning spent, which is what keeps a deep tree tractable.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The unit of recursion is a <em>hypothesis</em>, and the return value of a recursive call is a <em>verdict plus evidence</em>, not a transcript. This is the whole trick. If a child agent returned its reasoning, the parent's window would fill up just as fast as a single chain, and you would have gained nothing. By forcing each node to summarize itself to a small, structured object (a refuted-or-supported flag, a confidence, the two or three measurements that decided it, and any newly spawned sub-hypotheses), the tree of reasoning can be arbitrarily deep while every individual context stays small and sharply focused. Depth becomes free; only breadth costs tokens.</p>
+    </div>
+
+    <h2>The cast of agents</h2>
+    <p>A productive RCA team has four roles, and keeping them as distinct agents (distinct prompts, often distinct temperatures) is what stops the system collapsing back into one biased reasoner. The <strong>orchestrator</strong> owns the hypothesis tree: it holds the current frontier of open hypotheses, decides which to expand next, allocates the token budget, and stops when a leaf clears the confidence bar or the budget runs out. <strong>Investigator</strong> agents are the leaves that do the work: each takes one hypothesis, calls the tool belt from <a class="cross-ref" href="section-22.4.html">Section 22.4</a> (a spectral analyzer, a residual detector, a forecaster, a retrieval query over past incidents) to gather evidence, and reports a grounded verdict. The <strong>critic</strong> is an adversary whose only job is to attack the leading hypothesis: it looks for evidence that was ignored, alternative causes with the same signature, and confounds, which directly counters the anchoring failure a single chain suffers. The <strong>synthesizer</strong> takes the settled tree and writes the operator-facing explanation object, the same artifact defined in <a class="cross-ref" href="section-22.2.html">Section 22.2</a>, now backed by an auditable tree of evidence rather than one opaque chain.</p>
+    <p>These agents communicate through a shared <strong>blackboard</strong>: a structured store of hypotheses, evidence, and verdicts that every agent reads and appends to. The blackboard is the memory that a single context window cannot be, and because it is structured data rather than free text, it is also the audit trail. When a maintenance lead asks "why did you rule out the lubrication system?", the answer is a node in the blackboard with the oil-analysis tool call that refuted it, not a paragraph the model happened to generate.</p>
+
+    <p>The listing below is a compact recursion-of-thought orchestrator. The LLM and tool calls are stubbed with a deterministic mock so the control structure runs and prints a hypothesis tree; in production you swap <code>ask_llm</code> and <code>run_tool</code> for real model and detector calls. The point to read is the recursion: <code>investigate</code> expands a hypothesis, and only its summarized verdict returns upward.</p>
+
+    <pre class="language-python"><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass
+class Verdict:
+    hypothesis: str
+    supported: bool
+    confidence: float
+    evidence: list = field(default_factory=list)
+    children: list = field(default_factory=list)   # sub-verdicts, summarized
+
+# stubs: replace with a real LLM and real detector tools (Section 22.4)
+FAULT_TREE = {
+    "gearbox vibration high": ["bearing fault", "gear-mesh fault", "load transient"],
+    "bearing fault": ["inner-race defect", "outer-race defect"],
+    "gear-mesh fault": [], "load transient": [],
+    "inner-race defect": [], "outer-race defect": [],
+}
+EVIDENCE = {           # what the tool belt "measures" per hypothesis
+    "gearbox vibration high": ("detector-confirmed 40% RMS rise", 0.90),
+    "bearing fault":     ("elevated high-frequency envelope energy", 0.60),
+    "outer-race defect": ("BPFO peak at 162 Hz in envelope spectrum", 0.88),
+    "inner-race defect": ("no BPFI sidebands", 0.10),
+    "gear-mesh fault":   ("mesh frequency nominal", 0.15),
+    "load transient":    ("torque flat during event", 0.05),
+}
+
+def run_tool(hyp):                       # -> (evidence_string, support_score)
+    return EVIDENCE.get(hyp, ("no discriminating signal", 0.2))
+
+def investigate(hyp, budget, depth=0):
+    """Recursion-of-thought: expand one hypothesis, return a summarized verdict."""
+    evidence, score = run_tool(hyp)
+    children = []
+    subs = FAULT_TREE.get(hyp, [])
+    # only recurse into sub-hypotheses if this branch looks promising and budget allows
+    if subs and score > 0.3 and budget > 1:
+        per_child = max(1, budget // len(subs))
+        children = [investigate(s, per_child, depth + 1) for s in subs]
+        if children:                     # promote the best-supported child's confidence
+            score = max(score, max(c.confidence for c in children))
+    return Verdict(hyp, supported=score > 0.5, confidence=round(score, 2),
+                   evidence=[evidence], children=children)
+
+def show(v, indent=0):
+    mark = "SUPPORTED" if v.supported else "ruled out"
+    print("  " * indent + f"- {v.hypothesis} [{mark}, conf={v.confidence}] :: {v.evidence[0]}")
+    for c in v.children:
+        show(c, indent + 1)
+
+root = investigate("gearbox vibration high", budget=8)
+show(root)
+</code></pre>
+    <div class="code-caption">A minimal recursion-of-thought RCA orchestrator. Each <code>investigate</code> call reasons over exactly one hypothesis, calls its tools, recurses only into promising branches (score gating prunes the load-transient and gear-mesh paths cheaply), and returns a summarized <code>Verdict</code>. Swapping the stubs for a real model and the Section 22.4 detectors turns this skeleton into a working diagnosis engine.</div>
+
+    <p>Running it walks the tree, prunes the flat-torque and nominal-mesh branches on a cheap first look, descends into the bearing branch, and surfaces the outer-race defect with its envelope-spectrum evidence. That pruning is the budget discipline in action: breadth is paid for only where the first cheap measurement justifies it.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: a wind-turbine gearbox that fooled a single agent</h3>
+        <p>An offshore operator ran a lone diagnostic agent on a 3 MW turbine whose high-speed-shaft vibration had climbed 40% over two weeks. The single agent, handed the vibration spectrum and the SCADA log in one prompt, latched onto a temperature co-trend and confidently blamed the lubrication system, recommending an oil change. The oil was fine; vibration kept rising. Re-run as a four-agent recursion, the orchestrator opened three branches. The investigator on the bearing branch called an envelope-spectrum tool and found a clean ball-pass-outer-race peak; the load-transient investigator called the SCADA forecaster and found torque flat through the event, refuting the load story; and the critic challenged the lubrication hypothesis by noting the oil-analysis particle count was nominal, the same fact the single agent had glossed over. The synthesizer returned "outer-race spall on the high-speed-shaft bearing" with the envelope peak as evidence. The bearing was replaced at the next weather window, before secondary gear damage. The difference was not a smarter model, it was that the critic agent was structurally required to attack the leading story instead of decorating it.</p>
+    </div>
+
+    <h2>When to recurse, and when not to</h2>
+    <p>Recursion-of-thought is not free: every branch is an extra reasoning call and often extra tool calls, so it multiplies both latency and token cost, the subject of <a class="cross-ref" href="section-22.7.html">Section 22.7</a>. Reach for it only when the problem earns it. The signal is <em>fault-tree depth and cross-subsystem coupling</em>: if the same symptom can be produced by several subsystems and the discriminating evidence lives in different sensors, a single chain will thrash, and a tree pays off. For a shallow, single-sensor fault (a stuck valve, a saturated accelerometer as in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>) the recursion is pure overhead; the single-agent loop of Section 22.2 answers it in one call. A good orchestrator therefore gates recursion on a cheap complexity estimate: number of correlated channels that moved, number of plausible causes in the retrieved precedent set, and the confidence gap between the top two hypotheses. Recurse when the gap is small and the fan-out is wide; answer directly otherwise. Budget the tree explicitly, as the code does, so a pathological plant never spawns an unbounded thicket of agents at three in the morning.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Hand-rolling the orchestrator (message routing, per-agent state, retries, the blackboard, and tool dispatch) is a few hundred lines of fiddly async plumbing. A graph-based agent framework such as <strong>LangGraph</strong> models the orchestrator as an explicit state graph with nodes for each agent and conditional edges for the recurse-or-stop decision, giving you checkpointing, streaming, and the shared blackboard as typed state for free. The same team expressed with <strong>AutoGen</strong> or <strong>CrewAI</strong> declares the four roles and their allowed hand-offs and lets the runtime schedule them. Expect the orchestration layer to shrink from roughly 300 lines to about 40, and the framework handles concurrency, per-node budget limits, and replay-on-failure that you would otherwise get subtly wrong. You still write the prompts, the tools, and the recursion-gating logic; those are your product, and no library supplies them.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The lineage runs from Tree-of-Thoughts (Yao et al., 2023) and Graph-of-Thoughts (Besta et al., 2024), which showed that searching over branching reasoning states beats a single chain on hard problems, through debate and multi-agent frameworks such as AutoGen (Wu et al., 2023) and CAMEL (Li et al., 2023). Applying this to sensor and log RCA is very recent: industrial diagnostic copilots (the Argos, AgentFM, and CALM systems of <a class="cross-ref" href="section-22.3.html">Section 22.3</a>) are moving from single-agent explanation toward orchestrated hypothesis trees, and 2024 to 2025 work reports that critic and verifier agents materially cut hallucinated root causes versus a lone reasoner. Open problems remain sharp: there is no agreed benchmark for RCA correctness on real plants, calibrating the confidence a tree reports (Section 22.6) is unsolved, and knowing when a branch has enough evidence to stop is still mostly heuristic.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the listing with a <code>critic</code> function that receives the current best-supported <code>Verdict</code> and returns one alternative hypothesis with the same measured signature, then have <code>investigate</code> call it before returning any leaf with confidence above 0.8. Add a second entry to <code>EVIDENCE</code> that mimics an outer-race peak (say, an electrical-fault line at a nearby frequency) so the critic has a real confound to surface. Report how often the critic changes the final answer, and discuss why forcing the critic to run only on high-confidence leaves is both a cost decision and a calibration decision.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <ol>
+            <li>Why must a recursive <code>investigate</code> call return a summarized verdict rather than its full reasoning transcript, and what specifically breaks if it returns the transcript?</li>
+            <li>Give one fault for which recursion-of-thought is the wrong tool, and name the cheaper alternative from earlier in this chapter.</li>
+            <li>The critic agent runs at a different temperature and with an adversarial prompt than the investigators. What single-agent failure mode is this separation designed to defeat?</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-22.6.html">Section 22.6</a>, we confront the question this section deferred: a tree of agents can produce a beautifully structured wrong answer just as easily as a right one, so we turn to guardrails, calibrated confidence, and the human-in-the-loop checkpoints that decide when a diagnosis is trustworthy enough to act on and when it must be handed to an engineer.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.4: Tool use: agents that call detectors, filters, and forecasters. Building Sensory AI." name="description"/>
+<title>Section 22.4: Tool use: agents that call detectors, filters, and forecasters | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>Tool use: agents that call detectors, filters, and forecasters</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They asked me to compute the RMS of a 50 kHz vibration window in my head. I offered instead to call the function that does it correctly, and everyone was much happier."</p>
+        <cite>A Self-Aware AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you know the numerical instruments an agent will call: the linear-phase and IIR filters of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, the recursive state estimators of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, the change and anomaly detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and the zero-shot forecasters of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a>. It follows <a class="cross-ref" href="section-22.1.html">Section 22.1</a>, which framed the agentic loop, and <a class="cross-ref" href="section-22.2.html">Section 22.2</a>, which built the evidence packet the agent reasons over. Here the agent stops merely reading precomputed evidence and starts <em>choosing which computation to run next</em>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A language model is a superb router and a terrible calculator. Ask it to estimate a spectral centroid from raw samples and it will produce a confident, wrong number; give it a <code>compute_spectrum</code> function and it will call it with the right arguments and read the answer correctly. Tool use is the design pattern that puts each job where it belongs: the deterministic, calibrated, testable numerical work stays in ordinary code (a bandpass filter, a CUSUM detector, a Kalman smoother, a forecasting foundation model), and the model's role is to decide <em>which</em> tool to invoke, with <em>what</em> parameters, in <em>what</em> order, and how to act on the result. The agent becomes an orchestrator of the entire toolbox this book has built, not a replacement for any single tool in it. This section is about wiring that toolbox to a model safely: how to describe a detector as a callable function, how the observe-reason-act loop drives a multi-step diagnosis, and how to keep every number the agent utters traceable to a tool that actually produced it.</p>
+    </div>
+
+    <h2>A tool is a typed instrument with a contract</h2>
+    <p>In agent terminology a <strong>tool</strong> is a function the model may call, described to it by a machine-readable schema: a name, a one-line purpose, and a typed parameter list. The model never sees the implementation; it sees only the contract and decides whether calling it advances the task. For sensing, the natural tools are the operators you already trust. A <code>bandpass</code> tool wraps a Butterworth filter with cutoff arguments in hertz. A <code>detect_change</code> tool wraps a CUSUM or a residual test and returns a changepoint index with a score. A <code>forecast</code> tool wraps a model such as TimesFM or Chronos and returns a horizon of predictions with quantiles. Each is a small, deterministic, unit-tested piece of code; the intelligence added by the agent is purely in the choreography.</p>
+    <p>The contract matters more than the code. A good sensing tool declares its <em>units</em> (hertz, milliseconds, g, not dimensionless integers), returns <em>structured</em> results rather than prose, and carries its own <em>uncertainty</em> so the model cannot silently drop it. If <code>detect_change</code> returns just an index, the agent may report a changepoint as certain fact; if it returns \(\{\text{index}, \text{score}, p\}\), the agent can reason about whether the evidence clears an action threshold. Design tool outputs the way you would design a lab instrument's readout: a value is never useful without its scale and its error bar, a discipline that traces straight back to the calibration language of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Never let the model do arithmetic it can delegate. Every quantitative claim an agent makes should be the return value of a tool call, not a token the model generated. This single rule eliminates the most damaging failure mode in sensing agents: fluent hallucinated numbers. A model that says "the bearing fault frequency is 162 Hz" from memory is guessing; a model that calls <code>peak_frequency(band=[120,220])</code> and reports what came back is measuring. Ground numbers in tools, and the agent's confidence becomes an honest reflection of the instruments underneath it.</p>
+    </div>
+
+    <h2>The observe-reason-act loop</h2>
+    <p>Tool use turns a one-shot prompt into an iterative loop, usually the ReAct pattern: the model emits a short reasoning trace, then a structured tool call; the runtime executes the call and appends the result; the model observes the result and either calls another tool or finishes. A diagnosis is rarely one call. A vibration agent might first <code>bandpass</code> a raw accelerometer window to isolate the shaft-order band, then <code>compute_spectrum</code> on the filtered signal, then <code>peak_frequency</code> to locate the dominant line, then <code>forecast</code> the trend of that peak's amplitude to estimate how many days remain before it crosses an alarm limit. No single tool answers "should I schedule maintenance"; the chain does, and the model's contribution is knowing that a spectral peak on a filtered signal is the right next step after a raw window looks suspicious.</p>
+    <p>Two properties make this loop trustworthy. Tools should be <strong>idempotent and deterministic</strong> so the same call yields the same result, which makes runs reproducible and cacheable (and keeps cost bounded, the subject of <a class="cross-ref" href="section-22.7.html">Section 22.7</a>). And every call plus its result should be <strong>logged as a transcript</strong>, giving you an auditable record of exactly which filter ran with which cutoffs on which window. When an operator later asks "why did you say the pump was failing," the answer is a replayable sequence of tool calls, not an opaque paragraph.</p>
+
+    <h2>Building the sensing toolbox</h2>
+    <p>Below is a minimal registry that exposes three sensing tools to a function-calling model. The <code>@tool</code> decorator captures each function's typed signature and docstring and emits the JSON schema that model APIs expect, so adding a new instrument is a matter of writing one plain Python function. The <code>dispatch</code> helper is what the runtime calls when the model returns a tool request; it validates arguments and returns a structured result the model reads on the next turn.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np, json
+
+REGISTRY = {}
+def tool(fn):
+    """Register a plain function as an agent-callable tool."""
+    REGISTRY[fn.__name__] = fn
+    return fn
+
+@tool
+def bandpass(signal: list, fs_hz: float, low_hz: float, high_hz: float) -> dict:
+    """Zero-phase bandpass filter. Returns the filtered window."""
+    x = np.asarray(signal, float)
+    f = np.fft.rfftfreq(len(x), 1 / fs_hz)
+    keep = (f >= low_hz) & (f <= high_hz)
+    y = np.fft.irfft(np.fft.rfft(x) * keep, n=len(x))
+    return {"filtered": y.round(4).tolist(), "band_hz": [low_hz, high_hz]}
+
+@tool
+def detect_change(signal: list, k: float = 0.5, h: float = 5.0) -> dict:
+    """Two-sided CUSUM change detector. Returns index, score, and a flag."""
+    x = np.asarray(signal, float)
+    z = (x - x.mean()) / (x.std() + 1e-9)
+    s_hi = np.maximum.accumulate(np.clip(np.cumsum(z - k), 0, None))
+    idx = int(np.argmax(s_hi)) if s_hi.max() > h else -1
+    return {"changepoint": idx, "score": float(s_hi.max()), "fired": idx >= 0}
+
+@tool
+def peak_frequency(signal: list, fs_hz: float) -> dict:
+    """Dominant spectral line and its relative prominence."""
+    x = np.asarray(signal, float)
+    mag = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    f = np.fft.rfftfreq(len(x), 1 / fs_hz)
+    i = int(np.argmax(mag[1:]) + 1)
+    return {"peak_hz": float(f[i]), "prominence": float(mag[i] / (mag.mean() + 1e-9))}
+
+def dispatch(call: dict) -> dict:
+    """Execute a model-issued tool call: {'name':..., 'args':{...}}."""
+    fn = REGISTRY[call["name"]]
+    return fn(**call["args"])
+
+# What the model emits on turn 2, after seeing a raw window looks odd:
+model_call = {"name": "bandpass",
+              "args": {"signal": list(np.random.randn(256)),
+                       "fs_hz": 2048, "low_hz": 120, "high_hz": 220}}
+print(json.dumps(dispatch(model_call))[:80], "...")
+</code></pre>
+    <div class="code-caption">A three-tool sensing registry with automatic dispatch. The model never touches the DSP; it emits a JSON call naming a tool and its arguments, and <code>dispatch</code> runs the trusted numerical code and returns a structured result the model reads on its next turn.</div>
+
+    <p>The registry pattern scales cleanly: a <code>kalman_smooth</code> tool from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and a <code>forecast</code> tool from <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-19-time-series-foundation-models/index.html">Chapter 19</a> drop in the same way, and the model composes them without any new orchestration code. The hard engineering is not the wiring, it is <em>routing</em>: teaching the model, through tool descriptions and a few worked examples, which instrument fits which symptom. A crisp description ("use <code>detect_change</code> for step or drift shifts in slow telemetry; use <code>peak_frequency</code> for periodic mechanical faults in fast vibration") does most of the routing work.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: the wind-turbine gearbox agent</h3>
+        <p>A utility runs an agent over nacelle accelerometers on 400 turbines. An alert fires on turbine 118. The agent calls <code>bandpass(120, 220)</code> to isolate the gear-mesh band, then <code>peak_frequency</code>, which returns 162 Hz with high prominence; a lookup tool maps that to the intermediate-shaft gear-mesh line. It then pulls the last 90 days of that peak's amplitude and calls <code>forecast</code>, which projects the trend crossing the vibration alarm limit in roughly eleven days with an 80 percent interval of six to nineteen. The agent writes a work order: "Intermediate-shaft gear-mesh amplitude trending up, projected alarm in about 11 days (6 to 19), inspect at next low-wind window." Every number in that sentence is a tool return, not a guess. The maintenance planner schedules a crane during a calm forecast window instead of after a failure, and the whole chain is replayable from the logged transcript.</p>
+    </div>
+
+    <h2>Routing, grounding, and graceful failure</h2>
+    <p>Three disciplines separate a demo from a deployable agent. <strong>Routing</strong> must degrade safely: if no tool fits, the agent should say so and escalate rather than force an irrelevant call, and you constrain the space by exposing only the tools relevant to the asset class. <strong>Grounding</strong> must be enforced, not hoped for: a post-hoc check can verify that every numeral in the agent's final message appears in some tool result, rejecting outputs that smuggle in invented figures. <strong>Failure</strong> must be a first-class return: tools should surface errors as structured objects (a saturated sensor, a too-short window, an out-of-range cutoff) so the model can react, perhaps by widening the window and retrying, instead of receiving a stack trace it cannot interpret. An agent that handles a "signal too short for this band" error by requesting more data is behaving like an engineer; one that hallucinates a result to fill the gap is the reason people distrust these systems.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Library Shortcut</h3>
+        <p>Writing the schema-generation, argument validation, retry, and transcript plumbing by hand runs to roughly 200 lines and is easy to get subtly wrong. Frameworks that expose native function calling (the OpenAI and Anthropic tool APIs, or orchestration layers such as LangGraph and LlamaIndex) reduce the registry-and-loop wiring above to about 15 lines: you decorate each Python function, hand the list to the client, and the framework handles JSON-schema emission, the multi-turn tool loop, parallel calls, and result marshalling. Keep writing the detectors and filters yourself, since those are your trusted numerical core; let the library own only the model-to-tool glue.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Extend the registry with a <code>forecast(signal, horizon)</code> tool that returns a point path plus 10th and 90th percentile bands (a naive drift model is fine). Then write a grounding checker that scans an agent's final text, extracts every number, and flags any that does not appear in the concatenated tool results within a tolerance. Feed it a message that contains one hallucinated figure and confirm the checker catches it. Which numeric formats (scientific notation, units, rounding) break naive matching, and how would you normalize them?</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p>1. Why is delegating arithmetic to tools, rather than letting the model compute, the central safety move in this pattern?</p>
+        <p>2. A tool returns only a changepoint index with no score. What reasoning failure does that invite, and what would you add to the return value?</p>
+        <p>3. Give a concrete sensing task where the correct behavior is for the agent to call <em>no</em> tool and escalate to a human instead.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-22.5.html">Section 22.5</a>, we let several tool-using agents collaborate: a recursion-of-thought structure in which specialist agents call their own toolboxes and pass partial conclusions to a coordinator, turning the single diagnostic chain of this section into a full multi-agent root-cause investigation.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

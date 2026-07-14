@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.4: LLM-based reasoning over sensor streams (LLaSA, SensorLLM, HARGPT, LLMSense). Building Sensory AI." name="description"/>
+<title>Section 21.4: LLM-based reasoning over sensor streams (LLaSA, SensorLLM, HARGPT, LLMSense) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Multimodal Sensor-Language Models and Sensor Reasoning</a></div>
+<h1>LLM-based reasoning over sensor streams (LLaSA, SensorLLM, HARGPT, LLMSense)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They handed me three columns of accelerometer numbers and asked what the person was doing. I did not run a classifier. I reasoned: the periodicity says walking, the amplitude says a stairwell, the drift says fatigue. Then I wrote down why."</p><cite>A Deliberative AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Section 21.3 asked a sensor-language system a question and expected an answer. This section asks it to <em>show its work</em>. Reasoning over a sensor stream means chaining several inference steps: read a raw signal, name the intermediate observations (periodicity, amplitude, transients, co-occurrence across channels), and combine them into a conclusion that a human can audit. Four systems anchor the design space. <strong>HARGPT</strong> feeds raw inertial readings to a general-purpose LLM as text and coaxes step-by-step activity inference through prompting alone. <strong>SensorLLM</strong> and <strong>LLaSA</strong> attach a learned sensor encoder to a frozen LLM so the model reasons over embeddings instead of digits. <strong>LLMSense</strong> lifts the horizon from seconds to days, reasoning over long spatiotemporal traces where no single window holds the answer. The unifying question is not "can the model classify" but "can it explain a physical signal in steps you would accept from a domain expert."</p>
+</div>
+
+<p>This section assumes you have met sensor-to-language alignment (Section 21.1) and sensor question answering (Section 21.3), and that you know how a transformer ingests a tokenized series from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. The activity-recognition targets used throughout come from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>, and the sensor encoders that feed the aligned models are the self-supervised backbones of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. You do not need to train an LLM; every technique here treats the language model as a fixed reasoning engine and varies only how the signal reaches it.</p>
+
+<h2>Two interfaces: textualize the signal or encode it</h2>
+<p><strong>What</strong> separates the four systems is the interface between the physical stream and the language model. The <em>textualization</em> route serializes raw readings into a string and drops it into the prompt, so an accelerometer window becomes literally the characters <code>"0.98, 1.02, 0.71, ..."</code>. The <em>encoder</em> route passes the window through a trained sensor backbone, projects the resulting embedding into the LLM's token space, and lets the model attend to those soft tokens exactly as it attends to words. <strong>Why</strong> the choice matters: textualization needs zero training and works with any hosted model, but it burns context tokens fast and forces the LLM to recover structure from digits it was never pretrained on. Encoding is compact and accurate but requires an alignment stage and a specific model. <strong>When</strong> to pick which follows a simple rule: reach for textualization when you have a capable general LLM and short windows and no training budget; reach for an encoder when windows are long, accuracy is critical, or the signal is far from anything the LLM saw in text.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: reasoning is captioning plus a verifiable chain</h3>
+<p>Captioning (Section 21.2) produces a description; reasoning produces a description <em>and the intermediate signal evidence that licenses it</em>. The practical consequence is that every reasoning prompt should force the model to externalize its observations before its verdict: "state the dominant frequency, the peak-to-peak amplitude, and any transients, then conclude." A verdict without a chain is a guess you cannot debug. A chain lets you check each link against the raw signal, which is the only reason to prefer an LLM over a black-box classifier for a physical decision in the first place.</p>
+</div>
+
+<h2>Direct textual prompting: the HARGPT recipe</h2>
+<p>HARGPT showed that a strong general LLM, given raw IMU readings as text, can recognize human activities zero-shot, without any sensor-specific training. The result is surprising because the model never saw labeled accelerometer traces, yet it reaches high accuracy on activity benchmarks. <strong>How</strong> the recipe works rests on three prompt-engineering moves. First, an <em>expert persona</em>: instruct the model to act as an experienced inertial-signal analyst, which shifts it toward domain vocabulary. Second, <em>chain-of-thought</em>: demand explicit intermediate reasoning about frequency, amplitude, and gravity direction before the label, so the model computes structure rather than pattern-matching a number soup. Third, <em>light preprocessing in words</em>: tell the model the sampling rate and axis meaning so it can convert sample indices to seconds and interpret the constant near \(9.8\,\mathrm{m/s^2}\) as gravity. The window must be short; at 50 Hz a ten-second clip is 500 rows per axis, and packing three axes as text quickly saturates the context window, so downsampling or summarizing long streams is mandatory rather than optional.</p>
+
+<pre><code class="language-python">def hargpt_prompt(window, fs_hz, axes=("ax", "ay", "az")):
+    """Serialize an IMU window into a chain-of-thought HAR prompt.
+    `window` is shape (T, 3): accelerometer rows in m/s^2."""
+    rows = "\n".join(
+        f"t={i/fs_hz:.2f}s  " + "  ".join(f"{a}={v:+.2f}" for a, v in zip(axes, r))
+        for i, r in enumerate(window)
+    )
+    return (
+        "You are an expert inertial-signal analyst. The rows below are a "
+        f"tri-axial accelerometer clip sampled at {fs_hz} Hz, units m/s^2; "
+        "a resting axis reads about 9.8 (gravity).\n\n"
+        f"{rows}\n\n"
+        "Reason step by step: (1) estimate the dominant frequency, "
+        "(2) the peak-to-peak amplitude, (3) which axis holds gravity and "
+        "whether orientation changes, (4) any abrupt transients. "
+        "Only then name the activity and justify it from steps 1-4."
+    )
+</code></pre>
+<div class="code-caption">A HARGPT-style prompt builder: it timestamps every sample, tells the model the sampling rate and the gravity cue, and forces four named observations before the verdict. The four-step scaffold is what turns a bare classification into an auditable chain; the exercise below stress-tests it against window length.</div>
+
+<p>The <code>hargpt_prompt</code> helper above makes the cost visible: the serialized <code>rows</code> block is the token budget, and it grows linearly with window length times channel count. That single line of intuition explains why textualization does not scale to the multi-sensor, multi-hour setting and why encoder-based models exist.</p>
+
+<h2>Encoder-aligned reasoning: SensorLLM and LLaSA</h2>
+<p>SensorLLM and LLaSA both replace the digit string with a learned representation. <strong>SensorLLM</strong> uses a two-stage design familiar from vision-language models: a <em>sensor-language alignment</em> stage teaches a frozen LLM to consume embeddings from a time-series encoder by training on automatically generated trend and statistic descriptions, then a task stage adapts the aligned model to activity recognition. The payoff is that the model matches or beats specialized deep classifiers while retaining the ability to explain, and it handles channel counts and sequence lengths that would overflow a text prompt. <strong>LLaSA</strong> (Large Language and Sensor Assistant) couples an inertial encoder with an LLM and trains on paired sensor-question-answer and caption corpora so the assistant answers open-ended, multi-step questions about motion rather than emitting a single label. Both inherit the alignment machinery of Section 21.1: a projection layer maps encoder features into the LLM embedding space, and only that projection (plus optional low-rank adapters) is trained, so the language reasoning learned during pretraining is preserved. Because these systems are trained, the leakage discipline of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a> applies in full: subject-disjoint splits, or the reported reasoning accuracy is fiction.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a fall-risk review in a rehab clinic</h3>
+<p>A physiotherapy clinic streams waist-worn IMU from patients relearning to walk. Rather than a bare "walking / not walking" tag, the clinicians want a short reasoned note per session. An encoder-aligned assistant of the LLaSA family ingests each ten-minute session as embeddings and produces: "Gait cadence 0.9 Hz, below the 1.1 Hz baseline; step-time asymmetry rising across the session; two near-stumble transients at minutes 6 and 8 on the anterior-posterior axis. Interpretation: fatigue-driven asymmetry, elevated fall risk in the final third." Every clause is traceable to a signal feature, so the physiotherapist can confirm it against the raw trace before acting. A textualized prompt could not hold a ten-minute multi-axis session in context; the encoder route is what makes the session-level reasoning feasible.</p>
+</div>
+
+<h2>Long-horizon trace reasoning: the LLMSense pattern</h2>
+<p>HARGPT reasons over seconds; many real questions span days. LLMSense targets exactly this: high-level reasoning over long-term, spatiotemporal sensor traces, such as inferring behavioral changes from weeks of ambient-sensor firings or spotting a decline pattern in a smart-home log. <strong>How</strong> it copes with traces far longer than any context window is a two-stage pipeline. First, <em>perception</em> compresses raw or per-event data into compact textual summaries, one per manageable chunk, so a day of motion-sensor events becomes a paragraph. Second, <em>reasoning</em> runs the LLM over the sequence of summaries to answer the global question. To keep this tractable and grounded, LLMSense borrows two ideas the next section develops: chunk-level summarization to fit the horizon, and retrieval so the reasoning stage pulls only the relevant summaries rather than all of them. The design directly foreshadows the retrieval-augmented sensor reasoning of <a class="cross-ref" href="section-21.5.html">Section 21.5</a> and the tool-using sensor agents of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: the reasoning loop in a dozen lines</h3>
+<p>Wiring textualization, an expert-persona system prompt, chain-of-thought parsing, and multi-chunk summarization by hand is easily 300 to 500 lines once you add retry logic, token accounting, and output validation. A modern LLM SDK plus a light orchestration layer (for example a <code>litellm</code> or <code>guidance</code> call wrapped in a chunk-map-reduce) collapses the HARGPT path to a single <code>chat.completions</code> call over the string from <code>hargpt_prompt</code>, and the LLMSense path to a map step (summarize each chunk) followed by a reduce step (reason over summaries). Roughly a 20-to-1 reduction, and the SDK owns retries, streaming, and structured-output parsing so you own only the prompt design.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: from labels to auditable physical reasoning</h3>
+<p>The 2024-2026 frontier is moving past single-label activity recognition toward reasoning that survives scrutiny. HARGPT established zero-shot IMU reasoning by prompting alone; SensorLLM and LLaSA showed that a lightweight alignment layer lets a frozen LLM match specialized classifiers while explaining itself; LLMSense pushed reasoning to multi-day traces via summarize-then-reason. The open problems are faithfulness (does the stated chain reflect the signal, or is it a plausible confabulation), calibration of the verdict, and robustness when the sensor drifts. Coupling these systems with the conformal guarantees of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> and the grounding checks of Section 21.6 is where the field is headed, because a reasoning chain that cannot be verified against physics is a liability, not a feature.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using <code>hargpt_prompt</code> and any hosted LLM, reproduce a slice of the HARGPT result. (1) On a labeled IMU set, compare zero-shot accuracy with and without the four-step chain-of-thought scaffold; quantify how much the scaffold buys you. (2) Sweep window length from 2 s to 20 s at 50 Hz and plot accuracy against prompt token count; find the point where context saturation degrades reasoning. (3) For the ten longest sessions, implement the LLMSense summarize-then-reason pattern: chunk each session, summarize chunks, and answer a session-level question over the summaries. Report where the two-stage pipeline beats a single truncated prompt.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Give one signal characteristic that makes textualization (HARGPT) a poor fit and encoder alignment (SensorLLM) the right call. 2. Why does forcing intermediate observations before the label improve both accuracy and auditability? 3. In the LLMSense pattern, what specifically overflows a single prompt, and which of the two stages solves it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-21.5.html">Section 21.5</a>, we open up the prompting and retrieval machinery that the LLMSense pattern only sketched: how to structure sensor context, how to retrieve the right historical windows or reference signals to place beside a query, and how retrieval-augmented generation grounds a reasoning chain in evidence the model can cite rather than invent.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

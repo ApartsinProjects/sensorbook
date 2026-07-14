@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.2: Anomaly explanation and root-cause reasoning with LLMs. Building Sensory AI." name="description"/>
+<title>Section 22.2: Anomaly explanation and root-cause reasoning with LLMs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>Anomaly explanation and root-cause reasoning with LLMs</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The detector told me channel 7 crossed three sigma at 02:14. Thrilling. Nobody at 2am wants a z-score; they want to know whether to call the on-call engineer or go back to sleep."</p>
+        <cite>A Diagnostic AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the detectors that produce the alerts: the residual, CUSUM, and density methods of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> and the condition-monitoring pipelines of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>. It assumes the attribution and causal-tracing machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>, because an LLM explanation is only as honest as the attributions you feed it, and the predictive-uncertainty language of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. It follows <a class="cross-ref" href="section-22.1.html">Section 22.1</a>, which framed the shift from single-shot inference to an agentic loop; here we zoom into the single most valuable thing that loop does, turning a flag into a defensible causal story.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A classical detector answers <em>when</em> and <em>where</em>: a score crossed a threshold on some channel at some timestamp. An operator needs three more answers before acting: <em>what</em> is physically happening, <em>why</em> it happened, and <em>whether it matters</em>. That gap, between a number and an actionable narrative, is where an LLM earns its place in the sensing stack. The model does not detect the anomaly; the detector already did that far more cheaply and reliably. The model reads a structured bundle of evidence around the anomaly, reasons over it the way a seasoned engineer reads a trend screen, and returns a ranked set of candidate causes with the evidence for each. This section is about doing that well: what evidence to assemble, which reasoning patterns actually produce correct root causes rather than fluent guesses, and how to keep the model from inventing a tidy story that the data does not support.</p>
+    </div>
+
+    <h2>From a flag to an explanation</h2>
+    <p>Detection and explanation are different problems, and conflating them is the most common design error in this space. Detection is a hypothesis test: is this window anomalous, yes or no, with what confidence. Explanation is abductive inference: given that it is anomalous, what is the most plausible generating cause. The first is well served by the statistics and neural scorers of earlier parts precisely because it needs no world knowledge; a residual is large or it is not. The second is exactly where large models help, because naming a cause requires connecting a numeric pattern to a mechanism (a clogged filter, a drifting reference voltage, a loosening mount) and that mapping lives in text, manuals, and prior incidents rather than in the signal itself.</p>
+    <p>Concretely, the LLM's job is to take a detection event and produce an <strong>explanation object</strong>: a short causal narrative, a ranked list of candidate root causes each with a confidence and its supporting evidence, and a recommended next action or diagnostic test. The narrative must be grounded, meaning every claim traces back to a value in the evidence you supplied, not to the model's imagination. Ungrounded fluency is the failure mode that makes operators stop trusting the system, so the whole design is organized around forcing grounding.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The LLM is a reasoning layer bolted on top of a detector, not a replacement for it. Ask a model to both find and explain anomalies from raw samples and it does both badly: it hallucinates events that a CUSUM would never flag and misses subtle drifts a matched filter catches instantly. Split the labor. Cheap, calibrated, deterministic detectors decide <em>that</em> something is wrong; the expensive language model, invoked only on confirmed events, decides <em>what</em> and <em>why</em>. This division also controls cost, the concern of <a class="cross-ref" href="section-22.7.html">Section 22.7</a>, because the model runs on the rare event rather than every sample.</p>
+    </div>
+
+    <h2>The evidence packet: what you put in front of the model</h2>
+    <p>An LLM cannot reason over a megabyte of raw samples, and it should not try. The engineering that determines explanation quality is the construction of a compact, structured <strong>evidence packet</strong> that puts the diagnostically relevant facts in front of the model in a form it can read. A good packet has five ingredients. First, the detection metadata: which channel, which timestamp, which detector, and the anomaly score expressed as an interpretable quantity such as \(z = (x - \mu)/\sigma\) rather than a raw model output. Second, the local shape: a short, decimated snippet of the offending signal and its recent baseline, so the model can see whether this was a spike, a step, a ramp, or a variance change. Third, contemporaneous context: what the <em>other</em> correlated channels did in the same window, because root causes usually leave a fingerprint across several sensors. Fourth, static context: the asset's identity, its recent maintenance history, and any active work orders. Fifth, precedent: the closest past incidents retrieved from an incident store, which anchor the model in what has actually caused this signature before.</p>
+    <p>The listing below assembles such a packet from a detection event and serializes it as compact JSON, the format models parse most reliably. Note that it summarizes the waveform into a handful of descriptive statistics and a coarse trend token rather than dumping samples; this is the single highest-leverage choice in the whole pipeline.</p>
+
+    <pre class="language-python"><code class="language-python">import json
+import numpy as np
+
+def trend_token(x):
+    """Collapse a window into a human-readable shape label."""
+    slope = np.polyfit(np.arange(len(x)), x, 1)[0]
+    jump = abs(x[-1] - x[0]) / (x.std() + 1e-9)
+    if jump > 3 and slope > 0:   return "step_up"
+    if jump > 3 and slope < 0:   return "step_down"
+    if slope > 0:                return "ramp_up"
+    if slope < 0:                return "ramp_down"
+    return "flat_variance_change"
+
+def build_evidence_packet(event, window, baseline, siblings, meta, precedents):
+    z = (window[-1] - baseline.mean()) / (baseline.std() + 1e-9)
+    packet = {
+        "detection": {"channel": event["channel"], "ts": event["ts"],
+                      "detector": event["detector"], "z_score": round(float(z), 2)},
+        "signal_shape": {"trend": trend_token(window),
+                         "peak": round(float(window.max()), 3),
+                         "baseline_mean": round(float(baseline.mean()), 3)},
+        "correlated_channels": {name: trend_token(sig)      # what else moved
+                                for name, sig in siblings.items()},
+        "asset_context": meta,                              # id, last service, open work orders
+        "similar_past_events": precedents,                  # retrieved root causes + fixes
+    }
+    return json.dumps(packet, indent=2)</code></pre>
+    <div class="code-caption"><strong>Listing 22.2.1.</strong> Building a grounded evidence packet from a detection event. The waveform is compressed to a shape token and a few statistics, the sibling channels supply the cross-signal fingerprint a root cause leaves, and retrieved precedents anchor the model. This serialized object, not raw samples, is what the LLM reasons over.</div>
+
+    <p>Listing 22.2.1 embodies the grounding discipline: every field the model will later cite already exists in the packet, so a claim like "this looks like the bearing-wear signature from work order 4471" can be checked against the <code>similar_past_events</code> field rather than taken on faith. Retrieval of those precedents is a sensor-language grounding problem in its own right, developed in <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>You do not hand-write the prompt scaffolding, the JSON schema enforcement, and the precedent retrieval loop. A framework such as LangChain or LlamaIndex wires the evidence packet into a structured-output call with a Pydantic schema for the explanation object, a vector store for the incident precedents, and automatic retry on schema violations. The structured-output constraint alone (forcing the model to return a validated list of <code>{cause, confidence, evidence}</code> records) replaces roughly 60 to 80 lines of manual JSON parsing, validation, and re-prompting with a single decorated function, and it eliminates the class of bugs where a model returns prose where you expected fields. What you still own is the packet content of Listing 22.2.1; the plumbing around it is a solved problem.</p>
+    </div>
+
+    <h2>Reasoning patterns that produce correct causes</h2>
+    <p>Handing a model an evidence packet and asking "why?" gives a fluent answer, not a reliable one. Three structured reasoning patterns raise accuracy sharply. The first is <strong>differential diagnosis</strong>: instruct the model to enumerate several candidate causes first, then argue for and against each against the evidence, then rank. Borrowed from clinical reasoning, this forces breadth before commitment and suppresses the anchoring failure where the model latches onto its first guess. The second is <strong>hypothesize-and-test</strong>: the model proposes a cause, states what the evidence <em>should</em> show if the cause were true, and checks the packet for that signature. If a bearing fault is hypothesized, the model should predict elevated high-frequency vibration on the co-located accelerometer and then look for it in <code>correlated_channels</code>; absence is disconfirming. The third is <strong>causal-graph traversal</strong>, where a known dependency graph of the plant (pump feeds heat exchanger feeds outlet sensor) lets the model walk upstream from the symptomatic channel to its plausible sources rather than reasoning over an unstructured soup of signals.</p>
+    <p>These patterns matter because they convert the model's fluency from a liability into an asset. Chain-of-thought over a well-ordered evidence packet lets the model do the tedious cross-referencing a human diagnostician does, while the explicit disconfirmation step is what separates root-cause reasoning from confident storytelling. The multi-agent elaboration of these patterns, where separate agents propose and critique hypotheses, is the subject of <a class="cross-ref" href="section-22.5.html">Section 22.5</a>.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: the wind turbine that blamed the wrong part</h3>
+        <p>An operator of an offshore wind fleet ran vibration and temperature monitoring on every gearbox. One night the residual detector of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> flagged a slow <code>ramp_up</code> on gearbox oil temperature, z of 4.1. The first LLM prototype, given only that channel, produced a confident and wrong explanation: "gearbox bearing degradation, schedule replacement." Expensive, and it would have grounded a turbine for a week. The team rebuilt the packet as in Listing 22.2.1 to include the correlated channels, and the picture inverted. Oil temperature was ramping, but bearing vibration was flat and, crucially, the nacelle cooling-fan current had dropped to zero six hours earlier. Under differential diagnosis the model now ranked "cooling-fan failure causing secondary oil-temperature rise" above "bearing wear," predicted that a true bearing fault would show vibration (which was absent), and recommended the cheap fix. The root cause was a seized cooling fan. The lesson was not that the model got smarter; it was that the cross-signal fingerprint in the packet made the correct cause the one best supported by evidence, and the hypothesize-and-test pattern let the model rule out the expensive wrong answer.</p>
+    </div>
+
+    <h2>Grounding the causal claim and evaluating it</h2>
+    <p>The deepest hazard is that an LLM will narrate a cause from a correlation. Two channels moving together in one window is not a mechanism, and a model trained to be helpful will happily supply the missing "because." Three guardrails keep it honest. Insist on <strong>evidence citation</strong>: every ranked cause must point at specific packet fields, and a cause with no cited evidence is dropped, not shown. Force <strong>uncertainty expression</strong> in calibrated terms rather than false precision, connecting to the calibration discipline of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>; "moderate confidence, consistent with two of three expected signatures" beats an invented 92 percent. And keep a human in the loop for any action whose cost exceeds the model's demonstrated reliability, the guardrail architecture of <a class="cross-ref" href="section-22.6.html">Section 22.6</a>.</p>
+    <p>Evaluation is subtle because a fluent explanation and a correct one look identical to a casual reader. You cannot score these systems on language quality alone. The workable protocol scores explanations against a labeled incident registry: for each historical anomaly with a known, confirmed root cause, does the system's top-ranked cause match, and how far down the ranked list is the truth when it misses (a top-3 recall metric). This requires the leakage-safe splitting of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, since an incident the model saw in a retrieval store is not a fair test of its reasoning. The uncomfortable truth is that many impressive-looking anomaly copilots have never been scored this way, and a copilot that cannot beat "return the most common past cause for this asset" is not reasoning, it is guessing with good grammar.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>The live question is whether LLMs perform genuine causal reasoning over telemetry or sophisticated pattern completion. Benchmarks that pit models against labeled root-cause datasets, drawn from IT observability (the RCABench and related incident corpora) and increasingly from industrial telemetry, consistently show that raw chat models underperform, while agents given structured evidence packets, retrieval over past incidents, and explicit hypothesis-testing prompts close much of the gap. The 2024 to 2025 industrial-copilot systems taken up in <a class="cross-ref" href="section-22.3.html">Section 22.3</a> (Argos, AgentFM, and CALM) are the current reference points; their reported gains come far more from disciplined evidence assembly and tool-grounded verification than from a larger base model. The open frontier is causal grounding: coupling the language model to an explicit causal graph or an intervention model so that "A caused B" is a claim the system can test rather than assert. Until that is routine, the honest posture is to treat every LLM root cause as a ranked hypothesis awaiting confirmation, not a verdict.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a labeled anomaly from any monitoring dataset (a pump, an ECG lead, a server metric) where the true cause is known. (1) Build an evidence packet with Listing 22.2.1, including at least two correlated channels; feed it to a model and record its top-3 causes. (2) Now strip the <code>correlated_channels</code> field and re-run: does the ranking degrade, and does the model become more or less confident? Explain what this tells you about where the diagnostic information actually lives. (3) Add a fabricated precedent to <code>similar_past_events</code> that points at a wrong cause, and see whether the model is anchored by it; use the result to argue for or against including retrieved precedents in your production packet, and what verification you would add.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why is detection a poor fit for an LLM while explanation is a good one? Frame your answer in terms of what each task requires that the other does not.</p>
+        <p class="quiz-question">2. The evidence packet compresses a waveform to a shape token plus statistics instead of raw samples. Give two distinct reasons this improves explanation quality, not just cost.</p>
+        <p class="quiz-question">3. An operator shows you a fluent, confident LLM root-cause report and asks if the system is good. What single measurement would you demand before answering, and why does language quality not settle it?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-22.3.html">Section 22.3</a>, we scale this reasoning from a single anomaly to the flood of logs and telemetry a real operation emits, and study the industrial copilots built for exactly that: Argos, AgentFM, and CALM. You will see how the evidence-packet idea generalizes to log reasoning, how retrieval over massive telemetry histories replaces the hand-picked precedents used here, and where these production systems draw the line between what the agent decides and what it escalates to a human.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

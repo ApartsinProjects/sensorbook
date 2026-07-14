@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.2: Sensor-to-text: captioning and describing signals. Building Sensory AI." name="description"/>
+<title>Section 21.2: Sensor-to-text: captioning and describing signals | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Multimodal Sensor-Language Models and Sensor Reasoning</a></div>
+<h1>Sensor-to-text: captioning and describing signals</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I was asked to describe the signal. I wrote 'the patient is definitely walking briskly on a treadmill.' The strap had fallen off two minutes earlier. Nobody checked the timestamp but me, and I lied."</p>
+        <cite>A Loquacious AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the sensor-to-language alignment of <a class="cross-ref" href="section-21.1.html">Section 21.1</a>: it assumes you already have an encoder that maps a raw window into an embedding sharing a space with text. The encoder itself comes from <a class="cross-ref" href="../module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a> and the self-supervised objectives of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. The transformer decoder machinery is from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>, and the feature vocabulary a caption reaches for (spectral bands, statistical moments) is from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>. Appendix J holds the notation.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Section 21.1 gave sensor windows a passport into the language space. This section spends that passport on the first genuinely useful trip: turning a stretch of accelerometer, PPG, or vibration data into a paragraph a human, or another model, can read. Sensor captioning is the bridge between a classifier that emits <code>label=7</code> and a system that says "roughly forty seconds of stair-climbing, cadence rising, with a two-second stumble near the end." That sentence is not decoration. It is the interface layer for everything downstream in this chapter: question answering (<a class="cross-ref" href="section-21.3.html">Section 21.3</a>) needs a describable signal, and reasoning agents (<a class="cross-ref" href="section-21.4.html">Section 21.4</a>) reason over descriptions, not raw tensors. Get captioning right, and you have a universal, inspectable representation. Get it wrong, and you have a machine that hallucinates fluent nonsense about physical events that never happened.</p>
+    </div>
+
+    <p>Captioning is the sensor analogue of image captioning, but with a crueler evaluation problem: a reader can glance at a photo and judge whether "a dog on a beach" is right, yet almost nobody can look at a 200 Hz triaxial accelerometer trace and verify "descending stairs." The ground truth lives in metadata, video, or a clinician's note, never in the signal a human can eyeball. That asymmetry shapes every design choice below, and it is why grounding and verification earn their own section (<a class="cross-ref" href="section-21.6.html">Section 21.6</a>).</p>
+
+    <h2>What "describing a signal" actually means</h2>
+
+    <p><strong>What</strong> we are building is a conditional language model \(p_\theta(\mathbf{y} \mid \mathbf{x})\) that emits a token sequence \(\mathbf{y} = (y_1, \dots, y_T)\) given a raw sensor window \(\mathbf{x} = \{x_c(t)\}\). <strong>Why</strong> this is not just classification with extra steps: a label is one draw from a fixed, closed vocabulary, while a caption composes an open-ended description across several axes at once. A good sensor caption typically layers three things: (1) <em>a semantic event</em> ("brushing teeth"), (2) <em>quantitative signal properties</em> ("dominant energy near 2 Hz, amplitude growing over the window"), and (3) <em>context and caveats</em> ("brief signal dropout at second 12; motion artifact likely"). Layer (2) is what makes sensor captioning different from image captioning: the caption is expected to be numerically literate about the physics, not merely name the activity.</p>
+
+    <p><strong>How</strong> the levels differ in ambition matters for how you train. The weakest useful captioner is <em>templated</em>: a classifier plus a slot-filling sentence ("Detected {activity} for {duration}s at {confidence}"). It never hallucinates because it never composes, but it also cannot say anything the template author did not anticipate. The strongest is a <em>free-form generative</em> captioner that can describe events no label set enumerated, at the cost of being able to invent them. Most production systems live in between, and knowing where you sit on that spectrum is the single most important decision in the section.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Fluency is free; faithfulness is expensive. A decoder fine-tuned on a few thousand sensor-caption pairs will immediately produce grammatical, confident, plausible-sounding descriptions. Whether those descriptions track the actual signal is an entirely separate property that fluency actively disguises. The core engineering task in sensor captioning is not making the model talk well. It is stopping a model that already talks well from talking past the data.</p>
+    </div>
+
+    <h2>Architectures: prefix mapping versus adapter fusion</h2>
+
+    <p>Two families dominate. The first, and by far the most practical, is the <strong>prefix (or soft-prompt) mapping</strong> approach: freeze a pretrained language model, freeze (or lightly tune) the sensor encoder from <a class="cross-ref" href="section-21.1.html">Section 21.1</a>, and train only a small projection network \(g_\phi\) that turns the encoder output into a short sequence of "virtual tokens" prepended to the text prompt. The language model then decodes as if those vectors were words. This is the sensor cousin of how prefix-tuned image captioners and IMU2CLIP-style encoders bolt a perception module onto a frozen decoder. <strong>Why</strong> it wins in practice: it touches only a few million trainable parameters, so it fine-tunes on a modest sensor-caption corpus without catastrophically forgetting the language model's fluency, and it keeps the expensive decoder reusable across sensor modalities.</p>
+
+    <p>The second family, <strong>cross-attention adapter fusion</strong>, inserts trainable cross-attention layers inside the decoder so every generated token can attend back to the full sequence of sensor patch embeddings, not just a fixed-length prefix. This preserves fine temporal detail (useful when a caption must localize "a stumble near second 38"), at the cost of more trainable parameters and a decoder you can no longer swap freely. Choose prefix mapping when you want a portable, cheap captioner over window-level summaries; choose adapter fusion when the caption must reference specific moments within a long window.</p>
+
+    <pre><code class="language-python">import torch, torch.nn as nn
+
+class PrefixSensorCaptioner(nn.Module):
+    """Map a frozen sensor embedding into K virtual tokens for a frozen LLM."""
+    def __init__(self, sensor_encoder, llm, d_sensor=256, k_tokens=8):
+        super().__init__()
+        self.encoder = sensor_encoder.eval().requires_grad_(False)  # from 21.1
+        self.llm = llm.eval().requires_grad_(False)                 # frozen decoder
+        d_llm = llm.config.hidden_size
+        # The ONLY trainable part: a projection into k virtual tokens.
+        self.project = nn.Sequential(
+            nn.Linear(d_sensor, d_llm), nn.GELU(),
+            nn.Linear(d_llm, k_tokens * d_llm))
+        self.k, self.d_llm = k_tokens, d_llm
+
+    def prefix(self, window):                 # window: (B, C, T) raw sensor
+        with torch.no_grad():
+            z = self.encoder(window)          # (B, d_sensor)
+        return self.project(z).view(z.size(0), self.k, self.d_llm)  # (B, K, d_llm)
+
+    def forward(self, window, prompt_embeds):
+        soft = self.prefix(window)            # sensor "words"
+        inputs = torch.cat([soft, prompt_embeds], dim=1)
+        return self.llm(inputs_embeds=inputs).logits   # next-token logits
+</code></pre>
+    <div class="code-caption">A prefix-mapping captioner: the encoder and language model are frozen, and only <code>project</code> learns to translate one sensor embedding into <code>k_tokens</code> virtual words the decoder can read. This is the minimal skeleton behind the "sensor speaks to a frozen LLM" pattern; a real trainer adds the caption tokens as labels and optimizes cross-entropy on them alone.</div>
+
+    <p>The snippet above makes the parameter economy concrete: everything is frozen except <code>project</code>, so the gradient only ever flows through a two-layer MLP. That is why this pattern trains on a laptop-scale corpus while a full multimodal pretraining run does not.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool: Library Shortcut</h3>
+        <p>Wiring soft prefixes, tokenizer alignment, generation, and beam search by hand is roughly 150 to 200 lines of fiddly glue. With Hugging Face <code>transformers</code>, a model that accepts <code>inputs_embeds</code> lets you reuse <code>model.generate(inputs_embeds=torch.cat([soft, prompt], 1))</code> directly, so decoding, sampling, and stopping criteria are one call instead of a hand-rolled loop. The prefix trick collapses the whole "make an LLM read a non-text modality" problem to about 30 lines: define the projection, freeze the rest, train on caption cross-entropy. The library owns the decoder, the KV cache, and the generation strategy; you own only the projection.</p>
+    </div>
+
+    <h2>Where captions come from: the data bottleneck</h2>
+
+    <p>The hard part is never the architecture; it is the supervision. Sensor-caption pairs do not exist in the wild the way image-alt-text pairs do, so teams manufacture them. <strong>Three</strong> recipes recur. First, <em>label-to-caption templating</em>: take an existing labeled activity dataset and expand each label plus computed features into a sentence, optionally rewritten by an LLM for variety. Second, <em>feature narration</em>: compute an interpretable feature panel (dominant frequency, RMS trend, zero-crossing rate, peak intervals from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>) and prompt a strong LLM to narrate those numbers into prose, which grounds the caption in real measurements rather than free invention. Third, <em>expert annotation</em>, expensive but essential for clinical work. Recent sensor-language efforts such as the <strong>SensorCaps</strong> corpus (the captioning dataset introduced alongside the LLaSA work) combine templating and LLM narration precisely because pure human annotation does not scale to the token counts an LLM decoder needs.</p>
+
+    <div class="callout warning">
+        <h4>Leakage hides inside the caption generator</h4>
+        <p>When an LLM writes your captions from labels, the caption inherits the label. If the same LLM (or the same label-derived text) then supervises your captioner and later scores it, you have built a closed loop that measures paraphrase quality, not signal understanding. Split by <em>subject and session</em>, not by window, and hold out the caption-generation LLM from evaluation. This is the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, applied one level up: the leak is now in the text, not just the features.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">Practical Example: narrating a gait lab wearable</h3>
+        <p>A rehabilitation clinic instruments post-stroke patients with a lower-back inertial measurement unit and wants a plain-language summary appended to each session for the treating physiotherapist, who does not read raw traces. A window-level classifier already outputs "walking / standing / transition." The team adds a prefix captioner trained on feature-narrated captions, so the session note reads: "Continuous walking for 3 minutes 40 seconds, mean cadence 96 steps per minute, step-time asymmetry elevated on the left, two gait interruptions consistent with turning." The physiotherapist trusts it because the numbers are checkable against the clinic's stopwatch and the classifier's confidence. Crucially, the team caps the captioner at describing measured quantities and forbids diagnostic language: the model may report asymmetry, but not "the patient is at fall risk," because that inference belongs to the clinician and to the validated pipeline of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>, not to a fluent decoder.</p>
+    </div>
+
+    <h2>Making captions numerate and calibrated</h2>
+
+    <p>A caption that says "high-frequency vibration" is weaker than one that says "energy concentrated at 118 Hz, near the second bearing harmonic," and the difference is whether the caption carries real measurements. <strong>How</strong> to enforce this: feed the decoder not only the learned sensor embedding but a small, explicit <em>tool panel</em> of computed scalars (spectral peaks, trend slopes, event counts) as text, so the model narrates numbers it did not have to hallucinate. This is a preview of the retrieval-and-tool pattern in <a class="cross-ref" href="section-21.5.html">Section 21.5</a>, and it dramatically cuts numeric fabrication. The second discipline is <em>calibrated hedging</em>: a captioner should say "likely" when the encoder embedding sits far from any training cluster, and "clearly" when it sits in a dense one. Coupling caption confidence words to a conformal or ensemble uncertainty score (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) turns the caption's hedging from a stylistic tic into a trustworthy signal.</p>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Sensor captioning is early and moving fast. The current frontier pairs a frozen large decoder with a lightweight sensor projection and LLM-narrated corpora: <strong>SensorCaps</strong> and the <strong>LLaSA</strong> family for wearables, and <strong>IMU2CLIP</strong> for contrastive IMU-text-video alignment that a decoder can reuse. Open problems that no system has cleanly solved: faithful numeric captioning without an external tool panel, evaluation metrics that penalize confident physical falsehoods (BLEU and CIDEr reward paraphrase, not truth), and captioning long multi-hour streams where the interesting event is a fraction of a percent of the window. Expect the metrics, not the architectures, to be where the next real progress lands.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a labeled human-activity dataset (for example a wrist accelerometer HAR set). (1) Build a templated captioner: classifier plus a slot-filling sentence that reports activity, duration, and dominant frequency computed from the window. (2) Build a prefix captioner over the same encoder, trained on LLM-narrated captions. (3) Construct an adversarial test set of windows where the strap loosened (near-zero motion mislabeled as an activity) and measure how often each system hallucinates the labeled activity anyway. Report which system fails more gracefully, and explain why the templated one cannot invent an event it was not given a slot for.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p>1. Why is fluency a misleading proxy for a sensor captioner's quality, and what property should you measure instead?</p>
+        <p>2. In prefix mapping, which components are frozen and which are trained, and why does that choice make training feasible on a small caption corpus?</p>
+        <p>3. Your captions were written by an LLM from ground-truth labels, then used to both train and score your captioner. Name the leak and the two split rules that close it.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-21.3.html">Section 21.3</a>, we move from monologue to dialogue: instead of the model describing a signal unprompted, a human (or an agent) asks a specific question about it. We will meet the sensor question-answering benchmarks (SensorQA, SensorBench, OpenSQA), see how a captioner becomes the perception front end of a QA system, and learn why answering "did the patient fall?" is a sharper and more honest test of grounding than generating a paragraph nobody can fully check.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

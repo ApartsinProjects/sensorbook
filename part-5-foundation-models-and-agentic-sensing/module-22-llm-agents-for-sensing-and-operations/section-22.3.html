@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.3: Log/telemetry reasoning and industrial copilots (Argos, AgentFM, CALM). Building Sensory AI." name="description"/>
+<title>Section 22.3: Log/telemetry reasoning and industrial copilots (Argos, AgentFM, CALM) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>Log/telemetry reasoning and industrial copilots (Argos, AgentFM, CALM)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You gave me ten million log lines and asked what went wrong. So I did what any reasonable colleague would: I read three of them, wrote a detector, and let the machine read the other 9,999,997."</p><cite>A Delegating AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An operational system rarely emits one clean sensor stream. It emits a firehose: structured metrics (CPU, latency, vibration RMS, tank pressure) alongside semi-structured logs, event traces, and alarm codes, all timestamped and all correlated in ways no single dashboard shows. Section 22.2 taught an LLM to explain one anomaly and reason about its root cause. This section scales that skill up to the messy, mixed-modality reality of a running plant or a cloud fleet, and introduces the three architectural patterns that industrial copilots have converged on: an agent that <em>writes and refines its own detectors</em> (Argos), a team of <em>role-specialized agents that manage a failure end to end</em> (AgentFM), and a copilot that <em>grounds its narrative in an explicit causal model</em> (CALM). Get these three shapes clear and you can classify almost any telemetry-reasoning product you will meet.</p>
+</div>
+
+<p>This section assumes the agentic loop of <a class="cross-ref" href="section-22.1.html">Section 22.1</a> and the anomaly-explanation reasoning of <a class="cross-ref" href="section-22.2.html">Section 22.2</a>. It leans on the classical detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> (which remain the agent's workhorses), the industrial condition-monitoring context of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>, and the sensor-language grounding of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-21-multimodal-sensor-language-models-and-sensor/index.html">Chapter 21</a>. Because these systems make operational calls, the interpretability and root-cause machinery of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a> runs underneath everything here.</p>
+
+<h2>The modality gap: why logs and telemetry need agents</h2>
+
+<p>Telemetry reasoning is hard for a plain model because the data is heterogeneous in a way a fixed-shape network dislikes. Metrics are dense numeric tensors; logs are sparse, high-cardinality strings where a single template like <code>Connection to {host} timed out after {n} ms</code> generates millions of near-duplicate lines. An LLM is unusually well matched to the log half (it reads the template text natively) and poorly matched to the metric half (feeding it a raw 100,000-point series is both lossy and ruinously expensive in tokens). The agentic answer is not to ask the LLM to look at every number. It is to let the LLM <em>reason about which detector to run</em>, read the compact evidence that detector returns, and correlate that with the handful of log templates that spiked in the same window.</p>
+
+<p>The first practical step is almost always the same: collapse the log firehose into templates. Log parsing (the Drain family is the standard) turns raw lines into a small vocabulary of message types plus their variable slots, so that "9,999,997 lines" becomes "template 41 fired 8,000 times, template 12 appeared for the first time in this deployment." That reduction is what makes the whole thing fit in a prompt.</p>
+
+<pre><code class="language-python">from drain3 import TemplateMiner   # pip install drain3
+
+miner = TemplateMiner()
+for line in open("service.log"):
+    miner.add_log_message(line.rstrip())
+
+# Rank templates by how anomalous their count is in the incident window
+clusters = sorted(miner.drain.clusters, key=lambda c: c.size, reverse=True)
+context = "\n".join(
+    f"[t{c.cluster_id} x{c.size}] {c.get_template()}"
+    for c in clusters[:15]                      # top 15 templates, not 10M lines
+)
+prompt = (
+    "Metric detector flagged latency change-point at 14:22 UTC.\n"
+    "Top log templates in the 14:18-14:26 window:\n" + context +
+    "\nWhich template most plausibly explains the latency jump, and why?"
+)
+# prompt now fits comfortably in an LLM context window
+</code></pre>
+<div class="code-caption">Templatization is the enabling trick behind every log copilot: Drain3 compresses millions of raw lines into a ranked handful of message types, so the agent reasons over evidence rather than over a firehose. The metric side (the change-point at 14:22) comes from a classical detector out of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, not from the LLM.</div>
+
+<p>The code above frames the core move: the agent never sees the raw stream, only a detector's verdict plus a compressed log summary. Everything in this section is a more sophisticated version of that pairing.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>A hand-rolled log parser (regex banks, token clustering, variable-slot detection, an online template store that stays stable as new formats appear) is a genuine 200-to-300 line subsystem that teams have shipped and re-shipped for years. <code>drain3</code> replaces it with roughly the ten lines above: it handles the prefix-tree clustering, the similarity threshold, persistent state across restarts, and masking of numeric and hex variables. You supply the log; it supplies the vocabulary.</p>
+</div>
+
+<h2>Argos: the agent that writes its own detector</h2>
+
+<p>Argos exemplifies the first pattern: <em>autonomous rule generation</em>. Rather than treating the LLM as the detector (slow, expensive, and opaque per data point), Argos uses the LLM as a programmer that <em>authors</em> detection rules as executable code, runs them over historical telemetry, inspects where they misfire, and revises them. The output is not a black-box judgment; it is a human-readable rule, for example a threshold on a seasonally adjusted residual plus a template-count condition, that a reliability engineer can read, audit, and keep. The loop is a small optimization: propose a rule, evaluate precision and recall on labeled incidents, feed the confusion cases back, refine.</p>
+
+<p>Why this matters: the expensive LLM call happens a few dozen times during <em>rule synthesis</em>, then the cheap generated rule runs continuously in production at near-zero marginal cost. You get the LLM's semantic understanding of what an anomaly means for this service without paying inference on every data point, and you get an artifact that survives audit. This is the pattern to reach for when you have volume and need interpretability, which is most of industrial monitoring.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The highest-leverage use of an LLM over telemetry is usually not to <em>be</em> the detector but to <em>write</em> the detector. Anomaly labels are scarce and drift; a synthesized, inspectable rule is cheap to run, cheap to correct, and can be red-lined by a domain expert. Reserve live LLM inference for the rare, ambiguous cases the cheap rule cannot resolve. This "compile the reasoning into code" move is the single biggest cost and reliability lever in agentic operations, and it foreshadows the tool-use discipline of <a class="cross-ref" href="section-22.4.html">Section 22.4</a>.</p>
+</div>
+
+<h2>AgentFM: role-aware agents for the whole failure lifecycle</h2>
+
+<p>A real incident is not one task. It is detection, then localization ("which of 400 microservices?"), then diagnosis (why), then mitigation (roll back, scale out, failover), then verification that the fix held. AgentFM exemplifies the second pattern: a <em>role-aware multi-agent</em> framework in which specialized agents own distinct stages of the failure lifecycle and a coordinator routes evidence between them. One agent is expert at reading metric anomalies, another at correlating traces across service boundaries, another at proposing and gating mitigations. The division of labor mirrors how a human on-call rotation actually operates, and it lets each agent carry a focused toolset and a tighter prompt rather than one overloaded generalist trying to do everything.</p>
+
+<p>The design tension is coordination overhead. More agents means more messages, more latency, and more places for a hallucinated intermediate claim to propagate. AgentFM-style systems earn their keep in large microservice estates where the localization problem alone is combinatorial; on a single vibration sensor they would be overkill. The deeper treatment of multi-agent recursion for root-cause analysis, including how agents challenge each other's hypotheses, is the subject of <a class="cross-ref" href="section-22.5.html">Section 22.5</a>.</p>
+
+<h2>CALM: grounding the copilot in an explicit causal model</h2>
+
+<p>The third pattern answers a specific failure of naive log copilots: correlation masquerading as cause. When template 12 and a latency spike co-occur, a fluent model will happily narrate a causal story that is merely temporal coincidence. CALM exemplifies <em>causal grounding</em>: the copilot is coupled to an explicit causal or dependency graph (service call graph, physical process topology, or a learned causal structure) and is constrained to reason along edges that actually exist. The LLM's job becomes narration and hypothesis ranking <em>within</em> the graph's admissible paths, not free-form storytelling. This is the same discipline that separates real root-cause analysis from plausible-sounding fiction in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-67-interpretability-and-root-cause-analysis-for/index.html">Chapter 67</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: A Wind-Farm SCADA Copilot</h3>
+<p>An operator running 120 turbines feeds each turbine's SCADA telemetry (gearbox temperature, nacelle vibration, pitch-motor current) plus the controller's event log into a copilot. At 03:10 a gearbox over-temperature alarm fires on turbine 47. A pure log copilot might blame the most frequent template, a benign "grid reconnect" event that happens every night. The causal-graph-constrained copilot instead walks the turbine's known dependency structure: it correlates the classical change-point on vibration RMS (from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>) with a slow upward drift in gearbox temperature, finds no upstream grid event on the causal path, and reports "early-stage bearing wear, not a grid transient," attaching the two supporting series. The maintenance crew inspects and finds a spalling bearing weeks before catastrophic failure. The graph is what stopped the model from telling a fluent, wrong story about the grid, connecting this directly to the predictive-maintenance economics of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>State of the art in agentic telemetry reasoning is moving on three fronts. First, autonomous-rule systems in the Argos lineage now co-synthesize the detector <em>and</em> a natural-language justification, then self-evaluate on held-out incidents, pushing toward detectors that document themselves. Second, role-aware frameworks such as AgentFM are extending from cloud microservices to cyber-physical estates, where a mitigation agent cannot simply "roll back" a spinning turbine and must respect physical safety envelopes. Third, causal copilots (the CALM direction) are learning the dependency graph online from telemetry rather than assuming a hand-drawn one, which is the open problem: a wrong causal graph is more dangerous than no graph, because it lends false authority. Benchmarks such as the AIOps and RCA suites over microservice traces are the current proving grounds, and honest reporting there requires the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>: an agent that saw the incident's postmortem in training has not solved anything.</p>
+</div>
+
+<h2>Choosing a pattern</h2>
+
+<p>The three shapes are not competitors so much as answers to different questions. Ask "do I have volume and need auditable detectors?" and you want Argos-style rule synthesis. Ask "is my failure lifecycle long and my system large?" and you want AgentFM-style role decomposition. Ask "does my domain have a real dependency structure the model keeps ignoring?" and you want CALM-style causal grounding. Mature copilots combine all three: a rule-synthesis agent produces cheap detectors, role agents run the lifecycle, and a causal graph keeps the narration honest. Whichever you pick, the confidence of the final call must be calibrated (the conformal and calibration methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>), and a human must own the mitigation trigger, which is exactly the guardrail argument of Section 22.6.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public log dataset (for example HDFS or BGL) and a co-recorded metric series. (1) Run Drain3 to extract templates and rank them by count anomaly in a chosen incident window. (2) Write a prompt that pairs the top templates with a classical change-point verdict on the metric, and ask an LLM to name the most plausible culprit template with a justification. (3) Now implement the Argos move: have the model emit its reasoning as a short executable rule (a threshold plus a template condition), run that rule over the full log, and report its precision and recall against the ground-truth labels. Compare the cost of running the rule versus running the LLM on every window.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why is templatization (Drain-style) a prerequisite for feeding logs to an LLM, rather than an optional optimization? 2. Argos uses the LLM to write a detector instead of being the detector. State one cost benefit and one interpretability benefit of that choice. 3. A copilot reports that a nightly "grid reconnect" log caused a gearbox alarm. How would a CALM-style causal graph have prevented that specific error?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-22.4.html">Section 22.4</a>, we open up the tool interface these copilots depend on: how an agent decides <em>which</em> detector, filter, or forecaster to invoke, how it passes a windowed signal into a Chapter 12 change-point test or a Chapter 19 forecaster and reads the result back, and how tool schemas and function-calling turn a fluent narrator into a system that acts on the physical world.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.2: Pretraining corpora and tokenization (patching vs value tokenization). Building Sensory AI." name="description"/>
+<title>Section 19.2: Pretraining corpora and tokenization (patching vs value tokenization) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Time-Series Foundation Models</a></div>
+<h1>Pretraining corpora and tokenization (patching vs value tokenization)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A language model was handed a billion sentences. I was handed a billion sensors that never agreed on what a word was."</p><cite>A Well-Read AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A time-series foundation model is only as good as two upstream choices most readers never see: the <em>corpus</em> it pretrains on and the <em>tokenizer</em> that turns a raw waveform into model inputs. Text has a settled answer here (scrape the web, apply byte-pair encoding). Sensor data has no such luxury. Amplitudes span nanovolts to megawatts, sampling rates span millihertz to megahertz, and no universal vocabulary exists. This section explains how the leading models assemble their training data and the two dominant tokenization philosophies (continuous <em>patching</em> versus discrete <em>value tokenization</em>) so you can predict which family will behave well on your signal before you download a single checkpoint.</p>
+</div>
+
+<p>This section assumes you understand sampling and amplitude scaling from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, the leakage discipline for constructing datasets from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, and the patch-and-attend mechanics of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. Section 19.1 defined what earns a model the "foundation" label; here we look inside its mouth.</p>
+
+<h2>Corpora: where a billion time points come from</h2>
+
+<p>Text foundation models inherit a happy accident: the internet is a pre-assembled trillion-token corpus. Time series has nothing comparable, so each model builds its own. Three strategies dominate, usually blended.</p>
+
+<p><strong>Aggregated real archives.</strong> The largest curated open collection is <em>LOTSA</em> (Large-scale Open Time Series Archive, roughly 27 billion observations across energy, transport, climate, web, sales, and healthcare), assembled for the Moirai family. The classic <em>Monash</em> forecasting archive supplies dozens of smaller heterogeneous datasets. These give diversity of shape (trends, multiple seasonalities, intermittency) that a single domain cannot.</p>
+
+<p><strong>Web-scale weak signals.</strong> TimesFM pretrains on hundreds of billions of points harvested from Google Trends and Wikipedia page views, which are cheap, high-volume, and rich in human-driven seasonality. The bet is that broad statistical coverage beats domain purity, the same bet that made large language models work.</p>
+
+<p><strong>Synthetic generation.</strong> Because real corpora underrepresent clean periodicity and controlled trend-break structure, Chronos and TimesFM inject synthetic series built from Gaussian processes, composed sinusoids, and piecewise-linear trends (Chronos calls its generator <em>KernelSynth</em>). Synthetic data is unlimited, license-clean, and lets designers deliberately teach behaviors that are rare in the wild.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Corpus <em>diversity</em> matters more than corpus <em>size</em> for zero-shot transfer. A model that has seen ten thousand nearly identical electricity meters learns one pattern very well; a model that has seen electricity, foot traffic, river flow, and synthetic sinusoids learns the <em>shape grammar</em> of time series, which is what lets it forecast a vibration sensor it has never encountered. This is also why corpus composition is the single biggest leakage risk in Chapter 19: if your evaluation dataset overlaps the pretraining archive, the "zero-shot" number is a lie.</p>
+</div>
+
+<h2>Patching: the continuous tokenizer</h2>
+
+<p>Patching, popularized by PatchTST and used by TimesFM, Moirai, MOMENT, and the TinyTimeMixers, treats a token as a short contiguous window of real values. A series is split into non-overlapping patches of length \(P\) (typically 16 to 64 samples), each patch is instance-normalized, then mapped by a single linear layer into a \(d\)-dimensional embedding:</p>
+
+<p>$$ \mathbf{z}_i = \mathbf{W}\,\tilde{\mathbf{x}}_{iP:(i+1)P} + \mathbf{b}, \qquad \tilde{\mathbf{x}} = \frac{\mathbf{x} - \mu}{\sigma + \epsilon} $$</p>
+
+<p>Two properties follow. First, patching cuts the sequence length by a factor of \(P\), which is decisive for attention that scales as \(O(L^2)\): a 2048-sample window becomes 32 tokens, not 2048. Second, the representation stays <em>continuous</em>, so numeric resolution is preserved exactly and the model regresses real-valued outputs directly. The cost is a fixed patch length that bakes in an implicit timescale, and a linear projection that can smear a sharp transient sitting mid-patch.</p>
+
+<h2>Value tokenization: the discrete tokenizer</h2>
+
+<p>The opposite philosophy, made famous by Chronos, discards the continuous representation entirely. It <em>scales</em> each series (mean-scaling divides by the mean absolute value), then <em>quantizes</em> every single value into one of \(B\) bins, producing an integer token exactly like a word ID. The model is then a vanilla language model (Chronos reuses the T5 architecture unchanged) trained with cross-entropy over the bin vocabulary, and it forecasts by sampling token sequences, which yields a probabilistic forecast for free.</p>
+
+<p>The appeal is enormous reuse: the entire mature language-model stack (tokenizer, transformer, sampling, decoding) transfers with almost no modification. The price is quantization error and a fixed dynamic range: values beyond the outermost bins clip, and fine amplitude differences within a bin vanish. Chronos-Bolt later moved to patch-based inputs and direct multi-step decoding to claw back speed and precision, a telling convergence between the two camps.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def chronos_style_tokenize(x, n_bins=256, low=-15.0, high=15.0):
+    # 1. mean-scaling: normalize by mean absolute value (per series)
+    scale = np.mean(np.abs(x)) + 1e-8
+    x_scaled = x / scale
+    # 2. quantize into uniform bins over a fixed clamped range
+    edges = np.linspace(low, high, n_bins - 1)
+    tokens = np.digitize(np.clip(x_scaled, low, high), edges)
+    return tokens, scale
+
+def patchify(x, patch_len=16):
+    # continuous tokenizer: reshape into (n_patches, patch_len), no vocabulary
+    n = (len(x) // patch_len) * patch_len
+    return x[:n].reshape(-1, patch_len)
+
+sig = np.sin(np.linspace(0, 12 * np.pi, 256)) + 0.1 * np.random.randn(256)
+tok, scale = chronos_style_tokenize(sig)
+patches = patchify(sig)
+print("value tokens:", tok[:8], "| unique bins used:", len(np.unique(tok)))
+print("patch tensor shape:", patches.shape)  # (16, 16): 16 tokens, not 256
+</code></pre>
+<div class="code-caption">The same 256-sample signal seen two ways. Value tokenization emits one integer per sample from a fixed 256-word vocabulary (note how few bins a clean sine actually occupies, which is where quantization error lives). Patching emits 16 continuous vectors, a 16x sequence-length reduction with no discretization loss. Both are referenced in the tradeoff discussion below.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the tokenizer</h3>
+<p>The demo above is for intuition. In practice, <code>autogluon.timeseries</code> and the <code>chronos-forecasting</code> package expose the trained tokenizer, scaler, context handling, and sampler behind roughly three lines: <code>ChronosPipeline.from_pretrained("amazon/chronos-bolt-base")</code> then <code>pipeline.predict(context, horizon)</code>. That replaces the roughly 150 lines of scaling, binning, padding, batching, and probabilistic decoding you would otherwise maintain, and it guarantees your bin edges match the checkpoint's (a mismatch silently destroys accuracy).</p>
+</div>
+
+<h2>Choosing a tokenizer for real sensors</h2>
+
+<p>The decision hinges on your signal's statistics. Patching preserves amplitude precision and short context, so it suits smooth, well-scaled sensor streams (temperature, load, flow) and multivariate inputs where Moirai's "any-variate" patching shines. Value tokenization is robust to wild scale variation across a fleet because mean-scaling plus binning is aggressively normalizing, and its native probabilistic output is valuable when you need forecast intervals rather than a point estimate, which connects directly to the calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>. Neither handles heavy-tailed spikes gracefully: patching averages them away, quantization clips them, so pre-conditioning (log or arcsinh transforms) is often worth more than the model choice itself.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: vibration on a factory pump</h3>
+<p>An industrial team pointed a pretrained TimesFM patch model at a 25.6 kHz accelerometer on a centrifugal pump and got noise. The failure was not the model, it was the tokenizer's implicit timescale: a 32-sample patch spans 1.25 ms, far shorter than the 20 ms bearing-fault period, so each token saw meaningless high-frequency ripple. Downsampling the signal to an envelope at 100 Hz (so one patch covered a full mechanical cycle) turned the same checkpoint from useless to competitive. The lesson generalizes: match your sampling rate to the model's patch length before blaming the weights, a diagnostic that pairs naturally with condition-monitoring practice in <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Tokenization is unsettled and actively contested as of 2026. Value quantization (Chronos), continuous patching (TimesFM, Moirai, MOMENT), and lag-feature tokenization (Lag-Llama) coexist with no clear winner, and Chronos-Bolt's shift toward patched inputs plus mixture-of-experts routing (Moirai-MoE, Time-MoE) that lets the model pick specialized experts per token suggests the field is converging on hybrid, resolution-aware schemes rather than one universal vocabulary. Watch for learned, frequency-conditioned patching that adapts \(P\) to the detected dominant period instead of fixing it in advance.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a 10-minute PPG recording sampled at 64 Hz. (a) Compute how many patches a length-32 patcher produces and what wall-clock duration one patch spans. (b) Run the <code>chronos_style_tokenize</code> function above and report how many of the 256 bins are actually used; explain what that says about the signal's dynamic range. (c) Add a single artifact spike 50x the signal amplitude and describe, without running it, how each tokenizer distorts that sample.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does corpus diversity threaten the honesty of a "zero-shot" claim, and how does that connect to leakage-safe dataset construction?<br/>
+2. State one concrete advantage and one concrete disadvantage of value tokenization versus patching.<br/>
+3. A colleague reports terrible zero-shot accuracy on a 40 kHz ultrasonic sensor. What single tokenizer-related question do you ask first?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-19.3.html">Section 19.3</a>, we tour the model families themselves (TimesFM, Chronos and Chronos-Bolt, Moirai and Moirai-MoE, MOMENT, Time-MoE, the TinyTimeMixers, Lag-Llama, Toto, UniTS, and Timer) and show how each one's corpus and tokenization choices from this section directly shape what it does well and where it breaks.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

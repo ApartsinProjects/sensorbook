@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.5: Handling missingness, multi-rate, and multi-device inputs. Building Sensory AI." name="description"/>
+<title>Section 20.5: Handling missingness, multi-rate, and multi-device inputs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Sensor and Wearable Foundation Models</a></div>
+<h1>Handling missingness, multi-rate, and multi-device inputs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Half my inputs were absent, the other half arrived at rates that never lined up, and no two watches agreed on what 'now' meant. Somehow they still expected one embedding."</p>
+<cite>A Well-Aligned AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the sampling, timestamping, and clock-alignment machinery of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, the missing-data taxonomy from the estimation primer in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the patch-token transformer mechanics of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. The masked-pretraining view of missingness from <a class="cross-ref" href="section-20.2.html">Section 20.2</a> is assumed. Familiarity with an attention mask and additive positional embeddings is enough to read the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The tidy tensor that most models expect, a fixed set of channels, all sampled at one rate, all present, all clock-aligned, does not exist in the wild. A wrist wearable drops photoplethysmography during vigorous motion, logs accelerometer at 50 Hz and skin temperature once a minute, and runs beside a chest strap that reports ECG at 250 Hz on a phone whose Bluetooth timestamps drift. A sensor foundation model earns its keep precisely by ingesting that mess without a bespoke preprocessing pipeline per deployment. The trick is to stop treating missingness, rate, and device identity as defects to be scrubbed before the model, and start treating them as first-class information carried alongside the signal into the model. This section shows how: represent presence with an explicit mask, tokenize each stream at its own rate with a rate-aware position encoding, and describe each channel with a device and sensor descriptor so a single architecture accepts any subset of any fleet's sensors.</p>
+</div>
+
+<h2>Missingness is the default state, not the exception</h2>
+<p><strong>What.</strong> Sensor data is riddled with gaps: transient dropouts (a loose electrode, motion artifact), whole-channel absence (a device without a temperature sensor), off-body periods, low-battery downsampling, and packet loss over a radio link. Following the taxonomy of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, gaps are rarely missing-completely-at-random; PPG vanishes <em>because</em> the wearer is exercising, so the very fact of absence is predictive of the label you care about.</p>
+<p><strong>Why a mask beats imputation-then-forget.</strong> The classical reflex is to impute (forward-fill, interpolate, or model-based fill) and hand a dense array downstream. That destroys information twice: it fabricates values the model cannot distinguish from real ones, and it discards the absence pattern that was itself a signal. The foundation-model stance is to carry a binary <em>presence mask</em> \(m_t \in \{0,1\}\) as a parallel channel, so the model sees both the (possibly placeholder) value and the fact that it was missing. Concretely, a missing patch is replaced by a learnable mask embedding, and attention is told to weight it by its presence. This is the same mechanism as masked pretraining: the model was already trained to reason about which tokens are absent, so inference-time missingness is not a distribution shift but the regime it grew up in.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Absence is a feature, not a hole to be filled. The pattern of what is missing, when, and why (PPG gone during motion, ECG gone off-body) often correlates with the target more strongly than the surviving samples do. A model handed a smoothly imputed array is denied that signal; a model handed value-plus-mask keeps it. The design goal is not to make missingness invisible but to make it legible.</p>
+</div>
+
+<h2>Multi-rate inputs: tokenize each stream at its native cadence</h2>
+<p><strong>What breaks under resampling.</strong> The naive fix for heterogeneous rates is to resample everything to a common grid, upsampling temperature to 250 Hz or downsampling ECG to 50 Hz. Upsampling wastes compute and invents high-frequency content; downsampling aliases away the QRS morphology that made ECG worth collecting (revisit the aliasing warning of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>). A rate mismatch of 250:1 between ECG and temperature makes a single grid absurd.</p>
+<p><strong>How to keep native rates.</strong> The modern recipe patches each stream independently at a patch length matched to its own physics, then labels each resulting token with the <em>absolute time</em> of its window rather than an integer position. If channel \(c\) has sampling interval \(\Delta_c\) and patch length \(P_c\) samples, patch \(k\) covers real time \(t = k \, P_c \, \Delta_c\), and that continuous \(t\) drives the positional encoding. A common construction is the sinusoidal map over real time,</p>
+$$\mathrm{PE}(t)_{2i} = \sin\!\left(\frac{t}{10000^{\,2i/D}}\right), \qquad \mathrm{PE}(t)_{2i+1} = \cos\!\left(\frac{t}{10000^{\,2i/D}}\right),$$
+<p>so tokens from a 250 Hz stream and a once-per-minute stream land in a shared temporal coordinate system and attend to one another by <em>when</em> they occurred, not by index. Each token also carries its rate as a learned embedding, letting the model know a temperature patch summarizes sixty seconds while an ECG patch summarizes fractions of one. This continuous-time tokenization is what lets one transformer body fuse streams that share no common grid.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: an ICU multi-parameter monitor</h3>
+<p>A bedside monitor in a cardiac step-down unit streams ECG at 250 Hz, pulse oximetry at 1 Hz, non-invasive blood pressure every 15 minutes (irregular, triggered by cuff inflation), and manual nursing observations at no fixed cadence. Resampling to any common grid either drowns the ECG or fabricates a blood-pressure trace between cuffs. Instead the team patches each channel at its own rate, stamps every token with its wall-clock time and a channel descriptor, and marks the long inter-cuff gaps with the presence mask rather than interpolating. When a lead falls off during patient repositioning, the ECG tokens for that window become masked rather than missing rows, and the pooled patient state degrades gracefully instead of the pipeline crashing. This value-plus-mask, native-rate discipline mirrors the missing-modality robustness developed for fusion in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>.</p>
+</div>
+
+<h2>Multi-device inputs: variable channels described, not hard-coded</h2>
+<p><strong>The problem.</strong> A fleet is heterogeneous. One user has a watch with PPG and accelerometer; another adds a chest ECG strap; a third wears a ring reporting only temperature and heart rate. Placement varies (wrist versus chest versus finger), firmware versions differ, and channel counts change between recordings and even mid-session. A model with a fixed input width and a fixed channel order cannot serve this fleet without a brittle adapter per device.</p>
+<p><strong>The channel-as-token solution.</strong> Treat every channel as an independent token stream and <em>describe</em> it rather than assuming it. Each token gets an additive descriptor embedding built from metadata: sensor modality (PPG, ECG, accelerometer-x), body placement, and native rate. The transformer then accepts any subset of any order; a missing device is simply a set of tokens that were never emitted, indistinguishable in mechanism from a masked dropout. Because attention is permutation-equivariant over tokens, channel order carries no meaning and need not be standardized. This is the same modality-agnostic principle behind large sensor models that learn from incomplete data (<a class="cross-ref" href="section-20.2.html">Section 20.2</a>): the model conditions on <em>what each channel is</em>, so adding a new sensor type at deployment means adding a descriptor, not retraining the input layer.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">The Leakage and Alignment Trap</h3>
+<p>Multi-device pipelines invite two silent failures. First, when you fuse streams by wall-clock time, unsynchronized device clocks (Bluetooth timestamp drift of tens of milliseconds) misalign tokens; align to a shared reference using the methods of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> before trusting cross-channel attention. Second, the presence mask and per-channel normalization statistics must be fit on the training split and by <em>subject or device</em>, never across the pooled dataset; a normalizer that has seen test-device statistics leaks, exactly as the split discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> warns.</p>
+</div>
+
+<h2>A unified recipe: mask, rate, and descriptor in one tokenizer</h2>
+<p>The three problems collapse into one representation. Every token is a triple of (value patch, presence bit, descriptor), where the descriptor encodes both continuous time and channel metadata. The snippet below builds that token set for a heterogeneous, partially missing, multi-rate batch and pools it with a mask-aware attention that ignores absent tokens. The mask does double duty: it zeroes attention onto missing patches and it drives the learnable mask embedding that stands in for their values.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class HeteroSensorTokenizer(nn.Module):
+    def __init__(self, d=256, n_modalities=8):
+        super().__init__()
+        self.value_proj = nn.LazyLinear(d)          # patch -> token, any patch length
+        self.mask_token = nn.Parameter(torch.randn(d))  # stands in for absent patches
+        self.modality_emb = nn.Embedding(n_modalities, d)  # PPG, ECG, accel, temp, ...
+
+    def time_pe(self, t, d):                         # continuous-time sinusoidal PE
+        i = torch.arange(d // 2, device=t.device)
+        freq = 1.0 / (10000 ** (2 * i / d))
+        ang = t[..., None] * freq                    # (..., d/2), t in real seconds
+        return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+    def forward(self, patches, present, t_sec, modality):
+        # patches:(B,T,P) values | present:(B,T) 1=observed | t_sec:(B,T) wall-clock
+        tok = self.value_proj(patches)               # (B,T,d)
+        miss = ~present.bool()
+        tok = torch.where(miss[..., None], self.mask_token, tok)  # inject mask token
+        tok = tok + self.time_pe(t_sec, tok.size(-1)) + self.modality_emb(modality)
+        return tok, present.bool()                   # present -> attention key mask
+
+def masked_mean(tok, present):                       # pool, ignoring absent tokens
+    w = present.float()[..., None]
+    return (tok * w).sum(1) / w.sum(1).clamp(min=1e-6)
+</code></pre>
+<div class="code-caption">A rate- and device-agnostic tokenizer. Each stream is patched at its own length (<code>LazyLinear</code> adapts to any patch size), absent patches are replaced by a learned <code>mask_token</code>, and every token carries continuous-time positional encoding plus a modality descriptor. The returned <code>present</code> mask feeds a transformer's key-padding mask; <code>masked_mean</code> pools only observed tokens so a missing device never dilutes the patient state.</div>
+
+<p>Passing <code>present</code> as a transformer's <code>src_key_padding_mask</code> makes attention skip absent tokens entirely, so a batch mixing a two-sensor ring with a five-sensor watch runs in one forward pass. Nothing in the body of the model knows or cares how many channels arrived.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Hand-rolling mask-aware attention (building key-padding masks, guarding the masked-mean against an all-absent window, keeping missing tokens out of the softmax) is roughly 40 to 70 lines that are easy to get subtly wrong: a single unmasked padding token quietly poisons the pooled vector. PyTorch's <code>nn.TransformerEncoderLayer</code> accepts <code>src_key_padding_mask</code> directly, so the entire missing-token handling reduces to passing the presence mask you already computed, and <code>nn.LazyLinear</code> removes the per-rate patch-length bookkeeping. The library owns the softmax masking and shape inference; you own only the two decisions it cannot make, how to patch each rate and what metadata to put in the descriptor.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>How best to condition on missingness at scale is unsettled. Google's LSM-2 (<a class="cross-ref" href="section-20.2.html">Section 20.2</a>) advances <em>adaptive and inherited masking</em>, learning directly from incomplete wearable data rather than requiring imputed inputs, and reports that models trained to expect missingness degrade far more gracefully under sensor dropout than models trained on clean data. Open questions span all three axes: whether continuous-time attention or explicit resampling wins for extreme rate ratios, how to build a descriptor space that generalizes to sensor types unseen in pretraining (true zero-shot device transfer), and how to propagate calibrated uncertainty when a large fraction of channels is absent, a problem the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> can wrap around a mask-aware encoder's outputs.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a wearable dataset with at least three channels at different rates (for example accelerometer, PPG, and skin temperature). (1) Build the value-plus-mask representation and train a small mask-aware transformer probe; record accuracy on a held-out <em>subject</em> split. (2) Ablate the mask: forward-fill every gap so the model cannot see absence, and quantify the drop, especially on windows where missingness correlates with the label. (3) Replace continuous-time positional encoding with a single common-grid resampling and compare, noting compute cost and any aliasing of the fastest channel. (4) At inference, drop one entire channel (simulate a device without that sensor) and report how gracefully the masked model degrades versus the imputed baseline.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why is imputing then discarding the presence mask worse than carrying value-plus-mask into the model, in terms of the information the model can use? Give a concrete wearable example where absence itself is predictive.</p>
+<p class="quiz-question">2. A colleague resamples ECG (250 Hz) and temperature (1/min) to a common 10 Hz grid before the model. Name the two distinct failures this causes, one for each channel.</p>
+<p class="quiz-question">3. How does treating each channel as a described token let one trained model serve a two-sensor ring and a five-sensor watch without any per-device adapter, and what makes channel order irrelevant?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>A pretrained sensor model that ingests any fleet's ragged, multi-rate, partially-missing streams is still a generalist; it does not yet know <em>this</em> wearer's resting heart rate, gait, or skin tone. In <a class="cross-ref" href="section-20.6.html">Section 20.6</a>, we turn to personalization and adaptation: how to specialize a pretrained sensor foundation model to an individual or a device with few labels, from lightweight per-user calibration to parameter-efficient fine-tuning, without forfeiting the cross-user generalization that pretraining bought.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

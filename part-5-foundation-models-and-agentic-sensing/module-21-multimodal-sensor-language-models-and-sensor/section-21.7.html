@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.7: Evaluation of sensor-language systems. Building Sensory AI." name="description"/>
+<title>Section 21.7: Evaluation of sensor-language systems | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Multimodal Sensor-Language Models and Sensor Reasoning</a></div>
+<h1>Evaluation of sensor-language systems</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You scored me at 0.71 BLEU and declared me competent. I had described a sprint as a nap, fluently, in the annotator's exact phrasing. The metric applauded my grammar and never once looked at the accelerometer."</p><cite>A Well-Scored AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>The earlier sections of this chapter built systems that turn signals into words: captioners, question answerers, LLM reasoners over raw streams. This closing section asks the question that decides whether any of them can be trusted in the field: how do you know a sensor-language system is actually right, and not merely fluent? Evaluation here is genuinely harder than in either pure NLP or pure sensor classification, because a sensor-language answer can be linguistically perfect and physically false at the same time, and the two failure modes are uncorrelated. A borrowed text metric like BLEU rewards phrasing; a borrowed classification metric like accuracy cannot score a free-form sentence. Neither, alone, tells you whether the words match the physics. This section builds an evaluation stack that measures the thing that matters, faithfulness to the underlying signal, while controlling for the leakage, judge bias, and cost blind spots that quietly inflate every leaderboard.</p>
+</div>
+
+<p>This section leans on the leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> and the general benchmarking protocols of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>; it also assumes the calibration and reliability vocabulary of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, since a trustworthy verbal answer must also be a calibrated one. Where 21.6 asked how to <em>prevent</em> hallucination, this section asks how to <em>measure</em> whether you succeeded.</p>
+
+<h2>Why borrowed metrics lie here</h2>
+
+<p>Sensor-language evaluation inherits two toolkits, and both are wrong out of the box. From natural language generation come n-gram overlap scores (BLEU, ROUGE, METEOR) and embedding-similarity scores (BERTScore). These measure surface or semantic agreement with a reference sentence. The problem is that the reference space for a sensor description is tiny and paraphrase-rich: "the subject was walking" and "the person went for a run" share most tokens and much embedding mass, yet they differ on the one fact that matters, the activity label. A model that swaps walking for running loses almost no BLEU while being clinically or operationally wrong. Overlap metrics are numerically stable and completely blind to the physical error.</p>
+
+<p>From classification come accuracy, precision, recall, and F1. These are sharp and physically grounded, but they only apply once you have coerced a free-form answer into a label, which for open-ended questions ("why did my heart rate spike?") is not possible without another model doing the coercing. The result is a gap: the metrics that are grounded cannot read sentences, and the metrics that read sentences are not grounded. The whole craft of evaluating sensor-language systems is closing that gap deliberately, rather than picking one side and hoping.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A sensor-language answer has two independent axes of quality: linguistic (is it fluent, relevant, well-formed) and physical (does it match what the signal actually says). Fluency and faithfulness are only weakly correlated, so a single scalar collapses them and hides the failure you most need to see. Always report at least one metric per axis, and never let a high fluency score launder a low faithfulness score. The number that ships a medical or industrial system is the faithfulness number.</p>
+</div>
+
+<h2>Building a faithfulness metric</h2>
+
+<p>Faithfulness is the degree to which the claims in an answer are entailed by the signal. You cannot compute it directly against raw samples, so you route it through structured intermediate facts. The recipe that generalizes: extract a small set of checkable atomic claims from the generated text (activity = running, duration = 22 min, peak HR = 168 bpm), compute each corresponding quantity from the signal with a trusted classical or learned estimator, and score the match. For categorical claims this is an exact or taxonomy-aware comparison; for numeric claims it is a tolerance band. A clean way to express the numeric case is a relative-error gate,</p>
+
+$$\text{faithful}(c) = \mathbb{1}\!\left[\frac{\lvert \hat{v}_c - v_c \rvert}{\max(\lvert v_c\rvert, \epsilon)} \le \tau\right],$$
+
+<p>where \(\hat{v}_c\) is the value the model asserted for claim \(c\), \(v_c\) is the signal-derived reference, \(\tau\) is a domain tolerance (tight for a glucose figure, loose for a step count), and \(\epsilon\) guards the division near zero. The answer-level faithfulness is then the fraction of claims that pass, and you report it alongside a coverage number (how many claims were checkable at all), because a model can game any claim-level metric by making only vague, uncheckable statements. Faithfulness without coverage is the sensor-language equivalent of a witness who answers every question with "things happened."</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the fluent cardiologist that could not count</h3>
+<p>A wearable startup shipped a PPG assistant (the cardiovascular sensing of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>) that answered "how was my workout?" in warm, confident prose. Their internal dashboard showed ROUGE-L climbing release over release, and the team celebrated. When a clinician-led audit finally scored faithfulness by extracting the numeric claims (average HR, time in zone, recovery slope) and checking each against the reference pipeline, the picture inverted: the model had learned the <em>rhetoric</em> of a good summary and was hallucinating the numbers inside it, inventing a plausible-sounding peak HR that was off by twenty beats whenever the signal was noisy. ROUGE had been rewarding the template. The faithfulness-plus-coverage pair caught it in one afternoon and became the release gate; two fluency-only quarters had missed it entirely.</p>
+</div>
+
+<h2>LLM-as-judge, and how to keep it honest</h2>
+
+<p>For the open-ended, unscorable-by-label answers (explanations, comparisons, trends), the pragmatic modern default is an LLM judge: a strong model reads the question, the candidate answer, and a reference or the extracted signal facts, then rates correctness and grounding on a rubric. It scales, it reads sentences, and it can be pointed at the physical axis if you feed it the ground-truth facts rather than only a gold sentence. But a judge is a measurement instrument, and an uncalibrated instrument produces confident nonsense. Three biases dominate and must be controlled: position bias (the judge prefers whichever answer is shown first, so randomize or swap order), verbosity bias (longer answers score higher regardless of correctness, so normalize or instruct against it), and self-preference (a judge favors outputs from its own model family, so never judge a model with a sibling). The non-negotiable validation step is to measure the judge against human ratings on a held-out slice and report the agreement, typically Cohen's or Krippendorff's \(\kappa\); a judge with \(\kappa\) below roughly 0.6 against humans is not yet a metric, it is a hypothesis.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Hand-rolling a judge harness (prompt templating, order-swapping to cancel position bias, score parsing, retries, aggregation) is roughly 150 to 250 lines of fragile glue. Frameworks such as <code>ragas</code>, <code>deepeval</code>, and <code>lm-eval-harness</code> ship faithfulness, answer-relevance, and pairwise-judge metrics with debiasing and caching built in, collapsing the harness to about 10 lines: instantiate the metric, hand it a list of (question, answer, context) records, read back per-item and aggregate scores. You still own the two things a library cannot know: the signal-derived reference facts, and the tolerance \(\tau\) for each numeric claim type.</p>
+</div>
+
+<h2>A minimal faithfulness harness</h2>
+
+<p>The snippet below scores a batch of answers on the two axes at once: a reference-free fluency proxy and a signal-grounded faithfulness rate over extracted numeric claims. It deliberately keeps the claim extractor and signal estimator as pluggable stubs, because those are the domain-specific parts; the scoring skeleton is what stays constant across wearable, industrial, and automotive deployments.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def numeric_faithfulness(claims, signal_facts, tau=0.10, eps=1e-6):
+    """claims, signal_facts: dicts {name: value}. Returns (rate, coverage)."""
+    checkable = [k for k in claims if k in signal_facts]
+    if not checkable:
+        return float("nan"), 0.0            # nothing to verify: flag it
+    passed = 0
+    for k in checkable:
+        v_hat, v = claims[k], signal_facts[k]
+        rel_err = abs(v_hat - v) / max(abs(v), eps)
+        passed += int(rel_err <= tau)
+    coverage = len(checkable) / len(claims)  # fraction of claims verifiable
+    return passed / len(checkable), coverage
+
+def evaluate(batch):
+    """batch: list of dicts with 'claims' and 'signal_facts'."""
+    rates, covs = [], []
+    for item in batch:
+        r, c = numeric_faithfulness(item["claims"], item["signal_facts"])
+        if not np.isnan(r):
+            rates.append(r)
+        covs.append(c)
+    n = len(rates)
+    mean = float(np.mean(rates)) if n else float("nan")
+    # 95% bootstrap CI so a single number never travels without its error bar
+    boot = [np.mean(np.random.choice(rates, n, replace=True)) for _ in range(2000)] if n else []
+    ci = (float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))) if boot else (float("nan"),)*2
+    return {"faithfulness": mean, "ci95": ci, "coverage": float(np.mean(covs))}
+
+demo = [
+    {"claims": {"activity": 1, "duration_min": 22, "peak_hr": 168},
+     "signal_facts": {"activity": 1, "duration_min": 21, "peak_hr": 148}},  # HR hallucinated
+    {"claims": {"duration_min": 40, "peak_hr": 150},
+     "signal_facts": {"duration_min": 41, "peak_hr": 152}},
+]
+print(evaluate(demo))
+</code></pre>
+<div class="code-caption">A construct-honest evaluation core: it separates coverage (what fraction of claims were even checkable) from the faithfulness rate on the checkable subset, and it attaches a bootstrap 95% confidence interval so no faithfulness number is ever reported as a bare point estimate. The <code>peak_hr</code> hallucination in the first record is exactly the failure a fluency metric would miss.</div>
+
+<p>The confidence interval in that harness is not decoration. Sensor-language test sets are small and expensive (human-written questions, signal-verified answers), so differences between two systems are routinely inside the noise. Reporting a bootstrap interval, and refusing to declare a winner when intervals overlap, is the single cheapest defense against the over-claiming that plagues this young field.</p>
+
+<h2>Leakage, cost, and the protocol around the number</h2>
+
+<p>A faithfulness score is only as honest as the split it was computed on. Sensor-language datasets leak in ways NLP practitioners never anticipate: the same subject appears in train and test with different questions, so the model memorizes a person's routine rather than reasoning about a signal; consecutive windows from one recording straddle the split; or the LLM under test saw the public benchmark during pretraining, the sensor-language version of the contamination problem. The defenses are the subject-wise, recording-wise splitting rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, plus a held-out private test set whose questions were never published. Report the split policy next to every number; a leaderboard without a stated split policy is uninterpretable.</p>
+
+<p>Finally, evaluate the axes a leaderboard forgets. A sensor-language answer has a latency and a dollar cost, and for on-device wearable or vehicle use those often dominate the accuracy delta between two models. A faithful answer that arrives in nine seconds and drains the battery is a worse product than a slightly less faithful one that answers instantly on-device. Report faithfulness, coverage, calibration, latency, and cost as a vector, and choose along the frontier rather than by a single scalar. This is the same efficiency-versus-quality discipline that governs the edge deployment of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>, applied to words instead of tensors.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The open frontier is reference-free, signal-grounded evaluation at scale: judging a sensor-language answer directly against the raw stream with no human-written gold sentence. Recent sensor-QA benchmarks (SensorQA, SensorBench, OpenSQA) and time-series reasoning suites built on foundation models such as MOMENT, TimesFM, and Google's LSM are pushing toward automatic faithfulness scoring where a verifier model or a classical estimator supplies the ground-truth facts, so evaluation cost drops without giving up the physical axis. The unsolved parts are trustworthy verifiers for causal and trend questions (where even the "reference" is arguable) and judge robustness under distribution shift, where a judge validated on lab data quietly degrades in the field just as the model it is scoring does. Expect this to be an active research target through the current generation of sensor-language models.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a captioning model from Section 21.2 and 200 held-out windows. (1) Score it with ROUGE-L against gold captions. (2) Write a claim extractor that pulls the asserted activity label and duration from each caption, and score faithfulness and coverage against a reference classifier. (3) Plot ROUGE-L against faithfulness per item. If the correlation is high, explain why; if it is low (the usual outcome), identify three captions with high ROUGE and low faithfulness and describe the physical error each hides. (4) Re-run faithfulness with \(\tau\) at 0.05 and 0.20 and report how the ranking of two model checkpoints changes with tolerance.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ul>
+<li>Why can a sensor-language answer score 0.9 on BERTScore and still be physically wrong? What single change to the evaluation would expose it?</li>
+<li>You use one LLM to generate answers and a model from the same family to judge them. Name the specific bias this introduces and one concrete way to remove it.</li>
+<li>A colleague reports "faithfulness = 0.82" with no coverage number. What is the cheapest way for a model to inflate that 0.82, and why does coverage catch it?</li>
+</ul>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 21</h3>
+<p>build a sensor-QA prototype that answers natural-language questions over an activity/telemetry stream, with a grounding check.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Sensor-language benchmarks and evaluation</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2501.04974">Xu et al. (2025). SensorQA: A Question Answering Benchmark for Daily-Life Monitoring. arXiv / SenSys.</a></p><p class="bib-annotation">The human-grounded reference dataset for evaluating QA over long-horizon wearable streams; its question-type distribution is the honest test bed and its edge-vs-server gap frames why evaluation must include cost and latency.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2410.10741">Ganti et al. (2024). SensorBench: Benchmarking LLMs in Sensor Data Processing. arXiv.</a></p><p class="bib-annotation">Probes where LLMs succeed and fail on quantitative sensor tasks, making the case that fluency and correctness diverge and that task-typed breakdowns beat a single accuracy headline.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2411.14360">OpenSQA / Open-ended sensor question answering (2024). arXiv.</a></p><p class="bib-annotation">Targets open-ended, explanation-style sensor questions that no label-based metric can score, motivating rubric and judge-based evaluation for the causal and trend rungs of the question ladder.</p></div>
+
+<p class="bib-category">LLM-as-judge and text-generation metrics</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2306.05685">Zheng et al. (2023). Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. NeurIPS Datasets and Benchmarks.</a></p><p class="bib-annotation">The canonical study of LLM judges: quantifies position, verbosity, and self-enhancement bias and shows judge-human agreement can be high once these are controlled, the playbook for using a judge as a metric.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/1904.09675">Zhang et al. (2020). BERTScore: Evaluating Text Generation with BERT. ICLR.</a></p><p class="bib-annotation">The embedding-similarity metric whose strengths and blind spots this section dissects; useful as the linguistic axis but demonstrably unable to catch a swapped activity label.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://aclanthology.org/P02-1040/">Papineni et al. (2002). BLEU: a Method for Automatic Evaluation of Machine Translation. ACL.</a></p><p class="bib-annotation">The n-gram overlap metric that still anchors most captioning leaderboards; included to make concrete why a physically-blind surface metric misleads on sensor descriptions.</p></div>
+
+<p class="bib-category">Faithfulness and foundation-model evaluation</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2309.15217">Es et al. (2023). RAGAS: Automated Evaluation of Retrieval Augmented Generation. arXiv / EACL demo.</a></p><p class="bib-annotation">Introduces reference-light faithfulness and answer-relevance metrics that decompose an answer into checkable claims, the pattern this section adapts to signal-derived ground-truth facts.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://arxiv.org/abs/2402.03885">Goswami et al. (2024). MOMENT: A Family of Open Time-Series Foundation Models. ICML.</a></p><p class="bib-annotation">A representative time-series foundation model whose reasoning and description outputs need exactly this two-axis evaluation, and whose classical-estimator heads can supply the reference facts for automatic faithfulness scoring.</p></div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>, the sensor-language model stops being a passive describer and becomes an actor: an LLM agent that queries sensors, calls tools, and drives operations. Everything in this section becomes the safety harness for that agent, because an agent that acts on an unfaithful reading does not just produce a wrong sentence, it produces a wrong action, and the faithfulness metric you built here is what stands between a plausible paragraph and a false alarm on the plant floor.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

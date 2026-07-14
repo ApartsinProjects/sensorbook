@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.5: Prompting and retrieval over sensor context. Building Sensory AI." name="description"/>
+<title>Section 21.5: Prompting and retrieval over sensor context | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Multimodal Sensor-Language Models and Sensor Reasoning</a></div>
+<h1>Prompting and retrieval over sensor context</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You handed me an hour of accelerometer at a hundred hertz and asked me to be concise. I would too, if I could remember the middle of it."</p>
+<cite>An Overflowing AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section builds on the reasoning-over-streams patterns of <a class="cross-ref" href="section-21.4.html">Section 21.4</a> and the language alignment of <a class="cross-ref" href="section-21.1.html">Section 21.1</a>. You will need the idea of a learned sensor embedding as a searchable vector from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a> and the encoders of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>, the summary and symbolic features of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>, and the timestamp discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Familiarity with a nearest-neighbor search helps for the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A language model reasons only over what fits in its prompt, and a sensor produces far more than fits. One hour of a single 100 Hz axis is 360,000 numbers; serialized as text that is well over a million tokens, and you have not yet added the other five axes or the question. So the central engineering problem of sensor-language systems is not the model, it is the <em>context</em>: what slice of the signal, at what resolution, in what representation, alongside which retrieved evidence, do you place in front of the model so its answer is both grounded and affordable. This section covers the two levers that decide that. <em>Prompting</em> is how you serialize and frame the signal you already hold; <em>retrieval</em> is how you pull in the relevant fragment from a signal too large to hold, plus the labeled precedents and reference documents that turn a plausible answer into a supported one.</p>
+</div>
+
+<h2>Getting a signal into a prompt without drowning it</h2>
+<p><strong>What.</strong> Serialization is the map from a numeric window \(x \in \mathbb{R}^{C \times L}\) to the token string the model actually reads. Four serializations dominate, in ascending order of compression. <em>Raw numeric</em> writes decimated samples as text (<code>[0.02, -0.13, 0.41, ...]</code>); faithful but ruinously token-hungry, viable only for short, aggressively downsampled windows. <em>Summary statistics</em> replace the window with a compact descriptor block (mean, variance, dominant frequency, peak count, trend slope), the classical features of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a> rendered as key-value text. <em>Symbolic or event encoding</em> discretizes the stream into a short alphabet (SAX letters, or a sequence of detected events like "step, step, stumble, still") so an hour becomes a readable paragraph. <em>Embedding-plus-caption</em> runs the window through a sensor encoder and pairs the vector with a one-line natural-language description, letting a projection layer or a retrieved caption carry the semantics.</p>
+<p><strong>Why and when.</strong> The choice is a rate-distortion decision against a hard token budget. Raw numeric preserves everything and scales worst; symbolic and summary forms discard the waveform but survive long horizons and are legible to the model's language prior, which was trained on words, not on floating-point sequences. Match the serialization to the question: a query about a transient spike needs samples near that spike, while a query about a daily pattern needs a summary per hour. A robust default is <em>hierarchical</em>: a coarse summary over the whole span for orientation, plus raw or fine detail only around the region the question or a change detector flags as interesting.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Token budget is the true resolution knob of a sensor-language system, and you spend it, you do not save it. Every sample you serialize verbatim is a sample you cannot spend elsewhere in the context, so the design question is never "how do I fit the whole signal" (you cannot) but "which fraction, at which resolution, earns its tokens for <em>this</em> question." Sensor context is a budget allocation problem wearing a prompt-engineering costume.</p>
+</div>
+
+<h2>Prompt patterns that make sensor context legible</h2>
+<p><strong>Structure beats prose.</strong> Reliable sensor prompts are templated, not free-form. A dependable skeleton has four labeled blocks: a <em>system role</em> that states the sensor, its units, its sampling rate, and the model's job ("You are analyzing a wrist IMU sampled at 50 Hz; axes are in g"); a <em>context block</em> holding the serialized window and its metadata; a <em>task block</em> with the question and the exact output schema (a JSON field, a label from a closed set); and optional <em>exemplars</em>. Naming units and rate is not decoration: without them the model cannot tell 9.8 (gravity in \(\text{m/s}^2\)) from 9.8 (an alarming reading in some other unit), and it will hallucinate a scale if you make it guess.</p>
+<p><strong>In-context exemplars are supervised learning without training.</strong> A few labeled window/answer pairs placed in the prompt let the model pattern-match a new window against them, which is often the fastest path from zero to a usable classifier and needs no gradient step. The exemplars must be <em>construct-matched</em> to the query: same sensor, same serialization, same units, and ideally the same subject or machine family, or the analogy the model draws will be spurious. A chain-of-thought scaffold ("first note the dominant frequency, then compare it to the exemplars, then decide") helps on multi-step questions but must be constrained, because an unconstrained model will happily narrate physics it did not measure, the failure mode <a class="cross-ref" href="section-21.6.html">Section 21.6</a> is devoted to.</p>
+
+<h2>Retrieval: grounding answers in the signal you cannot hold</h2>
+<p><strong>What.</strong> Retrieval-augmented generation (RAG) over sensor context replaces "stuff everything in the prompt" with "index everything, fetch the relevant few, prompt on those." You precompute an embedding for every historical window with a frozen sensor encoder (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>), store the vectors in a similarity index, and at query time embed the current window and pull its \(k\) nearest neighbors. Three retrieval targets matter, and a strong system uses all three. <em>Episode retrieval</em> returns similar past windows with their known outcomes, which double as few-shot exemplars grounded in real history. <em>Metadata retrieval</em> pulls the machine's spec sheet, the patient's baseline, or the calibration record keyed by device ID. <em>Knowledge retrieval</em> fetches the relevant paragraph of a maintenance manual or clinical guideline so the model reasons against documented thresholds instead of invented ones.</p>
+<p><strong>Why.</strong> Retrieval attacks the two failures that pure prompting cannot. It defeats the context ceiling, since the index can hold years of history while the prompt holds only the handful of neighbors that matter. And it grounds the answer: an explanation that cites "three prior events with this same spectral signature, all labeled bearing-race fault" is checkable in a way a free-floating guess is not. Retrieval similarity also gives a cheap abstain signal, which the calibration machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> can turn into a real confidence bound.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Retrieve by subject, index by time</h3>
+<p>Two hazards specific to sensor RAG. First, respect the leakage boundary: when retrieved episodes will be scored as a system, the index must not contain windows from the same recording or subject as the query, or you are quoting the answer back to yourself. Second, honor time. A neighbor that is spectrally identical but temporally in the query's future is not admissible evidence in an online setting, so filter the index by timestamp using the clock discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. Nearest in embedding space is not the same as admissible.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a turbine telemetry copilot</h3>
+<p>A wind-farm operator wants an on-call engineer to ask "why did unit 12 trip at 03:14?" in plain language. The copilot embeds the ten-minute window around the trip with a frozen vibration encoder, retrieves the five most similar historical windows across the <em>other</em> turbines (never unit 12's own future), and finds four of them were labeled "yaw-bearing resonance during a wind veer." It also retrieves unit 12's spec sheet (its rated resonance band) and the two relevant paragraphs of the maintenance manual. The prompt then carries a coarse summary of the whole night, the raw spectrum around 03:14, those five labeled precedents as exemplars, and the manual excerpt. The model answers with a resonance hypothesis that <em>cites</em> the precedents and the rated band, and the engineer can click each citation. When the nearest neighbor sits far away in embedding space, the copilot says "no close precedent found" instead of inventing one, and the case escalates to the agentic root-cause workflow of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>.</p>
+</div>
+
+<h2>A code walk: retrieval over sensor episodes</h2>
+<p>The snippet below is the retrieval half of the copilot. It embeds a library of historical windows once, builds a nearest-neighbor index, and, for a new query window, fetches the closest labeled episodes and assembles a grounded prompt. The similarity distance of the top hit becomes the abstain gate discussed above.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.neighbors import NearestNeighbors
+
+# Z_lib: (M, D) embeddings of historical windows from OTHER subjects/units
+# labels, times: length-M metadata aligned to Z_lib
+index = NearestNeighbors(n_neighbors=5, metric="cosine").fit(Z_lib)
+
+def retrieve_and_prompt(z_query, t_query, question, k=5):
+    dist, idx = index.kneighbors(z_query[None], n_neighbors=k)
+    keep = [i for i, t in zip(idx[0], times[idx[0]]) if t < t_query]  # past only
+    if not keep or dist[0][0] > 0.35:            # no close, admissible precedent
+        return None                              # -> abstain / escalate
+    shots = "\n".join(f"- precedent: {labels[i]} (dist {d:.2f})"
+                      for i, d in zip(keep, dist[0]))
+    return (f"System: wrist IMU, 50 Hz, axes in g.\n"
+            f"Similar past episodes:\n{shots}\n"
+            f"Question: {question}\nAnswer with a label and a one-line reason.")
+</code></pre>
+<div class="code-caption">Episode retrieval as grounded few-shot construction. The cosine index returns candidate precedents, a timestamp filter drops any that lie in the query's future, and a distance threshold turns "no close precedent" into an explicit abstain rather than a confident hallucination. The returned string is the context block the language model receives.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Hand-rolling a production sensor-RAG pipeline means writing the embedding loop, an exact or approximate index (FAISS/HNSW), the metadata filter, the top-\(k\) merge, the prompt templating, and the model call: on the order of 150 to 250 lines with several places to leak or mis-rank. A retrieval framework such as LlamaIndex or LangChain collapses the vector-store, retriever, and prompt-assembly plumbing to roughly a dozen lines (define an embedding function, <code>VectorStoreIndex.from_documents(...)</code>, <code>index.as_query_engine()</code>), and lets you attach the timestamp and subject filters as metadata predicates. The library owns the index, the chunking, and the query engine; you still own the two things it cannot decide: which sensor encoder produces the embeddings and where the abstain threshold sits.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Retrieval-augmented sensor reasoning is early and contested. Recent systems around SensorQA and OpenSQA show that feeding an LLM retrieved summary statistics and event lists beats raw-sample prompting on long-horizon wearable questions, and telemetry copilots increasingly retrieve labeled precedents as in-context exemplars. Open problems concentrate on the retriever: general text and vision embeddings transfer poorly to sensor similarity, so what encoder yields a retrieval space where "similar signal" means "similar answer" is unsettled; how to jointly retrieve heterogeneous evidence (a window, a spec sheet, a manual paragraph) and rank across those types is unsolved; and whether retrieval genuinely reduces hallucination or merely relocates it into the choice of what to retrieve is exactly the grounding question of <a class="cross-ref" href="section-21.6.html">Section 21.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a labeled activity dataset logged as multichannel windows. (1) Build three serializations of one window (raw decimated numeric, a summary-statistics block, and a symbolic/event encoding) and measure the token count of each. (2) Prompt a model to classify the activity from each serialization with the same three in-context exemplars, and report accuracy against token cost. (3) Now build a nearest-neighbor index over frozen embeddings of the training windows, retrieve the top-3 labeled neighbors for each test window as exemplars, and compare to your fixed-exemplar prompt. (4) Add a distance threshold that abstains, split by subject so no neighbor shares the query's subject, and report how accuracy on the answered subset changes as you tighten the threshold.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why is "fit the whole signal in the prompt" the wrong framing, and what problem replaces it once you accept that the signal does not fit?</p>
+<p class="quiz-question">2. A retrieved neighbor is the closest match in embedding space but its timestamp is after the query's. Give two distinct reasons it may still be inadmissible as evidence.</p>
+<p class="quiz-question">3. You omit the sampling rate and units from the system block and accuracy drops. Mechanistically, what did the model have to do that it should not have had to, and how does that produce wrong answers?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>Prompting and retrieval decide <em>what</em> the model sees, but not whether it tells the truth about it. A well-retrieved precedent can still be over-interpreted, and a confident sentence about a spectral peak may describe a peak that is not there. In <a class="cross-ref" href="section-21.6.html">Section 21.6</a>, we turn to grounding, hallucination, and verification for physical signals: how to keep a sensor-language model's claims tied to the measurement, how to detect when they are not, and how to check an answer against the physics before a human acts on it.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

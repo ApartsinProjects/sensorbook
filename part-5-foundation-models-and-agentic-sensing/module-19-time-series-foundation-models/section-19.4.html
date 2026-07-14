@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.4: Zero-shot and few-shot forecasting, classification, imputation, anomaly detection. Building Sensory AI." name="description"/>
+<title>Section 19.4: Zero-shot and few-shot forecasting, classification, imputation, anomaly detection | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Time-Series Foundation Models</a></div>
+<h1>Zero-shot and few-shot forecasting, classification, imputation, anomaly detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They asked me to forecast a vibration channel I had never seen. I read the last 512 samples, thought for one forward pass, and did not retrain a single weight. The maintenance team called it magic. I called it Tuesday."</p><cite>An Unfazed AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Section 19.3 introduced the model families. This section is about what you actually <em>do</em> with them. A time-series foundation model (TSFM) turns four classic sensor problems, forecasting, classification, imputation, and anomaly detection, into variations of a single move: feed a context window in, read a prediction out, with either <strong>zero</strong> task-specific training (zero-shot) or a <strong>handful</strong> of labeled examples (few-shot). The context window is the interface. Instead of designing a bespoke network and collecting a training set for every new sensor channel, you pass recent history to a frozen model and let its pretrained prior do the work. This section teaches how each of the four tasks maps onto that prior, when the mapping is faithful, and how to spend a small labeling budget to close the last gap.</p>
+</div>
+
+<p>This section assumes you understand what a foundation model is (Section 19.1) and how patching and value tokenization encode a series (Section 19.2). It also leans on probabilistic forecasting notation and proper scoring rules from the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">uncertainty primer in Chapter 4</a>, and on the residual-based detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. You do not need to have trained a TSFM yourself; every technique here treats the backbone as a fixed function.</p>
+
+<h2>The zero-shot to few-shot spectrum</h2>
+<p><strong>What</strong> distinguishes the regimes is how much task-specific weight update you allow. <strong>Zero-shot</strong> means no gradient touches the model: you supply a context window \(x_{1:L}\) and the network emits its answer in one forward pass, exactly as a large language model answers a prompt it was never fine-tuned on. <strong>Few-shot</strong> means you have somewhere between a handful and a few hundred labeled windows, too few to train a model from scratch, and you use them to nudge the pretrained representation. The three standard nudges, from cheapest to most expressive, are the <em>linear probe</em> (freeze the backbone, fit a logistic or ridge head on its embeddings), <em>parameter-efficient fine-tuning</em> such as LoRA (inject a few low-rank adapter matrices, train only those), and <em>full fine-tuning</em> (unfreeze everything, viable only when you have thousands of windows).</p>
+
+<p><strong>Why</strong> zero-shot works at all is worth stating plainly: pretraining on hundreds of billions of time points across electricity, traffic, weather, finance, and sensor corpora teaches the model the shared grammar of temporal data, trend, seasonality, autocorrelation, level shifts, and heavy tails. A new vibration or glucose channel is rarely grammatically novel even when it is semantically novel. <strong>When</strong> the new signal violates that grammar (a control loop with a sampling rate the model never saw, a regime with no analogue in pretraining), zero-shot degrades and the few-shot budget earns its keep.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight: one backbone, four heads</h3>
+<p>Forecasting, imputation, and anomaly detection are the <em>same</em> generative task viewed through different masks. Forecasting masks the future. Imputation masks interior gaps. Anomaly detection compares the model's prediction to reality and flags the surprise. Only classification needs a genuinely different head, and even then a frozen embedding plus a linear classifier is often enough. If you internalize this masking view, you stop asking "which model for this task" and start asking "which mask, on which frozen backbone."</p>
+</div>
+
+<h2>Zero-shot forecasting: the flagship capability</h2>
+<p>Forecasting is where TSFMs shine hardest because it is the task most of them were pretrained on directly. <strong>How</strong> it runs: you choose a context length \(L\) (often 512 to 2048 samples), the model consumes the (instance-normalized) window, and it emits a distribution over the next \(H\) steps. Good TSFMs are <em>probabilistic</em>: they return quantiles \(q_\alpha(x_{L+h})\) rather than a single point, so you get calibrated intervals for free. That matters for sensor decisions, where a predictive-maintenance alert needs a confidence band, not just a mean. Evaluate with a quantile loss such as the weighted quantile loss, \(\mathrm{WQL} = \tfrac{2}{\sum_h |x_{L+h}|}\sum_{h,\alpha} \big[\alpha(x - q_\alpha)_+ + (1-\alpha)(q_\alpha - x)_+\big]\), which rewards sharp, calibrated intervals and reduces to mean absolute error at the median.</p>
+
+<p>Two practical knobs dominate zero-shot quality. First, <strong>context length</strong>: too short and the model cannot see the dominant seasonality; too long and irrelevant ancient history dilutes the prior. Match \(L\) to at least two or three periods of the slowest cycle you care about. Second, <strong>instance normalization</strong>: nearly all TSFMs standardize each window internally, so a channel measured in \(\mathrm{m/s^2}\) and one in millivolts are treated identically; you rarely need to rescale by hand, but you must ensure the window has enough non-constant signal for the statistics to be meaningful.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: a wind-farm gearbox nobody labeled</h3>
+<p>An operator commissions a new turbine model and gets a gearbox oil-temperature channel at one-minute cadence. There is no historical fault data for this exact unit, so a supervised forecaster has nothing to train on. The reliability team feeds the last 1440 samples (one day) to a frozen Chronos-Bolt model and reads a 90-minute-ahead forecast with an 80% interval. When the measured temperature climbs out of the upper quantile band for three consecutive windows during a normal-load period, the system raises a soft alert. No model was trained, no fault labels existed, and the same pipeline that forecasts becomes the anomaly detector described below. The team later confirms a degrading cooling pump. This is precisely the workflow <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a> formalizes for prognostics.</p>
+</div>
+
+<h2>Classification, imputation, and anomaly detection from the same prior</h2>
+<p><strong>Imputation</strong> is forecasting turned inward. Sensor streams drop samples: a wearable loses skin contact, a CAN bus drops a frame, a lidar returns nothing off a black surface. A TSFM with a masked-reconstruction objective (MOMENT is the canonical example) fills interior gaps by conditioning on both past and future context, which is strictly more information than a causal forecaster has, so zero-shot imputation is often excellent. <strong>Anomaly detection</strong> reuses either head: run the model, form the residual \(r_t = x_t - \hat{x}_t\) (forecast residual) or the reconstruction error (imputation residual), and threshold it. The surprise signal is model-agnostic; you are simply asking "how far did reality fall outside what the pretrained prior expected," which connects directly to the residual detectors and change-point tests of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. <strong>Classification</strong> is the one task that needs a new head: extract a pooled embedding \(z = f_\theta(x_{1:L})\) from the frozen backbone and fit a small classifier on top. Section 19.5 develops this embeddings-as-features view in depth; here the point is that even classification rides the same frozen model.</p>
+
+<pre><code class="language-python">import numpy as np
+from chronos import ChronosBoltPipeline   # frozen TSFM, no training
+
+pipe = ChronosBoltPipeline.from_pretrained("amazon/chronos-bolt-base")
+
+def zero_shot_anomaly(series, context=512, horizon=1, k=3.0):
+    """Slide a frozen forecaster over a channel; flag samples that fall
+    outside its predicted quantile band by more than k robust sigmas."""
+    flags = np.zeros(len(series), dtype=bool)
+    for t in range(context, len(series) - horizon):
+        ctx = series[t - context:t]
+        q = pipe.predict_quantiles(ctx, prediction_length=horizon,
+                                   quantile_levels=[0.1, 0.5, 0.9])
+        lo, mid, hi = q[0, 0], q[1, 0], q[2, 0]      # 10/50/90 percentiles
+        band = max(hi - lo, 1e-6)                     # predicted spread
+        resid = abs(series[t] - mid)
+        flags[t] = resid > k * band                   # surprise exceeds prior
+    return flags
+</code></pre>
+<div class="code-caption">Zero-shot anomaly detection built entirely on a frozen forecaster: no fault labels, no task training. The predicted 10-90 percentile spread supplies a self-calibrating threshold, so a quiet channel gets a tight band and a noisy one gets a wide band automatically. Referenced by the wind-farm example above and the exercise below.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library shortcut: four tasks, one import</h3>
+<p>Hand-rolling a probabilistic forecaster, a masked-imputation network, and an embedding classifier from scratch is easily 800 to 1200 lines across three training loops, plus data pipelines and checkpoint management. With a TSFM library (<code>chronos</code>, <code>momentfm</code>, or <code>tirex</code>) the zero-shot path collapses to a <code>from_pretrained</code> call and one <code>predict</code>, imputation is the same call with an interior mask, and classification is a frozen <code>embed</code> plus a scikit-learn <code>LogisticRegression</code>. Roughly a 30-to-1 line reduction, and the library owns instance normalization, patching, quantile decoding, and batching. You write the task glue; the library owns the model.</p>
+</div>
+
+<h2>Few-shot adaptation: spending a small label budget well</h2>
+<p>When zero-shot leaves a gap, do not jump to full fine-tuning. The efficient frontier is: linear probe first, then LoRA, then full unfreeze only if data justifies it. A <strong>linear probe</strong> on frozen embeddings needs only tens of examples per class and cannot overfit the backbone, making it the right first move for a new activity-recognition or arrhythmia-screening task. <strong>LoRA</strong> adds low-rank matrices \(W + \Delta W\) with \(\Delta W = BA\), \(A \in \mathbb{R}^{r\times d}\), \(B \in \mathbb{R}^{d\times r}\) and small rank \(r\); you train perhaps 0.1 to 1% of the parameters, which shifts the forecasting or reconstruction behavior toward your domain without erasing the pretrained prior. Because you touch so few weights, few-shot fine-tuning is also far less prone to the leakage traps of full retraining, though you still hold out a strictly future validation window, a discipline this book returns to in Section 19.6 and in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research frontier: in-context adaptation without gradients</h3>
+<p>The 2024-2026 frontier pushes toward <em>gradient-free</em> few-shot: models such as TimesFM 2.5 and TiRex handle longer context and richer conditioning, and covariate-aware regressors (TimesFM's <code>covariate</code> path, Chronos with exogenous inputs) let you inject related channels as context so the model adapts through its prompt rather than its weights. Related work on in-context fine-tuning shows a TSFM improving on a target domain purely from example series placed in the context window, echoing few-shot prompting in language models. Calibrating the resulting intervals with the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> is the current best practice for turning a raw zero-shot band into a guaranteed-coverage one.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the <code>zero_shot_anomaly</code> function above and evaluate it on a labeled anomaly benchmark of your choice. (1) Sweep the threshold multiplier \(k\) and plot precision versus recall; where does the self-calibrating band beat a fixed global 3-sigma rule? (2) Replace the forecast residual with a masked-imputation residual (use past and future context) and compare detection latency. (3) Now give yourself a budget of 20 labeled anomaly windows and fit a linear probe on the backbone's embeddings instead; report how much the small labeled set improves \(F_1\) over the fully zero-shot detector.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why is zero-shot imputation often easier for a TSFM than zero-shot forecasting of the same channel? 2. You have 40 labeled windows for a new gesture class. Rank linear probe, LoRA, and full fine-tuning by expected reliability and explain your ordering. 3. A frozen forecaster's residuals flag an "anomaly" every night at the same hour on a building-energy meter. What is the most likely benign cause, and which knob from this section fixes it?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-19.5.html">Section 19.5</a>, we go one level deeper on the classification move that appeared here only in passing: using a frozen foundation model purely as a feature extractor, so its embeddings become drop-in inputs for downstream classifiers, regressors, retrieval, and clustering, and we measure when those embeddings beat hand-engineered features.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

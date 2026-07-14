@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.1: From time-series FMs to raw multi-sensor FMs. Building Sensory AI." name="description"/>
+<title>Section 20.1: From time-series FMs to raw multi-sensor FMs | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Sensor and Wearable Foundation Models</a></div>
+<h1>From time-series FMs to raw multi-sensor FMs</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They handed me a clean univariate series and called me a sensor model. I have never once met a sensor that behaved that politely."</p>
+        <cite>A Disillusioned AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This chapter assumes you have met the time-series foundation models of <a class="cross-ref" href="../module-19-time-series-foundation-models/index.html">Chapter 19</a> (patch tokenization, zero-shot forecasting, the leakage-and-benchmarking cautions), the self-supervised and contrastive objectives of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and the transformer sequence machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>. The sampling, multi-rate, and clock-synchronization vocabulary comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>; the measurement-model view of a raw signal (physical units, per-channel noise) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Appendix B refreshes the deep-learning primitives; Appendix J holds the notation.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Chapter 19 built a foundation model for <em>the abstract time series</em>: a clean, regularly sampled sequence of numbers with no physical identity. A stock price, a river level, and an electricity load all look the same to it, and that deliberate amnesia is exactly what let one model forecast thousands of unrelated series. This chapter asks a harder question: what happens when the numbers are not abstract at all, but raw readings pouring off an accelerometer, a photoplethysmography (PPG) diode, and a skin-temperature thermistor on the same wrist, at three different rates, with gaps, and each carrying its own physics? A sensor foundation model is not a time-series foundation model with a new dataset. It is a model that treats <em>heterogeneity, missingness, and multi-device reality as the input, not the exception</em>. This section draws the line between the two, so that everything after it (Google's Large Sensor Model, Apple-style biosignal encoders, motion foundation models) reads as a family answering one shared design problem.</p>
+    </div>
+
+    <p>A time-series foundation model such as TimesFM, MOMENT, or Chronos earns its generality by throwing information away: it strips units, provenance, and channel meaning until every series is just a strip of scalars to be patched and predicted. That abstraction is a feature when you forecast retail demand. It is a liability the moment your input is a wrist. Wearable and multi-sensor data violate almost every assumption the time-series model relies on: the channels are not exchangeable (a gyroscope axis is not a heart rate), they arrive at different sampling rates, they drop out when a strap loosens or a radio stalls, and their joint structure (the way motion corrupts a PPG pulse, the way temperature drifts a bias) is the very signal we want to learn. This section names those gaps precisely and shows the design moves that close them, setting up the concrete systems in the rest of the chapter.</p>
+
+    <div class="callout warning">
+        <h4>Common Misconception</h4>
+        <p>The tempting shortcut is to say "a wearable stream is just a multivariate time series, so a multivariate time-series foundation model already covers it." It does not. A multivariate time-series model assumes its channels are aligned on one clock, present at every step, and interchangeable enough to share a tokenizer. Raw multi-sensor input breaks all three: rates differ, presence is intermittent, and channel semantics are load-bearing. Feeding such data to a plain time-series model does not fail loudly; it silently learns a diluted representation and blames the sensors.</p>
+    </div>
+
+    <h2>Why a time-series foundation model is not yet a sensor foundation model</h2>
+
+    <p><strong>What</strong> separates the two is the object each one models. A time-series foundation model (Chapter 19) is trained on \(x[n]\), a sequence of unitless scalars, and its universality comes from being <em>blind</em> to what those scalars mean. A sensor foundation model is trained on a bundle of raw channels \(\{x_c(t)\}_{c=1}^{C}\), each with its own physical measurement model \(x_c = h_c(s) + \eta_c\) (the world-to-signal map from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>), its own rate \(f_{s,c}\), and its own failure behavior. <strong>Why</strong> the blindness stops paying off: when the channels are heterogeneous, discarding their identity discards the cross-channel physics that carries most of the information. The correlation between an accelerometer burst and a PPG artifact is not noise to be averaged out; it is the label-free structure self-supervision feeds on.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The move from a time-series foundation model to a sensor foundation model is a move from <em>channel-agnostic</em> to <em>channel-aware</em> pretraining. The time-series model wins by forgetting which series it is looking at; the sensor model wins by remembering, because the identity, rate, and reliability of each channel are inputs the representation must condition on. Generality no longer comes from amnesia; it comes from learning a shared latent space in which many differently-shaped sensors can be embedded together.</p>
+    </div>
+
+    <h2>What "raw multi-sensor" actually demands</h2>
+
+    <p>Call a stream <em>raw</em> when it has not been collapsed into hand-designed features (band energies, heart-rate estimates, step counts) but arrives as the digitized waveform itself. Learning directly on raw multi-sensor input imposes four demands a time-series model was never built to meet. <strong>First, heterogeneity of physics:</strong> a three-axis accelerometer at 50 Hz, a PPG channel at 25 Hz, an electrodermal channel at 4 Hz, and a temperature channel at 1 Hz share a wrist but not a unit, a range, or a noise model. <strong>Second, multi-rate time:</strong> the channels do not share a sample index, so "step \(n\)" is meaningless across them; only wall-clock time \(t\) aligns them, and even that needs the synchronization care of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>. <strong>Third, missingness as the norm:</strong> straps loosen, radios drop packets, and users take the device off, so any given channel is absent for long, structured stretches rather than at random. <strong>Fourth, multi-device variation:</strong> the same nominal sensor differs across hardware revisions, wear positions, and users, so the model must generalize across devices it never saw in training.</p>
+
+    <p>These four demands are the connective tissue of the whole chapter. Missingness and multi-rate handling get their own treatment in <a class="cross-ref" href="section-20.5.html">Section 20.5</a>; here the point is only that they are <em>defining</em>, not incidental. A model that treats them as preprocessing to be finished before the "real" model runs has already lost the structure.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: A Wrist That Refuses to Cooperate</h3>
+        <p>A sleep-and-recovery wearable startup collected two years of continuous data from a wrist band with an accelerometer, a green-light PPG, and a skin thermistor. Their first pipeline resampled everything to a common 50 Hz grid, forward-filled gaps, and fed the result to an off-the-shelf multivariate time-series encoder. It worked on the bench and fell apart in the field: forward-filling a PPG dropout for forty seconds manufactured a flat, confident "resting heart rate" that the model trusted, and resampling the 1 Hz temperature to 50 Hz taught the encoder that temperature was fifty times more informative than it was. When they rebuilt the front end to keep each channel at its native rate, tag every token with its channel identity and a presence flag, and let the transformer attend across the ragged set, cross-user heart-rate error dropped by roughly a third and the model stopped hallucinating vitals through gaps. Nothing about the encoder changed; what changed was that heterogeneity and missingness were represented instead of erased.</p>
+    </div>
+
+    <h2>Tokenizing heterogeneous streams: the central design choice</h2>
+
+    <p>Everything a sensor foundation model can and cannot do is decided at the tokenizer, the layer that turns ragged raw channels into a sequence of vectors a transformer can attend over. <strong>What</strong> the tokenizer must produce: a set of tokens, each carrying (1) a content embedding of a short patch of one channel, (2) a channel or modality embedding that says <em>which</em> sensor it came from, (3) a time embedding anchored to wall-clock \(t\) rather than a shared index, and (4) a presence signal that lets the model distinguish "measured zero" from "missing." <strong>Why</strong> this differs from Chapter 19: the time-series model patches a single homogeneous series and needs only content plus position. Here the channel and presence embeddings are what let one model swallow a wrist, a chest strap, and a phone in the same forward pass.</p>
+
+    <p><strong>How</strong> the design axes shake out: patch each channel independently (a <em>channel-independent</em> tokenizer, robust and simple) versus fuse channels early (a <em>channel-mixing</em> tokenizer, which can capture cross-sensor structure but bakes in a fixed channel set). Most current sensor foundation models lean channel-independent at the token level and let the transformer's attention do the mixing, precisely because it keeps the model open to sensors it has not met. <strong>When</strong> each is right: channel-independent when your fleet is heterogeneous and evolving; channel-mixing when the sensor suite is fixed and tightly coupled (a single automotive inertial measurement unit, say). The listing below builds a minimal channel-independent tokenizer for a multi-rate wrist bundle, producing exactly the four-part tokens described above.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def tokenize_multirate(channels, patch_seconds=1.0):
+    """channels: dict name -> (samples[np.ndarray], fs_hz, t0_seconds).
+    Returns a flat token list; each token carries content, channel id,
+    wall-clock time, and a presence flag (0 = imputed/missing)."""
+    tokens = []
+    for chan_id, (name, (x, fs, t0)) in enumerate(channels.items()):
+        step = int(round(patch_seconds * fs))          # samples per patch
+        for start in range(0, len(x), step):
+            patch = x[start:start + step]
+            present = 1 if np.isfinite(patch).all() and len(patch) == step else 0
+            patch = np.nan_to_num(patch)               # zero-fill for the encoder
+            content = np.array([patch.mean(), patch.std(), patch.max() - patch.min()])
+            t_center = t0 + (start + step / 2) / fs     # wall-clock, not sample index
+            tokens.append(dict(chan=chan_id, name=name, t=t_center,
+                               present=present, content=content))
+    tokens.sort(key=lambda tok: tok["t"])              # interleave by real time
+    return tokens
+
+wrist = {
+    "acc":  (np.random.randn(50 * 8),         50, 0.0),   # 8 s @ 50 Hz
+    "ppg":  (np.concatenate([np.random.randn(25 * 4),
+                             np.full(25 * 4, np.nan)]),  25, 0.0),   # 4 s data, 4 s gap
+    "temp": (np.random.randn(1 * 8) + 32.0,    1, 0.0),   # 8 s @ 1 Hz
+}
+toks = tokenize_multirate(wrist)
+missing = sum(1 for t in toks if t["present"] == 0)
+print(f"{len(toks)} tokens, {missing} flagged missing, "
+      f"channels seen: {sorted({t['name'] for t in toks})}")
+</code></pre>
+    <div class="code-caption"><strong>Listing 1.</strong> A minimal channel-independent tokenizer for a ragged, multi-rate wrist bundle. Each channel is patched at its own native rate, tokens are interleaved on wall-clock time, and a presence flag marks the PPG dropout instead of pretending the gap is data. The three-number content summary stands in for a learned patch embedding.</div>
+
+    <p>Listing 1 is deliberately skeletal: the content vector is three statistics rather than a learned embedding, and the time embedding is a raw timestamp rather than a sinusoidal or rotary code. The architecture, though, is the real one. Notice what the tokenizer <em>did not</em> do: it did not resample every channel to a common grid, and it did not forward-fill the PPG gap into a plausible-looking lie. It kept temperature at 1 Hz, kept the accelerometer at 50 Hz, and handed the transformer a ragged token stream in which the gap is explicitly flagged. That single decision, carried into a real learned encoder, is most of the difference between a sensor foundation model and a repurposed forecaster.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool</h3>
+        <p>You will not hand-roll the ragged batching, padding, and attention masking that a real multi-rate tokenizer needs at training scale. A Hugging Face style data collator collapses it to a few lines:</p>
+        <pre><code class="language-python">from transformers import DataCollatorWithPadding
+collate = DataCollatorWithPadding(tokenizer=None, padding="longest",
+                                  return_tensors="pt")
+batch = collate(token_dicts)          # pads ragged token lists, builds attention_mask
+</code></pre>
+        <div class="code-caption"><strong>Listing 2.</strong> A padding collator turns variable-length, ragged token lists into a padded batch with an attention mask ready for a transformer encoder.</div>
+        <p>Three lines replace roughly 150 lines of manual length bookkeeping, pad-token insertion, and boolean mask construction. The library handles the longest-in-batch padding, emits the attention mask that keeps the encoder from attending to pad positions, and returns framework tensors. What it does <em>not</em> do for you is the channel and presence embedding; those are yours to design, because they encode the sensor semantics that make the model a sensor model.</p>
+    </div>
+
+    <h2>The pretraining recipe and why now</h2>
+
+    <p><strong>What</strong> the recipe is: take vast quantities of unlabeled raw sensor data, tokenize it as above, and train the encoder with a self-supervised objective (the masked-reconstruction and contrastive families of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>): mask a fraction of tokens and reconstruct them, or pull augmented views of the same window together in embedding space. <strong>Why</strong> self-supervision rather than labels: labeled wearable data is scarce, expensive, and privacy-encumbered, while raw data is essentially free at fleet scale, and masking a multi-rate, gap-riddled stream doubles as a way to teach the model to reason about the missingness it will face at inference. <strong>When</strong> this became feasible is the "why now" of the whole chapter: consumer wearables and industrial fleets now generate billions of device-hours of raw signal, enough that a single sensor encoder can be pretrained once and adapted to many downstream tasks, exactly as language models did a few years earlier. Because that pretraining is done once and reused, <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">leakage-safe splitting by user and by device</a> is not optional hygiene; a subject who appears in both pretraining and the downstream test inflates every number you report.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The current state of the art makes this framing concrete. Google's Large Sensor Model (LSM), and its 2024 successor LSM-2, pretrain on the order of a million subject-hours of multimodal wearable data and introduce masking schemes built for missingness rather than bolted on afterward (the subject of <a class="cross-ref" href="section-20.2.html">Section 20.2</a>). Apple-style biosignal foundation models train PPG, electrocardiography (ECG), and accelerometer encoders with self-supervision at a scale of hundreds of thousands of participants (<a class="cross-ref" href="section-20.3.html">Section 20.3</a>), and motion and human-activity foundation models do the same for inertial streams (<a class="cross-ref" href="section-20.4.html">Section 20.4</a>, building on the activity-recognition groundwork of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). What unites them is not an architecture but the answer to this section's question: they are channel-aware, missingness-native, multi-rate encoders pretrained on raw signal, not forecasters handed a sensor dataset. The open frontier is generalizing across sensor <em>suites</em> the model never saw, so that one encoder serves a wrist, a chest patch, and a ring without retraining.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take the wrist bundle in Listing 1 and add a fourth channel: a 4 Hz electrodermal-activity signal that is present only for the first three seconds of the window. (1) Extend <code>tokenize_multirate</code> so its tokens interleave correctly on wall-clock time with the other three channels. (2) Report how many tokens are flagged missing and argue why a plain multivariate time-series encoder, which needs one aligned grid, could not represent this window without either resampling or imputation. (3) Propose a masking strategy for self-supervised pretraining on this stream that would teach the model to handle the structured PPG and electrodermal gaps rather than only random dropouts.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. A time-series foundation model succeeds by being blind to channel identity. Why does a sensor foundation model have to reverse that choice?</p>
+        <p class="quiz-question">2. Name the four pieces of information a heterogeneous-stream token should carry, and say which two a Chapter 19 time-series tokenizer omits.</p>
+        <p class="quiz-question">3. Why is forward-filling a long PPG dropout before the encoder dangerous, and what does a presence flag do instead?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-20.2.html">Section 20.2</a>, we make this framing concrete with the first large-scale system to embody it: Google's Large Sensor Model and LSM-2, and their adaptive and inherited masking schemes that turn "learning from incomplete data" from a preprocessing headache into the core pretraining objective.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.3: Sensor question answering (SensorQA, SensorBench, OpenSQA). Building Sensory AI." name="description"/>
+<title>Section 21.3: Sensor question answering (SensorQA, SensorBench, OpenSQA) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Multimodal Sensor-Language Models and Sensor Reasoning</a></div>
+<h1>Sensor question answering (SensorQA, SensorBench, OpenSQA)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"You handed me eleven days of accelerometer counts and asked whether you had been active enough. Active enough for what, by whose threshold, over which of the eleven days? The signal is precise; your question is not."</p><cite>A Literal-Minded AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 21.2 taught a model to <em>describe</em> a signal: given a window, produce a caption. Question answering flips the interaction. Now a human asks something specific and open-ended (<em>"How much did I sit last Tuesday versus my weekly average?"</em>, <em>"Which axis shows the fault first?"</em>) and the system must locate the relevant span, compute over it, and reply in words. That is harder than captioning in a way easy to underestimate: the same stream supports an unbounded space of questions, most demanding aggregation, comparison, or temporal reasoning that a single-window caption never touches. This section dissects the three benchmarks that defined the field, SensorQA, SensorBench, and OpenSQA, as three deliberate points in a design space. Knowing where each sits tells you which to trust for your problem, and how to build your own without fooling yourself.</p>
+</div>
+
+<p>This section assumes the activity-recognition vocabulary of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> (the labels a wearable QA system reasons over), the sampling-and-time discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (a question about "last Tuesday" is meaningless without a trustworthy clock), and the leakage-safe splitting rules of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, which turn out to decide whether a QA benchmark measures reasoning or memorization.</p>
+
+<h2>What a sensor question actually asks</h2>
+
+<p>Before comparing benchmarks, fix a taxonomy, because the single most important property of a sensor-QA dataset is the <em>distribution of question types</em> it samples. A useful ladder, in rough order of difficulty:</p>
+
+<ul>
+<li><strong>Retrieval / lookup:</strong> "What was I doing at 3pm?" One span, one label. Solvable by the classifier alone.</li>
+<li><strong>Aggregation:</strong> "How many hours did I walk today?" Requires summing over segments, so the model must first segment, then count, then convert units.</li>
+<li><strong>Comparison:</strong> "Did I sleep more this week than last?" Two aggregates and a relation.</li>
+<li><strong>Temporal / trend:</strong> "Has my sedentary time been increasing?" A slope over aggregates, sensitive to the window the question implies.</li>
+<li><strong>Causal / explanatory:</strong> "Why did my heart rate spike at noon?" The model must cross-reference channels (activity, motion) and produce a justified narrative, the hardest and least automatically scorable class.</li>
+</ul>
+
+<p>Every real question maps to one or more rungs of this ladder, and performance collapses predictably as you climb it. A model can nail retrieval and still be useless at comparison, because comparison composes two error-prone aggregates and the errors multiply. This is why "accuracy on sensor QA" is a near-meaningless headline: it averages over question types whose difficulty spans an order of magnitude.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Sensor QA is not one task. It is a classifier (which activity), an aggregator (how much), and a reasoner (why, compared to what), stacked. The benchmark that matters for you is the one whose question-type distribution matches your users' real questions. A dataset that is 80% lookup will crown a model that is merely a good classifier; a dataset heavy in comparison and trend will punish exactly that model. Always read the question-type histogram before the leaderboard.</p>
+</div>
+
+<h2>Three benchmarks, three design choices</h2>
+
+<p><strong>SensorQA</strong> is the human-grounded reference point. It pairs long-term daily-activity time series (the multi-day accelerometer-plus-context streams of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>) with roughly 5.6K question-answer pairs written and answered by human annotators reading visualized activity timelines. Because humans wrote the questions, the distribution is realistic: it leans on aggregation, comparison, and duration over long horizons rather than instant lookup. Its central finding is practical and sobering: models small enough to run on a phone lag well behind large server models, so the systems you would actually deploy at the edge are the ones that struggle most on natural questions. SensorQA measures the gap you fight in production.</p>
+
+<p><strong>SensorBench</strong> asks a different question: not "can a model answer a daily-life query" but "can a large language model <em>process raw sensor signals</em> at all". It presents an LLM with numerical sensor data and a battery of tasks ordered by difficulty, from property extraction (find the peak, the mean, the dominant period) up to composed multi-step processing, while systematically varying the prompting strategy. Its lesson mirrors the taxonomy above: models handle atomic operations far better than compositions, and prompt scaffolding (decomposition, explicit computation) helps most exactly where naive prompting fails. SensorBench is a diagnostic of raw-signal competence, upstream of any natural-language interface.</p>
+
+<p><strong>OpenSQA</strong> pushes toward open-ended, instruction-style answering. Where SensorQA's human set is small and closed, an open-ended corpus is generated at scale to <em>instruction-tune</em> a sensor-language model, teaching it to produce free-form explanatory answers rather than pick from a fixed set. It trades the guaranteed correctness of human labels for the volume needed to fit a model, and it foregrounds the hardest rung, explanations, where scoring is open research. Together the three cover the pipeline: OpenSQA-style data to train, SensorBench to probe raw-signal skill, SensorQA to check natural-question performance under an honest edge-versus-cloud comparison.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a physiotherapy adherence coach</h3>
+<p>A clinical team built a QA layer over knee-rehab patients' IMU streams so a physiotherapist could ask plain-language questions between visits. Early demos looked flawless because every demo question was a lookup ("was she wearing the band Tuesday morning?"), answered directly by the underlying activity classifier. The system fell apart in the field on the questions clinicians actually asked, all comparisons and trends: "Is her exercise volume recovering toward her pre-surgery baseline?" That single question stacks segmentation, per-day aggregation, a baseline lookup, and a slope, and each stage's small error compounded into confidently wrong summaries. The fix was not a bigger model but a benchmark rebuild: re-weighting the internal test set to match the clinician question histogram (mostly comparison and trend) exposed the weakness and justified adding an explicit aggregation tool the model could call, foreshadowing the agentic pattern of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-22-llm-agents-for-sensing-and-operations/index.html">Chapter 22</a>.</p>
+</div>
+
+<h2>How you score a free-form answer</h2>
+
+<p>Evaluation is where sensor QA quietly gets hard. For a categorical lookup, exact match or token F1 (borrowed from reading-comprehension QA) is fine. For aggregation and comparison the answer is a number with units, and exact match is nonsense: "3.9 hours" against a gold "4 hours" is essentially correct and should not score zero. The workable convention is a <em>tolerance-banded numeric match</em>: parse the quantity, then accept it if it falls within a relative tolerance of the gold value. For a predicted quantity \(\hat{y}\) and gold \(y\),</p>
+
+$$ \text{correct}(\hat{y}, y) \;=\; \mathbb{1}\!\left[\, \frac{|\hat{y} - y|}{\max(|y|,\, \epsilon)} \le \delta \,\right], $$
+
+<p>with a small \(\epsilon\) to guard the zero-gold case and a tolerance \(\delta\) (often 0.1 to 0.2) chosen to match how precisely the question can even be answered from the sensor. The code below implements exactly this split: categorical answers get normalized exact match, numeric answers get the tolerance band. Reporting one blended accuracy hides the story, so it also breaks the score out by question type, which is the number that actually guides model improvement.</p>
+
+<pre><code class="language-python">import re
+
+def parse_qty(ans):
+    m = re.search(r"[-+]?\d*\.?\d+", str(ans))     # first number in the string
+    return float(m.group()) if m else None
+
+def score_answer(pred, gold, kind, delta=0.15, eps=1e-6):
+    if kind == "categorical":
+        norm = lambda s: re.sub(r"\s+", " ", str(s).strip().lower())
+        return float(norm(pred) == norm(gold))
+    yhat, y = parse_qty(pred), parse_qty(gold)       # numeric: tolerance band
+    if yhat is None or y is None:
+        return 0.0
+    return float(abs(yhat - y) / max(abs(y), eps) &lt;= delta)
+
+qa = [
+    ("walking",        "Walking",        "categorical"),
+    ("about 3.9 hours","4 hours",        "numeric"),
+    ("5.5 hours",      "4 hours",        "numeric"),
+]
+from collections import defaultdict
+by_kind = defaultdict(list)
+for pred, gold, kind in qa:
+    by_kind[kind].append(score_answer(pred, gold, kind))
+for kind, s in by_kind.items():
+    print(f"{kind:12s} acc = {sum(s)/len(s):.2f}")
+</code></pre>
+<div class="code-caption">A minimal sensor-QA scorer: normalized exact match for categorical answers, a relative-tolerance band for numeric ones, reported per question type rather than as a single blended number. The tolerance \(\delta\) and the per-kind breakout are the two design choices that separate an honest evaluation from a misleading one.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the QA metric stack</h3>
+<p>The token-normalization, exact-match, and F1 machinery for the categorical case is a solved roughly 120-line problem. Hugging Face <code>evaluate</code> (<code>evaluate.load("squad")</code> for exact-match and F1, or the <code>rouge</code>/<code>bertscore</code> metrics for free-form explanatory answers) gives you the normalization, aggregation, and confidence intervals in about five lines. Keep your own code only for the sensor-specific numeric-tolerance band above, which no general QA metric provides, and let the library own everything downstream of parsing the quantity.</p>
+</div>
+
+<h2>Building your own set without poisoning it</h2>
+
+<p>You will usually need a domain-specific QA set, and the failure modes are the book's earlier ones, sharpened. First, split <em>by subject and by time</em>: if windows from one wearer (or worse, adjacent windows from one recording) land in both train and test, a model that merely memorized that person's routine scores like a reasoner. This is the <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> discipline applied to the question, not just the signal. Second, balance the question-type ladder deliberately; a set scraped from convenient templates drifts toward lookup and flatters classifiers. Third, because comparison and trend answers carry compounding uncertainty, a deployed QA system should report calibrated confidence rather than a bare number, which is exactly the conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026 the anchor benchmarks are SensorQA (human-annotated daily-activity QA that exposed the edge-versus-cloud accuracy gap), SensorBench (a difficulty-tiered probe of whether LLMs can process raw sensor signals under varied prompting), and the OpenSQA line of open-ended, instruction-generated sensor QA used to tune sensor-language models. The open problems cluster at the top of the ladder: automatic, faithful scoring of explanatory ("why") answers without a human in the loop; benchmarks that resist the classifier-flattering lookup bias; and QA over multi-sensor streams where the answer requires genuine cross-channel fusion rather than reading one modality. Expect the next generation to couple QA models with callable computation tools so aggregation and comparison are executed exactly rather than hallucinated, moving the model's job from arithmetic to question understanding.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a public activity dataset and hand-write 20 questions: 5 lookup, 5 aggregation, 5 comparison, 5 trend. (a) Answer each from the ground-truth labels to build a gold set. (b) Run the <code>score_answer</code> function above against a small language model's answers and report accuracy <em>per question type</em>. (c) Now re-split your data so one subject appears in both a "few-shot examples" pool and the test set, re-run, and quantify how much the lookup accuracy inflates. Explain in two sentences why aggregation inflates less than lookup under this leakage.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why is a single blended "sensor-QA accuracy" number misleading, and what should you report instead?<br/>
+2. What distinct capability does SensorBench probe that SensorQA does not, and why does that make them complementary rather than redundant?<br/>
+3. Why is exact match the wrong metric for an aggregation answer, and what does the tolerance \(\delta\) in the numeric scorer encode about the sensor itself?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-21.4.html">Section 21.4</a>, we move from measuring whether a model can answer sensor questions to the mechanisms that let it reason over raw streams in the first place: LLaSA, SensorLLM, HARGPT, and LLMSense, and the architectural choices (tokenizing signals, aligning them to language, prompting for step-by-step inference) that turn a language model into a sensor reasoner.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

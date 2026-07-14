@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.7: Cost, latency, and reliability of agentic pipelines. Building Sensory AI." name="description"/>
+<title>Section 22.7: Cost, latency, and reliability of agentic pipelines | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: LLM Agents for Sensing and Operations</a></div>
+<h1>Cost, latency, and reliability of agentic pipelines</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They loved my reasoning until the invoice arrived. Turns out every brilliant thought I had was billed by the token, and the bearing did not care how eloquent I was at 03:14."</p>
+        <cite>A Budget-Conscious AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section closes the chapter, so it assumes the loop of <a class="cross-ref" href="section-22.1.html">Section 22.1</a>, the tool-calling machinery of <a class="cross-ref" href="section-22.4.html">Section 22.4</a>, and the guardrails and confidence of <a class="cross-ref" href="section-22.6.html">Section 22.6</a>. From elsewhere in the book you need the streaming-deadline mindset of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>, the fleet-operations framing of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>, and a little probability from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. No new agent vocabulary is introduced; we are costing and hardening what you already built.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>An agentic sensing loop is a beautiful idea and a running bill. Each turn is a model call plus a tool call, so the very thing that makes an agent smart, its willingness to look again, is also what makes it slow, expensive, and prone to compounding failure. A demo that resolves one anomaly in six turns feels magical. Multiply it by a fleet of ten thousand assets, each emitting alerts around the clock, and the same design is a five-figure monthly invoice with a tail latency that blows past your alarm deadline and a per-incident success rate that quietly erodes as stochastic steps stack up. This section is the engineering discipline that decides whether an agentic pipeline ships: how to <em>budget</em> tokens and turns, how to <em>bound</em> latency under a real deadline, and how to keep a chain of unreliable steps reliable enough to trust. It is where the perception work of this book meets the operations reality of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-69-mlops-for-sensor-fleets/index.html">Chapter 69</a>.</p>
+    </div>
+
+    <h2>Costing the loop: turns are the unit of spend</h2>
+
+    <p><strong>What</strong> drives the bill is not the model in the abstract but the <em>turn count</em>. Every turn re-sends the full accumulated context (the prompt, the reasoning so far, every tool result) plus generates new tokens, so a \(k\)-turn investigation does not cost \(k\) times a single call, it costs more, because the context grows on each pass. If the prompt starts at \(p_0\) tokens and each turn appends about \(a\) tokens of observation and reasoning, the total input billed across the episode is roughly</p>
+
+    $$ T_{\text{in}} \;=\; \sum_{i=1}^{k}\bigl(p_0 + (i-1)\,a\bigr) \;=\; k\,p_0 + a\,\frac{k(k-1)}{2}. $$
+
+    <p><strong>Why</strong> this matters: the quadratic term means cost grows with the <em>square</em> of the turn budget, not linearly. Doubling the maximum number of turns an agent may take to chase a stubborn fault can quadruple the token spend on the episodes that actually use them. This is the single most important number to instrument, and it is why <a class="cross-ref" href="section-22.1.html">Section 22.1</a>'s crude <code>max_turns</code> guard was never cosmetic. <strong>When</strong> you feel the pain: sensor telemetry is verbose, so \(a\) is large (a spectrum summary, a SCADA dump, a detector's full output), and the quadratic bites early. The mitigations are context <em>compression</em> (summarize old turns instead of re-sending them verbatim) and prompt <em>caching</em>, where the provider bills the unchanged prefix at a steep discount so re-sending the stable system prompt and tool schemas each turn is nearly free.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>The right economic unit for an agentic pipeline is not cost per token or cost per call. It is <em>cost per resolved incident</em>: total spend divided by the number of alerts the agent actually closed correctly. A cheaper model that needs eight fumbling turns to reach the same verdict a stronger model reaches in three is not cheaper. Optimize the whole trajectory, not the per-token price, because a model that reasons well buys back its unit-cost premium in avoided turns, and turns are quadratic.</p>
+    </div>
+
+    <h2>Latency: the tail is the sensor deadline</h2>
+
+    <p>Sensing has deadlines that a chatbot does not. A vibration alarm that must reach a control room within fifteen seconds, a cardiac-rhythm flag that gates a clinician's page, a substation-protection decision, all impose a hard wall-clock budget that an agentic loop must respect even in its worst case. <strong>What</strong> makes agent latency hard is that a turn is <em>sequential</em>: the model must finish thinking before it can call a tool, and it must see the tool result before it can think again. So the per-episode latency is a sum of serial legs,</p>
+
+    $$ L \;=\; \sum_{i=1}^{k}\bigl(\ell^{\text{llm}}_i + \ell^{\text{tool}}_i\bigr), $$
+
+    <p>and because each leg is itself a random variable with a heavy right tail (model queue time, a slow database, a cold detector), the episode tail is worse than the sum of the medians. <strong>Why</strong> you must design to the tail: an SLO written on the p50 is a lie an operator finds out about during the one incident that mattered. Budget to p95 or p99. <strong>How</strong> to bound it: cap turns hard, run <em>independent</em> tool calls concurrently within a turn rather than serially (fetch three channels at once), set aggressive per-tool timeouts with a defined fallback, and stream partial verdicts so a human sees the leading hypothesis before the loop formally concludes. The streaming and deadline discipline of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> applies here almost verbatim; an agent is just a very expensive stream stage.</p>
+
+    <h2>Reliability: many stochastic steps, one compounding pipeline</h2>
+
+    <p>A pipeline is only as reliable as the product of its parts, and an agentic loop has many parts: an LLM step that may hallucinate a tool name, a detector that may time out, a parser that may choke on malformed output, a channel fetch that may return stale data. If each turn succeeds independently with probability \(r\), an unguarded \(k\)-turn episode completes with probability \(r^{k}\), which decays fast: at \(r = 0.97\) and \(k = 8\), episode success is only about \(0.78\). <strong>Why</strong> agents feel flaky in production even when each component looks solid is exactly this compounding. <strong>How</strong> to fight it, borrowed wholesale from distributed-systems engineering: bounded <em>retries</em> on transient tool failures (with idempotent tools so a retry is safe), <em>timeouts</em> so a hung step cannot stall the deadline, a <em>circuit breaker</em> that stops hammering a detector that is failing, and above all a <em>fallback path</em>. When the agent cannot conclude within budget, it must degrade gracefully to something trustworthy: the classical threshold detector of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> firing a plain, uncalibrated-but-honest alert beats an agent that silently drops the incident. The guardrails of <a class="cross-ref" href="section-22.6.html">Section 22.6</a> decide <em>what</em> to trust; this section decides what to do when the machinery <em>fails</em>.</p>
+
+    <p>The snippet below estimates all three quantities for a candidate design before you deploy it, so the turn budget is a decision backed by a number rather than a hope. It composes the quadratic token model, the serial-latency sum, and the compounding-reliability product into one back-of-envelope planner referenced throughout this section.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def episode_budget(k, p0=1200, a=800, price_in=3e-6, price_out=15e-6,
+                   out_per_turn=250, ell_llm=1.4, ell_tool=0.6, r_turn=0.97):
+    """Expected tokens, cost ($), p95 latency (s), and success prob for a k-turn loop."""
+    tok_in  = k * p0 + a * k * (k - 1) / 2          # quadratic: context regrows each turn
+    tok_out = k * out_per_turn
+    cost    = tok_in * price_in + tok_out * price_out
+    # serial legs; tail approximated by sampling each leg as heavy-right (lognormal)
+    rng = np.random.default_rng(0)
+    legs = rng.lognormal(np.log(ell_llm), 0.5, (20000, k)) + \
+           rng.lognormal(np.log(ell_tool), 0.5, (20000, k))
+    p95 = np.percentile(legs.sum(axis=1), 95)
+    success = r_turn ** k                            # unguarded compounding
+    return dict(tokens_in=int(tok_in), cost_usd=round(cost, 4),
+                p95_latency_s=round(p95, 2), success=round(success, 3))
+
+for k in (3, 6, 10):
+    print(k, episode_budget(k))
+</code></pre>
+    <div class="code-caption"><strong>Listing 1.</strong> A one-function pipeline planner. Running it shows the three curves that govern every agentic-sensing design decision: cost rising super-linearly in the turn budget \(k\), p95 latency climbing past the alarm deadline, and unguarded success eroding as \(r^{k}\). Tune the arguments to your model's real prices and your tools' measured latencies, then read off the largest \(k\) your deadline and budget allow.</div>
+
+    <p>Listing 1 turns the turn budget from a guess into an engineering choice. In the defaults shown, ten turns already roughly triples the token cost of three and drops unguarded success below \(0.75\), which is why real pipelines rarely let an agent wander past six or seven turns without a fallback catching it.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: A Wind-Fleet Copilot That Learned to Triage</h3>
+        <p>A renewables operator ran an agentic monitor across 4,200 turbines. The first design sent every alert, benign or not, into a full six-turn investigation on a frontier model. It worked, and the monthly inference bill was indefensible: most alerts were gust-loading false positives that a single cheap check could clear. The team restructured it as a <em>cascade</em>. A tiny fast model (or often just the classical envelope detector of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-37-condition-monitoring-and-anomaly-detection/index.html">Chapter 37</a>) triaged first; roughly 88 percent of alerts were resolved there in one turn for a fraction of a cent. Only the ambiguous remainder escalated to the full agentic loop, and even that loop got a hard turn cap of five plus a fallback that emitted a classical-severity alert if the budget ran out. Cost per resolved incident fell by about 9x, p95 latency on the common path dropped from twelve seconds to under two, and, because the fallback never silently dropped an alert, incident recall actually improved. The lesson: an agent should be the expensive specialist you call when cheap triage cannot decide, not the front door.</p>
+    </div>
+
+    <h2>Model routing and cascades: spend where it pays</h2>
+
+    <p>The wind-fleet story generalizes into the central cost lever for agentic sensing: <em>do not run one model on everything</em>. A <strong>cascade</strong> (also called a router) sends each input to the cheapest stage that can handle it and escalates only on uncertainty. <strong>Why</strong> it works so well here is the structure of sensor alerts: the distribution is heavily skewed toward the easy and the benign, so a cheap triage stage clears the bulk and the costly agent sees only the genuinely hard tail. Expected cost per alert becomes a mixture, \(\mathbb{E}[C] = \sum_j \pi_j\, C_j\), where \(\pi_j\) is the fraction of traffic escalating to stage \(j\) and \(C_j\) its cost; because \(\pi\) decays fast down the cascade while \(C\) rises, the product stays small. <strong>How</strong> to set the escalation threshold: use the <em>calibrated</em> confidence of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>, not a raw softmax, so "escalate when unsure" means something honest. A conformal prediction set that is a singleton passes; a wide set escalates. <strong>When</strong> a cascade backfires: if the cheap stage is miscalibrated and confidently clears real faults, you have saved money by missing incidents, which is the worst trade in sensing. Calibrate the gate before you trust it.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Right Tool</h3>
+        <p>Retries, timeouts, circuit breakers, exponential backoff, and fallback chains are exactly the reliability primitives that request libraries have offered for a decade; you should not hand-roll them around an LLM call. A resilience decorator wires the whole hardened path in a few lines:</p>
+        <pre><code class="language-python">from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3),
+       wait=wait_exponential(multiplier=0.3, max=4))   # backoff on transient tool errors
+def call_detector(args):
+    return bearing_envelope(args, timeout=2.0)          # per-tool deadline
+
+def hardened_turn(step):
+    try:
+        return call_detector(step.args)
+    except Exception:
+        return classical_fallback(step.args)            # graceful degradation, never drop
+</code></pre>
+        <div class="code-caption"><strong>Listing 2.</strong> Bounded retries with exponential backoff, a per-tool timeout, and a classical fallback, composed around one tool call.</div>
+        <p>Adopting a resilience library (tenacity, or a framework's built-in retry policy) replaces roughly 60 to 80 lines of hand-written backoff, jitter, attempt-counting, and circuit-breaker state with a decorator and a try/except. What it cannot supply is the <em>fallback</em> itself: choosing that a failed agentic turn degrades to the classical detector of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> rather than to silence is a sensing decision, and it is the one that keeps the pipeline trustworthy.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>Making agentic pipelines cheap and reliable enough for always-on telemetry is an open research area, not a solved one. LLM <em>cascades and routing</em> (FrugalGPT and its successors) show large cost reductions by escalating only hard queries, but principled, calibrated escalation gates for streaming sensor data remain immature. <em>Prompt caching</em> and KV-cache reuse across turns, now offered by the major model providers, sharply cut the quadratic context cost, yet the accounting of what is cacheable in a live tool-calling loop is still being worked out. On the reliability side, the industrial copilots named in <a class="cross-ref" href="section-22.3.html">Section 22.3</a> (Argos, AgentFM, CALM) report the operational metrics that actually gate deployment, cost per resolved incident, tail latency, and escalation-to-human rate, and standardizing those metrics across the field is itself frontier work. The honest state of the art: a well-built cascade with a hard turn cap and a classical fallback is deployable today; a fully autonomous, unbounded agentic investigator over safety-critical sensing is not.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Using Listing 1: (1) Plot cost, p95 latency, and unguarded success as functions of the turn budget \(k\) from 1 to 12 for your own model's real token prices; identify the largest \(k\) that fits a 10-second p95 deadline. (2) Add a fallback so the loop always concludes within the deadline (either the agent's verdict or a classical alert), and derive the <em>guarded</em> episode success probability, which no longer decays as \(r^k\). (3) Model a two-stage cascade: let a fraction \(\pi\) of alerts escalate from a cheap stage (cost \(C_1\)) to the agent (cost \(C_2\)) and compute the crossover \(\pi\) below which the cascade is cheaper than running the agent on everything. Comment on what happens to that crossover if the cheap stage is miscalibrated.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does the token cost of a \(k\)-turn agentic episode grow quadratically rather than linearly in \(k\), and name one mechanism that flattens the growth.</p>
+        <p class="quiz-question">2. Why must an agentic-sensing latency SLO be written on the p95 or p99 rather than the median, and what happens to a bounded-retry design's success probability compared with the unguarded \(r^k\)?</p>
+        <p class="quiz-question">3. State the metric that should replace cost-per-token when optimizing an agentic pipeline, and explain why a cheaper per-token model can be more expensive by it.</p>
+    </div>
+
+    <div class="callout lab">
+        <h3 class="callout-title">Lab 22</h3>
+        <p>build an agent that monitors a sensor stream, invokes a detector tool, and produces an explained, uncertainty-tagged alert.</p>
+    </div>
+
+    <section class="bibliography" id="bibliography">
+    <h2 class="bibliography-title">Bibliography</h2>
+
+    <p class="bib-category">Agent loops and reliability primitives</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2210.03629">Yao et al. (2023). ReAct: Synergizing Reasoning and Acting in Language Models. ICLR.</a></p>
+        <p class="bib-annotation">The interleaved reason-then-act loop whose turn count this section costs; every latency and reliability sum here is measured over its turns.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2303.11366">Shinn et al. (2023). Reflexion: Language Agents with Verbal Reinforcement Learning. NeurIPS.</a></p>
+        <p class="bib-annotation">Self-critique adds turns, and therefore cost and failure surface; a concrete case for why the turn budget must be bounded.</p>
+    </div>
+
+    <p class="bib-category">Cost, cascades, and efficient inference</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2305.05176">Chen et al. (2023). FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance. arXiv.</a></p>
+        <p class="bib-annotation">The cascade/router argument this section builds on: escalate only hard inputs to expensive models, the central cost lever for fleet-scale sensing.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2309.06180">Kwon et al. (2023). Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM). SOSP.</a></p>
+        <p class="bib-annotation">KV-cache reuse and paged attention are what make re-sending a growing agent context affordable; the systems basis for prompt caching.</p>
+    </div>
+
+    <p class="bib-category">Industrial and operational agents</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2501.06706">Roy et al. (2025). Exploring LLM Agents for Cleaning and Root-Cause Analysis of Cloud Telemetry (AgentFM and related). arXiv.</a></p>
+        <p class="bib-annotation">Reports the operational metrics (cost, latency, escalation rate) that decide whether an agentic telemetry pipeline ships, the concern of this section.</p>
+    </div>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://arxiv.org/abs/2306.05499">OpenAI et al. (2023). Function Calling and Tool Use in Production LLMs (developer documentation and system reports).</a></p>
+        <p class="bib-annotation">Practical grounding for the tool-call latency and failure modes that dominate the per-turn reliability product.</p>
+    </div>
+
+    <p class="bib-category">Reliability engineering carried over</p>
+    <div class="bib-entry-card">
+        <p class="bib-ref"><a href="https://sre.google/sre-book/handling-overload/">Beyer et al. (2016). Site Reliability Engineering. O'Reilly / Google.</a></p>
+        <p class="bib-annotation">The timeout, retry, circuit-breaker, and graceful-degradation vocabulary this section imports wholesale to harden a stochastic agent pipeline.</p>
+    </div>
+    </section>
+
+    <h2>What's Next</h2>
+    <p>That closes Part V and the foundation-model arc of this book: you can now represent sensor streams with pretrained models, fuse them with language, and wrap the whole thing in an agent that reasons, acts, and stays within a budget. In <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, we return to the physical bedrock these agents ultimately reason about, opening Part VI with the inertial sensors, accelerometers, gyroscopes, and magnetometers, whose noisy motion signals drive everything from step counting to dead reckoning.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

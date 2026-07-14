@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.5: Foundation-model embeddings as features for downstream tasks. Building Sensory AI." name="description"/>
+<title>Section 19.5: Foundation-model embeddings as features for downstream tasks | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Time-Series Foundation Models</a></div>
+<h1>Foundation-model embeddings as features for downstream tasks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They trained me to predict the next hundred steps. Then they threw away my prediction and kept the shrug I made just before it."</p>
+<cite>A Repurposed AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes you have met the patch-token pretraining and model families of <a class="cross-ref" href="section-19.2.html">Section 19.2</a> and <a class="cross-ref" href="section-19.3.html">Section 19.3</a>, and can run a model in the zero-shot mode of <a class="cross-ref" href="section-19.4.html">Section 19.4</a>. The idea of a learned representation as a reusable feature comes from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, and the classical alternative it competes with (hand-built descriptors, PCA) is <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>. Basic scikit-learn (a logistic regression, a train/test split) is enough for the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A time-series foundation model was trained to forecast, but forecasting is not the only thing it learned. To predict the next window it had to build an internal summary of what a signal <em>is</em> doing: its regime, its periodicity, its recent shocks. That summary is a vector, and you can pull it out and use it directly. Freeze the giant model, run each of your recordings through it once, keep the vectors, and train a small classifier or regressor on top. When labels are scarce, this frozen-encoder route frequently beats a bespoke network trained from scratch, at a fraction of the engineering and compute. This section is about how to extract those vectors, how to pool and normalize them so they behave, and how to know when a linear head on a foundation embedding is the right tool.</p>
+</div>
+
+<h2>From forecaster to feature extractor</h2>
+<p><strong>What.</strong> An <em>embedding</em> is the internal activation a model produces for your input, read off before the task-specific output head. A patch-tokenizing model like MOMENT, Chronos, or Moirai turns a window of length \(L\) into a sequence of patch tokens, passes them through a transformer stack, and emits a sequence of \(D\)-dimensional hidden states \(h_1, \dots, h_P\) (one per patch, with \(D\) typically \(512\) to \(1024\)). The forecasting head normally consumes those states; feature extraction discards the head and keeps the states, collapsing them to a single per-series vector \(z \in \mathbb{R}^D\).</p>
+<p><strong>Why.</strong> The economics are the whole argument. Pretraining saw billions of time points across dozens of domains, so the encoder already knows what a trend, a seasonal cycle, and a transient look like. Your downstream task (is this bearing healthy, which of six activities is this, does this ECG beat look ectopic) rarely needs the model to relearn that vocabulary; it needs a decision boundary in a space where the vocabulary already lives. Learning a boundary from a handful of labels is a far smaller statistical problem than learning a representation from scratch, so a frozen embedding plus a linear probe is sample-efficient exactly where hand-labeled sensor data is expensive. It is also cheap to serve: one forward pass produces a vector reusable across classification, clustering, retrieval, and anomaly scoring at once.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A forecaster and a feature extractor are the same network read at two different depths. The forecast lives at the output; the transferable knowledge lives one layer earlier, in the pooled hidden state. You almost never want the model's prediction for a classification task. You want the shrug it made just before predicting: the compressed description of the signal that the prediction was going to be built from.</p>
+</div>
+
+<h2>Pooling, layer choice, and normalization</h2>
+<p><strong>How you collapse \(P\) tokens into one vector matters more than which model you picked.</strong> Three pooling choices dominate. <em>Mean pooling</em>, \(z = \frac{1}{P}\sum_p h_p\), is the robust default: it is permutation-stable, insensitive to sequence length, and rarely the worst option. <em>Last-token pooling</em> takes \(z = h_P\); it suits causal, decoder-style models (Lag-Llama, Timer, Time-MoE) whose final position has attended to the whole history, but it throws away early context and is fragile to padding. <em>Attention pooling</em> learns a weighted average, which helps when the discriminative event is a brief transient buried in a long window, at the cost of extra parameters to fit. For a multichannel sensor of \(C\) axes, decide deliberately whether to pool each channel to its own \(z_c\) and concatenate (preserving per-axis structure, dimension \(C \cdot D\)) or to pool across channels too; the concatenate-then-probe choice usually wins for inertial and vibration data where axes are not interchangeable.</p>
+<p><strong>Which layer.</strong> The last hidden layer is the most specialized to the pretraining objective and is not always the most transferable. Middle layers often carry more general-purpose structure, a pattern inherited from language and vision encoders. Treat the extraction layer as a hyperparameter you validate, not a constant.</p>
+<p><strong>Normalization is not optional.</strong> Two steps repay their cost. First, standardize each <em>input</em> window (subtract its mean, divide by its standard deviation) before the forward pass, because these models were pretrained on instance-normalized data and expect it; feeding raw millivolts or raw g-forces silently degrades every downstream number. Second, standardize the <em>output</em> embeddings across your dataset, or whiten them, so no single high-variance coordinate dominates the distance metric your classifier or nearest-neighbor search relies on. Skipping output standardization is the most common reason a promising embedding underperforms a boring hand-crafted feature set.</p>
+
+<h2>Linear probing, kNN, and the honest baseline</h2>
+<p><strong>The downstream head should start small.</strong> A <em>linear probe</em> (logistic regression for classification, ridge for regression) trained on frozen embeddings is the canonical protocol. It is a deliberately weak head: if it succeeds, the credit belongs to the representation, which is what you wanted to test. A <em>k-nearest-neighbor</em> probe is even more diagnostic, because it uses no learned parameters at all and answers a single question: are same-label recordings actually close in embedding space? Full <em>fine-tuning</em> (unfreezing the encoder) is a different regime with a different budget; it can win when you have thousands of labels and a domain far from the pretraining corpus, but it forfeits the sample efficiency and the shared-encoder economics that motivated embeddings in the first place. Start frozen, and only unfreeze when a frozen probe has plateaued and you can afford the compute and the leakage risk.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">The Leakage Trap in Embedding Pipelines</h3>
+<p>Frozen embeddings feel leakage-proof because the encoder never saw your labels. Two hazards remain. First, fit your output standardizer and any whitening transform on the <em>training</em> split only, then apply it to validation and test; fitting it on the pooled dataset leaks test statistics into every vector. Second, split by <em>recording or subject</em>, never by window, since overlapping windows from one session land near-identical embeddings on both sides of the split and inflate accuracy. The leakage-safe splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> applies unchanged; the embedding step does not launder it away.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: bearing fault triage on a retrofit line</h3>
+<p>A plant retrofits vibration sensors onto twenty older motors and wants fault classification, but engineering could hand-label only about forty runs per fault class before the pilot deadline. Training a convolutional network from scratch on \(240\) labeled recordings overfits within an epoch. Instead the team streams each \(4{,}096\)-sample accelerometer window through a frozen MOMENT encoder, mean-pools to a \(1024\)-dimensional vector per channel, standardizes the vectors on the training motors only, and fits a multinomial logistic regression. The probe reaches deployable accuracy on held-out <em>motors</em> (not just held-out windows), and because the vectors are reusable, the same embeddings feed a nearest-neighbor "show me the closest known fault" retrieval tool that maintenance technicians trust more than a bare class label. When more labels arrive, this frozen baseline becomes the honest bar that any fine-tuned model must clear, echoing the prognostics workflow of <a class="cross-ref" href="../../part-8-industrial-energy-and-infrastructure-sensor-ai/module-36-predictive-maintenance-and-prognostics/index.html">Chapter 36</a>.</p>
+</div>
+
+<h2>A code walk: embeddings plus a linear probe</h2>
+<p>The snippet below is the whole pattern: load a frozen model in embedding mode, encode a batch of standardized windows once, then hand the vectors to scikit-learn. The encoder is never trained; only the logistic regression sees labels. Note that the standardizer is fit on the training split and merely applied to the test split, which is the leakage guard the warning above insists on.</p>
+
+<pre><code class="language-python">import numpy as np, torch
+from momentfm import MOMENTPipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+# X: (N, C, L) instance-normalized windows; y: (N,) recording-level labels
+model = MOMENTPipeline.from_pretrained(
+    "AutonLab/MOMENT-1-large",
+    model_kwargs={"task_name": "embedding"},   # drop the forecasting head
+)
+model.init(); model.eval()
+
+@torch.no_grad()
+def embed(X):                                  # one frozen forward pass
+    out = model(x_enc=torch.as_tensor(X, dtype=torch.float32))
+    return out.embeddings.cpu().numpy()        # (N, D) mean-pooled per series
+
+Z_tr, Z_te = embed(X_tr), embed(X_te)          # encode train and test once
+scaler = StandardScaler().fit(Z_tr)            # FIT on train split only
+Z_tr, Z_te = scaler.transform(Z_tr), scaler.transform(Z_te)
+
+probe = LogisticRegression(max_iter=2000, C=1.0).fit(Z_tr, y_tr)
+print("held-out accuracy:", probe.score(Z_te, y_te))
+</code></pre>
+<div class="code-caption">A frozen-encoder linear probe. The foundation model runs in <code>embedding</code> mode so it emits pooled vectors instead of forecasts; scikit-learn's <code>StandardScaler</code> is fit only on training embeddings, and the entire learnable head is one <code>LogisticRegression</code>. Everything expensive happens once, in the two <code>embed</code> calls.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">The Right Tool</h3>
+<p>Rolling your own extractor means registering a forward hook on the right transformer block, handling padding masks, choosing and implementing a pooling reduction, and stitching in standardization: roughly 40 to 60 lines that are easy to get subtly wrong (a mispooled padding token silently poisons every vector). The <code>momentfm</code> embedding task collapses that to the three lines above (<code>from_pretrained</code>, <code>init</code>, <code>model(x_enc=...).embeddings</code>); Chronos exposes an analogous <code>embed()</code> that returns encoder states. The library owns the hook placement, the masking, and the default pooling. You still own the two decisions it cannot make for you: which layer to read and whether to standardize the output, both of which you must validate.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>Whether a general time-series embedding is competitive as a feature extractor is contested. MOMENT was designed with an explicit embedding/representation objective and reports strong linear-probe classification across the UCR/UEA archive, and Chronos representations have been repurposed for anomaly and classification tasks. Yet careful reproductions on sensor domains show that a well-tuned classical descriptor set or a domain self-supervised encoder (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) sometimes matches or beats a forecasting-pretrained embedding, because forecasting and discrimination are not the same objective. The open questions are which pretraining objective yields the most transferable features, and how to calibrate confidence on a probe built over a frozen encoder, a problem the conformal methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> can wrap around the probe's outputs.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a UCR/UEA classification dataset (for example a wearable HAR set logged as multichannel windows). (1) Extract frozen embeddings with mean pooling and fit a logistic-regression probe; record accuracy. (2) Repeat with last-token pooling and with per-channel-concatenate pooling, and report which wins and by how much. (3) Run the whole pipeline once <em>without</em> output standardization and once with it, and quantify the gap. (4) Compare all of the above against a plain hand-crafted feature baseline (window mean, variance, dominant frequency) plus the same logistic regression, and write one sentence stating whether the foundation embedding earned its compute on this dataset.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p class="quiz-question">1. Why is a k-nearest-neighbor probe a more direct test of representation quality than a logistic-regression probe, and what property of the embedding space does it interrogate?</p>
+<p class="quiz-question">2. You fit your output <code>StandardScaler</code> on the pooled train-plus-test embeddings and accuracy jumps two points. Why is that jump not real, and what exactly leaked?</p>
+<p class="quiz-question">3. Give one concrete situation where full fine-tuning should beat a frozen linear probe, and one where the frozen probe is the correct choice despite lower ceiling accuracy.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>Frozen embeddings and linear probes are only as trustworthy as the numbers you report over them, and time-series benchmarking is riddled with leakage, non-stationarity, and train/test overlap that make impressive probe accuracies evaporate on honest splits. In <a class="cross-ref" href="section-19.6.html">Section 19.6</a>, we confront the evaluation crisis head-on: what GIFT-Eval, the Monash archive, and LOTSA do and do not guarantee, and how to benchmark a foundation model (in embedding mode or forecasting mode) so the score survives contact with a new sensor.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

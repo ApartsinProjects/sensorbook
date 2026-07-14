@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.3: Apple-style wearable biosignal foundation models (PPG/ECG/accelerometer SSL at scale). Building Sensory AI." name="description"/>
+<title>Section 20.3: Apple-style wearable biosignal foundation models (PPG/ECG/accelerometer SSL at scale) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Foundation Models and Agentic Sensing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Sensor and Wearable Foundation Models</a></div>
+<h1>Apple-style wearable biosignal foundation models (PPG/ECG/accelerometer SSL at scale)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They never labeled a single heartbeat. They just told me the two minutes from the same wrist belong together, and let me infer the rest of cardiology."</p><cite>A Self-Taught AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Section 20.2 showed Google's route to a large sensor model: reconstruct masked patches across every channel at once. This section covers the other dominant recipe, exemplified by Apple's work on the Apple Heart and Movement Study. Instead of masked reconstruction over a fused multi-sensor tensor, Apple trains a separate self-supervised encoder per biosignal (one for photoplethysmography, one for electrocardiogram, and behavioral models over accelerometer-derived activity), and it exploits a resource that only wearables have in abundance: <em>weeks of unlabeled data from the same identified person</em>. That single fact reshapes the entire training objective. Understanding why lets you predict when this family beats a masked model, and why its central trick is also its central privacy hazard.</p>
+</div>
+
+<p>This section builds directly on the contrastive and self-supervised machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, the PPG signal physics of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>, and single-lead ECG from <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-29-ecg-and-cardiac-ai/index.html">Chapter 29</a>. It also assumes the leakage discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, because participant identity is the axis along which both the method and its failure modes turn.</p>
+
+<h2>The wearable advantage: identity as a free label</h2>
+
+<p>A consumer smartwatch produces a peculiar dataset. It is enormous (Apple's PPG corpus draws on roughly 20 million segments from more than 140,000 participants, and the ECG corpus from tens of thousands more), it is almost entirely unlabeled, and, crucially, it is <em>partitioned by wearer</em>. You do not know a participant's ejection fraction, but you know with certainty that two 60-second windows recorded from the same wrist on the same day come from the same cardiovascular system, the same vascular geometry, the same skin tone under the same green LEDs.</p>
+
+<p>That structure is the whole game. In text or images, deciding which pairs of samples are "similar enough" to pull together is an art of augmentation. On a wearable, the data hands you a similarity relation for free: same participant means physiologically related. Apple's core objective, participant-level contrastive learning, promotes segments from one person to be neighbors in embedding space while pushing different people apart. The model is forced to discover the stable per-person factors (resting heart-rate morphology, pulse-wave shape, arrhythmia burden) because those are exactly what distinguishes one wrist from another across time.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Masked models (Section 20.2) learn <em>within-window</em> structure: predict the hidden part of one recording from the visible part. Participant-contrastive models learn <em>across-window, within-person</em> structure: what is invariant about this individual over hours and days. The two objectives capture different physiology. That is why the Apple recipe excels at person-level traits that persist (age, sex, BMI, chronic conditions) while a masked reconstruction model is often stronger at reconstructing a corrupted single beat. Pick the pretext task that matches the label you will eventually predict.</p>
+</div>
+
+<h2>Participant-level contrastive learning, precisely</h2>
+
+<p>The training loop is a variant of InfoNCE, the loss you met in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. For an anchor embedding \(z_i\) from participant \(p\), a positive \(z_i^{+}\) is another segment from the <em>same</em> participant \(p\) (optionally also augmented), and the negatives are segments from other participants in the batch or a momentum queue:</p>
+
+$$ \mathcal{L}_{\text{NCE}} = -\log \frac{\exp\!\big(\mathrm{sim}(z_i, z_i^{+})/\tau\big)}{\displaystyle\sum_{j}\exp\!\big(\mathrm{sim}(z_i, z_j)/\tau\big)}, \qquad \mathrm{sim}(a,b)=\frac{a^\top b}{\lVert a\rVert\,\lVert b\rVert} $$
+
+<p>Here \(\tau\) is a temperature that controls how sharply the model separates people. Apple's refinement blends two positive-pair sources: augmentation-based positives (the standard SimCLR-style view of the <em>same</em> segment under jitter, cropping, and magnitude warping) and participant-based positives (a <em>different</em> segment from the same person). Weighting these two is a design knob: lean on augmentation and you learn signal-invariances; lean on participant positives and you learn person-invariances. The regularized combination is what gave their embeddings state-of-the-art transfer across dozens of downstream targets.</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+def participant_infonce(z, participant_ids, tau=0.1):
+    # z: (N, d) L2-normalized embeddings; participant_ids: (N,) integer wearer id
+    z = F.normalize(z, dim=1)
+    sim = z @ z.t() / tau                      # (N, N) cosine similarities
+    N = z.size(0)
+    same = participant_ids[:, None] == participant_ids[None, :]
+    pos = same.clone(); pos.fill_diagonal_(False)   # positives = same wearer, not self
+    sim.fill_diagonal_(float("-inf"))               # never contrast a sample with itself
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    # average log-prob over each anchor's positives (skip anchors with no same-wearer peer)
+    has_pos = pos.any(dim=1)
+    loss = -(log_prob * pos).sum(1)[has_pos] / pos.sum(1)[has_pos]
+    return loss.mean()
+
+z = torch.randn(8, 32)
+ids = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])   # 4 wearers, 2 segments each
+print(float(participant_infonce(z, ids)))
+</code></pre>
+<div class="code-caption">A minimal participant-level InfoNCE: positives are other segments from the same wearer, negatives are everyone else in the batch. Compare this to the augmentation-only contrastive loss in Chapter 17; the single change (defining positives by <code>participant_ids</code> rather than by augmented views) is the entire conceptual leap of the Apple recipe.</div>
+
+<p>The snippet above is deliberately bare so the mechanism is visible. The production system adds a momentum encoder and a large negative queue (so a batch effectively contrasts against tens of thousands of other people), plus the augmentation-positive term.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't rebuild the contrastive scaffold</h3>
+<p>The momentum encoder, negative queue, projection head, and distributed loss synchronization are a well-solved roughly 400-line stack. <code>lightly</code> (for <code>MoCo</code>, <code>NNCLR</code>, and friends) or <code>pytorch-metric-learning</code>'s <code>SupConLoss</code> give you the queue, the exponential-moving-average target network, and multi-GPU gathering in about a dozen lines: instantiate the loss, pass embeddings and a group label, and let it treat your <code>participant_id</code> as the class. That replaces the batch-gather and queue bookkeeping that is easy to get subtly wrong (a desynced negative queue silently collapses the embedding).</p>
+</div>
+
+<h2>One encoder per modality, and why</h2>
+
+<p>Apple trains modality-specific encoders rather than one fused tokenizer. The PPG encoder and the ECG encoder are separate 1D convolutional networks (EfficientNet-style backbones adapted to time series), each pretrained on its own signal at that signal's native rate. This is the opposite of the LSM philosophy in Section 20.2, and the reasons are physical, not arbitrary. PPG is an optical volume signal at tens of hertz with motion-dominated artifacts (see <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-30-ppg-and-wearable-cardiovascular-sensing/index.html">Chapter 30</a>); single-lead ECG is an electrical potential at hundreds of hertz with entirely different noise (baseline wander, powerline). Their morphologies, sampling rates, and failure modes barely overlap, so a shared patch embedding wastes capacity forcing one projection to serve both. The accelerometer stream (from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>) enters more often through <em>derived behavioral features</em> (step cadence, activity bouts, sleep) than as raw triaxial waveforms, and Apple's later behavioral foundation model pretrains on years of these wearable-derived summaries rather than the raw accelerometer trace.</p>
+
+<p>The tradeoff is explicit: separate encoders give clean, high-quality per-modality embeddings and let each network respect its signal's timescale, at the cost of losing the tight cross-modal fusion (PPG and ECG measuring the same heartbeat from two physics) that a joint model could exploit. When you need that fusion you combine the frozen embeddings downstream, which connects to the missing-modality robustness techniques in the next sections and in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: a startup screening for atrial fibrillation</h3>
+<p>A clinical wearables startup had 3,000 labeled AFib recordings, far too few to train a cardiac model from scratch. Instead they froze a PPG foundation encoder pretrained by participant-contrastive SSL, computed one 256-dimensional embedding per 60-second window, and trained a logistic-regression head on top. With only those 3,000 labels the head reached screening-grade sensitivity, because the encoder had already learned pulse-wave morphology from 140,000 unlabeled wearers. The instructive failure came next: the same frozen embeddings also predicted participant <em>age</em> and <em>sex</em> with uncomfortable accuracy, which the team had not intended and which forced a privacy review before deployment. The embedding that makes you data-efficient is the same embedding that encodes demographics you never asked for, a tension that runs straight into <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>.</p>
+</div>
+
+<h2>Evaluating and using the embeddings without fooling yourself</h2>
+
+<p>The standard evaluation is linear probing: freeze the encoder, fit a simple head per downstream target, and report transfer. The non-negotiable rule is that the split must be <em>by participant</em>. If windows from one wearer appear in both train and test, the participant-contrastive objective has explicitly optimized the model to recognize that person, so any leakage inflates every number catastrophically. This is the Chapter 5 discipline made sharp: for this model family, subject-level splitting is not best practice, it is the difference between a real result and a re-identification score in disguise. Because these embeddings feed clinical decisions, pair them with the calibration and conformal machinery of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> so a downstream head reports honest uncertainty rather than an overconfident point estimate.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>As of 2026 the state of the art in this family is defined by Apple's Apple Heart and Movement Study biosignal encoders (PPG and ECG foundation models trained with regularized participant-plus-augmentation contrastive learning) and their subsequent wearable behavioral foundation model pretrained on billions of hours of activity data. The open questions are live: how to combine masked-reconstruction and participant-contrastive objectives so one encoder captures both within-beat and across-person structure; whether participant positives should be replaced by physiology-aware positives (same person only when in the same physiological state) to avoid entangling identity with health; and how to pretrain without turning the encoder into a covert biometric identifier. Expect the next generation to add explicit identity-disentanglement penalties so the useful physiology survives while the re-identification signal is suppressed.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using the <code>participant_infonce</code> function above: (a) construct a batch where every segment comes from a <em>different</em> wearer and explain what the loss does (and why training would collapse). (b) Sweep the temperature \(\tau\) over {0.05, 0.1, 0.5} on a fixed random batch and describe how the loss magnitude and the sharpness of the implied person-separation change. (c) Modify the positive mask so that a segment is a positive only when it shares both <code>participant_id</code> and a coarse activity label; argue in two sentences why that could reduce demographic leakage.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does a smartwatch corpus give you a "free" similarity label that an image corpus does not, and which loss term exploits it?<br/>
+2. Give one physiological reason Apple uses separate PPG and ECG encoders instead of one fused tokenizer, and one capability that choice sacrifices.<br/>
+3. A colleague reports 0.99 AUC for age prediction from PPG embeddings using a random 80/20 window split. What is almost certainly wrong, and how do you fix the evaluation?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-20.4.html">Section 20.4</a>, we turn from cardiovascular biosignals to motion: how accelerometer and IMU foundation models are pretrained for human activity recognition, why their augmentations and pretext tasks differ from the biosignal recipe here, and how the two families are beginning to merge into a single wearable encoder.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
