@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.1: GPS/GNSS basics and error sources. Building Sensory AI." name="description"/>
+<title>Section 25.1: GPS/GNSS basics and error sources | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Localization, GNSS, and RF Positioning</a></div>
+<h1>GPS/GNSS basics and error sources</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I do not measure where you are. I measure how long light took to reach you from four clocks in the sky, and I subtract the lies each one told."</p>
+<cite>A Trilaterating AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the time-of-flight and clock-synchronization ideas from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>: a position fix is fundamentally a timing measurement, and a nanosecond of clock error is about thirty centimetres of range error. It also leans on the measurement-model and uncertainty vocabulary of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, since every error source below is a bias or a variance we must model rather than wish away. Linear algebra and least squares from the Part I math reference are enough; no prior knowledge of satellite navigation is assumed. Python with NumPy suffices for the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A GNSS receiver is a clock comparator that happens to output coordinates. It listens to several satellites, each broadcasting the time it thinks it is, computes how long each signal took to arrive, multiplies by the speed of light to get a range, and intersects those ranges to find itself. That is the whole idea. Everything hard about the field, and everything that makes a raw phone fix wander by ten metres in a city, lives in the gap between that clean geometric story and the messy physics of clocks, atmospheres, and reflections. This section builds the clean story first, then dismantles it error source by error source, because a sensory-AI system that treats GNSS as ground truth will be misled exactly where cities, canyons, and tunnels make it least reliable. The fusion that repairs this (with inertial dead reckoning from <a class="cross-ref" href="../module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>) is the subject of the rest of the chapter; here we earn the right to distrust the number.</p>
+</div>
+
+<h2>Constellations, signals, and what a receiver actually hears</h2>
+<p>GNSS, Global Navigation Satellite System, is the umbrella term for four independent constellations: the United States' <strong>GPS</strong>, Russia's <strong>GLONASS</strong>, the European Union's <strong>Galileo</strong>, and China's <strong>BeiDou</strong>. Each flies roughly 24 to 30 satellites in medium Earth orbit near 20,000 km, arranged so that at least four are above the horizon almost anywhere on Earth at any time. A modern receiver chip is multi-constellation: it does not care whose satellite it is, only that the satellite broadcasts its position and a precise time. Each satellite carries an atomic clock and continuously transmits a signal encoding two things: the exact time of transmission, and the <strong>ephemeris</strong>, a compact orbital model from which the receiver computes where that satellite was at that instant. Knowing where the transmitter was and when it transmitted is half of a range measurement; the receiver supplies the other half by noting when the signal arrived.</p>
+<p>The measured quantity is not a true range but a <strong>pseudorange</strong>. The receiver's own clock is a cheap quartz oscillator, not an atomic standard, so it is offset from GNSS system time by an unknown bias \(b\). The distance it infers from time of flight is therefore
+\[ \rho_i = \lVert \mathbf{x} - \mathbf{s}_i \rVert + c\,b + \varepsilon_i, \]
+where \(\mathbf{x}\) is the unknown receiver position, \(\mathbf{s}_i\) the known position of satellite \(i\), \(c\) the speed of light, and \(\varepsilon_i\) lumps together every error we will catalogue below. The clock bias \(b\) is shared across all satellites in a given epoch, which is the crucial structural fact: it is a fourth unknown alongside the three coordinates of \(\mathbf{x}\), so a receiver needs at least <strong>four satellites</strong> to solve for four unknowns. Three would suffice for pure trilateration if the clock were perfect; the fourth satellite pays for the luxury of a cheap clock.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The receiver clock bias is not a nuisance to be minimized, it is a solved-for state variable, and that changes how you should think about GNSS. Because \(b\) is estimated jointly with position at every epoch, a GNSS receiver effectively disciplines its own cheap clock to atomic accuracy as a free by-product of positioning, which is why GNSS is the backbone of timing for power grids, cellular networks, and financial timestamping. It also explains the four-satellite minimum in one line: three unknowns of position plus one of time. When you later fuse GNSS with an inertial navigation system in <a class="cross-ref" href="section-25.5.html">Section 25.5</a>, you carry this clock bias (and its drift) as part of the fused state, not as noise to be filtered out.</p>
+</div>
+
+<h2>Solving the fix: nonlinear least squares</h2>
+<p>The pseudorange equation is nonlinear in \(\mathbf{x}\) because of the Euclidean norm, so we cannot invert it directly. The standard solution linearizes about a current guess and iterates, a Gauss-Newton method. Stack the residuals \(r_i = \rho_i - (\lVert \mathbf{x} - \mathbf{s}_i \rVert + c\,b)\) and their Jacobian with respect to the four unknowns \([\mathbf{x}, b]\); each row of the Jacobian is the unit line-of-sight vector from receiver to satellite, followed by \(c\). Solving the linear least-squares update and repeating converges in three or four iterations. The same geometry that drives that Jacobian also governs how measurement noise inflates into position error, a factor called <strong>dilution of precision</strong>, developed below. The code makes the whole loop concrete.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def solve_position(sats, pseudoranges, iters=6):
+    """Estimate [x, y, z, c*b] from satellite ECEF positions and pseudoranges.
+    sats: (N, 3) satellite positions (m); pseudoranges: (N,) measured ranges (m)."""
+    x = np.zeros(4)                          # start at Earth's centre, clock bias 0
+    for _ in range(iters):
+        diff = x[:3] - sats                  # (N, 3) receiver-minus-satellite
+        ranges = np.linalg.norm(diff, axis=1)
+        predicted = ranges + x[3]            # geometric range + clock-bias term
+        residual = pseudoranges - predicted  # (N,)
+        los = diff / ranges[:, None]         # unit line-of-sight vectors
+        H = np.hstack([los, np.ones((len(sats), 1))])   # (N, 4) Jacobian
+        dx, *_ = np.linalg.lstsq(H, residual, rcond=None)
+        x = x + dx
+        if np.linalg.norm(dx) &lt; 1e-4:
+            break
+    return x[:3], x[3]                        # position (m), clock bias * c (m)
+
+# Four satellites (toy ECEF coords); true position near Earth's surface.
+sats = np.array([[15600e3, 7540e3, 20140e3], [18760e3, 2750e3, 18610e3],
+                 [17610e3, 14630e3, 13480e3], [19170e3, 610e3, 18390e3]])
+true_pos = np.array([-2694e3, -4293e3,  3857e3]); true_bias = 85.0   # metres
+pr = np.linalg.norm(true_pos - sats, axis=1) + true_bias             # clean pseudoranges
+est_pos, est_bias = solve_position(sats, pr)
+print(f"position error = {np.linalg.norm(est_pos - true_pos):.3f} m")
+print(f"clock bias est = {est_bias:.2f} m  (true {true_bias})")
+</code></pre>
+<div class="code-caption">A complete four-satellite GNSS fix by Gauss-Newton least squares. Each Jacobian row is the unit line-of-sight vector plus a one for the shared clock-bias column; the loop converges in a few iterations. With clean pseudoranges the position error is sub-millimetre, isolating the geometry from the physical error sources added in the next section. This is the estimation core beneath every receiver.</div>
+
+<p>With perfect pseudoranges, as printed, the fix recovers position to numerical precision and reads the clock bias back exactly. Real pseudoranges are never clean, and adding realistic per-satellite errors to <code>pr</code> above turns that sub-millimetre number into metres. The rest of the section is a tour of what fills \(\varepsilon_i\), because a sensory-AI pipeline must know which errors are slowly varying biases it can correct and which are unpredictable spikes it must reject.</p>
+
+<h2>The error budget: where the metres come from</h2>
+<p>The total ranging error is conventionally decomposed into a per-satellite <strong>user-equivalent range error</strong> (UERE), then amplified by geometry. Taking the sources in order of typical magnitude: the <strong>ionosphere</strong>, a layer of charged particles from about 50 to 1000 km up, slows the signal's code and speeds its phase, contributing up to several metres of delay that varies with solar activity, time of day, and elevation angle. Because this delay is frequency-dependent, a dual-frequency receiver measuring the same satellite on two bands can solve for and remove most of it, the single biggest reason modern multi-band phone chips fix so much better than the single-frequency chips of a decade ago. The <strong>troposphere</strong>, the lowest 10 to 15 km, adds a further delay from water vapour and dry air that is frequency-independent (so it cannot be cancelled that way) but is smooth and well modelled from elevation angle and a standard atmosphere, leaving a residual under a metre. <strong>Satellite clock and ephemeris errors</strong> are the small remaining mismatches between where the broadcast says a satellite is and when its clock says it is versus reality; the ground control segment keeps these to a metre or two, and precise correction services drive them to centimetres.</p>
+<p>Two error sources behave differently because they are local to the receiver's environment and therefore uncorrelated with anything a satellite or a wide-area model can fix. <strong>Multipath</strong> is the signal arriving both directly and via reflections off buildings, water, or the ground; the receiver correlates a blurred sum and mismeasures the range, adding anywhere from centimetres in the open to tens of metres in an urban canyon. <strong>Receiver thermal noise</strong> is the irreducible jitter of the tracking loops, typically a few decimetres. Multipath is the villain of city navigation precisely because it is not Gaussian: it produces sudden, biased, non-symmetric errors that violate the assumptions of the least-squares solver above and of the Kalman filters in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, which is why robust or fault-detecting estimators earn their keep here.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the rideshare app that put the pickup on the wrong street</h3>
+<p>A rideshare platform saw a cluster of complaints in one downtown district: the app repeatedly placed riders and drivers a full block away, on the parallel avenue, so cars circled and trips started late. The phones were not broken. Between two rows of glass towers, the direct signals from low-elevation satellites were blocked, and the receiver was tracking their reflections bouncing off the opposite facade, a multipath bias of 30 to 40 metres that pushed the least-squares fix sideways onto the next street. The single-frequency fix could not detect it, and the geometry was poor because only satellites near the strip of visible sky overhead contributed. The eventual mitigation combined three things this chapter builds toward: rejecting low-elevation satellites, snapping the fix to the road network (map matching, <a class="cross-ref" href="section-25.4.html">Section 25.4</a>), and fusing with the phone's inertial dead reckoning so a physically impossible sideways jump was down-weighted. No single fix sufficed; the lesson is that urban GNSS error is structural, not random, and must be attacked as such.</p>
+</div>
+
+<h2>Geometry, corrections, and what you can actually expect</h2>
+<p>Even with perfectly measured pseudoranges, the position error depends on <em>where</em> the satellites are, not just how well each is measured. If all visible satellites cluster in one patch of sky, their line-of-sight vectors are nearly parallel, the least-squares problem is ill-conditioned, and small ranging errors blow up into large position errors. This amplification is <strong>geometric dilution of precision</strong> (GDOP), and it is computed directly from the same Jacobian \(H\) the solver already builds: the position error covariance is \(\sigma^2 (H^\top H)^{-1}\), and the DOP values are the square roots of its diagonal. A GDOP near 1 is excellent (satellites well spread); a GDOP above 6 means a metre of ranging error becomes six metres of position error. Wide sky helps, canyons and tree cover hurt, and a good receiver reports DOP so downstream code can weight the fix, a habit that connects directly to the localization-quality metrics of <a class="cross-ref" href="section-25.6.html">Section 25.6</a>.</p>
+<p>Putting numbers to it: an unaugmented single-frequency receiver in the open sky delivers roughly 3 to 5 metres of horizontal error (95th percentile). Augmentation services close the gap. <strong>SBAS</strong> (WAAS, EGNOS, and peers) broadcasts wide-area corrections and integrity flags from geostationary satellites, reaching 1 to 2 metres. <strong>Differential GNSS</strong> and <strong>RTK</strong> (real-time kinematic) use a nearby reference station of known position to cancel the spatially correlated errors (ionosphere, troposphere, satellite clock/ephemeris) that the two receivers share, and RTK's use of the carrier phase reaches <em>centimetre</em> accuracy, which is what surveying, precision agriculture, and automated vehicles rely on. <strong>PPP</strong> (precise point positioning) achieves similar accuracy globally without a local base, at the cost of a long convergence time. The pattern is consistent: corrections work by cancelling the errors that are common to nearby receivers, leaving only the local ones, multipath and receiver noise, that no external service can remove for you.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: <code>georinc</code> and <code>gnss-lib</code> for real receiver data</h3>
+<p>The least-squares solver above is the pedagogical core, but a production pipeline must parse RINEX observation and navigation files, compute satellite positions from broadcast ephemerides (a page of Keplerian orbital mechanics with relativistic corrections), apply the Klobuchar ionosphere and Saastamoinen troposphere models, and weight by elevation, easily 500 to 800 lines of careful, standards-conformant code. Open GNSS toolkits such as <code>georinest</code>/<code>gnss_lib_py</code> reduce reading a day of dual-frequency observations and producing weighted least-squares fixes with DOP to roughly a dozen calls. They handle the RINEX parsing, the ephemeris propagation, and the standard atmospheric models that would otherwise dominate your codebase. Implement the four-satellite solver once to understand the geometry, then let the library carry the standards compliance in production.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the code above. (1) Add independent Gaussian noise of standard deviation 3 m to each pseudorange and run the fix 1000 times; report the horizontal error distribution and compare its spread to the DOP prediction \(\sigma\sqrt{\operatorname{trace}(H^\top H)^{-1}_{\text{horizontal}}}\). (2) Move all four satellites into a narrow overhead cone and repeat; show that GDOP and the empirical error both explode. (3) Add a 30 m biased error to one satellite (a multipath spike) and show that plain least squares smears it across the fix, then implement a simple residual-threshold rejection that detects and drops the faulty satellite when a fifth is available.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does a GNSS receiver need four satellites rather than three, and what is the fourth unknown? 2. Which error sources can a dual-frequency receiver cancel on its own, and which require an external reference station or model, and why does that distinction fall along the line of frequency dependence? 3. A receiver reports a clean fix with a GDOP of 9. What does that tell you about the satellite geometry, and how should a downstream fusion filter treat that epoch?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-25.2.html">Section 25.2</a>, we come indoors, where the satellite signals this section relied on are blocked by walls and the whole trilateration story must be rebuilt from terrestrial radios. Wi-Fi, Bluetooth, and ultra-wideband beacons play the role the satellites played here, but with new twists: no atomic clocks, far shorter ranges, and severe multipath in reflective rooms. The pseudorange and dilution-of-precision intuitions you now hold carry directly across, and set up the geometric-versus-fingerprinting contrast of <a class="cross-ref" href="section-25.3.html">Section 25.3</a>.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

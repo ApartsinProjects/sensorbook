@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.4: IMU calibration (bias, scale, misalignment). Building Sensory AI." name="description"/>
+<title>Section 23.4: IMU calibration (bias, scale, misalignment) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Inertial Sensors and Motion Signals</a></div>
+<h1>IMU calibration (bias, scale, misalignment)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"They told me the device measures acceleration. What it actually measures is acceleration, plus a lie it tells consistently, times a number that is almost one, rotated by an angle nobody soldered on purpose."</p><cite>A Recalibrated AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An uncalibrated inertial measurement unit (IMU) does not report the physical quantity you asked for. It reports a distorted, offset, cross-coupled version of it. A gyroscope that reads \(0.6\,^\circ/\text{s}\) while sitting perfectly still will, if you integrate it for orientation as Chapter <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">24</a> does, drift more than \(2000^\circ\) over a single hour. The good news is that most of the error is systematic and repeatable, which means it is <em>correctable</em>. Calibration is the step that turns raw counts into physically meaningful acceleration and angular rate, and it is the single highest-leverage preprocessing action you can take before any downstream orientation, dead-reckoning, or activity model sees the data. This section builds the deterministic error model, shows how to estimate its parameters from simple static and rotation experiments, and explains when the effort pays off.</p>
+</div>
+
+<p>This section assumes you know what accelerometers and gyroscopes measure (Section <a class="cross-ref" href="index.html">23.1</a>), the body and world coordinate frames they live in (Section 23.2), and the basic idea of a linear measurement model with additive noise from Chapter <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">2</a>. The random part of the error, characterized by Allan variance and noise density, is a companion topic; here we target the <em>deterministic</em> part that a fixed correction can remove.</p>
+
+<h2>The deterministic error model</h2>
+
+<p>For each triaxial sensor (accelerometer or gyroscope), the standard affine model relates the true physical vector \(\mathbf{s}\) to the raw measured vector \(\mathbf{y}\) through three effects, in order of magnitude for a typical consumer microelectromechanical systems (MEMS) part: <strong>bias</strong>, <strong>scale-factor error</strong>, and <strong>axis misalignment</strong>. Written compactly,</p>
+
+$$\mathbf{y} = M\,\mathbf{s} + \mathbf{b} + \boldsymbol{\varepsilon}, \qquad M = \begin{bmatrix} s_x & m_{xy} & m_{xz} \\ m_{yx} & s_y & m_{yz} \\ m_{zx} & m_{zy} & s_z \end{bmatrix}.$$
+
+<p>Here \(\mathbf{b}\) is the additive bias (also called offset or, for gyroscopes, zero-rate output), the diagonal of \(M\) holds the scale factors \(s_x, s_y, s_z\) that should each be exactly 1 but are typically \(1 \pm 0.01\) to \(1 \pm 0.05\), the off-diagonal entries of \(M\) capture <em>misalignment</em> (the sensitive axes are not perfectly orthogonal, and the sensor triad is not perfectly aligned to the case), and \(\boldsymbol{\varepsilon}\) is the zero-mean random noise we are <em>not</em> trying to remove here. Calibration means estimating \(M\) and \(\mathbf{b}\), then recovering the corrected estimate at run time by inverting the affine map:</p>
+
+$$\hat{\mathbf{s}} = M^{-1}(\mathbf{y} - \mathbf{b}).$$
+
+<p><strong>Why each term matters.</strong> Bias dominates gyroscope drift: it integrates directly into a linearly growing angle error, so a constant \(0.6\,^\circ/\text{s}\) bias is catastrophic for dead reckoning. Scale error matters most under large signals: a 3 percent accelerometer scale error is invisible at rest but corrupts a \(4\,\text{g}\) impact by more than \(1\,\text{m/s}^2\). Misalignment leaks motion between axes, so a pure yaw rotation shows up partly as false pitch and roll, which is exactly the kind of error a naive step counter or gesture model cannot recover from.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Bias and misalignment errors are <em>constant with respect to the signal</em>, while scale errors are <em>proportional to the signal</em>. This is why a device can pass a flat-on-the-table sanity check (small signals, scale error hidden) and still be badly calibrated for high-dynamic motion. Always validate calibration across the amplitude range you actually operate in, not just at rest.</p>
+</div>
+
+<h2>Accelerometer calibration: the sphere trick</h2>
+
+<p>The accelerometer has a free, always-available reference: gravity. When the device is held still in any orientation, the true specific-force vector has magnitude \(g \approx 9.81\,\text{m/s}^2\). Geometrically, the set of true static readings across all orientations traces out a sphere of radius \(g\) centered at the origin. An uncalibrated sensor instead traces an <em>ellipsoid</em> that is offset (bias), stretched unevenly (scale), and tilted (misalignment). Calibration is therefore an ellipsoid-fitting problem: collect static samples in a variety of orientations, fit the ellipsoid, and find the affine transform that maps it back to the unit sphere scaled by \(g\).</p>
+
+<p>Concretely, we solve for \(M\) and \(\mathbf{b}\) that minimize the constraint residual over \(N\) static poses:</p>
+
+$$\min_{M,\,\mathbf{b}} \; \sum_{i=1}^{N} \Big( \lVert M^{-1}(\mathbf{y}_i - \mathbf{b}) \rVert - g \Big)^2.$$
+
+<p>Six well-separated orientations (roughly each face of the device pointing up and down) are the classic minimum, but a dozen varied poses fit the misalignment terms far more robustly. Crucially this needs no turntable and no lab equipment, which is why it is the calibration a phone runs silently in your pocket.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def calibrate_accel(static_samples, g=9.81):
+    """Fit bias + symmetric scale/misalignment so |M^-1 (y - b)| = g.
+    static_samples: (N, 3) accel readings, device held still in varied poses."""
+    Y = np.asarray(static_samples, float)
+    # Ellipsoid fit: y^T A y + y^T k + d = 0, solved as linear least squares.
+    x, y, z = Y[:, 0], Y[:, 1], Y[:, 2]
+    D = np.column_stack([x*x, y*y, z*z, 2*x*y, 2*x*z, 2*y*z, 2*x, 2*y, 2*z,
+                         np.ones_like(x)])
+    _, _, Vt = np.linalg.svd(D, full_matrices=False)
+    p = Vt[-1]                                  # null-space = ellipsoid params
+    A = np.array([[p[0], p[3], p[4]],
+                  [p[3], p[1], p[5]],
+                  [p[4], p[5], p[2]]])
+    k, d = p[6:9], p[9]
+    b = -np.linalg.solve(A, k)                  # ellipsoid center = bias
+    # Whitening transform maps the ellipsoid back onto a sphere of radius g.
+    scale = A / (b @ A @ b - d)
+    L = np.linalg.cholesky(scale) * g
+    return L.T, b                               # returns (M_inv-like, bias)
+
+M_corr, bias = calibrate_accel(collected_static_poses)
+corrected = (raw_accel - bias) @ M_corr        # apply at run time
+</code></pre>
+<div class="code-caption">Ellipsoid-fit accelerometer calibration from static poses only. The <code>calibrate_accel</code> routine recovers bias as the ellipsoid center and the combined scale/misalignment as its whitening transform, then the last line applies the correction to a live stream. No turntable, motor, or reference instrument is required.</div>
+
+<p>The code above illustrates the core estimation, but production systems rarely reimplement the ellipsoid solver. The next callout shows why.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Library Shortcut</h3>
+<p>Hand-rolling the SVD ellipsoid fit, pose selection, and outlier rejection is roughly 60 to 80 lines to get right, plus a numerically stable inverse. Libraries such as <code>imucal</code> (its <code>FerrarisCalibration</code> and <code>TurntableCalibration</code> classes) or <code>scikit-kinematics</code> reduce a full six-position accelerometer-plus-gyro calibration to about 5 lines: load the labeled recording, call <code>compute()</code>, and serialize the resulting calibration object to JSON for the fleet. They handle the pose bookkeeping, temperature fields, and the affine inversion so you correct with a single <code>cal.calibrate(data)</code> call.</p>
+</div>
+
+<h2>Gyroscope calibration and the awkwardness of angular rate</h2>
+
+<p>Gyroscopes have no free reference analogous to gravity, because there is no constant, always-present angular-rate field to lean on. This splits gyro calibration into two tractable halves. The <strong>bias</strong> is easy: hold the device perfectly still and average each axis over several seconds; the mean is the zero-rate offset \(\mathbf{b}_{\text{gyro}}\). Because this bias drifts slowly with temperature and even between power cycles, good systems re-estimate it opportunistically whenever they detect the device is stationary (a technique you will meet again as the zero-velocity update in Chapter <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">24</a>).</p>
+
+<p>The <strong>scale and misalignment</strong> are harder because they need a known rotation. The lab answer is a rate table or turntable that commands a precise angular velocity. The field answer is to rotate the device by a known <em>total angle</em> (for example a clean 90 or 360 degrees against a mechanical stop) and require that the integrated gyro reading matches that angle; the ratio of measured to true integrated angle gives the scale factor per axis. Misalignment terms follow from rotating about one axis and measuring the spurious integrated rate on the others.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical Example: the drifting warehouse forklift</h3>
+<p>A robotics team deployed autonomous forklifts using a low-cost MEMS IMU for short-horizon dead reckoning between lidar fixes. Straight aisles tracked fine, but every tight 90-degree turn accumulated a heading error, and after a shift the vehicles were consistently biased clockwise. The culprit was not noise: it was a \(-2.1\) percent gyroscope z-axis scale error, so every commanded quarter-turn was under-integrated by nearly two degrees. A one-time turntable calibration of the scale matrix, stored per unit and applied with \(M^{-1}\), removed the systematic heading drift and cut the reliance on lidar re-localization by a third. The random noise never changed; only the repeatable lie did, and that was the whole problem.</p>
+</div>
+
+<h2>Temperature, per-unit variation, and when to bother</h2>
+
+<p>The affine parameters are not truly constant. MEMS bias and scale drift measurably with temperature, so aerospace-grade and automotive parts ship with a factory temperature model, \(\mathbf{b}(T) = \mathbf{b}_0 + \mathbf{c}_1 T + \mathbf{c}_2 T^2\), and the best consumer pipelines log die temperature alongside every sample and fit a low-order correction. Calibration parameters are also <em>per unit</em>: two chips from the same reel differ enough that a single fleet-wide constant leaves visible residual bias. This is a data-engineering concern as much as a signal one; treat the calibration object as versioned metadata attached to a specific serial number, and beware of training a model on device A's corrected data and testing on device B's, which is a subtle leakage trap of the kind Chapter <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">5</a> warns about.</p>
+
+<p><strong>When is it worth it?</strong> If you only classify coarse activities (walking versus sitting) from a single well-placed sensor, downstream models often absorb a modest miscalibration and the return is small. If you integrate the signal over time (orientation, velocity, position), calibrate aggressively, because integration converts a small constant bias into an unbounded error. The magnetometer, mentioned in Section 23.1, has its own calibration story dominated by hard-iron and soft-iron distortion; it uses the same ellipsoid-fitting machinery as the accelerometer but references the local geomagnetic field instead of gravity.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You record a gyroscope perfectly still for 10 seconds and measure a mean of \(0.45\,^\circ/\text{s}\) on the z-axis. (a) If you integrate this raw signal to estimate heading, how large is the accumulated error after 5 minutes? (b) After removing the estimated bias, the residual random walk has an Allan-deviation noise density of \(0.01\,^\circ/\sqrt{\text{s}}\); estimate the standard deviation of the heading error after the same 5 minutes and compare the two magnitudes. Comment on which error the calibration eliminated and which it did not.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<ul>
+<li>Why can an accelerometer be calibrated with no external equipment, while a gyroscope's scale factor generally cannot?</li>
+<li>Which of bias, scale, and misalignment produces an error whose size is independent of how fast the device is moving, and why does that make a static desk test misleading?</li>
+<li>You correct a live stream with \(\hat{\mathbf{s}} = M^{-1}(\mathbf{y}-\mathbf{b})\). What goes wrong if you store \(M\) fit at 25&deg;C and run the device at 60&deg;C?</li>
+</ul>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-23.5.html">Section 23.5</a>, we put the newly trustworthy accelerometer signal to work: detecting individual footsteps and characterizing gait. Calibration is what lets a step detector rely on the true vertical acceleration peak rather than an axis-leaked artifact, so the correction you built here is the quiet foundation under everything that follows.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

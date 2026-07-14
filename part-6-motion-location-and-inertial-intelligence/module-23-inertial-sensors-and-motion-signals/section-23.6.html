@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.6: IMU failure and saturation modes. Building Sensory AI." name="description"/>
+<title>Section 23.6: IMU failure and saturation modes | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Inertial Sensors and Motion Signals</a></div>
+<h1>IMU failure and saturation modes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The accelerometer reported the crash was exactly sixteen g, because sixteen g was the largest number it owned."</p>
+<cite>A Clipped AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>Every model in this part assumes the six numbers arriving from an inertial measurement unit (IMU) are honest samples of motion. They are not always honest. When a limb swings hard, a drill impacts steel, or a phone hits the floor, the accelerometer or gyroscope runs out of range and <em>clips</em>: the output pins to the full-scale value and stops tracking the world. Elsewhere the failure is quieter, a frozen register, a dropped packet, a bias that jumps a degree per second after a thermal shock. The danger is that none of these arrive with a flag. A saturated sample looks like a large but valid reading, and a downstream orientation filter will happily integrate the lie into a drifting attitude. This section builds the physical intuition for when an IMU stops telling the truth, a taxonomy of the failure signatures you will actually meet, and a small runnable detector that tags corrupt samples <em>before</em> they poison estimation. Treating failure detection as a first-class preprocessing stage, not an afterthought, is what separates a demo that works on a desk from a system that survives a real wrist, a real vehicle, or a real machine.</p>
+</div>
+
+<p>This section assumes you know what the three inertial sensors physically measure and their full-scale ranges from <a class="cross-ref" href="section-23.1.html">Section 23.1</a>, and that calibration in <a class="cross-ref" href="section-23.4.html">Section 23.4</a> has already removed nominal bias, scale, and misalignment. Failure and saturation are what remains after calibration: they are not errors you fit away with a constant, they are regimes where the measurement model \(x = h(s) + \eta\) from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> breaks entirely, because \(h(\cdot)\) is no longer invertible. Here we answer only <em>how</em> an IMU fails and <em>how you notice</em>. What to do with a flagged gap during fusion belongs to <a class="cross-ref" href="section-23.7.html">Section 23.7</a> and to the orientation estimators of <a class="cross-ref" href="../module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>.</p>
+
+<h2>Saturation: when the sensor runs out of range</h2>
+
+<p>A microelectromechanical (MEMS) accelerometer measures proper acceleration by how far a tiny proof mass deflects; a gyroscope measures angular rate through a Coriolis-driven vibration. Both have a configured <em>full-scale range</em> (FSR), for example \(\pm 16\,g\) for a consumer accelerometer or \(\pm 2000\,^\circ/\text{s}\) for its gyroscope. Inside that range the response is close to linear. Push past it and the analog-to-digital converter simply cannot represent a larger number, so the output <em>clips</em> to the rail:</p>
+
+$$\hat{a} = \operatorname{clip}(a,\, -a_{\max},\, +a_{\max}) = \max\!\big(-a_{\max},\, \min(a_{\max},\, a)\big).$$
+
+<p>The moment true acceleration \(a\) exceeds \(a_{\max}\), every excess sample reads exactly \(a_{\max}\). This is why saturation is so treacherous: the value is not garbage, it is a plausible maximum, and a threshold-based magnitude feature will read it as a strong, clean event rather than a truncated one. Clipping also destroys information asymmetrically. The peak of an impact is exactly the part you most want to measure, and it is exactly the part that is erased. Two impacts of very different severity, one at \(20\,g\) and one at \(60\,g\), produce identical clipped waveforms once both exceed \(16\,g\), so the true magnitude is unrecoverable from the record alone.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Saturation is not noise, it is <em>censorship</em>. Noise adds a zero-mean perturbation you can average down; saturation deletes the tail of the signal and replaces it with a constant, so no filtering, averaging, or smoothing recovers what was clipped. The only fixes are upstream (choose a wider FSR before you record) or inferential (treat the clipped span as a censored observation with a known lower bound \(|a| \ge a_{\max}\), a right-censoring view that <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> gives you the vocabulary for). Widening the range is not free: a larger FSR spreads the same fixed number of ADC codes over a bigger span, so quantization noise rises. Range selection is a genuine trade, not a default.</p>
+</div>
+
+<h2>A taxonomy of IMU failure signatures</h2>
+
+<p>Clipping is the loudest failure, but a deployed IMU stream carries a whole family of corruptions, each with a recognizable fingerprint in the raw trace. Naming them is the first step to detecting them, because each has a distinct test.</p>
+
+<ul>
+<li><strong>Saturation / clipping.</strong> One or more axes pinned at, or within a hair of, the configured FSR for a run of consecutive samples. Signature: the value equals \(a_{\max}\) repeatedly while a real signal would wander.</li>
+<li><strong>Stuck / frozen samples.</strong> A register or bus fault repeats the last valid reading. Signature: exactly zero change across many samples on a sensor that is never truly silent because of its own noise floor.</li>
+<li><strong>Dropouts and gaps.</strong> Lost packets over a wireless link (a Bluetooth wrist band) or a starved buffer. Signature: timestamps jump, the effective rate falls, samples are missing rather than wrong. This is where the timing discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> earns its keep.</li>
+<li><strong>Spikes and bit flips.</strong> A single wildly out-of-family sample from a transmission glitch. Signature: one point far outside the local distribution, gone by the next sample.</li>
+<li><strong>Bias jumps.</strong> A mechanical shock or thermal transient shifts the zero-rate offset abruptly. Signature: a step in the running mean of a gyroscope axis with no matching physical motion, the change-point problem of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>.</li>
+<li><strong>Vibration rectification and aliasing.</strong> High-frequency vibration above the Nyquist rate folds down into a false low-frequency bias, and nonlinearities rectify it into a constant offset. Signature: a phantom tilt or drift that appears only under vibration.</li>
+<li><strong>Magnetometer interference.</strong> Nearby ferrous metal (hard-iron) or currents (soft-iron) distort the field so heading becomes meaningless. Signature: measured field magnitude departs from the local geomagnetic norm.</li>
+</ul>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: an airbag that did not know how hard the car hit</h3>
+<p>An automotive supplier logged crash-test IMUs configured at \(\pm 24\,g\) to save a wider-range part. In a barrier test the longitudinal channel pinned flat at \(24\,g\) for eleven milliseconds while the true deceleration peaked near \(45\,g\). The restraint controller, reading the clipped peak, computed a lower crash severity and staged the airbag a few milliseconds late. Nothing in the data stream looked broken: the trace was smooth, on-scale by its own definition, and self-consistent. The fix was twofold. First, hardware: move to a \(\pm 100\,g\) crash-rated accelerometer so the event lives inside the range. Second, software: flag any span within one percent of FSR as censored, and fuse it with the wider-range channel rather than trusting the pinned value. The lesson generalizes far past airbags: <em>a saturated sensor fails silently, so the pipeline, not the sensor, must raise the alarm</em>. Functional-safety practice for exactly this failure class is developed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-68-robustness-sensor-spoofing-and-functional-safety/index.html">Chapter 68</a>.</p>
+</div>
+
+<h2>Detecting corruption in the stream</h2>
+
+<p>Each signature above maps to a cheap, causal test you can run on a sliding window before any feature extraction. The routine below tags four of the most common failures on a triaxial accelerometer window: near-rail saturation, frozen runs, per-sample spikes, and timing gaps. It returns a boolean mask per sample so a downstream model receives a validity channel alongside the data, exactly the missing-data convention that <a class="cross-ref" href="section-23.7.html">Section 23.7</a> feeds into an orientation-aware network.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def flag_imu_faults(acc, t, fsr=16.0, sat_frac=0.99,
+                    freeze_run=5, spike_k=8.0, gap_factor=1.5):
+    """Return a per-sample fault mask for a triaxial accelerometer window.
+    acc: (N, 3) in g; t: (N,) timestamps in seconds. True = suspect sample."""
+    N = acc.shape[0]
+    mask = np.zeros(N, dtype=bool)
+
+    # 1. Saturation: any axis within sat_frac of the full-scale rail.
+    sat = np.any(np.abs(acc) >= sat_frac * fsr, axis=1)
+
+    # 2. Frozen: exact repeats across a run (real MEMS output never sits still).
+    same_as_prev = np.all(np.diff(acc, axis=0) == 0.0, axis=1)
+    frozen = np.zeros(N, dtype=bool)
+    run = 0
+    for i in range(1, N):
+        run = run + 1 if same_as_prev[i - 1] else 0
+        if run >= freeze_run - 1:
+            frozen[i - run:i + 1] = True
+
+    # 3. Spikes: robust z-score of the sample-to-sample jump magnitude.
+    jump = np.linalg.norm(np.diff(acc, axis=0, prepend=acc[:1]), axis=1)
+    med = np.median(jump)
+    mad = np.median(np.abs(jump - med)) + 1e-9
+    spike = jump > med + spike_k * 1.4826 * mad
+
+    # 4. Timing gaps: an inter-sample interval far above the nominal period.
+    dt = np.diff(t, prepend=t[0] - np.median(np.diff(t)))
+    gap = dt > gap_factor * np.median(np.diff(t))
+
+    mask = sat | frozen | spike | gap
+    return mask, {"saturated": sat.sum(), "frozen": frozen.sum(),
+                  "spikes": spike.sum(), "gaps": gap.sum()}</code></pre>
+<div class="code-caption"><strong>A causal four-test fault mask for a triaxial accelerometer window.</strong> Each test targets one signature from the taxonomy: rail proximity for saturation, exact-repeat runs for frozen registers, a median-absolute-deviation z-score for spikes, and inter-sample interval blowups for dropouts. The returned mask travels with the data as a validity channel; the counts summarize what the window suffered.</div>
+
+<p>Notice the design choices. The saturation test compares against a fraction of the rail rather than exact equality, because calibration scaling in <a class="cross-ref" href="section-23.4.html">Section 23.4</a> nudges the pinned value slightly off the nominal \(a_{\max}\). The spike test uses the median and median absolute deviation, not the mean and standard deviation, so a single \(50\,g\) glitch does not inflate its own threshold. The freeze test insists on <em>exact</em> equality across several samples, which a genuinely noisy MEMS device essentially never produces, so false positives are rare. Every test is causal and cheap, so the whole mask runs in real time on a microcontroller, the deployment target of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: let a signal-quality library score the window</h3>
+<p>The hand-rolled mask is about forty lines and four tuned thresholds. For the freeze and gap tests you can lean on vectorized rolling operators instead of the explicit loop, and for saturation a one-liner suffices once the FSR is known.</p>
+<pre class="language-python"><code class="language-python">import pandas as pd, numpy as np
+df = pd.DataFrame(acc, columns=list("xyz"))
+# Frozen runs: rolling range of zero over any axis.
+frozen = (df.rolling(5).apply(lambda w: w.max() - w.min()) == 0).any(axis=1)
+saturated = (df.abs() >= 0.99 * 16.0).any(axis=1)</code></pre>
+<div class="code-caption"><strong>Frozen-run and saturation flags in two vectorized lines with <code>pandas</code>.</strong> The rolling window replaces the manual run counter, and the library handles the sliding-window bookkeeping and NaN edges internally.</div>
+<p>Two lines replace roughly fifteen of the manual loop, and pandas manages the window edges and vectorization. You still choose the thresholds; the library only removes the boilerplate.</p>
+</div>
+
+<h2>Living with failure: what a robust pipeline does next</h2>
+
+<p>Detection is only half the job. Once a span is flagged, three responses cover most systems. <strong>Mask and impute.</strong> Mark the samples invalid and let a gap-aware model or a filter propagate through them on its motion prior rather than trusting the corrupt value; short gaps of a few samples are often safely interpolated, long ones are not. <strong>Downweight in fusion.</strong> A Bayesian filter (the <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Kalman family of Chapter 9</a>) can inflate the measurement noise \(R\) for a flagged sample toward infinity, which cleanly tells the estimator to ignore it and coast on prediction, the same missing-modality robustness pattern as <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-50-deep-multimodal-fusion-and-missing-modality/index.html">Chapter 50</a>. <strong>Fail over.</strong> When a redundant IMU or a wider-range channel exists, switch to it. Above all, the validity mask must travel downstream: a model that never learns which samples were faked will learn the fakes as if they were motion, and leakage-safe evaluation demands that saturated segments be labeled truthfully in both training and test splits.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You record a boxing-glove IMU at \(\pm 16\,g\) and find that hard jabs saturate the accelerometer for two to four samples at a time. (a) Explain why you cannot recover the true peak magnitude from the clipped record, and state the one-sided inequality the clipped samples still guarantee. (b) You reconfigure the same part to \(\pm 32\,g\) and the clipping disappears, but your quiet-stance noise floor worsens. Explain the mechanism in one sentence. (c) Propose a two-sensor arrangement that keeps fine resolution for gentle motion and never clips on a punch, and say how the fusion layer decides which channel to trust.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p class="quiz-question">1. Why is a saturated accelerometer sample more dangerous to a downstream orientation filter than a sample corrupted by ordinary white noise?</p>
+<p class="quiz-question">2. The freeze detector requires <em>exact</em> equality across several samples. Why is that a safe test on a real MEMS device but a poor test on a heavily low-pass-filtered stream?</p>
+<p class="quiz-question">3. Vibration well above the Nyquist rate produces a phantom constant tilt after aliasing. Which two sensor properties, one temporal and one about linearity, together create this rectified offset?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-23.7.html">Section 23.7</a>, we turn the validity mask built here into a first-class input feature and assemble the full preprocessing pipeline for orientation-aware models: resampling to a common clock, gravity-aware normalization, windowing, and the encoding of gaps and saturation flags so a network learns motion from the trustworthy samples and knows to distrust the rest.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

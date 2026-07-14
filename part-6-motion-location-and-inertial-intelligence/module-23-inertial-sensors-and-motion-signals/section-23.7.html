@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.7: Preprocessing for orientation-aware models. Building Sensory AI." name="description"/>
+<title>Section 23.7: Preprocessing for orientation-aware models | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Inertial Sensors and Motion Signals</a></div>
+<h1>Preprocessing for orientation-aware models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I trained flawlessly on wrist data, then a user put the watch on upside down and I decided walking was falling."</p>
+<cite>An Orientation-Naive AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>An inertial measurement unit does not report motion in the world. It reports motion in <em>its own body frame</em>, and that frame is glued to however the device happens to sit: a phone face-up in a pocket, the same phone upside down in a bag, a watch on the left wrist or the right, a machine-mounted sensor bolted at whatever angle the bracket allowed. Change the mounting and every raw axis changes, even though the physical activity is identical. Orientation is therefore the single largest <em>nuisance covariate</em> in inertial machine learning: a model that memorizes raw axes learns the mounting, not the motion, and collapses the first time the device is worn differently. This section builds the preprocessing stage that neutralizes that covariate. We resample the stream onto a clean clock, separate gravity from motion, rotate the signal into a mounting-independent frame, decide between building invariance in or augmenting it in, and package everything (including the validity mask from the previous section) into fixed windows that a network or a foundation model can consume without secretly learning to depend on how the sensor was strapped on.</p>
+</div>
+
+<p>This section assumes you can name the body, sensor, and world coordinate frames and convert between them from <a class="cross-ref" href="section-23.2.html">Section 23.2</a>, that gravity has been separated from linear acceleration as in <a class="cross-ref" href="section-23.3.html">Section 23.3</a>, and that corrupt samples already carry the validity mask built in <a class="cross-ref" href="section-23.6.html">Section 23.6</a>. It also leans on the sampling and synchronization discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, because a rotation is only meaningful when the three axes it mixes were sampled at the same instant. What we produce here is the tensor that feeds the activity models of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> and the orientation estimators of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>.</p>
+
+<h2>Orientation is the hidden covariate</h2>
+
+<p>Write the reading of a triaxial sensor in its own body frame as \(x_b\). If the same device were mounted with a rotation \(R\) relative to some reference, the world-frame motion \(x_w\) relates to the reading by \(x_b = R^\top x_w\). A model \(f\) trained on \(x_b\) and evaluated on a differently mounted \(x_b' = (R')^\top x_w\) sees an input that can be arbitrarily far from anything in training, even though the underlying activity is unchanged. This is not overfitting in the usual sense; the training distribution genuinely did not cover the deployment mounting. Two devices, two brackets, or two users who wear a watch differently are enough to break a naive model.</p>
+
+<p>There is a crucial asymmetry that makes the problem tractable. Gravity is always present and always points down, so the accelerometer's low-frequency component is a free, absolute observation of <em>two</em> of the three rotational degrees of freedom: roll and pitch. Only heading (rotation about the vertical, yaw) is left ambiguous from the accelerometer alone, and resolving it needs a magnetometer or integrated gyroscope, which is the business of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>. So the practical goal of orientation preprocessing is modest and achievable: rotate every window so that gravity points along a canonical axis, removing the two degrees of freedom you can pin down cheaply, and then handle the residual heading either by invariance, by augmentation, or by simply accepting it.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Gravity is a built-in orientation reference that costs nothing to measure. Low-pass the accelerometer and you have a vector that is guaranteed to point down; rotating each sample so that vector lands on \([0,0,1]\) removes roll and pitch entirely and leaves only heading unresolved. That single step converts a three-degree-of-freedom nuisance into a one-degree-of-freedom nuisance, which is why gravity alignment is the backbone of almost every orientation-robust inertial pipeline. The catch: the estimate is only as good as your gravity/linear-acceleration split, so during vigorous motion the low-pass "gravity" is contaminated and the alignment wobbles. That coupling to <a class="cross-ref" href="section-23.3.html">Section 23.3</a> is not incidental; a better gravity estimate is directly a better frame.</p>
+</div>
+
+<h2>Two roads: invariance by construction versus learned equivariance</h2>
+
+<p>There are two defensible strategies, and mature systems often blend them. The first is <strong>invariance by construction</strong>: transform the raw signal into features that do not change under rotation, so the model never sees the nuisance at all. The acceleration magnitude \(\lVert a \rVert\) is fully rotation-invariant; the gravity-aligned vertical and horizontal components are invariant to heading; pairwise axis correlations and the gyroscope's rotation-invariant angular-rate norm add more. This is cheap, interpretable, and shrinks the input, which matters on the microcontrollers of Part XII. Its cost is that a hard invariance <em>discards</em> information: once you keep only \(\lVert a \rVert\), a model can no longer tell a forward lean from a sideways one, and some activities become indistinguishable. Feature-engineering that trades expressiveness for invariance is exactly the design tension of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-08-feature-engineering-and-dimensionality-reduction/index.html">Chapter 8</a>.</p>
+
+<p>The second road is <strong>learned equivariance through augmentation</strong>: keep the full three-axis signal but, during training, apply random rotations to every window so the model sees each motion under many mountings and learns to be robust on its own. This preserves directional information while still discouraging dependence on any one frame, and it is the dominant approach for deep models. Random-rotation augmentation is now standard practice for wearable networks and a core positive-pair transform for the contrastive self-supervised methods of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>. The two roads are not exclusive: a common recipe gravity-aligns first (removing roll and pitch deterministically) and then augments only the residual heading (random rotation about the vertical), getting most of the robustness of augmentation at a fraction of the variance.</p>
+
+<h2>Building the pipeline</h2>
+
+<p>A production inertial pipeline is a fixed sequence: resample onto a uniform clock, separate gravity, rotate into the gravity-anchored frame, window, normalize, and attach the validity mask as an extra channel. The order matters. Resampling comes first because rotation mixes axes and is meaningless across a timing jitter; masking comes last because normalization statistics must be computed over valid samples only, or a saturated span poisons the mean. The core geometric step, gravity alignment, is short enough to write from scratch, and doing so once makes the abstraction concrete.</p>
+
+<pre class="language-python"><code class="language-python">import numpy as np
+
+def gravity_align(acc, gyro, fs, g_cutoff=0.3):
+    """Rotate each sample into a gravity-anchored frame (z = up).
+    acc, gyro: (N, 3) resampled arrays; fs: sample rate in Hz.
+    Removes roll and pitch; heading (yaw) is left unresolved."""
+    # 1. Estimate gravity: a one-pole low-pass keeps only the DC-ish tilt.
+    alpha = np.exp(-2 * np.pi * g_cutoff / fs)
+    grav = np.empty_like(acc)
+    grav[0] = acc[0]
+    for i in range(1, len(acc)):
+        grav[i] = alpha * grav[i - 1] + (1 - alpha) * acc[i]
+    g_hat = grav / (np.linalg.norm(grav, axis=1, keepdims=True) + 1e-9)
+
+    up = np.array([0.0, 0.0, 1.0])
+    acc_r, gyro_r = np.empty_like(acc), np.empty_like(gyro)
+    for i in range(len(acc)):
+        v = np.cross(g_hat[i], up)           # rotation axis
+        s, c = np.linalg.norm(v), g_hat[i] @ up
+        if s < 1e-8:                         # already up or fully inverted
+            R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+        else:                                # Rodrigues' formula
+            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+        acc_r[i], gyro_r[i] = R @ acc[i], R @ gyro[i]
+    return acc_r, gyro_r
+</code></pre>
+<div class="code-caption"><strong>Gravity alignment via a per-sample Rodrigues rotation.</strong> A one-pole low-pass estimates the gravity direction, and each sample is rotated so that direction maps onto the vertical axis. The result is invariant to how the device was tilted in roll and pitch; only heading remains, and the gyroscope is rotated by the same matrix so both signals stay in one consistent frame.</div>
+
+<p>The routine above is the geometric heart of the pipeline referenced throughout this section. After it runs, the vertical acceleration channel means the same thing whether the phone was face-up or face-down, which is precisely what lets a downstream network of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> generalize across mountings. Two design notes. First, the smoother cutoff \(g_{\text{cutoff}}\) trades a steadier gravity estimate (lower cutoff) against faster response to genuine tilt changes (higher cutoff); 0.2 to 0.5 Hz is typical for human wear. Second, the per-sample Python loop is written for clarity, not speed; the library shortcut below vectorizes it.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In practice: a fall detector that survived pocket flips</h3>
+<p>A clinical wearables team shipped a hip-worn fall detector trained on data where the device was always clipped in one orientation. In the field, caregivers re-clipped it however was convenient, sometimes rotated 180 degrees, and the false-alarm rate tripled: a brisk sit-down in a flipped mounting produced an acceleration pattern the model had only ever seen during simulated falls. The fix was pure preprocessing, no new labels. They inserted gravity alignment so vertical always meant vertical, then added random heading rotation as a training augmentation to cover the residual yaw. Cross-mounting false alarms fell back to the original level and, as a bonus, the model transferred to a wrist form factor with far less new data, because the gravity-anchored representation already spoke the same geometric language. The lesson generalizes past falls: <em>orientation robustness is a data-representation problem, and it is almost always cheaper to fix in preprocessing than to paper over with more labels</em>. Leakage-safe evaluation, in the spirit of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>, meant testing on held-out <em>subjects and mountings</em>, not random windows, so the robustness gain was real rather than a split artifact.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: rotations and augmentation from a library</h3>
+<p>The from-scratch alignment is about twenty-five lines with a hand-coded Rodrigues formula and an explicit loop. <code>scipy.spatial.transform.Rotation</code> vectorizes the whole thing and gives you random rotations for augmentation for free.</p>
+<pre class="language-python"><code class="language-python">from scipy.spatial.transform import Rotation as Rot
+import numpy as np
+
+def align_and_augment(acc_r, rng, yaw_only=True):
+    # Random heading rotation as an augmentation (already gravity-aligned).
+    ang = rng.uniform(0, 2 * np.pi)
+    R = Rot.from_rotvec([0, 0, ang]) if yaw_only else Rot.random(random_state=rng)
+    return R.apply(acc_r)          # vectorized over all samples at once
+</code></pre>
+<div class="code-caption"><strong>Vectorized rotation and heading augmentation with <code>scipy</code>.</strong> <code>Rotation.apply</code> replaces the per-sample matrix loop, and <code>from_rotvec</code> / <code>random</code> generate the augmentation transforms in one call.</div>
+<p>Roughly twenty lines of loop and manual matrix algebra collapse to two, and the library handles the numerically careful cases (near-parallel vectors, normalization) that the hand-rolled version guards against with epsilons. You still choose the alignment strategy; the library only removes the geometry boilerplate.</p>
+</div>
+
+<h2>Windowing, normalization, and carrying the mask</h2>
+
+<p>With the stream in a stable frame, the last steps assemble training tensors. <strong>Windowing</strong> slices the continuous signal into fixed-length segments (commonly one to a few seconds, 50 percent overlap) because most inertial models classify or embed a window, not a single sample; window length is a genuine hyperparameter that trades latency against how much of a gait cycle each example contains. <strong>Normalization</strong> should use statistics computed per channel over <em>valid</em> samples only, and, critically, fit on the training split alone and reused on validation and test, or you leak future statistics backward. <strong>The validity mask</strong> from <a class="cross-ref" href="section-23.6.html">Section 23.6</a> rides along as an extra input channel so the network learns which samples to distrust rather than treating a saturated pin as real motion. Package the result as a tensor of shape (window, channels) where channels include gravity-aligned acceleration, gyroscope, useful invariant features such as \(\lVert a \rVert\), and the mask. That tensor is the contract this chapter hands to the models of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> and to the wearable foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>, which increasingly expect exactly this canonicalized, masked, fixed-window form.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have a smartphone accelerometer dataset for walking, collected with the phone always face-up in a chest pocket, and you must deploy to phones carried in any orientation. (a) Explain why training directly on the raw axes will fail, in terms of the covariate \(x_b = R^\top x_w\). (b) Apply gravity alignment and state precisely which rotational degree of freedom remains unresolved and why the accelerometer cannot fix it. (c) Choose between hard rotation-invariant features and random-rotation augmentation for the residual, and justify your choice given that you also need to distinguish walking upstairs from walking on the flat. (d) Describe one way your gravity estimate degrades during a fast descent and how it corrupts the alignment.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p class="quiz-question">1. Why must resampling onto a uniform clock happen <em>before</em> any rotation that mixes the three axes?</p>
+<p class="quiz-question">2. Gravity alignment removes two of three rotational degrees of freedom for free. Which two, and what physical fact makes them observable from a single accelerometer?</p>
+<p class="quiz-question">3. You normalize each window using its own mean and variance instead of training-split statistics. Name two distinct problems this causes, one about information leakage and one about destroying a feature the model needs.</p>
+</div>
+
+<div class="callout lab">
+<h3 class="callout-title">Lab 23</h3>
+<p>build an IMU preprocessing pipeline for orientation-aware activity recognition.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Orientation-robust representations and features</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1016/j.patcog.2017.06.006">Yurtman, A. and Barshan, B. (2017). Activity recognition invariant to sensor orientation with wearable motion sensors. Pattern Recognition.</a></p>
+<p class="bib-annotation">Develops explicit transformations that make inertial features invariant to how the sensor is oriented on the body, the formal grounding for the invariance-by-construction road in this section.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.mdpi.com/1424-8220/14/4/6474">Banos, O., Galvez, J.-M., Damas, M., Pomares, H., and Rojas, I. (2014). Window size impact in human activity recognition. Sensors.</a></p>
+<p class="bib-annotation">A systematic study of how window length trades recognition accuracy against latency, the empirical basis for the windowing hyperparameter choices here.</p>
+</div>
+
+<p class="bib-category">Augmentation and self-supervised transforms</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1145/3136755.3136817">Um, T. T. et al. (2017). Data augmentation of wearable sensor data for Parkinson's disease monitoring using convolutional neural networks. ICMI.</a></p>
+<p class="bib-annotation">Introduces rotation, jitter, and warping augmentations for inertial data; the rotation augmentation is the canonical technique for learned orientation robustness.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://doi.org/10.1145/3328932">Saeed, A., Ozcelebi, T., and Lukkien, J. (2019). Multi-task self-supervised learning for human activity recognition. Proc. ACM IMWUT.</a></p>
+<p class="bib-annotation">Uses signal transformations, including rotations, as self-supervision signals, connecting orientation preprocessing to the contrastive learning of Chapter 17.</p>
+</div>
+
+<p class="bib-category">Deep models and datasets for inertial HAR</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.mdpi.com/1424-8220/16/1/115">Ordonez, F. J. and Roggen, D. (2016). Deep convolutional and LSTM recurrent neural networks for multimodal wearable activity recognition. Sensors.</a></p>
+<p class="bib-annotation">The DeepConvLSTM architecture that consumes windowed, multichannel inertial tensors of exactly the form this pipeline produces.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://www.esann.org/sites/default/files/proceedings/legacy/es2013-84.pdf">Anguita, D., Ghio, A., Oneto, L., Parra, X., and Reyes-Ortiz, J. L. (2013). A public domain dataset for human activity recognition using smartphones. ESANN.</a></p>
+<p class="bib-annotation">The widely used UCI HAR dataset, whose gravity/body-acceleration split and fixed windows mirror the preprocessing steps taught here.</p>
+</div>
+
+<p class="bib-category">Foundation models for wearable inertial data</p>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2410.13638">Narayanswamy, G. et al. (2024). Scaling wearable foundation models (LSM). arXiv:2410.13638.</a></p>
+<p class="bib-annotation">Google's Large Sensor Model, trained on massive wearable streams; it expects the canonicalized, masked, fixed-window inputs that this section standardizes.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref"><a href="https://arxiv.org/abs/2206.02909">Yuan, H. et al. (2024). Self-supervised learning for human activity recognition using 700,000 person-days of wearable data. npj Digital Medicine.</a></p>
+<p class="bib-annotation">Large-scale accelerometer pretraining showing that rotation-aware augmentation and gravity-anchored representations scale to population-level models.</p>
+</div>
+</section>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, we stop treating orientation as a nuisance to remove and start estimating it as a quantity of interest: quaternions and rotation representations, complementary and Madgwick/Mahony filters that fuse accelerometer, gyroscope, and magnetometer into a full attitude, and the dead-reckoning that turns those orientations into a trajectory when no external position fix is available.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

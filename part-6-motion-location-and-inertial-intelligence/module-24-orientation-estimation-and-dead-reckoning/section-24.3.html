@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.3: Attitude and heading reference systems. Building Sensory AI." name="description"/>
+<title>Section 24.3: Attitude and heading reference systems | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Attitude and heading reference systems</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I knew exactly how the drone was tilted and had no idea which way it faced. Gravity is a generous witness; it will tell you everything except where north went."</p>
+        <cite>A Well-Oriented but Lost AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the rotation vocabulary of <a class="cross-ref" href="section-24.1.html">Section 24.1</a> (quaternions and \(SO(3)\)) and the fusion filters of <a class="cross-ref" href="section-24.2.html">Section 24.2</a> (complementary, Mahony, Madgwick), which are the estimators an attitude and heading reference system runs inside. It builds on the three inertial sensors and the frame conventions of <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, and on the magnetometer error models introduced with sensor physics in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>. Basic uncertainty reasoning from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> helps when we discuss trusting or rejecting a measurement.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>A filter in isolation gives you a number. A product needs a <em>system</em>: something that starts up on an unknown surface, produces a full orientation the instant you power it, holds that orientation when one sensor lies, and never silently reports garbage. That system is an <strong>attitude and heading reference system</strong> (AHRS). The word "attitude" means roll and pitch (how the device is tilted relative to gravity); "heading" means yaw (which way it faces relative to north). The deep lesson of this section is that these two halves are not symmetric. Gravity anchors attitude for free, but nothing you have measured so far anchors heading. Fixing that gap, and doing it robustly when magnetic fields are hostile, is what separates a demo filter from an AHRS you can ship on a drone, a phone, or an autonomous forklift.</p>
+    </div>
+
+    <h2>From a filter to a system</h2>
+    <p>Section 24.2 gave you estimators that fuse a gyroscope with an accelerometer to track orientation over time. An AHRS is the engineering wrapper around such an estimator that makes it deployable. Concretely it adds four things the bare filter lacks. First, an <strong>initialization</strong> (often called alignment): at power-on there is no history, so the system must derive a starting orientation from a single static snapshot of the sensors. Second, a <strong>third reference vector</strong>, the magnetometer, because two of the three orientation axes are otherwise unobservable (the next subsection is entirely about why). Third, <strong>calibration and disturbance handling</strong>, since a magnetometer near a motor or a laptop reports a field that has nothing to do with north. Fourth, <strong>degraded modes and health flags</strong>, so that when the magnetic environment is untrustworthy the system tells you it is coasting rather than pretending. A commercial AHRS module such as the VectorNav VN-100 or the Xsens MTi packages exactly these behaviors behind a serial stream of quaternions; the point of this section is to understand what that stream is quietly protecting you from.</p>
+
+    <h2>Why heading is the hard half</h2>
+    <p>Attitude and heading feel like one problem, but they have different amounts of evidence behind them. Consider what each sensor observes. The gyroscope measures angular rate on all three axes, so integrating it moves the estimate correctly in the short term but accrues drift on all three (Section 24.2). The accelerometer, at rest, measures the gravity direction, a fixed vector in the navigation frame. Aligning the estimated gravity to the measured gravity pins down two rotational degrees of freedom: roll and pitch. It cannot pin the third. Rotating the device about the gravity axis (a change of heading) leaves the gravity vector pointing in exactly the same place, so the accelerometer sees no difference at all. Yaw is <em>invisible</em> to gravity.</p>
+    <p>This is an observability statement, and it is the crux of the whole section. With only a gyroscope and an accelerometer, roll and pitch are corrected by an absolute reference and stay bounded, while heading has no absolute reference and drifts without limit, at the gyroscope's bias rate, forever. A cheap MEMS gyro drifting a degree or two per minute will have your heading a full quadrant wrong within the hour, even though your attitude stays crisp. The only way to make heading observable is to add a second, non-parallel reference vector fixed in the world. The Earth's magnetic field is the one every device can carry: a vector that points roughly toward magnetic north with a downward tilt, and crucially one that is <em>not</em> parallel to gravity, so it supplies the missing degree of freedom.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Attitude is self-correcting; heading is not. A gyro-plus-accelerometer system has a bounded error in roll and pitch and an <em>unbounded</em> error in yaw, because gravity constrains two axes and is completely blind to rotation about itself. The magnetometer is not a nice-to-have accessory in an AHRS. It is the only sensor in the box that makes heading observable at all, which is exactly why AHRS design is dominated by the problem of trusting a magnetometer that is almost never clean.</p>
+    </div>
+
+    <h2>Making the magnetometer tell the truth</h2>
+    <p>Two reference vectors give you a full orientation through the classic solution to Wahba's problem: find the single rotation that best aligns the measured gravity-and-field pair to their known navigation-frame directions (the TRIAD and QUEST algorithms do this in closed form, and an AHRS uses one at startup for instant alignment). But this only works if the magnetometer is honest, and out of the box it is not. Three corruptions must be handled before the field vector means anything.</p>
+    <p><strong>Hard-iron</strong> distortion is a constant offset added by permanently magnetized material soldered next to the sensor (speaker magnets, steel screws). It shifts the whole field measurement, so the locus of readings taken while rotating the device is a sphere <em>not centered at the origin</em>. <strong>Soft-iron</strong> distortion comes from nearby ferromagnetic material that warps the field, stretching that sphere into an ellipsoid. Both are fixed relative to the device and are removed by a one-time calibration: rotate the unit through all orientations, fit an ellipsoid to the cloud of readings, and store the offset and shape correction that map it back to a unit sphere. The third correction is <strong>magnetic declination</strong>: the field points at <em>magnetic</em> north, which differs from <em>true</em> (geographic) north by a location-dependent angle, tens of degrees near the poles. You add the declination for your location, obtained from a model like the World Magnetic Model, to turn magnetic heading into true heading before handing it to a map.</p>
+    <p>Even calibrated, the field must be de-rotated into the horizontal plane before it yields a heading, because a magnetometer tilted with the device reads a field pointing partly down. Listing 24.1 performs this <em>tilt compensation</em>: it recovers roll and pitch from gravity, uses them to level the magnetometer, and only then computes heading. This is the computation an AHRS runs every cycle to feed its yaw correction.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def tilt_compensated_heading(acc, mag, declination_deg=0.0):
+    """True heading in degrees from an accelerometer and a (calibrated)
+    magnetometer. acc and mag are 3-vectors in the sensor frame."""
+    ax, ay, az = acc / np.linalg.norm(acc)          # gravity direction
+    roll  = np.arctan2(ay, az)                       # tilt about forward axis
+    pitch = np.arctan2(-ax, np.hypot(ay, az))        # tilt about right axis
+
+    cr, sr = np.cos(roll),  np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    mx, my, mz = mag
+    mh_x = mx*cp + my*sr*sp + mz*cr*sp               # level the field into the
+    mh_y = my*cr - mz*sr                             # local horizontal plane
+    heading = np.degrees(np.arctan2(-mh_y, mh_x))
+    return (heading + declination_deg) % 360.0
+
+# Device pitched 30 deg forward, magnetometer reads a north-ish tilted field
+acc = np.array([-0.5, 0.0, 0.866]) * 9.81
+mag = np.array([18.0, -4.0, 42.0])                   # microtesla, sensor frame
+print(round(tilt_compensated_heading(acc, mag, declination_deg=11.0), 1))</code></pre>
+    <div class="code-caption"><strong>Listing 24.1.</strong> Tilt-compensated magnetic heading. Roll and pitch come from the gravity direction, then level the magnetometer into the horizontal plane so that yaw is read from the true horizontal field. Adding the local declination (here 11 degrees) converts magnetic heading to true heading. Without the tilt step, any pitch or roll would corrupt the reported heading by tens of degrees.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>Listing 24.1 is only the yaw observation; a full AHRS also needs gyro integration, alignment, and magnetic-disturbance rejection, which is a few hundred lines to write and debug correctly. The <code>imufusion</code> package (the Python binding of the widely used x-io Fusion AHRS) gives you the entire system, including automatic hard-iron and rejection logic, in about six lines:</p>
+        <pre class="language-python"><code class="language-python">import imufusion, numpy as np
+ahrs = imufusion.Ahrs()                       # gyro + accel + magnetometer
+for gyro, accel, mag in stream:               # deg/s, g, microtesla
+    ahrs.update(gyro, accel, mag, dt=1/100)
+    q = ahrs.quaternion.wxyz                   # calibrated orientation
+    euler = ahrs.quaternion.to_euler()         # roll, pitch, heading</code></pre>
+        <div class="code-caption"><strong>Listing 24.2.</strong> A complete AHRS with <code>imufusion</code>: roughly 300 lines of alignment, integration, and disturbance handling collapse to about six, and the magnetic-rejection flags come for free via <code>ahrs.flags</code>.</div>
+        <p>Use the library in any real pipeline; keep Listing 24.1 to understand what the yaw correction inside it is actually doing when a heading goes wrong.</p>
+    </div>
+
+    <h2>Rejection, degraded modes, and staying honest</h2>
+    <p>The reason a serious AHRS is more than tilt-compensated heading plus a filter is that indoor and vehicular magnetic environments are hostile. A steel doorway, an elevator, or a running motor can bend the local field by tens of microtesla, swamping the Earth's roughly 50-microtesla signal. If the filter naively trusts the magnetometer, heading snaps toward the disturbance and then unwinds slowly, a signature wobble that ruins a trajectory. The defense is <strong>disturbance rejection</strong>: on every sample the AHRS checks whether the measured field magnitude and inclination match the expected local values, and if they do not, it temporarily ignores the magnetometer and lets the gyroscope carry heading on its own. Because gyro heading drifts only slowly, coasting for a few seconds through a bad patch is far better than believing it. This is a direct application of gating an outlier measurement, the same robustness idea that appears in the Kalman family of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>. A well-designed AHRS also exposes a health flag when it is coasting, so downstream fusion (for example with GNSS in <a class="cross-ref" href="../module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>) can down-weight heading rather than trust a number the AHRS itself does not.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: an autonomous warehouse forklift that stops trusting north</h3>
+        <p>An indoor autonomous forklift used an AHRS for heading between GNSS-denied aisles. In open testing it tracked beautifully. On the warehouse floor it periodically lurched a few degrees off course, always at the same spots. The culprit was steel: racking, rebar in the concrete, and the forklift's own lift motor bent the local magnetic field aisle by aisle, and the AHRS was pulling heading toward each disturbance. The engineers did two things. They ran the ellipsoid calibration with the forklift's own motor energized, folding the vehicle's static soft-iron signature into the correction, and they enabled magnetic-disturbance rejection with a tighter magnitude gate so the system coasted on the gyroscope through the racking. Heading error dropped from several degrees to well under one, and the exposed rejection flag let the path planner slow slightly whenever the AHRS was coasting for more than a second. The lesson is that an AHRS is only as trustworthy as its willingness to distrust its own magnetometer.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research Frontier</h3>
+        <p>Classical AHRS tune fixed gains and hand-set rejection thresholds. Recent work replaces those heuristics with learning. RIANN (Weber, Gühmann, and Seel, 2021) is a recurrent network that estimates attitude directly from gyro and accelerometer streams and generalizes across sampling rates and motion profiles without per-device tuning. On the sensor-cleaning side, Brossard, Barrau, and Bonnabel's "Denoising IMU Gyroscopes with Deep Learning" (2020) learns to remove gyroscope noise and bias so well that heading stays usable far longer between magnetic corrections, easing the reliance on a clean magnetometer. A parallel thread pursues magnetometer-free heading, using learned motion priors to constrain yaw where the field is untrustworthy, which connects directly to the learned inertial odometry of <a class="cross-ref" href="section-24.6.html">Section 24.6</a>. The open problem is calibrated confidence: an AHRS that outputs not just an orientation but a trustworthy uncertainty on it, the theme of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Log gyroscope, accelerometer, and magnetometer from a phone app (phyphox exposes all three) while walking a closed square and returning to the start facing your original direction. (1) Integrate the gyroscope alone to produce heading and measure the closing error in degrees; relate it to the gyro bias. (2) Compute tilt-compensated magnetic heading with Listing 24.1 over the same walk and compare its closing error. (3) Walk the square again passing close to a refrigerator or a laptop, plot the magnetometer magnitude, and mark the samples where it deviates more than 20 percent from its open-space value. Propose a magnitude gate that would have rejected those samples, and describe what the heading estimate should do while they are rejected.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Why does a gyroscope-plus-accelerometer system keep roll and pitch bounded while heading drifts without limit?</p>
+        <p class="quiz-question">2. What are hard-iron and soft-iron distortions, and why does a one-time rotate-through-all-orientations calibration remove them but not a passing magnetic disturbance?</p>
+        <p class="quiz-question">3. When an AHRS detects a magnetic disturbance, what does it do with the magnetometer, and why is exposing a health flag to downstream fusion important?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>An AHRS solves orientation: which way the device is tilted and which way it faces. It says nothing about <em>where</em> the device is. In <a class="cross-ref" href="section-24.4.html">Section 24.4</a>, we attempt the far harder step of integrating acceleration into velocity and position, and meet the unforgiving reason pure inertial navigation drifts away in seconds: the same gravity that anchored our attitude now contaminates every position estimate through the smallest orientation error.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

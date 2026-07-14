@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.2: Complementary and Mahony/Madgwick filters. Building Sensory AI." name="description"/>
+<title>Section 24.2: Complementary and Mahony/Madgwick filters | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Complementary and Mahony/Madgwick filters</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"The gyroscope knows exactly how fast the world is turning and slowly forgets where it started. The accelerometer never forgets down but panics at every pothole. I married them, and the marriage works."</p>
+        <cite>A Well-Fused AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section builds directly on the quaternion algebra of <a class="cross-ref" href="section-24.1.html">Section 24.1</a>: you should be comfortable multiplying unit quaternions, forming the quaternion derivative from an angular rate, and reading a quaternion as a rotation. It also assumes the three inertial sensors and their frames from <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, especially that a gyroscope measures angular rate while an accelerometer at rest measures gravity. Familiarity with high-pass and low-pass filters from <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> makes the core idea land faster, and the estimation vocabulary from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a> frames why we accept a fast approximate answer here.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>You have two ways to know which way is up, and both are broken in complementary ways. Integrate the gyroscope and you get a beautifully smooth orientation that is correct for seconds and then wanders off, because tiny bias errors accumulate without bound. Look at the accelerometer and you get an absolute reference to gravity that never drifts, but it is contaminated by every bump, turn, and vibration the device experiences. The trick that powers nearly every drone, phone, VR headset, and fitness band on Earth is to trust the gyroscope on short timescales and the accelerometer on long ones, blending them so the answer is both smooth and drift-free. This section builds that blend three ways: the scalar complementary filter that shows the idea in one line, and the Mahony and Madgwick filters that make it work on the full rotation group in real time on a microcontroller.</p>
+    </div>
+
+    <h2>Why one sensor is never enough</h2>
+    <p>Start from the honest failure of each sensor alone. A gyroscope reports angular rate \(\omega\) in the body frame, and integrating it propagates orientation forward: in quaternion form the estimate evolves as \(\dot{q} = \tfrac{1}{2}\, q \otimes (0,\omega)\), the relation established in <a class="cross-ref" href="section-24.1.html">Section 24.1</a>. This integration is exact in principle and exquisitely smooth in practice, since a MEMS gyro is quiet and fast. The problem is bias: every gyroscope has a small, temperature-dependent offset \(b\), so you are really integrating \(\omega + b\), and the constant \(b\) integrates into an angle error that grows linearly with time. After a minute of a few tenths of a degree per second of bias, your heading is tens of degrees wrong. Nothing in the gyro signal itself tells you which part was drift.</p>
+    <p>The accelerometer supplies the missing anchor. When the device is not accelerating, it measures only gravity, a vector that points in a fixed navigation direction forever. That gives an absolute pitch and roll with zero drift. But "when the device is not accelerating" is the catch: any real motion adds linear acceleration on top of gravity, so during a drone's climb or a runner's stride the accelerometer's idea of down is momentarily a lie. A magnetometer plays the same role for heading, anchoring yaw to magnetic north, and it is corrupted the same way by nearby ferrous metal and motors. The pattern is clean: gyro is trustworthy at high frequency and untrustworthy at low frequency (drift), while accelerometer and magnetometer are trustworthy at low frequency and untrustworthy at high frequency (motion, vibration). Their error spectra are complementary, and that word is not decoration; it is the design.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>A complementary filter is a frequency-domain division of labor written as a single fusion rule. If \(H(s)\) is a high-pass filter and \(L(s)=1-H(s)\) its complementary low-pass, then feeding the gyro-integrated angle through \(H\) and the accelerometer angle through \(L\) and summing gives an estimate whose transfer function is \(H+L=1\): the true angle passes through undistorted, while each sensor only contributes in the band where it is reliable. You are not choosing between the sensors; you are letting each one own the frequencies it is good at. Everything Mahony and Madgwick add is a way to do this same split correctly on the curved space of rotations instead of on a single scalar angle.</p>
+    </div>
+
+    <h2>The complementary filter in one line</h2>
+    <p>For a single tilt angle the whole idea collapses to one update. Let \(\theta_k\) be the estimated angle at step \(k\), \(\omega_k\) the gyro rate, \(\Delta t\) the sample interval, and \(\theta^{\text{acc}}_k\) the angle computed from the accelerometer's gravity direction. Then</p>
+    \[ \theta_k = \alpha\,\bigl(\theta_{k-1} + \omega_k\,\Delta t\bigr) \;+\; (1-\alpha)\,\theta^{\text{acc}}_k. \]
+    <p>The first term integrates the gyro (the high-pass path, dominant at short timescales); the second nudges toward the accelerometer's absolute reading (the low-pass path, dominant over long timescales). The single knob \(\alpha \in (0,1)\), usually between \(0.95\) and \(0.995\), sets the crossover: close to one trusts the gyro longer and rejects vibration well but corrects drift slowly, while lower values chase the accelerometer harder. The relation to a time constant is \(\tau = \alpha\,\Delta t /(1-\alpha)\), so at \(200\text{ Hz}\) and \(\alpha=0.99\) you correct drift with roughly a half-second memory. This is the entire algorithm, and it is why the complementary filter runs on eight-bit microcontrollers that could never host a Kalman filter (<a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>).</p>
+
+    <h2>Mahony: proportional-integral feedback on SO(3)</h2>
+    <p>The scalar filter breaks the moment orientation is a full three-dimensional rotation, because you cannot simply add a gyro angle to an accelerometer angle when both live on the curved manifold \(SO(3)\). Robert Mahony's insight was to keep the gyro integration on the manifold (using the quaternion derivative) and inject the accelerometer correction as a feedback torque rather than a weighted average. The device predicts where gravity should point given its current orientation estimate, \(\hat{v} = \hat{q}^{-1}\otimes g \otimes \hat{q}\), and compares it to the measured gravity direction \(a\) from the accelerometer. The mismatch is a rotation error, and on a sphere the natural measure of that error is the cross product</p>
+    \[ e = a \times \hat{v}. \]
+    <p>This error vector points along the axis you must rotate about to bring predicted gravity onto measured gravity, and its magnitude grows with the angle between them. Mahony then feeds it back into the gyro integration through a proportional-integral controller: the proportional term \(K_p\,e\) corrects the current orientation, while the integral term \(K_i \int e\, dt\) accumulates to estimate and cancel the gyro bias \(b\), the very quantity that caused drift in the first place. The corrected rate \(\omega + K_p e + \hat{b}\) drives the quaternion update. The beauty is that the integral action does not merely mask drift; it identifies the constant bias and subtracts it at the source, so a Mahony filter left running on a stationary device converges to the true gyro offset. The controller gains play the role \(\alpha\) played before: larger \(K_p\) trusts the accelerometer more, larger \(K_i\) tracks a faster-changing bias.</p>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: keeping a racing drone level through the vibration storm</h3>
+        <p>A first-person-view racing quadcopter runs its flight controller loop at \(8\text{ kHz}\) on a small ARM chip, and the single most important number it produces is attitude: roll and pitch, thirty times faster than a human could react. The accelerometer on that airframe is buried in motor vibration and reads several g of noise during hard throttle, so a naive average toward the accelerometer would make the craft twitch and oscillate. Betaflight and its kin use a Mahony-style complementary filter precisely because the proportional gain can be tuned low enough to ride out the vibration while the gyro carries the fast dynamics, and the integral term quietly cancels the bias that would otherwise let the horizon tilt over a long flight. Pilots feel the difference directly: a well-tuned filter holds a locked horizon through a full-throttle punch-out, while a badly tuned one washes out and the quad "floats." The same filter, at a tenth the loop rate, stabilizes the gimbal that keeps the onboard camera steady.</p>
+    </div>
+
+    <h2>Madgwick: gradient descent toward the reference</h2>
+    <p>Sebastian Madgwick's filter reaches the same goal by a different route that is often cheaper and, for many practitioners, easier to reason about. Instead of a cross-product feedback torque, it poses the accelerometer correction as an optimization: find the small orientation change that best aligns predicted gravity with the measured accelerometer vector. That is a least-squares objective \(f(\hat{q}) = \hat{q}^{-1}\otimes g \otimes \hat{q} - a\), and its analytic gradient \(\nabla f\) points in the direction of steepest orientation error. Madgwick takes a single gradient-descent step of size \(\beta\) along the normalized gradient at each sample, and blends it with the gyro integration exactly in the complementary spirit: the gyro sets the direction of travel, and the gradient step corrects it toward the drift-free reference. The one tuning parameter \(\beta\) has a clean physical meaning: it is the filter's assumed gyroscope measurement error, in radians per second, so you can set it from the gyro datasheet rather than by trial and error.</p>
+    <p>Both filters solve the same problem and, well tuned, produce indistinguishable accuracy of roughly one to two degrees RMS on consumer IMUs. The differences are practical. Madgwick is a fixed, branch-light computation attractive for the tiniest targets; Mahony's explicit integral state makes its bias estimate easy to inspect and reset, which matters when a gyro's bias jumps with temperature. Neither is a probabilistic estimator: unlike the Kalman family of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, they carry no covariance and cannot report a calibrated uncertainty on the orientation they output, a limitation worth remembering when a downstream system needs to know how much to trust the attitude (see <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> on calibrated uncertainty). Their answer for the tradeoff is deliberate: give up the covariance to gain a filter that fits in a few dozen lines and a few microseconds.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+def madgwick_update(q, gyro, accel, beta=0.033, dt=1/200):
+    """One Madgwick IMU step. q=[w,x,y,z] unit quaternion, gyro in rad/s,
+    accel in any consistent unit (only its direction is used)."""
+    q = q / np.linalg.norm(q)
+    a = accel / np.linalg.norm(accel)          # gravity direction only
+    w, x, y, z = q
+
+    # Gradient of (predicted gravity - measured gravity): objective f and Jacobian J
+    f = np.array([2*(x*z - w*y) - a[0],
+                  2*(w*x + y*z) - a[1],
+                  2*(0.5 - x*x - y*y) - a[2]])
+    J = np.array([[-2*y,  2*z, -2*w, 2*x],
+                  [ 2*x,  2*w,  2*z, 2*y],
+                  [ 0.0, -4*x, -4*y, 0.0]])
+    grad = J.T @ f
+    grad = grad / (np.linalg.norm(grad) + 1e-12)
+
+    # Gyro-driven quaternion rate, corrected by a beta-sized step down the gradient
+    qdot = 0.5 * quat_mult(q, np.array([0.0, *gyro])) - beta * grad
+    q = q + qdot * dt
+    return q / np.linalg.norm(q)
+
+def quat_mult(a, b):
+    w1, x1, y1, z1 = a; w2, x2, y2, z2 = b
+    return np.array([w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                     w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                     w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                     w1*z2 + x1*y2 - y1*x2 + z1*w2])</code></pre>
+    <div class="code-caption"><strong>Listing 24.1.</strong> A complete Madgwick IMU update (accelerometer plus gyroscope, no magnetometer). The gyro drives <code>qdot</code> smoothly; the <code>-beta * grad</code> term is the drift-free correction that pulls predicted gravity toward the measured accelerometer direction. The single knob <code>beta</code> is the assumed gyro error in rad/s, set here for a typical consumer IMU at 200 Hz. Feeding this a stationary device and a slowly rotating one reproduces the smooth-yet-anchored behavior described above.</div>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>The update in Listing 24.1 plus its magnetometer path, bias handling, and initialization runs to roughly 120 lines to get right, and the sign conventions in the Jacobian are exactly where bugs hide. The <code>ahrs</code> Python package ships tested Madgwick, Mahony, and a dozen other attitude filters that consume a whole session at once:</p>
+        <pre class="language-python"><code class="language-python">from ahrs.filters import Madgwick
+# gyr, acc are (N, 3) arrays; returns (N, 4) quaternions, fully vectorized
+Q = Madgwick(gyr=gyr, acc=acc, frequency=200.0).Q</code></pre>
+        <div class="code-caption"><strong>Listing 24.2.</strong> The same filter over an entire recording in three lines with <code>ahrs</code>, versus roughly 120 lines from scratch. The library handles quaternion initialization from the first accelerometer sample, normalization, and the magnetometer variant behind one flag.</div>
+        <p>Use the library in any pipeline; keep the from-scratch version to understand what the gain is doing when the horizon drifts unexpectedly.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Log an IMU stream (a phone app such as phyphox exposes raw gyro and accelerometer) while you set the device flat, rotate it slowly by exactly \(90^{\circ}\) about one axis, hold, and return. (1) Integrate the gyro alone and plot the estimated angle; measure how many degrees it has drifted after two minutes of stillness at the end. (2) Run the complementary update from this section with \(\alpha=0.98\) and again with \(\alpha=0.999\), and describe how the drift and the vibration rejection trade off. (3) Replace the scalar filter with <code>ahrs</code>'s Madgwick and Mahony over the same log; report the peak difference in estimated pitch between the two, and relate its size to the one-to-two-degree figure quoted above.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. In what frequency band does the gyroscope dominate the fused estimate, and in what band does the accelerometer dominate, and why is this split called "complementary"?</p>
+        <p class="quiz-question">2. What does the integral term in a Mahony filter estimate, and why does that make its drift correction fundamentally better than simply averaging toward the accelerometer?</p>
+        <p class="quiz-question">3. Give one concrete situation in which the accelerometer's gravity reference is temporarily wrong, and explain what the complementary structure does about it.</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>These filters give you a clean, drift-free attitude from three cheap chips, but a shippable product needs more: automatic bias calibration, magnetometer soft- and hard-iron correction, and a defined behavior when a sensor drops out or saturates. In <a class="cross-ref" href="section-24.3.html">Section 24.3</a>, we assemble the complementary filter into a full attitude and heading reference system (AHRS), the packaged orientation module that drones, phones, and headsets actually deploy.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.1: Quaternions and rotation representations. Building Sensory AI." name="description"/>
+<title>Section 24.1: Quaternions and rotation representations | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Quaternions and rotation representations</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me three angles and I will eventually lose a degree of freedom at the worst possible moment. Give me four numbers on a sphere and I will never look down and find the floor missing."</p>
+<cite>A Well-Oriented AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the angular-rate signal \(\boldsymbol\omega\) and the body-frame idea from <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>: a gyroscope reports rotational velocity in the sensor's own axes, and to speak about the world we must relate that moving frame to a fixed one. Vectors, matrices, and the cross product from the math reference in Part I are enough; no prior exposure to quaternions is needed. The integration-and-drift consequences of the kinematics derived here are developed in <a class="cross-ref" href="section-24.2.html">Section 24.2</a> and <a class="cross-ref" href="section-24.4.html">Section 24.4</a>. Python and NumPy suffice for the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Everything in this chapter, complementary filters, attitude and heading reference systems, dead reckoning, learned inertial odometry, rests on one object: the orientation of a body in space, and how it changes when a gyroscope hands you an angular rate. Choose the wrong way to write that orientation down and you inherit singularities, expensive re-orthogonalization, or interpolation that visibly stutters. The unit quaternion is the representation that estimation code overwhelmingly settles on, not for elegance but because it integrates cleanly, composes cheaply, never suffers gimbal lock, and stays valid with a single division. Master the four-number object here and the rest of Part VI becomes bookkeeping over rotations rather than a fight with the coordinate system.</p>
+</div>
+
+<h2>Four ways to write down a rotation</h2>
+<p>A rigid-body orientation is a single geometric fact, but it has several algebraic clothes, and each trades away something. A <strong>rotation matrix</strong> \(R \in SO(3)\) is a \(3\times 3\) orthogonal matrix with determinant \(+1\); it rotates a vector by plain multiplication, \(\mathbf v' = R\,\mathbf v\), and composes by matrix product. It is unambiguous and fast to apply, but it spends nine numbers on three degrees of freedom, and after many multiplications floating-point error makes it drift away from orthogonality, forcing a periodic and costly re-orthogonalization. <strong>Euler angles</strong> (roll, pitch, yaw) use the minimum three numbers and read intuitively, which is exactly why they persist in user interfaces and datasheets. They carry a fatal defect for estimation: at a pitch of \(\pm 90^\circ\) two of the three axes align and one degree of freedom vanishes, a singularity called <em>gimbal lock</em>, where the orientation is still well defined but its rate becomes undefined and small motions demand infinite angular speed in the parameters.</p>
+<p>The <strong>axis-angle</strong> form states the geometric truth directly: any orientation is a rotation by angle \(\theta\) about a unit axis \(\hat{\mathbf n}\) (Euler's rotation theorem). It has no gimbal lock but composes awkwardly. The <strong>unit quaternion</strong> is the axis-angle written so that composition and integration become algebra. It is a four-vector
+\[ q = \begin{bmatrix} w \\ \mathbf v \end{bmatrix} = \begin{bmatrix} \cos(\theta/2) \\ \hat{\mathbf n}\,\sin(\theta/2) \end{bmatrix}, \qquad \lVert q \rVert = 1, \]
+where \(w\) is the scalar part and \(\mathbf v \in \mathbb{R}^3\) the vector part. The half-angle is not decoration: it is what makes the quaternion double-cover the rotation group, so \(q\) and \(-q\) name the identical physical orientation, a subtlety we return to.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Pick the representation by the operation you do most. If you mostly <em>apply</em> a fixed rotation to many vectors, cache a rotation matrix; the multiply is one dense \(3\times 3\). If you mostly <em>estimate and integrate</em> orientation from a gyroscope, hundreds of times a second, use quaternions: they update with a small multiply, renormalize with one division, and cannot hit a singularity. If a <em>human</em> must read or set the value, convert to Euler angles at the very last moment, at the boundary of your system, and never let them into the filter state. Most orientation bugs in inertial code trace to Euler angles leaking inward.</p>
+</div>
+
+<h2>The quaternion algebra you actually use</h2>
+<p>Three operations carry almost all the weight. <strong>Composition</strong> of rotations is the Hamilton product. For \(q_1=(w_1,\mathbf v_1)\) and \(q_2=(w_2,\mathbf v_2)\),
+\[ q_1 \otimes q_2 = \begin{bmatrix} w_1 w_2 - \mathbf v_1 \cdot \mathbf v_2 \\ w_1 \mathbf v_2 + w_2 \mathbf v_1 + \mathbf v_1 \times \mathbf v_2 \end{bmatrix}, \]
+which applies \(q_2\) first, then \(q_1\), just like stacking matrices. Because it contains a cross product, quaternion multiplication does not commute, correctly reflecting that rotations do not either. <strong>Rotating a vector</strong> \(\mathbf u\) embeds it as a pure quaternion \((0,\mathbf u)\) and conjugates: \(\mathbf u' = q \otimes (0,\mathbf u) \otimes q^{-1}\), and for a unit quaternion the inverse is just the conjugate \(q^{-1}=(w,-\mathbf v)\). <strong>Inversion</strong> is therefore free. These three, multiply, conjugate, rotate, are the entire working vocabulary; you rarely need anything else in an estimator.</p>
+<p>The operation that makes quaternions the natural home for inertial work is kinematics: how \(q\) evolves under a measured angular rate \(\boldsymbol\omega\) (body frame, from your gyroscope in <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>). The continuous law is beautifully compact,
+\[ \dot q = \tfrac{1}{2}\, q \otimes (0,\boldsymbol\omega), \]
+a single quaternion product, with none of the trigonometric case-splitting that Euler-angle rates require near their singularity. Over one sample of duration \(\Delta t\) the exact update is a rotation by \(\lVert\boldsymbol\omega\rVert\,\Delta t\) about \(\boldsymbol\omega/\lVert\boldsymbol\omega\rVert\), which you build as a small quaternion \(\Delta q\) and compose. This exact-exponential step is why a quaternion integrator stays numerically clean where a matrix integrator slowly forgets it is a rotation.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def quat_mul(a, b):
+    """Hamilton product a (x) b, quaternions as [w, x, y, z]."""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+def integrate_gyro(q, omega, dt):
+    """Advance orientation q by body-frame rate omega (rad/s) over dt.
+    Uses the exact axis-angle exponential, robust as ||omega|| -> 0."""
+    theta = np.linalg.norm(omega) * dt          # rotation angle this step
+    if theta < 1e-9:                            # avoid 0/0 for tiny rates
+        dq = np.array([1.0, *(0.5 * omega * dt)])
+    else:
+        axis = omega / np.linalg.norm(omega)
+        dq = np.array([np.cos(theta/2), *(axis * np.sin(theta/2))])
+    q_new = quat_mul(q, dq)                     # body-frame update: q (x) dq
+    return q_new / np.linalg.norm(q_new)        # one division keeps it valid
+
+# 200 Hz gyro, a steady 30 deg/s yaw for 3 seconds -> expect ~90 deg heading.
+q = np.array([1.0, 0.0, 0.0, 0.0])             # identity orientation
+omega = np.deg2rad([0.0, 0.0, 30.0])
+for _ in range(600):
+    q = integrate_gyro(q, omega, 1/200)
+yaw = np.rad2deg(2 * np.arctan2(q[3], q[0]))   # yaw from a pure-z rotation
+print(f"integrated yaw = {yaw:.2f} deg")       # ~ 90.00
+</code></pre>
+<div class="code-caption">A complete quaternion gyroscope integrator in a dozen lines. The axis-angle exponential is exact for the constant-rate step, the small-angle branch avoids a divide-by-zero when the device is nearly still, and the final normalization is the single division that keeps \(q\) on the unit sphere. This loop is the kinematic core beneath every filter in <a class="cross-ref" href="section-24.2.html">Section 24.2</a>.</div>
+
+<p>The printout lands on roughly \(90^\circ\), as a steady \(30^\circ/\mathrm{s}\) yaw for three seconds should. Note what the loop does <em>not</em> need: no special case at pitch \(90^\circ\), no re-orthogonalization, no trigonometric unwinding. That economy, one multiply and one divide per sample, is why quaternion integration runs comfortably on a microcontroller sampling an IMU at hundreds of hertz, a point we lean on again in the edge-deployment discussion of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-61-tinyml-and-microcontroller-sensor-ai/index.html">Chapter 61</a>.</p>
+
+<h2>Interpolation, the double cover, and staying on the sphere</h2>
+<p>Two quaternion pitfalls bite in practice. First, <strong>interpolation</strong>. Blending two orientations by averaging their four components and renormalizing (nlerp) is cheap but moves at non-uniform angular speed and can swing the long way around. The correct constant-rate blend is spherical linear interpolation, <em>slerp</em>:
+\[ \mathrm{slerp}(q_0,q_1,t) = \frac{\sin((1-t)\Omega)}{\sin\Omega}\,q_0 + \frac{\sin(t\Omega)}{\sin\Omega}\,q_1, \qquad \cos\Omega = q_0\cdot q_1, \]
+which traces the shortest great-circle arc at uniform angular velocity, exactly what you want to resample an orientation trajectory or to smooth a camera path. Second, the <strong>double cover</strong>: because \(q\) and \(-q\) are the same rotation, \(q_0\cdot q_1\) can be negative even when the orientations are close. Before slerping (or before comparing, or averaging) flip one sign so the dot product is non-negative; skip this and slerp will take the \(340^\circ\) detour instead of the \(20^\circ\) one. The same sign ambiguity is why you never compute orientation error as a raw component difference: use \(q_{\text{err}} = q_{\text{ref}}^{-1}\otimes q_{\text{est}}\) and read the angle from its scalar part, a habit that carries straight into the trajectory metrics of <a class="cross-ref" href="section-24.7.html">Section 24.7</a>.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the VR headset that snapped through the floor</h3>
+<p>A standalone VR headset fused its gyroscope into a quaternion orientation at 1 kHz and streamed it to the renderer at 90 Hz, interpolating between fused samples to hit exact frame times. On fast head turns some users reported a brief, sickening snap where the world spun almost fully around before settling. The cause was textbook double cover: the interpolator blended consecutive quaternions without the sign check, so whenever integration produced a sample near \(-q\) of its predecessor, the slerp chose the long arc. The fix was two lines, negate the incoming quaternion when its dot product with the previous one was negative, before interpolating. No filter change, no added latency; the artifact vanished. It is the canonical reminder that a quaternion pipeline needs sign hygiene as much as it needs the right math.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: <code>scipy.spatial.transform.Rotation</code></h3>
+<p>Everything above, Hamilton products, vector rotation, conversions to and from matrices, Euler angles, and axis-angle, plus a numerically careful slerp, ships in SciPy. Rotating a batch of vectors is <code>Rotation.from_quat(q).apply(vectors)</code>; converting for a human is <code>.as_euler('xyz', degrees=True)</code>; interpolating a trajectory is <code>Slerp(times, rotations)(query_times)</code>. That collapses the roughly 40 lines of hand-written product, normalization, sign-fix, and conversion code a full pipeline accumulates into three or four calls, and SciPy uses the scalar-<em>last</em> \([x,y,z,w]\) convention, so confirm the ordering when you hand quaternions across a library boundary. Hand-roll the algebra once to understand it (as above), then let the library carry it in production.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: rotations that neural networks can regress</h3>
+<p>Quaternions are ideal for integrating a gyroscope, but they are a poor <em>output</em> target for a neural network: the double cover and the unit-norm constraint make the map from network activations to rotations discontinuous, and regression to it trains badly. Zhou et al. (2019), "On the Continuity of Rotation Representations in Neural Networks," showed that quaternions and Euler angles are discontinuous representations for learning, and proposed a continuous <strong>6D representation</strong> (two 3-vectors passed through Gram-Schmidt to form a rotation matrix) that networks regress far more accurately. This choice is now standard in learned pose and orientation heads, including the learned inertial odometry models of <a class="cross-ref" href="section-24.6.html">Section 24.6</a> and the pose estimators of <a class="cross-ref" href="../module-27-gesture-pose-and-neuromotor-interfaces/index.html">Chapter 27</a>. The lesson: use quaternions in the filter, but reach for a continuous parameterization at a network's output layer.</p>
+</div>
+
+<h2>When each representation earns its place</h2>
+<p>Put the choices in one frame. Store and integrate orientation state as a <strong>unit quaternion</strong>: it is singularity-free, cheap to propagate from angular rate, and trivially renormalized, which is why the filters of <a class="cross-ref" href="section-24.2.html">Section 24.2</a> and the quaternion error-state Kalman filters that build on <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> carry a quaternion in their state. Apply orientation with a <strong>rotation matrix</strong> when you transform many vectors at once, for example projecting a lidar sweep into a world frame in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>. Expose orientation to people as <strong>Euler angles</strong> only at the interface. Regress orientation from a network with a <strong>continuous representation</strong>. One geometric fact, four algebraic clothes, and the engineering skill is matching the garment to the task rather than forcing one everywhere.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the integrator above. (1) Feed it a time-varying rate that ramps yaw up and back down, and confirm the net orientation returns to identity, so that \(q\) reads \([1,0,0,0]\) up to sign. (2) Add a constant gyroscope bias of \(0.5^\circ/\mathrm{s}\) on one axis and integrate for ten minutes; plot the growing orientation error and connect the slope to the drift analysis you will meet in <a class="cross-ref" href="section-24.4.html">Section 24.4</a>. (3) Implement slerp with the sign fix, then deliberately remove the sign fix and construct two nearby orientations whose interpolation takes the long way around; measure the peak angular speed in both cases.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does the half-angle appear in the quaternion definition, and what does the resulting \(q\) versus \(-q\) ambiguity mean physically? 2. A device pitches through vertical (\(90^\circ\)) during a maneuver. Explain why an Euler-angle filter state can blow up there while a quaternion state does not. 3. You must interpolate between two orientations whose quaternion dot product is \(-0.98\). What is the shortest-arc angle between them, and what one step must you take before calling slerp?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-24.2.html">Section 24.2</a>, we turn the clean quaternion kinematics of this section into a working estimator. Integrating the gyroscope alone drifts (a preview of <a class="cross-ref" href="section-24.4.html">Section 24.4</a>), so we blend that smooth-but-drifting orientation with the absolute-but-noisy tilt and heading references from the accelerometer and magnetometer. The complementary filter and the Mahony and Madgwick filters are exactly that fusion, expressed as small, elegant corrections applied to the quaternion state you now know how to propagate.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

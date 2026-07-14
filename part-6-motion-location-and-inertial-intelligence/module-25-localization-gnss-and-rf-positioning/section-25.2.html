@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.2: Wi-Fi, Bluetooth, and UWB positioning. Building Sensory AI." name="description"/>
+<title>Section 25.2: Wi-Fi, Bluetooth, and UWB positioning | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Localization, GNSS, and RF Positioning</a></div>
+<h1>Wi-Fi, Bluetooth, and UWB positioning</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Three access points swear I am three different distances away. Two of them are honest. The third has been talking to me through a wall, and it will not admit it."</p>
+<cite>A Trilaterating AI Agent</cite>
+</blockquote>
+
+<div class="prerequisites">
+<h3>Prerequisites</h3>
+<p>This section assumes the general measurement model of true value plus bias plus noise from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>, the notion of clock offset and time-of-flight from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and least-squares estimation from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>. It builds on the satellite ranging geometry of <a class="cross-ref" href="section-25.1.html">Section 25.1</a> and reuses its trilateration intuition indoors. How a single RSSI-to-location map is learned rather than modeled is deferred to <a class="cross-ref" href="section-25.3.html">Section 25.3</a>; fusing these fixes with inertial dead reckoning waits for <a class="cross-ref" href="section-25.5.html">Section 25.5</a>. Basic Python and NumPy suffice for the code.</p>
+</div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>GNSS stops at the door. Indoors and in urban canyons the satellites are blocked, so machines fall back on the radios that are already in the building: Wi-Fi access points, Bluetooth beacons, and ultra-wideband anchors. All three do the same thing GPS does, measure a geometric quantity between a tag and a set of known reference points, then solve for position, but they trade against each other on a single axis you must internalize: <em>timing bandwidth buys distance precision</em>. Wi-Fi and classic Bluetooth measure crude signal strength and land you in the right room. Ultra-wideband measures sub-nanosecond flight time and lands you on the right shelf. This section is about what each radio actually measures, why the accuracies differ by two orders of magnitude, and the one enemy, multipath, that ruins all of them.</p>
+</div>
+
+<h2>The four observables an RF radio can offer</h2>
+<p>Every RF positioning scheme reduces to one of four measurements between a mobile device and an infrastructure node at a known location. Knowing which observable a technology exposes tells you its accuracy ceiling before you read a single datasheet.</p>
+<p><strong>Received signal strength (RSSI)</strong> is the cheapest and worst. Power falls off with distance, so in principle strength encodes range through the log-distance path-loss model
+\[ P(d) = P_0 - 10\,n \log_{10}\!\left(\frac{d}{d_0}\right) + X, \]
+where \(P_0\) is the power at reference distance \(d_0\), \(n\) is the environment's path-loss exponent (about 2 in free space, 3 to 5 through walls), and \(X\) is shadowing noise of several dB. Because a few dB of fading translates to metres of range error, RSSI ranging is accurate to roughly a room. Every Wi-Fi chip and every Bluetooth beacon reports it for free, which is why it dominates despite being poor.</p>
+<p><strong>Time of flight (ToF)</strong> converts a measured propagation delay \(\tau\) into distance through \(d = c\,\tau\), with \(c\) the speed of light. This is the good observable, but it is unforgiving: light covers 30 cm per nanosecond, so a 30 cm distance error demands 1 ns of timing accuracy, and that in turn demands wide signal bandwidth, since a receiver's ability to pin down an arrival edge scales roughly with \(1/\text{bandwidth}\). A 20 MHz Wi-Fi channel resolves time only to tens of nanoseconds (metres); a 500 MHz ultra-wideband pulse resolves it to a fraction of a nanosecond (centimetres). The physics of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> is the whole story here.</p>
+<p><strong>Time difference of arrival (TDoA)</strong> and <strong>angle of arrival (AoA)</strong> round out the set. TDoA avoids needing a synchronized clock on the tag by comparing arrival times across time-synchronized anchors, placing the tag on a hyperbola. AoA uses an antenna array to measure the bearing of an incoming signal, placing the tag on a ray; two bearings intersect at a fix. Bluetooth direction finding and Wi-Fi both exploit these.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>The accuracy of any RF positioning system is set by two numbers: the precision of its observable and the geometry of its anchors. Signal strength gives you room-level truth because a decibel is a coarse ruler; time of flight over wide bandwidth gives you centimetre truth because a nanosecond is a fine one. Everything else, machine learning included, is an attempt to squeeze the last bit out of a noisy observable, not to change which observable the radio physically produces.</p>
+</div>
+
+<h2>Wi-Fi: from strength maps to round-trip timing</h2>
+<p>Wi-Fi positioning has two generations. The classic approach reads RSSI from every access point (AP) a device can hear and either trilaterates through the path-loss model above or, far more commonly, matches the vector of strengths against a pre-surveyed map (the fingerprinting of <a class="cross-ref" href="section-25.3.html">Section 25.3</a>). This needs no new hardware and reaches 3 to 10 m indoors, good enough to say "aisle 7" but not "which product." The modern approach is <strong>802.11mc Fine Timing Measurement (FTM)</strong>, also called Wi-Fi Round-Trip Time (RTT). Here the device and AP exchange timestamped frames and measure the round trip directly, cancelling clock offset by construction, and reach 1 to 2 m when the AP has line of sight. A third, research-grade signal is <strong>channel state information (CSI)</strong>, the per-subcarrier amplitude and phase of the OFDM channel, which exposes multipath structure that plain RSSI throws away and feeds the RF sensing models of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-47-rf-and-wireless-sensing/index.html">Chapter 47</a>.</p>
+
+<h2>Bluetooth Low Energy: beacons and direction finding</h2>
+<p>BLE trades range and data rate for power: a coin-cell beacon runs for years broadcasting a tiny advertising packet. The first wave (Apple iBeacon, Google Eddystone) used only RSSI for proximity, sorting a phone into immediate, near, or far zones and driving retail and museum "you are standing next to exhibit X" experiences. Accuracy was poor, but the deployment cost was a battery and a sticker. <strong>Bluetooth 5.1 direction finding</strong> changed the picture by adding AoA and AoD: a multi-antenna receiver samples the constant-tone extension of a packet across its array and estimates the bearing to the transmitter, reaching sub-metre accuracy with enough antennas. The newest step, <strong>Bluetooth Channel Sounding</strong> (introduced in the 6.0 core specification), adds phase-based and round-trip-time ranging so that two commodity BLE devices can measure the distance between them directly, bringing time-of-flight-style ranging to the lowest-power radio in the building.</p>
+
+<h2>Ultra-wideband: centimetres by counting nanoseconds</h2>
+<p>UWB is the precision tier. Instead of a narrow modulated carrier it transmits impulse-radio pulses spanning 500 MHz or more (the IEEE 802.15.4z standard), and that enormous bandwidth is exactly what lets a receiver resolve the first-arriving path to a fraction of a nanosecond. The dominant scheme is <strong>two-way ranging (TWR)</strong>: the tag sends a poll, the anchor replies, and each side timestamps transmit and receive events. The round-trip time minus the anchor's known processing delay is twice the flight time, so neither device needs a shared clock. Symmetric double-sided TWR further cancels the residual clock-drift error between the two crystals. The result is 10 to 30 cm accuracy in line of sight, robust enough that it now anchors automotive digital keys, warehouse asset tracking, and the "point your phone at a device" spatial features in recent smartphones. UWB pays for this with dedicated silicon and higher energy per fix than a BLE beacon, so it is deployed where centimetres justify the cost.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the car that refused to unlock through a wall</h3>
+<p>A carmaker replaced its BLE-only phone-as-key system, which measured RSSI, with a UWB ranging system after a wave of relay attacks: thieves amplified the low-frequency signal to make the car believe a key fob was at the door when it sat on a kitchen table 15 m away. RSSI cannot tell a strong nearby signal from an amplified distant one, but UWB measures flight time, and no amplifier can make light arrive earlier than physics allows. The engineering catch appeared in testing: when the owner stood just inside a glass storefront, the direct path was blocked and the first pulse the anchors detected had bounced off a pillar, adding 40 cm of phantom range and occasionally placing the "key" outside the unlock zone. The team's fix combined a first-path detection threshold on the UWB channel impulse response with a short inertial gate from <a class="cross-ref" href="../module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, rejecting a fix whose implied motion was physically impossible. The lesson: even the precision tier needs a non-line-of-sight guardrail.</p>
+</div>
+
+<h2>Turning ranges into a position</h2>
+<p>Once a radio gives you distances \(r_i\) to anchors at known coordinates \(\mathbf a_i\), the fix is a nonlinear least-squares problem identical in form to the GNSS solve of <a class="cross-ref" href="section-25.1.html">Section 25.1</a>, just indoors and at metre scale. You seek the position \(\mathbf x\) minimizing the squared residual between predicted and measured range,
+\[ \hat{\mathbf x} = \arg\min_{\mathbf x} \sum_i \big(\lVert \mathbf x - \mathbf a_i \rVert - r_i\big)^2. \]
+With three or more well-spread anchors this is over-determined and robust to a little noise; with anchors nearly collinear the geometry is weak and error explodes, the indoor analogue of poor satellite geometry. The code below solves it with Gauss-Newton and shows why anchor placement, not just ranging precision, decides your accuracy.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def multilaterate(anchors, ranges, x0=None, iters=20):
+    """Least-squares position from noisy ranges to known anchor points.
+    anchors: (N,2) array of anchor coords; ranges: (N,) measured distances."""
+    anchors = np.asarray(anchors, float)
+    ranges = np.asarray(ranges, float)
+    x = anchors.mean(axis=0) if x0 is None else np.asarray(x0, float)
+    for _ in range(iters):
+        diff = x - anchors                      # (N,2) vectors to each anchor
+        pred = np.linalg.norm(diff, axis=1)     # predicted ranges
+        pred = np.where(pred < 1e-9, 1e-9, pred)
+        J = diff / pred[:, None]                # Jacobian rows = unit bearings
+        resid = pred - ranges                   # range error
+        dx, *_ = np.linalg.lstsq(J, -resid, rcond=None)
+        x = x + dx
+        if np.linalg.norm(dx) < 1e-6:
+            break
+    return x
+
+anchors = np.array([[0, 0], [10, 0], [0, 8], [10, 8]])   # room corners (m)
+true = np.array([6.5, 3.0])
+rng = np.random.default_rng(0)
+noisy = np.linalg.norm(true - anchors, axis=1) + rng.normal(0, 0.15, 4)
+fix = multilaterate(anchors, noisy)
+print(f"true = {true}, estimate = {fix.round(2)}, error = {np.linalg.norm(fix-true):.2f} m")
+</code></pre>
+<div class="code-caption">Gauss-Newton multilateration from four anchors at the corners of a 10x8 m room. With 15 cm range noise (UWB-grade) the fix lands within a few centimetres; rerun with the anchors moved nearly collinear and watch the same noise blow the error up by an order of magnitude, the indoor face of geometric dilution of precision.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: robust multilateration in a few lines</h3>
+<p>The hand-rolled Gauss-Newton loop above is about 15 lines and assumes clean Gaussian noise. Real indoor ranges have non-line-of-sight outliers that are positive-biased (a bounced path is always longer), which pull an ordinary least-squares fix off target. SciPy's <code>scipy.optimize.least_squares(resid_fn, x0, loss="soft_l1")</code> replaces the whole loop with one call and adds a robust loss that down-weights the NLOS outliers automatically, roughly 20 lines of careful iteration and outlier handling collapsed to three. Reach for it whenever your anchors sit in a real building rather than a simulator.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using <code>multilaterate</code>, study geometry and precision. (1) Fix the true position and sweep the range-noise standard deviation from 0.02 m (UWB) to 3 m (Wi-Fi RSSI); plot median position error over 500 trials at each level and confirm the two-order-of-magnitude gap this section claims. (2) Move all four anchors onto a nearly straight line along one wall and repeat: quantify how much a poor anchor layout costs you at fixed ranging precision. (3) Inject one NLOS outlier by adding 2 m to a single range and show how the plain solver degrades, then re-solve with a robust <code>soft_l1</code> loss and report the improvement.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why does ultra-wideband achieve centimetre accuracy while a 20 MHz Wi-Fi channel measuring the same time of flight reaches only metres? 2. Two-way ranging needs no synchronized clock between tag and anchor, yet time-difference-of-arrival does need synchronized anchors. Explain the difference. 3. A relay attacker amplifies a key fob's signal. Why does this defeat an RSSI-based proximity check but not a UWB flight-time check?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-25.3.html">Section 25.3</a>, we confront the choice this section kept deferring: when the multipath is too tangled to model, you stop computing geometry and start learning a map. We compare geometric methods, the trilateration and multilateration solved here, against fingerprinting, which memorizes the signal signature at every point and looks up new observations, and we lay out when each wins.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

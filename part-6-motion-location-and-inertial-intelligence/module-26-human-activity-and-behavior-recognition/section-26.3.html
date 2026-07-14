@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.3: Segmentation and transition states. Building Sensory AI." name="description"/>
+<title>Section 26.3: Segmentation and transition states | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Human Activity and Behavior Recognition</a></div>
+<h1>Segmentation and transition states</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"I was ninety-eight percent sure the user was sitting and ninety-eight percent sure they were standing. The half second in between, when they were neither, is the only part anyone ever asks me about."</p>
+        <cite>An Over-Confident AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes you can turn an inertial stream into per-window features, developed earlier in this chapter and in <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, and that you know the activity label hierarchy from <a class="cross-ref" href="index.html">Section 26.1</a>. The boundary-finding methods here are the change-detection tools built in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>, and the sequence models that learn boundaries implicitly come from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. The evaluation pitfalls draw on leakage-safe protocol design from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>An activity classifier is trained on tidy, pre-cut clips: three seconds of pure walking, three seconds of pure sitting. The world does not arrive pre-cut. It arrives as an unbroken stream in which the user walks, slows, pauses at a door, fumbles for a key, and sits, with no markers telling you where one activity ends and the next begins. <strong>Segmentation</strong> is the act of drawing those boundaries, and <strong>transition states</strong> are the messy in-between spans that belong cleanly to no activity at all. Get this wrong and a model that scores 95% on a benchmark of clean clips will stumble in deployment, not because its clip-level judgement is bad, but because it is being asked the wrong question at the wrong instant. This section is about where to cut the stream, what to do with the moments that resist cutting, and how to score the result without fooling yourself.</p>
+    </div>
+
+    <h2>Why the continuous stream resists cutting</h2>
+    <p>The dominant approach is the <strong>sliding window</strong>: slice the stream into fixed-length frames of length \(W\) with hop \(H\), extract features from each, and classify each frame independently. It is simple, streams naturally, and dominates the literature. It also hides an unavoidable tension in the choice of \(W\). A window must be long enough to contain the periodic structure of the activity: a full gait cycle for walking is roughly one second, so a \(0.5\ \mathrm{s}\) window literally cannot see a stride and will confuse walking with fidgeting. But a long window is more likely to straddle a boundary and contain two activities at once, which no single label describes. This is the segmentation dilemma stated as a bias-variance style tradeoff: short windows resolve boundaries sharply but lack the temporal context to classify well, long windows classify robustly but smear every transition.</p>
+    <p>Formally, with a hop \(H\) the fraction of windows that are "mixed" (contain a true boundary) grows with \(W\). If activity segments have mean duration \(\bar{d}\), the expected number of boundary-straddling windows per segment is about \(W/H\), independent of \(\bar{d}\), so short activities suffer most: a two-second bout of stair-climbing sampled with a three-second window may never produce a single pure window. Overlapping windows (small \(H\)) improve temporal resolution and give more training examples, but they also make adjacent windows highly correlated, which quietly inflates any accuracy number computed by splitting windows randomly rather than by subject or by time.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Transitions are not noise to be filtered away; they are a legitimate class of their own. Real segmentation ground truth almost always needs three kinds of label, not one: the activities themselves, a <strong>NULL</strong> class for spans that are none of the target activities (standing idle, unclassifiable fumbling), and explicit <strong>transition</strong> spans (sit-to-stand, lie-to-sit) that are dynamically distinct and often the clinically interesting part. A model trained only on pure activity clips has never seen a transition and will confidently misclassify it as whichever activity it superficially resembles. The most common deployment failure in activity recognition is not a wrong activity call; it is a right call made half a second too late because the model was never taught what the boundary looks like.</p>
+    </div>
+
+    <h2>Two families of segmentation</h2>
+    <p>Segmentation strategies split into two families. <strong>Explicit</strong> (bottom-up) segmentation first finds boundaries, then classifies the resulting variable-length segments. Boundaries come from change-point detection on the signal statistics: a sit-to-stand event shows up as a sharp change in the mean and variance of vertical acceleration, exactly the kind of shift the CUSUM and sliding-window change detectors of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> are designed to catch. The appeal is that each classified segment is internally homogeneous, so the classifier never sees a mixed window. The risk is cascading error: a missed boundary merges two activities forever, and an early boundary detector run on raw acceleration will fire on every footstep unless you smooth or threshold it carefully.</p>
+    <p>The listing below applies an off-the-shelf change-point search to a synthetic accelerometer-magnitude trace with three regimes (still, walking, still) and recovers the two boundaries.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+import ruptures as rpt
+
+fs = 50.0
+t = np.arange(0, 12, 1 / fs)
+sig = np.full(t.size, 9.81)                     # accel magnitude, resting
+walk = (t > 4) & (t < 8)                        # a walking bout
+sig[walk] += 2.5 * np.sin(2 * np.pi * 1.8 * t[walk])   # ~1.8 Hz gait
+sig += np.random.normal(0, 0.15, t.size)
+
+# Pelt search on a shift in mean+variance; penalty controls sensitivity.
+algo = rpt.Pelt(model="rbf", min_size=int(1.0 * fs)).fit(sig)
+bkps = algo.predict(pen=12.0)                   # indices of change points
+print("boundaries at t =", [round(b / fs, 2) for b in bkps[:-1]], "s")</code></pre>
+    <div class="code-caption"><strong>Listing 26.3.</strong> Explicit segmentation with the <code>ruptures</code> library. Pelt searches for shifts in the signal distribution and returns boundary indices near \(t=4\) and \(t=8\ \mathrm{s}\); the <code>pen</code> penalty is the one knob that trades missed boundaries against spurious ones. The recovered spans are then classified individually, so no classifier window ever straddles the walk-to-still transition.</div>
+
+    <p>As Listing 26.3 shows, boundary-finding can be a few lines rather than a hand-rolled CUSUM. The second family, <strong>implicit</strong> (dense) segmentation, skips explicit boundaries entirely: a sequence model emits a label at every timestep, and boundaries simply appear wherever the predicted label changes. Recurrent and temporal-convolutional networks from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> do this naturally, learning transition dynamics from data instead of from a hand-tuned detector. This is now the default for high-quality systems because it makes the boundary a learned, context-aware decision rather than a threshold on a single statistic. Its cost is data hunger and the need for densely labelled streams, which are far more expensive to annotate than isolated clips.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A hand-written offline change-point search (dynamic programming over segment costs, plus penalty tuning and a homemade cost model) is easily 80 to 150 lines and slow. The <code>ruptures</code> package collapses it to the three lines in Listing 26.3: it ships Pelt, binary segmentation, window-based and kernel cost models, and exact and approximate search, so you choose a model and a penalty and it owns the optimization. For streaming rather than offline use, <code>river</code> provides online change detectors (ADWIN, Page-Hinkley) with a one-line <code>update</code> interface. Reach for these before writing a detector; hand-roll only when you are on a microcontroller where neither fits.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: sit-to-stand in a fall-risk wearable</h3>
+        <p>A hip-worn monitor for older adults is deployed to count sit-to-stand transitions per day, a validated marker of frailty and fall risk. The vendor's first model was trained on the usual clean clips of sitting and standing and scored well in the lab, yet in the field it under-counted transitions badly. The reason was structural: sit-to-stand is not "sitting" and it is not "standing," it is a distinct two-second postural event with a characteristic forward-lean and vertical-rise signature, and the model had literally never been shown one. It classified the transition as whichever static posture the window happened to overlap more, so the event that the whole product existed to count fell into the gap between labels. The fix was to relabel the training data with an explicit sit-to-stand transition class and to switch to a dense per-timestep model that could place the event boundary in context. Counting recovered to clinical agreement. The lesson generalizes to any behavior product: the transition you are tempted to treat as boundary noise is frequently the exact quantity of interest.</p>
+    </div>
+
+    <h2>Evaluating a segmentation without fooling yourself</h2>
+    <p>Segmentation quality cannot be judged by frame accuracy alone, and here the running leakage theme from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> bites twice. First, frame-level accuracy is dominated by the long, easy, stationary spans and is nearly blind to the short transitions you most care about; a model can score 94% frame accuracy while missing half of all sit-to-stand events. Report <em>event-level</em> metrics too: count a predicted segment as a true positive only if it overlaps the correct ground-truth segment by more than some threshold, and report insertions, deletions, merges, and fragmentation, the classic segmentation error taxonomy. Second, because overlapping windows are strongly correlated in time, splitting them randomly into train and test leaks near-identical neighbours across the split and inflates every number. Always split by subject and by contiguous time block, never by window.</p>
+    <p>A final, subtler point concerns the boundaries themselves: human annotators disagree about exactly where a transition starts by a few hundred milliseconds, so demanding frame-exact boundary agreement penalizes a model for beating the noise floor of the labels. Score boundaries with a tolerance window (a predicted boundary within, say, \(\pm 0.5\ \mathrm{s}\) of a labelled one counts as correct), matching the intrinsic imprecision of the ground truth rather than pretending it is exact.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Take a densely labelled activity stream (for example the PAMAP2 or Opportunity dataset) and build two segmenters: a fixed \(3\ \mathrm{s}\) sliding window with majority-vote labels, and the explicit change-point approach of Listing 26.3 followed by per-segment classification. Evaluate both with (a) frame-level accuracy and (b) event-level F1 using a \(50\%\) overlap criterion and a \(\pm 0.5\ \mathrm{s}\) boundary tolerance. Show that the two methods can rank differently under the two metrics, and identify which activities (short ones, transitions) drive the gap. Then repeat the split by random window versus by subject and quantify how much the random split inflates frame accuracy.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Explain the sliding-window dilemma: what does a too-short window fail at, what does a too-long window fail at, and why can no single length fix both?</p>
+        <p class="quiz-question">2. Why will a model trained only on pure activity clips systematically mishandle a sit-to-stand transition, and what two changes to the labelling and model fix it?</p>
+        <p class="quiz-question">3. A model reports 94% frame accuracy but misses half the sit-to-stand events. How is this possible, and which metric would have exposed it?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-26.4.html">Section 26.4</a>, we turn from where to cut the stream to whose stream it is. Segmentation and classification both degrade when a model trained on one population meets a new user whose gait, pace, and transition style differ, so we take up user personalization and adaptation: how to bend a general model toward the individual wearing it without collecting a fresh labelled dataset for every person.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

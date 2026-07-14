@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.5: GNSS-inertial fusion. Building Sensory AI." name="description"/>
+<title>Section 25.5: GNSS-inertial fusion | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Localization, GNSS, and RF Positioning</a></div>
+<h1>GNSS-inertial fusion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"The satellites go quiet the instant the tunnel begins. The accelerometers never stop talking, they just start lying more with every passing second. My job is to know exactly how much to trust each one."</p><cite>A Dead-Reckoning AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>GNSS and inertial sensors are opposites with complementary flaws. A satellite fix is absolute and drift-free but slow, noisy, and prone to vanishing in tunnels, canyons, and parking garages. An inertial measurement unit is fast, always available, and quiet in the short term, but it integrates its own bias and noise into position error that grows without bound. Fuse them and each covers the other's weakness: the IMU carries the trajectory smoothly at hundreds of hertz and through the gaps, while every GNSS fix reels the drift back to ground truth and, in the process, calibrates the very biases that cause the drift. This section is about the estimator that performs that trade continuously: the error-state Kalman filter that sits inside almost every phone, car, and drone that knows where it is.</p>
+</div>
+
+<p>This section builds directly on two earlier chapters. The inertial mechanization, biases, and noise densities come from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, and the strapdown integration and drift growth were the subject of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>. The estimator itself is the Kalman family from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, applied here to an error state rather than the full state. GNSS error sources (Section 25.1) set the measurement noise you will feed the update step.</p>
+
+<h2>Why fuse: the complementary error spectra</h2>
+
+<p>The cleanest way to see why fusion works is in the frequency domain. Inertial dead reckoning is excellent at high frequency: sample-to-sample it captures every bump, turn, and acceleration with millisecond latency. Its error lives at low frequency, a slow ramp as bias and gravity-projection mistakes integrate twice into position. GNSS is the mirror image: its error is high-frequency (a few meters of independent noise per fix, plus multipath jitter) but it has no long-term drift, because each fix is an independent absolute measurement tied to the satellites. Fusion is therefore a complementary filter in spirit: trust the IMU for the fast changes, trust GNSS for the slow truth, and let the estimator find the crossover. The Kalman formulation makes that crossover optimal and, critically, adaptive to how good each sensor currently is.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>The filter's most valuable output is not the corrected position, it is the estimated IMU biases. A GNSS fix arrives once per second, but between fixes the trajectory is pure inertial integration. If the filter has learned the current accelerometer and gyroscope biases from previous fixes, that integration stays accurate for far longer. This is why a well-tuned fusion system coasts through a 30-second tunnel with meters of error rather than the hundreds of meters raw double integration would produce: the recent GNSS history did not just fix the past position, it calibrated the sensor that must now navigate blind.</p>
+</div>
+
+<h2>Loosely, tightly, and deeply coupled architectures</h2>
+
+<p>Fusion systems are classified by <em>where</em> in the GNSS processing chain the inertial data enters. In <strong>loosely coupled</strong> fusion, the GNSS receiver computes its own position-velocity solution and the filter treats that solution as a measurement. It is simple, modular, and works with any receiver that outputs a fix, which is why it dominates consumer devices. Its weakness is that the receiver needs four or more satellites to produce any solution at all, so in a deep urban canyon where only two or three are visible, a loosely coupled filter gets nothing.</p>
+
+<p><strong>Tightly coupled</strong> fusion instead feeds the raw pseudoranges (the individual satellite-to-receiver distance measurements from Section 25.1) directly into the filter, one measurement per satellite. Now even a single visible satellite contributes a constraint, so the system degrades gracefully instead of falling off a cliff when the count drops below four. The cost is complexity: the filter must model satellite geometry, clock bias, and per-range noise. <strong>Deeply (ultra-tightly) coupled</strong> systems close the loop even further, feeding the inertial-predicted motion back into the receiver's signal tracking loops so they can hold a lock through brief dropouts. That last tier lives in aviation and defense hardware; for the mobile and automotive systems this book targets, loosely and tightly coupled cover the ground.</p>
+
+<h2>The error-state Kalman filter</h2>
+
+<p>The idea that makes GNSS-inertial fusion tractable is to estimate the <em>error</em> in the navigation solution rather than the solution itself. A strapdown mechanization (Chapter 24) integrates the IMU at full rate to produce a nominal position, velocity, and attitude. Alongside it, an error-state Kalman filter (ESKF, also called an indirect or complementary filter) tracks a small state vector of the corrections to that nominal trajectory:</p>
+
+$$\delta \mathbf{x} = \begin{bmatrix} \delta \mathbf{p} & \delta \mathbf{v} & \delta\boldsymbol{\theta} & \mathbf{b}_a & \mathbf{b}_g \end{bmatrix}^{\!\top}$$
+
+<p>These are, in order, the position error, velocity error, a small-angle attitude error, and the accelerometer and gyroscope biases. Working in the error state buys two things. First, the error dynamics are close to linear even when the true attitude is not, because the errors themselves stay small, so an extended Kalman filter linearization is accurate. Second, the fast nonlinear integration runs outside the filter at IMU rate, while the filter runs a low-dimensional linear model. The error-state prediction propagates the covariance with the linearized dynamics and driving noise:</p>
+
+$$\delta\mathbf{x}_{k} = \mathbf{F}_k\,\delta\mathbf{x}_{k-1} + \mathbf{w}_k, \qquad \mathbf{P}_k = \mathbf{F}_k \mathbf{P}_{k-1} \mathbf{F}_k^{\!\top} + \mathbf{Q}_k$$
+
+<p>where \(\mathbf{Q}_k\) encodes the IMU noise densities and the bias random-walk. When a GNSS fix arrives, its disagreement with the nominal position (the innovation) drives the update. The filter computes the Kalman gain, estimates the current error state, and then <em>injects</em> that correction back into the nominal trajectory and resets the error state to zero. The bias estimates persist, and that is the machinery that keeps the dead reckoning honest between fixes.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Loosely coupled error-state KF, 1D for clarity: state = [pos_err, vel_err, accel_bias].
+# The nominal trajectory is integrated from the IMU outside the filter;
+# here we track its error and correct it whenever a GNSS fix arrives.
+
+dt = 0.01                                  # 100 Hz IMU
+F = np.array([[1, dt, -0.5*dt*dt],         # pos_err += vel_err*dt - 0.5*bias*dt^2
+              [0,  1,       -dt],          # vel_err += -bias*dt
+              [0,  0,         1]])          # bias is a slow random walk
+Q = np.diag([0.0, (0.02*dt)**2, (1e-4)**2])   # accel noise, bias random-walk
+H = np.array([[1.0, 0.0, 0.0]])            # GNSS observes position only
+R = np.array([[5.0**2]])                   # 5 m GNSS noise
+
+P = np.diag([10.0**2, 1.0**2, 0.1**2])     # initial uncertainty
+dx = np.zeros(3)                           # error state, reset to 0 after each update
+
+def predict():
+    global dx, P
+    dx = F @ dx
+    P = F @ P @ F.T + Q
+
+def gnss_update(nominal_pos, gnss_pos):
+    global dx, P
+    innov = np.array([gnss_pos - nominal_pos]) - H @ dx   # fix vs. nominal+error
+    S = H @ P @ H.T + R
+    K = P @ H.T @ np.linalg.inv(S)
+    dx = dx + (K @ innov)
+    P = (np.eye(3) - K @ H) @ P
+    correction = dx.copy()                 # inject into nominal, keep bias estimate
+    dx[:2] = 0.0                            # reset pos/vel error; bias carries forward
+    return correction                      # apply to nominal pos, vel, and bias
+</code></pre>
+<div class="code-caption">A minimal loosely coupled error-state Kalman filter. <code>predict()</code> runs every IMU sample; <code>gnss_update()</code> runs only when a fix arrives, returns the correction to inject into the externally integrated nominal trajectory, and resets the position and velocity error while preserving the estimated accelerometer bias that keeps the next stretch of dead reckoning accurate.</div>
+
+<p>The code above is the loosely coupled skeleton in one dimension. A production system replaces the scalar position with a full 15-state model in a local navigation frame, uses quaternions for attitude with the small-angle \(\delta\boldsymbol{\theta}\) as the error, and swaps the position-only measurement for a position-plus-velocity fix (GNSS Doppler gives an excellent velocity observation that pins down the accelerometer bias fast). To go tightly coupled you change only \(H\) and the update: each satellite contributes one pseudorange row, and \(H\) becomes the line-of-sight geometry to that satellite. The prediction step is untouched, which is exactly why the error-state design is so durable.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: an automotive dead-reckoning module through a river tunnel</h3>
+<p>A navigation supplier ships a positioning module for cars that must hold the vehicle in the correct lane through a 1.2-kilometer river tunnel where GNSS is completely absent for roughly 70 seconds at 90 km/h. Raw inertial double integration would accumulate hundreds of meters of error over that span, enough to place the car on the wrong road when it emerges. Their loosely coupled ESKF fuses the wheel-speed odometry and a MEMS IMU, and in the minute of open road before the tunnel the filter drives the accelerometer and gyroscope bias estimates to convergence using the steady stream of GNSS position and Doppler-velocity fixes. Entering the tunnel, the update step simply stops firing; the calibrated prediction coasts on odometry and inertial heading. The car exits with a few meters of along-track error and correct lane assignment, and the first post-tunnel fix snaps it back cleanly. The value was in the pre-tunnel calibration, not any heroics in the dark.</p>
+</div>
+
+<h2>Practical necessities: initialization, ZUPT, and outlier rejection</h2>
+
+<p>Three details separate a filter that works on paper from one that works on a vehicle. <strong>Initialization</strong> matters because the error-state linearization assumes small errors: the filter needs a reasonable initial heading, which on a moving platform comes from GNSS course-over-ground, and at rest from a magnetometer or a dual-antenna GNSS baseline. A bad initial yaw is the classic reason a fresh filter diverges. <strong>Zero-velocity updates (ZUPT)</strong> exploit moments when the platform is provably stationary (detected from low IMU variance): feeding a synthetic "velocity is zero" measurement during those windows is a nearly free, extremely informative observation that crushes velocity drift and sharpens the bias estimates, and it is the single most effective trick in pedestrian and industrial dead reckoning. <strong>Outlier rejection</strong> guards the update: a multipath-corrupted GNSS fix in an urban canyon can be tens of meters wrong, and if it enters the filter unchallenged it corrupts both position and the precious bias states. Gating each fix by its normalized innovation (the chi-square test on the innovation covariance \(\mathbf{S}\)) rejects fixes that disagree with the prediction far beyond what the noise model allows, and it connects directly to the anomaly-detection machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: fusion stacks you should not reimplement</h3>
+<p>The 15-state, quaternion-attitude, tightly coupled filter with initialization, ZUPT, and innovation gating runs to a few thousand lines of carefully tested code, and the failure modes are subtle enough that hand-rolling it for production is a poor bet. Established stacks package it. The open-source <code>ekf</code> in PX4 (ECL/EKF2) fuses GNSS, IMU, magnetometer, and barometer for drones in a battle-tested error-state formulation; <code>robot_localization</code> in ROS provides configurable EKF and UKF nodes that fuse GNSS with odometry and IMU out of the box; and RTKLIB plus an inertial front end covers precise tightly coupled work. Configuring one of these to your sensor set is roughly a hundred lines of YAML and glue, versus the multi-thousand-line filter underneath. Build the error-state filter once to understand it; deploy a maintained stack to ship it.</p>
+</div>
+
+<h2>When the batch smoother beats the filter</h2>
+
+<p>A Kalman filter is causal: at each instant it uses only past and present data. For live navigation that is mandatory. But for offline reconstruction (mapping runs, survey trajectories, post-drive analytics) you have the whole log, and a batch smoother that revisits every timestep with both past and future measurements is strictly more accurate. Modern high-accuracy GNSS-inertial reconstruction is increasingly posed as a factor graph, where IMU measurements between GNSS fixes become preintegrated motion factors linking pose nodes, and each fix becomes a unary factor. Optimizing the whole graph is the smoothing problem of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-11-factor-graphs-and-smoothing/index.html">Chapter 11</a>, and it is the same formulation that underlies visual-inertial odometry and SLAM. The filter and the smoother are two views of one estimation problem, and the fusion principles in this section carry over directly into the general multi-sensor fusion of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-49-probabilistic-and-bayesian-fusion/index.html">Chapter 49</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Extend the 1D error-state filter into a simulated tunnel. (1) Generate a nominal trajectory with a constant true accelerometer bias, integrate it, and feed noisy GNSS position fixes at 1 Hz for 60 seconds so the filter converges the bias estimate. (2) Stop the GNSS updates for the next 30 seconds (the tunnel) and plot the position error growth with and without the converged bias correction applied to the prediction. Quantify how much the calibrated bias reduces the coasting error. (3) Add a single grossly wrong fix (50 meters off) just before the tunnel and show how an innovation-gating threshold on \(\mathbf{S}\) prevents it from poisoning the bias estimate.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>In frequency terms, which sensor supplies the trustworthy high-frequency motion and which supplies the drift-free low-frequency reference, and how does that map onto the filter's prediction and update steps?</li>
+<li>Why does a loosely coupled filter produce nothing when only three satellites are visible, while a tightly coupled filter still improves its estimate? What changes in the measurement model between the two?</li>
+<li>The filter tracks accelerometer and gyroscope biases as part of its state. Why are those bias estimates, rather than the corrected position, the reason the system survives a GNSS outage?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-25.6.html">Section 25.6</a>, we turn from building estimators to judging them: the metrics that quantify localization quality (horizontal and along-track error, CEP, availability, and time-to-first-fix) and the leakage-safe evaluation protocols that keep a fusion system honest about how well it will actually perform in the wild.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

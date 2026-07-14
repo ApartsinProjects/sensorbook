@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.5: Continual learning for changing behavior. Building Sensory AI." name="description"/>
+<title>Section 26.5: Continual learning for changing behavior | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Human Activity and Behavior Recognition</a></div>
+<h1>Continual learning for changing behavior</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"They taught me to recognize running in March. In September the same person runs differently, and I have quietly forgotten how they walked. Nobody told me I was allowed to remember both."</p>
+        <cite>A Forgetful AI Agent</cite>
+    </blockquote>
+
+    <div class="prerequisites">
+        <h3>Prerequisites</h3>
+        <p>This section assumes the personalization and adaptation machinery of <a class="cross-ref" href="section-26.4.html">Section 26.4</a>, which bends a model toward one user at one moment; here that moment keeps moving. You should be comfortable with the neural sequence models of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> and with detecting when a signal's statistics shift, the change-detection tooling of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a>. The deployment-side counterparts, on-device continual learning under memory limits and streaming online updates, are developed in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-62-on-device-continual-learning/index.html">Chapter 62</a> and <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>; the evaluation discipline draws on <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a>.</p>
+    </div>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">The Big Picture</h3>
+        <p>Personalization tunes a model to a user as they are today. But a person is not a fixed distribution. They recover from an injury and their gait changes; they take up cycling and introduce an activity the model has never seen; they age, and the brisk walk of last year becomes this year's shuffle. Sensors drift too: a watch is worn on the other wrist, a firmware update re-scales the accelerometer, a phone moves from pocket to bag. A model frozen at deployment slowly decays against a world that keeps moving. <strong>Continual learning</strong> is the discipline of updating a model over its whole lifetime, absorbing new behavior as it appears while keeping what it already knew. The central obstacle is <strong>catastrophic forgetting</strong>: naively training on the new data overwrites the old competence. This section is about why behavior drifts, why the obvious fix breaks, and the three families of methods that let a deployed activity model keep learning without erasing its own past.</p>
+    </div>
+
+    <h2>Why behavior drifts and why retraining forgets</h2>
+    <p>Two very different things get lumped together as "drift," and treating them the same causes trouble. In <strong>virtual drift</strong> (also called covariate shift) the incoming features \(P(x)\) change but the mapping from motion to activity, \(P(y \mid x)\), stays fixed: the same walking is now sampled from a differently worn watch. In <strong>real drift</strong> (concept drift) the relationship itself moves: the acceleration pattern that meant "jogging" for a healthy user comes to mean "brisk recovery walk" for the same user post-surgery, so the correct label for a near-identical signal has changed. The distinction matters because virtual drift can often be fixed by re-normalizing or re-calibrating the input, while real drift genuinely requires the model to learn a new decision, and only the second is a reason to change what the classifier believes.</p>
+    <p>The tempting response, fine-tune the network on whatever fresh labelled data arrives, runs straight into catastrophic forgetting. Gradient descent on a new task pulls every weight toward minimizing the new loss with no term that protects the old one, so the shared representation is repurposed and accuracy on earlier activities collapses. This is one face of the <strong>stability-plasticity dilemma</strong>: a network plastic enough to absorb new behavior is, by the same token, plastic enough to destroy old behavior, and a network stable enough to never forget cannot learn anything new. Every method below is a different bargain struck at this exact tension.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Key Insight</h3>
+        <p>Detection and adaptation are separate decisions, and conflating them is the most common design error. First ask <em>whether</em> to update at all: a drift detector (a change detector from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-12-classical-anomaly-and-change-detection/index.html">Chapter 12</a> watching the model's own error rate, or a distance on the feature distribution) tells you something has moved. Only then ask <em>how</em>: whether the shift is virtual (re-calibrate the input, leave the weights alone) or real (update the decision). A system that retrains on every batch is not continually learning; it is continually forgetting, because most batches carry no new concept and each blind update spends a little of the model's stability for nothing. The unglamorous win is often the update you decided <em>not</em> to make.</p>
+    </div>
+
+    <h2>Three families that fight forgetting</h2>
+    <p>Continual-learning methods for activity recognition fall into three families, distinguished by what they protect. <strong>Replay</strong> (rehearsal) keeps a small memory of past examples and mixes them into every update, so the gradient always sees old activities alongside new ones. It is the simplest idea and, on inertial activity data, usually the strongest: a few hundred stored windows per class is often enough to hold the line, because a rehearsal buffer approximates the old data distribution directly rather than trying to summarize it. The cost is storage and, for wearables and health data, the privacy weight of retaining raw user motion.</p>
+    <p><strong>Regularization</strong> methods store no data. They instead add a penalty that discourages moving the weights that mattered for old tasks. Elastic Weight Consolidation (EWC) is the canonical example: after learning, it estimates each parameter's importance with the diagonal of the Fisher information matrix \(F_i\) and, while learning the next task, penalizes movement away from the old optimum \(\theta^{\ast}_i\),</p>
+    \[
+    \mathcal{L}(\theta) = \mathcal{L}_{\text{new}}(\theta) + \frac{\lambda}{2} \sum_i F_i \, (\theta_i - \theta^{\ast}_i)^2 .
+    \]
+    <p>Important weights are held nearly rigid while unimportant ones stay free to absorb the new activity. Regularization is memory-light and privacy-friendly, but its protection is approximate and it degrades as many tasks accumulate. The third family, <strong>parameter isolation</strong>, sidesteps interference by giving new behavior new capacity: a small adapter or a set of masked sub-network weights per context, freezing the rest. It forgets least but grows with the number of contexts, which suits the finite, known activity set of a fitness tracker better than an open-ended stream.</p>
+    <p>The listing below implements the workhorse of the first family: a class-balanced <strong>reservoir</strong> replay buffer that maintains a bounded, uniform sample of the stream so that rare activities are not crowded out by common ones.</p>
+
+    <pre class="language-python"><code class="language-python">import numpy as np
+
+class ReplayBuffer:
+    """Per-class reservoir sampling: a bounded, uniform memory of past windows."""
+    def __init__(self, per_class=200, n_features=64, seed=0):
+        self.per_class = per_class
+        self.rng = np.random.default_rng(seed)
+        self.store, self.seen = {}, {}          # label -> (X, count-seen)
+
+    def add(self, x, y):
+        if y not in self.store:
+            self.store[y] = np.zeros((self.per_class, x.size), np.float32)
+            self.seen[y] = 0
+        n = self.seen[y]
+        if n < self.per_class:                  # buffer not yet full: append
+            self.store[y][n] = x
+        else:                                   # full: replace with prob k/n
+            j = self.rng.integers(0, n + 1)
+            if j < self.per_class:
+                self.store[y][j] = x
+        self.seen[y] = n + 1
+
+    def sample(self, k):
+        xs, ys = [], []
+        for y, X in self.store.items():
+            m = min(self.seen[y], self.per_class)
+            for i in self.rng.integers(0, m, size=max(1, k // len(self.store))):
+                xs.append(X[i]); ys.append(y)
+        return np.stack(xs), np.array(ys)
+
+buf = ReplayBuffer(per_class=200)
+for x, y in [(np.random.randn(64), lbl) for lbl in np.random.randint(0, 5, 5000)]:
+    buf.add(x.astype(np.float32), int(y))       # stream one window at a time
+Xr, yr = buf.sample(128)                         # mix these into each new update
+print("rehearsal batch:", Xr.shape, "classes:", np.bincount(yr))</code></pre>
+    <div class="code-caption"><strong>Listing 26.5.</strong> A per-class reservoir replay buffer. Reservoir sampling keeps every window seen so far equally likely to survive in memory, so the buffer stays representative without storing the whole stream; the per-class split guarantees rare activities (stair-climbing, sit-to-stand) keep a foothold that global reservoir sampling would erode. Mixing <code>buf.sample()</code> into each fine-tuning batch is what turns catastrophic forgetting into a controlled trade.</div>
+
+    <p>As Listing 26.5 shows, the mechanism that beats forgetting is modest: bounded memory plus balanced sampling. The subtlety is entirely in the sampling policy, which is why hand-rolled buffers tend to quietly starve the classes you most wanted to protect.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">The Right Tool</h3>
+        <p>A full continual-learning setup, replay buffers, EWC and its variants, task-aware evaluation, and the bookkeeping that computes forgetting and transfer, is several hundred lines to build and easy to get subtly wrong. The <code>avalanche</code> library (a PyTorch continual-learning framework) reduces it to a handful: wrap your stream as a <code>benchmark</code>, pick a strategy such as <code>Replay(mem_size=...)</code> or <code>EWC(ewc_lambda=...)</code>, and its evaluation plugins log accuracy, forgetting, and backward transfer per experience automatically. You supply the activity model and the data stream; it owns the buffer mechanics and the metrics. Reach for it before writing your own loop; hand-roll only the on-device version of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-62-on-device-continual-learning/index.html">Chapter 62</a>, where the framework will not fit.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">In Practice: a post-surgery rehabilitation wearable</h3>
+        <p>A clinic issues ankle-worn inertial monitors to patients recovering from knee replacement, to score exercise adherence and gait quality across a twelve-week program. The recognizer ships pre-trained on healthy adults, and in week one it works. By week three it is failing, and instructively so. The patient's "walking" now includes a pronounced limp and a walker, so the healthy-gait template no longer fits (real drift: the same label, a new signal). Simultaneously a new prescribed activity, seated knee extensions, appears that was never in the training set at all. A naive nightly fine-tune on the patient's fresh data fixed both within days but silently destroyed the model's ability to recognize normal walking, so when the patient recovered in week ten the system could no longer tell they were healthy again. The deployed fix was replay: a small per-patient buffer retained early-recovery and healthy-gait exemplars, and each update mixed them with the new limping and knee-extension windows. The model tracked the patient's changing behavior across the full arc of recovery while still recognizing the endpoints, and the buffer's per-class balance kept the rare extension exercise from being drowned by the thousands of walking windows.</p>
+    </div>
+
+    <h2>Evaluating continual learning without fooling yourself</h2>
+    <p>A single accuracy number cannot describe a model that changes over time, and reporting only the final one hides exactly the failure this section is about. Evaluate along the time axis with three quantities computed on held-out data from every stage the model has passed through. <strong>Average accuracy</strong> after learning stage \(T\) is the mean over all stages \(j \le T\) of accuracy on stage \(j\)'s test set. <strong>Backward transfer</strong> (forgetting) measures how much learning later stages hurt earlier ones: with \(a_{T,j}\) the accuracy on stage \(j\) after training through stage \(T\),</p>
+    \[
+    \mathrm{BWT} = \frac{1}{T-1} \sum_{j=1}^{T-1} \left( a_{T,j} - a_{j,j} \right),
+    \]
+    <p>where a large negative value is catastrophic forgetting and a small positive value means later behavior actually reinforced earlier competence. <strong>Forward transfer</strong> asks the complementary question: does what the model already knows help it learn the next behavior faster? The right online protocol is <strong>prequential</strong> (test-then-train): for each incoming window, first predict and score, then use it to update, so every example is a genuine test before it is ever a training point. And the leakage rule from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-65-evaluation-protocols-and-leakage-safe/index.html">Chapter 65</a> bites with special force here: because consecutive windows are correlated in time, a random split leaks the near-future into the training set and makes a forgetful model look stable. Split by contiguous time and by subject, and never let a replay buffer's contents leak into the test set. Continual learning that adapts to genuinely new relationships is the temporal sibling of the test-time adaptation and distribution-shift methods of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>; the difference is that here the model is allowed to keep the update, so measuring what it lost matters as much as measuring what it gained.</p>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise</h3>
+        <p>Build a three-stage continual stream from a subject in PAMAP2 or a similar dataset: stage 1 = {walk, sit, stand}, stage 2 adds {ascend stairs, descend stairs}, stage 3 introduces a simulated real drift by re-labelling a perturbed "walk" as a new "recovery walk" class. Train (a) a plain fine-tuning baseline, (b) EWC, and (c) the reservoir replay of Listing 26.5. After each stage, evaluate on the held-out test sets of all stages seen so far and report average accuracy and BWT. Show that fine-tuning has strongly negative BWT, that replay with a few hundred windows per class largely closes the gap, and that EWC lands in between. Then rerun with a random window split instead of a time-and-subject split and quantify how much it flatters the forgetful baseline.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-Check</h3>
+        <p class="quiz-question">1. Distinguish virtual drift from real (concept) drift with an activity-recognition example of each, and explain why only one of them is a reason to change the classifier's weights.</p>
+        <p class="quiz-question">2. State the stability-plasticity dilemma and place replay, EWC, and parameter isolation on the trade it describes: what does each one protect, and at what cost?</p>
+        <p class="quiz-question">3. A continual model reports 91% accuracy on its most recent activity but its backward-transfer score is -22%. What has happened, and why would a single final-accuracy number have hidden it?</p>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-26.6.html">Section 26.6</a>, we widen the lens from one changing user to a whole population. A model that learns continually still learns from whoever generates the most data, and behavior varies not only over time but across bodies, ages, and demographics. We take up fairness across users: how activity recognizers come to work well for some groups and poorly for others, how to measure that gap, and how to close it.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

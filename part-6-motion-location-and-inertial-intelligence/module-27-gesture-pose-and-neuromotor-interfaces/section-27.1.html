@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.1: Touch, pressure, capacitive, and proximity sensing. Building Sensory AI." name="description"/>
+<title>Section 27.1: Touch, pressure, capacitive, and proximity sensing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Gesture, Pose, and Neuromotor Interfaces</a></div>
+<h1>Touch, pressure, capacitive, and proximity sensing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A finger is just a grounded electrode with opinions. My job is to guess the opinion from the charge it steals."</p><cite>A Capacitively Coupled AI Agent</cite></blockquote>
+
+<div class="prerequisites"><h3>Prerequisites</h3><p>This section leans on the sensor physics and measurement models of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a> (transduction, calibration curves, and where nonlinearity comes from) and the sampling and synchronization ideas of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> (scan rates, aliasing, and jitter). Baseline tracking and denoising build on <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>. The richer force-and-slip transducers used in robot fingertips are developed later in <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-56-tactile-sensing-and-electronic-skin/index.html">Chapter 56</a>; here we stay on the surface-contact modalities that drive human interaction devices.</p></div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>Every phone screen, laptop trackpad, elevator button, earbud stem, and steering-wheel hands-on detector runs on one of four closely related electrical tricks: measuring how hard you press (resistive and piezoresistive pressure), how much you perturb an electric field by touching (capacitive), or how much you perturb it without touching (proximity and hover). These are the cheapest, lowest-power, most manufacturable interaction sensors in existence, and they are the front door to the whole chapter: before you can classify an IMU flick or decode a neuromotor intent, most systems first ask the far simpler question, "is a finger here, and how hard?" This section is about that raw signal, what physics produces it, what noise corrupts it, and what a model can and cannot recover from it. Get the front end wrong and no amount of clever downstream learning saves you.</p>
+</div>
+
+<h2>Four modalities, one idea: perturbing a physical quantity</h2>
+<p>All four modalities share a template from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-02-sensor-physics-and-measurement-models/index.html">Chapter 2</a>: a contact event changes a measurable electrical quantity, and we invert that change to infer the event. They differ in <em>which</em> quantity and how directly the finger couples to it.</p>
+<p><strong>Resistive touch</strong> uses two conductive layers separated by a small air gap; pressing shorts them, and the position is read as a voltage divider along each axis. It is pressure-activated (works with a gloved finger or stylus), cheap, but single-touch and mechanically fragile. <strong>Piezoresistive and force-sensitive-resistor (FSR) pressure sensing</strong> goes further: a polymer whose bulk resistance \(R\) falls as applied force \(F\) rises, so a simple divider yields a continuous force estimate. The transfer is strongly nonlinear and hysteretic, roughly \(R \propto F^{-\gamma}\) with \(\gamma\) near 0.5 to 1 over the usable range, which is why FSRs are excellent for coarse "hard vs soft press" but poor as calibrated scales. <strong>Capacitive sensing</strong>, the dominant modality, measures the capacitance between electrodes; a finger (a grounded conductor rich in water) adds or diverts capacitance when it approaches. <strong>Proximity and hover</strong> are the same capacitive measurement operated at higher sensitivity, reading the finger before contact, trading spatial precision for range.</p>
+<p>The reason capacitive won the interaction market is that it has no moving parts, survives millions of touches behind a sealed glass surface, supports true multi-touch, and scales to fine grids. The cost is that it senses a proxy (charge), not force, so it cannot natively tell a light rest from a hard press, and it is exquisitely sensitive to anything else that couples to the field: water, a hovering palm, a charging cable, a person's other hand on the case.</p>
+
+<h2>Capacitive sensing in depth: self versus mutual</h2>
+<p>Two capacitive architectures dominate, and knowing which one produced your data changes how you model it. In <strong>self-capacitance</strong>, each electrode's capacitance to ground is measured. A finger increases that capacitance because the body offers a large path to ground:
+\[ C_{\text{self}} = C_0 + \Delta C_{\text{finger}}, \qquad \Delta C_{\text{finger}} \approx \varepsilon_0 \varepsilon_r \frac{A}{d}, \]
+where \(A\) is the effective overlap area and \(d\) the finger-to-electrode distance through the cover glass and air. Self-capacitance is very sensitive (great for proximity and hover, where \(d\) is large) but on a row-and-column grid it is ambiguous under multi-touch: two touches light up two rows and two columns, which is consistent with either of two diagonal pairs, the classic "ghost point" problem.</p>
+<p>In <strong>mutual capacitance</strong>, one set of electrodes drives (transmit, TX) and an orthogonal set receives (RX). At each row-column crossing there is a small coupling capacitance \(C_m\); a finger <em>steals</em> field lines from that junction and <em>reduces</em> \(C_m\). Because every intersection is measured independently, mutual capacitance yields a true two-dimensional image of \(-\Delta C_m\) with no ghosting, which is exactly why every modern multi-touch screen uses it. The measured object is literally a low-resolution grayscale image (a "capacitance image" or heatmap), and that framing is the bridge to everything in Part IV: a \(16\times 28\) capacitance frame is a tiny image you can run a convolutional network over, as we do in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A mutual-capacitance touchpad does not output "touch coordinates." It outputs a small, noisy, drifting image of field perturbation, and the coordinates are an <em>inference</em> someone chose to compute from it. The moment you treat the raw capacitance frame as the signal, force estimation, hover, palm rejection, water rejection, and gesture recognition stop being separate hardware features and become one learning problem over one image stream. Firmware that throws the frame away and ships only fingertip \((x,y)\) has already discarded the information your model needs.</p>
+</div>
+
+<h2>The analog front end and the signal you actually get</h2>
+<p>The idealized \(\Delta C\) hides the engineering that decides whether your data is usable. Capacitance is measured by charging the electrode and timing or integrating the result, typically by charge transfer or a sigma-delta converter, scanning the whole grid tens to hundreds of times per second. Three realities follow directly, and each is a modeling constraint, not a nuisance to wish away.</p>
+<p>First, <strong>baseline drift</strong>. The "no touch" capacitance \(C_0\) wanders with temperature, humidity, a water film, and slow charge buildup, on time scales of seconds to minutes. Every practical system tracks a running baseline and reports the deviation from it, which is why a finger held perfectly still eventually "fades": the baseline tracker adapts to it. Your detector therefore responds to <em>changes</em>, and the tracker's time constant is a genuine hyperparameter, per the drift-and-denoising treatment of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>. Second, <strong>sample rate and latency</strong>. A 120&nbsp;Hz scan gives an 8&nbsp;ms frame period; a swipe that must feel instant leaves only a handful of frames, so aliasing and jitter (from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>) directly limit gesture responsiveness, a theme the whole chapter returns to and Section 27.7 makes a budget of. Third, <strong>interference and grounding</strong>. Mains hum, a noisy display underneath, and a poorly grounded device (a phone on a wooden table versus in your hand) all inject noise; "my touchscreen goes crazy when charging with a cheap adapter" is a real, physics-level grounding failure, not a bug.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def touch_from_capacitance(frame, baseline, alpha=0.02, on=8.0, off=4.0, state=False):
+    """One frame of a capacitive touch pipeline.
+    frame, baseline: same-shape arrays of raw per-cell readings.
+    alpha: baseline-tracker rate (small = slow adaptation).
+    on/off: hysteresis thresholds in signal units. Returns (touch, xy, baseline, state)."""
+    signal = frame - baseline                      # deviation from the tracked "no touch" level
+    peak = signal.max()
+    # Hysteresis: need > on to engage, must fall below off to release (debounces flicker).
+    if not state and peak > on:   state = True
+    elif state and peak < off:    state = False
+    xy = None
+    if state:
+        r, c = np.unravel_index(np.argmax(signal), signal.shape)
+        # Sub-cell centroid over a 3x3 window: this is why reported resolution beats the grid pitch.
+        rs, cs, w = slice(max(r-1,0), r+2), slice(max(c-1,0), c+2), signal[max(r-1,0):r+2, max(c-1,0):c+2].clip(0)
+        gr, gc = np.mgrid[rs, cs]
+        xy = ((gr*w).sum()/w.sum(), (gc*w).sum()/w.sum())
+    # Freeze the baseline while touched; adapt only in no-touch cells to chase drift, not the finger.
+    baseline = np.where(signal &lt; off, (1-alpha)*baseline + alpha*frame, baseline)
+    return state, xy, baseline, state
+
+rng = np.random.default_rng(0)
+base = np.full((12, 20), 100.0)
+frame = base + rng.normal(0, 0.5, base.shape); frame[5, 9] += 30  # a press at (5,9)
+print(touch_from_capacitance(frame, base)[:2])
+</code></pre>
+<div class="code-caption">A minimal capacitive touch pipeline: baseline subtraction, hysteresis debouncing, sub-cell centroid interpolation, and drift-chasing baseline update that freezes under the finger. The three-line comment blocks mark the exact places where a naive "argmax over the frame" implementation fails in the field. Referenced in the front-end and gesture discussions.</div>
+
+<h2>From raw frames to gestures, force, and rejection</h2>
+<p>With the frame in hand, four downstream tasks fall out, in rising difficulty. <strong>Detection and localization</strong> is the centroid math above; sub-cell interpolation is why a screen with 5&nbsp;mm electrode pitch reports sub-millimeter coordinates. <strong>Gesture recognition</strong> (tap, swipe, pinch, rotate, edge-swipe) is a temporal-pattern problem over the sequence of frames or extracted points, and for anything beyond hand-tuned state machines it is the recurrent and convolutional modeling of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> applied to a very small signal. <strong>Force estimation</strong> is the interesting one: pure capacitance cannot measure force, yet a fingertip flattens as you press, so the <em>contact area</em>, the number of activated cells and their summed magnitude, is a usable force proxy. Apple's early "3D Touch" combined a genuine capacitive strain layer with this area cue; many systems today skip the extra layer and learn force from contact-area features alone, which works acceptably per user but drifts across users and finger sizes, a cross-user generalization problem exactly like the one Section 27.5 tackles for neuromotor decoding. <strong>Rejection</strong> (palm, water, cheek-against-screen during a call) is where naive thresholds die: a water droplet and a light touch produce similar peak deviations, and only the <em>shape</em> of the blob in the frame tells them apart, which is precisely why treating the frame as an image and learning the discrimination outperforms any single threshold.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the automotive capacitive door handle that unlocked in the car wash</h3>
+<p>A carmaker replaced mechanical door handles with flush capacitive touch pads: a self-capacitance proximity zone that wakes the handle as your hand approaches, and a mutual-capacitance touch pad that unlocks on contact. In validation it worked beautifully. In the field, cars began unlocking themselves in automatic car washes and heavy rain, because a sheet of grounded water couples to the electrodes almost exactly like a hand, spiking self-capacitance across the whole pad. The fix was not a higher threshold (that killed gloved-hand detection); it was to stop thresholding a single number and instead look at the spatial and temporal <em>signature</em>. A hand approaches from one side and creates a moving, localized gradient; a water sheet arrives everywhere at once and saturates uniformly. A small classifier over the multi-cell proximity pattern plus its rate of change separated the two, restoring both the water immunity and the gloved-hand sensitivity that a scalar threshold could never reconcile. The lesson recurs across every modality in this section: the discriminating information usually lives in the spatial-temporal pattern, not in the peak value firmware likes to report.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the touch state machine</h3>
+<p>The debounce, multi-touch tracking, and tap/swipe/pinch recognition in the pipeline above are a notorious source of edge-case bugs (double-taps, dropped fingers, ghost releases). On any real device you should not write them from scratch: a platform gesture recognizer (Android's <code>GestureDetector</code> and <code>ScaleGestureDetector</code>, or the browser Pointer Events API with a wrapper such as <code>hammer.js</code>) turns a raw pointer stream into named gesture callbacks in well under 20 lines, replacing several hundred lines of finite-state-machine and timing code that you would otherwise get subtly wrong. Hand-roll only when you are working below the OS with raw capacitance frames the platform never exposes; that is exactly when the learning approach of this chapter earns its keep.</p>
+</div>
+
+<h2>When each modality is the right choice</h2>
+<p>Selection follows the physics. Choose <strong>resistive</strong> when cost dominates and you need single-touch operation with gloves or a stylus (industrial panels, budget appliances). Choose an <strong>FSR or piezoresistive</strong> element when you genuinely need a continuous force or grip signal and can tolerate loose calibration (a squeezable earbud stem, a soft robot gripper's coarse contact sense, a smart-scale footpad). Choose <strong>mutual-capacitance</strong> whenever you need multi-touch, durability behind glass, and the richest signal for learning, accepting the water and grounding sensitivities. Choose <strong>self-capacitance proximity</strong> when non-contact wake, hover, or hands-on-wheel detection is the goal and coarse localization suffices. Crucially, these are not exclusive: the strongest interaction stacks fuse them, mutual capacitance for the touch image, self-capacitance for hover, and an FSR or strain layer for true force, and that fusion is the multimodal-interaction subject of Section 27.6. For gesture systems that must work at a distance with no surface at all, capacitive sensing hands off to the radar and RF techniques of <a class="cross-ref" href="../../part-9-radar-lidar-depth-thermal-event-and-rf-sensing/module-47-rf-and-wireless-sensing/index.html">Chapter 47</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You are given a stream of raw \(12\times 20\) mutual-capacitance frames at 100&nbsp;Hz from a trackpad, with ground-truth labels for {no-touch, single tap, two-finger scroll, palm}. (1) Explain why a per-frame peak-deviation threshold cannot separate "palm" from "two-finger scroll," and name the frame feature that can. (2) Design the baseline tracker: give a time constant, and justify why it must freeze under a sustained touch but keep adapting elsewhere. (3) Propose a small model that consumes a short window of frames and predicts the four classes, and state how you would split train and test data so a per-user leakage does not inflate your accuracy (recall the discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>).</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. In one sentence each, what physical quantity does resistive, FSR, mutual-capacitive, and self-capacitive sensing each measure, and which one a finger <em>reduces</em> rather than increases?<br/>
+2. Why does a finger held perfectly still on a capacitive pad eventually stop registering, and what design choice causes it?<br/>
+3. Mutual capacitance eliminates the multi-touch "ghost point" ambiguity that self-capacitance suffers. Why, in terms of what is measured at each electrode intersection?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-27.2.html">Section 27.2</a>, we lift off the surface entirely and let the hand move through free space, turning the accelerometer and gyroscope of <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> into a gesture sensor. The central tension shifts from field perturbation to <em>latency</em>: an inertial flick must be recognized in a few tens of milliseconds to feel like control rather than lag, which reframes the whole problem as low-latency inference on a motion stream.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

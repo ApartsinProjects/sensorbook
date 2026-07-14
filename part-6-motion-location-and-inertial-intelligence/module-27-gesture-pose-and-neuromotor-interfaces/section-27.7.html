@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.7: Human factors, usability, and latency budgets. Building Sensory AI." name="description"/>
+<title>Section 27.7: Human factors, usability, and latency budgets | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Gesture, Pose, and Neuromotor Interfaces</a></div>
+<h1>Human factors, usability, and latency budgets</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"A user will forgive me for guessing wrong long before they forgive me for guessing late. Make me fast, then make me right, and never confuse the order."</p><cite>An Impatient AI Agent</cite></blockquote>
+
+<div class="prerequisites"><h3>Prerequisites</h3><p>This section closes the chapter by turning the accuracy metrics of the previous six sections into <em>interaction</em> metrics, so it assumes the classifiers of <a class="cross-ref" href="section-27.2.html">Section 27.2</a> through <a class="cross-ref" href="section-27.5.html">Section 27.5</a>. The timing arithmetic rests on the sampling, clocking, and jitter concepts of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>, and the latency-reduction toolbox (quantization, pruning, operator fusion) lives in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> and the streaming machinery of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a>. Confidence thresholding for rejection uses the calibration ideas of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p></div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>An input device is not judged by its confusion matrix. It is judged by whether a person can point, select, type, or gesture faster and more comfortably than with whatever they had before, and keep doing it for an hour without pain or embarrassment. That reframing is brutal for machine learning engineers, because it means a model that scores 99% offline can still ship a product that feels broken: 40&nbsp;ms too slow, firing on an accidental scratch, or exhausting the arm after ninety seconds. This section gives you the three quantitative lenses that separate a demo from a product: a <strong>latency budget</strong> that accounts for every millisecond from muscle to feedback, a <strong>throughput and error model</strong> (Fitts's law and the asymmetric cost of false activations) that tells you whether the interaction is actually efficient, and a set of <strong>human-factors constraints</strong> (fatigue, the Midas-touch problem, learnability, accessibility) that a leaderboard can never surface. These are the numbers that decide whether the elegant neuromotor decoder of the previous sections becomes something people use.</p>
+</div>
+
+<h2>The latency budget: accounting for every millisecond</h2>
+<p>The single most important number in an interactive system is end-to-end latency, the time from the user's motor act to the perceivable response. It is a sum of stages, and each stage is owned by a different part of the stack:</p>
+\[ L = t_{\text{sense}} + t_{\text{buffer}} + t_{\text{infer}} + t_{\text{comm}} + t_{\text{render}} + t_{\text{display}}. \]
+<p>Here \(t_{\text{sense}}\) is the sampling and analog settling time, \(t_{\text{buffer}}\) is the window your model needs before it can even decide (a gesture recognizer that consumes 150&nbsp;ms of IMU history has already spent 150&nbsp;ms), \(t_{\text{infer}}\) is model compute, \(t_{\text{comm}}\) is any wireless or bus hop (Bluetooth Low Energy adds a connection-interval-quantized 7.5 to 30&nbsp;ms all by itself), and \(t_{\text{render}}\) plus \(t_{\text{display}}\) are the UI and panel refresh. Why does the exact number matter so much? Because human perception has sharp thresholds. Under roughly 20&nbsp;ms, a dragged object feels glued to the finger; by 100&nbsp;ms the system still feels "responsive" for discrete actions but direct manipulation feels rubbery; past 100&nbsp;ms of head-to-display latency in a headset, users get motion sick. Nielsen's classic tiers (0.1&nbsp;s feels instant, 1&nbsp;s keeps flow, 10&nbsp;s loses attention) are the coarse version; interaction designers work an order of magnitude finer.</p>
+<p>The subtle, expensive mistake is to budget for the <em>mean</em>. Users do not perceive averages; they perceive the worst hitches. A pipeline whose median latency is a comfortable 45&nbsp;ms but whose 99th percentile is 180&nbsp;ms will feel intermittently broken, and the culprit is usually variance, not the mean: a garbage-collection pause, a Bluetooth retransmit, a thermally throttled core. You must budget the <em>tail</em>. The code below models each stage as a distribution and reports the percentiles that users actually feel.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Each stage: (name, mean_ms, jitter_ms). Buffer is deterministic; BLE and GC are heavy-tailed.
+stages = [
+    ("sense",   2.0,  0.3),
+    ("buffer", 40.0,  0.0),   # fixed model context window
+    ("infer",   6.0,  1.0),   # on-device quantized net
+    ("comm",   12.0,  9.0),   # BLE connection interval, occasional retransmit
+    ("render",  4.0,  1.5),
+    ("display", 8.3,  4.8),   # ~120 Hz panel, phase-random wrt event
+]
+
+rng = np.random.default_rng(0)
+N = 200_000
+total = np.zeros(N)
+for name, mu, jit in stages:
+    # Gamma keeps latency positive and gives a realistic right tail.
+    shape = (mu / jit) ** 2 if jit > 0 else 0.0
+    s = rng.gamma(shape, jit**2 / mu, N) if jit > 0 else np.full(N, mu)
+    total += s
+for p in (50, 95, 99, 99.9):
+    print(f"p{p:<4} end-to-end latency: {np.percentile(total, p):6.1f} ms")
+print(f"fraction over 100 ms budget: {100*np.mean(total > 100):.2f}%")
+</code></pre>
+<div class="code-caption">A tail-aware latency budget. Stages are summed as random variables, not point estimates, so the report exposes the p99 and p99.9 hitches a user actually notices. Note how the fixed 40&nbsp;ms buffer dominates the median while BLE and display phase dominate the tail: two different stages, two different fixes. Referenced throughout this section.</div>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>Latency and accuracy trade against each other, and the human sets the exchange rate. Every millisecond you spend collecting more context (\(t_{\text{buffer}}\)) or running a bigger model (\(t_{\text{infer}}\)) buys accuracy, but past the perceptual threshold that accuracy is invisible while the lag is not. The right operating point is not the top of the accuracy curve; it is the fastest configuration whose error rate is <em>tolerable given the cost of an error</em>. For a media-pause gesture, ship the fast, slightly worse model. For a "confirm payment" gesture, spend the milliseconds. The model that wins the benchmark and the model that ships are rarely the same model.</p>
+</div>
+
+<h2>Throughput and the asymmetric cost of errors</h2>
+<p>Speed and accuracy combine into <strong>throughput</strong>, the real currency of an input device. For pointing and selection tasks the governing law is Fitts's law: the movement time to acquire a target of width \(W\) at distance \(D\) is</p>
+$$ MT = a + b \, \log_2\!\left(\frac{D}{W} + 1\right), \qquad \text{throughput } TP = \frac{ID}{MT}, $$
+<p>where the logarithmic term is the index of difficulty \(ID\) in bits, and \(a, b\) are device-and-user constants fit by regression. The ISO 9241-411 standard formalizes this into a repeatable multidirectional-tapping test, and it is how you compare a wristband cursor against a trackpad against eye-gaze on equal footing: measured in bits per second, a good mouse reaches roughly 4 to 5&nbsp;bit/s, mid-air hand gesture typically 2 to 3, and early neuromotor cursors are climbing into that range. Fitts's law is also a design tool: it tells you that making targets bigger (\(W \uparrow\)) or closer (\(D \downarrow\)) helps more, per bit, than shaving raw latency, which is why good gesture UIs use large forgiving targets rather than demanding pixel precision from a noisy sensor.</p>
+<p>Then there is the error the leaderboard hides: the <strong>false activation</strong>. In a gesture system, false positives and false negatives are not symmetric. A missed swipe costs one repeat; a spurious "delete" or an accidental unlock costs trust, and possibly data or money. This is the same operating-point choice as calibrated rejection in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>: you set the decision threshold not at the equal-error point but where the <em>expected cost</em> is minimized, given that a false activation may be ten or a hundred times worse than a miss. Always-on gesture sensing makes this acute because the "null" class (the user doing anything other than gesturing) is enormous and adversarial, so a 0.1% false-positive rate per second is dozens of phantom commands a day.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the car that let you twirl a finger to change the volume, and then took it away</h3>
+<p>A premium automaker shipped a mid-air gesture control: twirl a finger near the dashboard camera to adjust volume, swipe to reject a call. In the showroom it delighted. In daily use it quietly failed the human-factors test on three axes at once. Latency: the vision pipeline plus confirmation debounce pushed feedback past 200&nbsp;ms, so drivers overshot and hunted. Throughput: a physical knob has an index of difficulty near zero (you grab it without looking), while the gesture demanded a deliberate, eyes-drawn arm motion in free space, a strictly worse Fitts operating point. Fatigue and false activation: an animated conversation with a passenger threw enough incidental hand motion to trigger phantom volume changes, the Midas-touch problem in a moving vehicle. Telemetry showed most owners used it once or twice, then never again, and later model years dropped the feature. The lesson is not that gestures are bad; it is that an interaction can be technically accurate and still lose to a knob because latency, throughput, and false activation, not classification accuracy, decide adoption.</p>
+</div>
+
+<h2>Fatigue, the Midas touch, and designing the interaction</h2>
+<p>Two human-factors failure modes recur across every modality in this chapter, and both are invisible in an offline metric. The first is <strong>fatigue</strong>, epitomized by "gorilla arm": sustained mid-air interaction against gravity is exhausting because the shoulder is a poor holding actuator. This is why the best pose and neuromotor interfaces, including the wristband electromyography of <a class="cross-ref" href="section-27.4.html">Section 27.4</a>, deliberately favor small, low-effort, hand-and-finger micro-gestures resting in the lap over expansive arm waving. Comfort is a design constraint you can measure (with instruments like the Borg exertion scale or the Consumed Endurance metric), and it should appear in your evaluation protocol next to accuracy.</p>
+<p>The second is the <strong>Midas-touch problem</strong>: when the sensor is always on, how does it know when you <em>mean</em> to command it versus merely moving? Every practical always-on interface solves this with an explicit <em>segmentation</em> strategy rather than a better classifier: an arming gesture or wake motion, a dead-zone the signal must exceed, a required dwell or a deliberate onset shape, or a physical clutch (a button, a pinch-to-engage). These are cheap, and they buy more perceived reliability than another point of model accuracy, because they convert a hard open-set problem into an easier gated one. Good interaction design also closes the loop: immediate, unambiguous <strong>feedback</strong> (a haptic tick, a visual highlight, an audio cue) at the moment of recognition lets the user build an accurate mental model of what the system heard, which is what actually makes an imperfect recognizer feel trustworthy.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: measure latency percentiles instead of hand-rolling timers</h3>
+<p>Do not sprinkle <code>time.perf_counter()</code> pairs through your inference code and average them; that hides the tail you care about and mismeasures GPU and NPU work that runs asynchronously. A dedicated benchmarking harness such as <code>torch.utils.benchmark.Timer</code> (or ONNX Runtime's built-in profiler) handles warmup, device synchronization, and outlier-robust percentile reporting in about five lines, replacing forty-plus lines of fragile manual timing that would otherwise report a confidently wrong mean. It gives you p50/p95/p99 for \(t_{\text{infer}}\) directly, which is the one stage of the budget you own as a model author. Pair it with the deployment-side optimizations of <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a> to actually move the number.</p>
+</div>
+
+<h2>Measuring usability and designing for everyone</h2>
+<p>Beyond speed and errors sit the qualities that decide whether a first-time user succeeds and a long-term user stays: <strong>learnability</strong> (how fast a novice reaches competence), <strong>memorability</strong> (whether they retain the gestures after a week away), <strong>guessability</strong> (whether the natural first attempt is the right one), and overall <strong>satisfaction</strong>. These are measured with real people, using instruments you should treat as seriously as your test set: the System Usability Scale (SUS) for a comparable 0 to 100 score, task-completion and error rates from a supervised study, and structured elicitation studies to choose gestures users actually propose rather than ones an engineer invented. Crucially, evaluate with a <em>held-out population</em> of users, not the three colleagues who helped train the model, for exactly the leakage reasons that the cross-user work of <a class="cross-ref" href="section-27.5.html">Section 27.5</a> and the activity-recognition splits of <a class="cross-ref" href="../module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> insist on.</p>
+<p>Finally, human factors means <strong>all</strong> humans. Gesture and neuromotor interfaces have an extraordinary accessibility upside, offering input paths for people who cannot use a keyboard, mouse, or touchscreen, but only if you design for variation rather than a median 25-year-old engineer. Tremor, limited range of motion, a prosthesis, one-handed use, and differing skin, limb, and physiology all shift the signal distribution. The design responses are concrete: adjustable thresholds and dwell times, personalization and quick recalibration, redundant input paths, and never gating a critical action behind a single gesture the user might be unable to perform. Accessibility is not a compliance afterthought; it is the same distribution-shift robustness problem the whole book keeps returning to, pointed at the most important out-of-distribution population of all.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have a wristband gesture recognizer with a 120&nbsp;ms context window, 5&nbsp;ms on-device inference, and a BLE hop to a phone that renders feedback. (1) Write the six-term latency budget and identify which single term you would attack first to get median end-to-end latency under 80&nbsp;ms, justifying the choice against the perceptual thresholds in this section. (2) The product owner wants the false-activation rate cut 10x for the "unlock" gesture without retraining. Propose two segmentation or thresholding changes (from this section) that achieve it, and state what each costs the user in throughput or effort. (3) Design a 12-person usability study that reports SUS and Fitts throughput and would catch a gorilla-arm fatigue problem the offline accuracy metric cannot.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Why is the p99 latency, not the mean, the number that decides whether an interaction "feels" responsive, and name two pipeline stages that typically dominate the tail?<br/>
+2. Fitts's law says throughput depends on target width and distance, not just on your sensor. Give one UI change that improves throughput more, per bit, than shaving 10&nbsp;ms of latency.<br/>
+3. What is the Midas-touch problem, and why does adding an arming gesture or dead-zone often improve perceived reliability more than improving the classifier?</p>
+</div>
+
+<div class="callout lab"><h3 class="callout-title">Lab 27</h3><p>train a gesture/neuromotor classifier and optimize it for low-latency, cross-user interaction.</p></div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-28-biosignal-foundations/index.html">Chapter 28</a>, we cross from interaction into physiology. The same electrodes and inertial units that decoded intent now measure the body's own signals, ECG, PPG, EEG, EMG, respiration, and electrodermal activity, where the "latency budget" gives way to a "reliability and validation budget" and a wrong answer is no longer a missed swipe but a missed diagnosis, raising the stakes on every idea from this part.</p>
+
+<section class="bibliography" id="bibliography">
+<h2 class="bibliography-title">Bibliography</h2>
+
+<p class="bib-category">Latency and human perception of responsiveness</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.nngroup.com/articles/response-times-3-important-limits/">Nielsen, J. (1993). Response Times: The 3 Important Limits. Nielsen Norman Group / Usability Engineering.</a></p><p class="bib-annotation">The canonical 0.1&nbsp;s / 1&nbsp;s / 10&nbsp;s tiers of perceived responsiveness that every latency budget in interactive systems still starts from.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/2611387">Ng, A., Dietz, P., et al. (2014). In the Blink of an Eye: Investigating Latency Perception during Stylus Interaction. CHI / ACM.</a></p><p class="bib-annotation">Empirical demonstration that users perceive drag latency well below the once-assumed limits, motivating sub-20&nbsp;ms direct-manipulation targets.</p></div>
+
+<p class="bib-category">Throughput, pointing, and interaction models</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.tandfonline.com/doi/abs/10.1207/s15327051hci0704_3">MacKenzie, I. S. (1992). Fitts' Law as a Research and Design Tool in Human-Computer Interaction. Human-Computer Interaction.</a></p><p class="bib-annotation">The reference treatment that turned Fitts's law into the throughput metric and the ISO tapping protocol used to compare input devices.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/1518701.1518866">Wobbrock, J. O., Morris, M. R., Wilson, A. D. (2009). User-Defined Gestures for Surface Computing. CHI / ACM.</a></p><p class="bib-annotation">Introduced elicitation studies and guessability scoring, the method for choosing gestures users actually propose rather than ones engineers invent.</p></div>
+
+<p class="bib-category">Fatigue, Midas touch, and usability instruments</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/2556288.2557130">Hincapie-Ramos, J. D., Guo, X., et al. (2014). Consumed Endurance: A Metric to Quantify Arm Fatigue of Mid-Air Interactions. CHI / ACM.</a></p><p class="bib-annotation">A quantitative fatigue metric for gorilla-arm interactions, making comfort measurable alongside accuracy and speed.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://dl.acm.org/doi/10.1145/123078.123143">Jacob, R. J. K. (1990). What You Look At is What You Get: Eye Movement-Based Interaction Techniques. CHI / ACM.</a></p><p class="bib-annotation">The paper that named the Midas-touch problem for always-on input and motivated explicit arming and dwell-based segmentation.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.taylorfrancis.com/chapters/edit/10.1201/9781498710411-35/sus-quick-dirty-usability-scale-john-brooke">Brooke, J. (1996). SUS: A Quick and Dirty Usability Scale. Usability Evaluation in Industry.</a></p><p class="bib-annotation">The System Usability Scale, the ten-item questionnaire that yields the comparable 0 to 100 usability score used across input-device studies.</p></div>
+
+<p class="bib-category">Standards and neuromotor interaction</p>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.iso.org/standard/54106.html">ISO 9241-411 (2012). Ergonomics of Human-System Interaction: Evaluation Methods for the Design of Physical Input Devices. ISO.</a></p><p class="bib-annotation">The standardized multidirectional-tapping and throughput protocol for fair, repeatable comparison of pointing and gesture devices.</p></div>
+<div class="bib-entry-card"><p class="bib-ref"><a href="https://www.nature.com/articles/s41586-025-09255-w">CTRL-labs at Reality Labs (2025). A Generic Non-Invasive Neuromotor Interface for Human-Computer Interaction. Nature.</a></p><p class="bib-annotation">The surface-EMG wristband work whose product framing foregrounds latency, cross-user generalization, and low-effort micro-gestures over raw accuracy.</p></div>
+
+</section>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

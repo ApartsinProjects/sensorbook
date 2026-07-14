@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.5: Zero-velocity updates and pedestrian dead reckoning. Building Sensory AI." name="description"/>
+<title>Section 24.5: Zero-velocity updates and pedestrian dead reckoning | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Zero-velocity updates and pedestrian dead reckoning</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You told me to integrate. So I integrated. The building grew a third floor that does not exist, and by the lobby I was standing in the car park across the street."</p>
+<cite>An Unbounded AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>A raw inertial navigation system tracking a walking person diverges catastrophically: even a good MEMS IMU accumulates hundreds of meters of position error per minute, because the accelerometer bias gets integrated twice into a runaway parabola. This section is about the single most effective trick for taming that divergence indoors, where GNSS cannot help. The insight is embarrassingly physical. Every stride, the stance foot is momentarily still, and "still" is a free, exact measurement of velocity: zero. Feeding that fact back into the filter as a pseudo-measurement, the zero-velocity update or ZUPT, converts an unbounded drift into a small per-step wobble. We build the foot-mounted ZUPT-aided navigator from the detector up, then contrast it with the lighter-weight step-and-heading style of pedestrian dead reckoning used when the sensor is on the wrist or in a pocket. Together they are how a firefighter, a warehouse robot, or a phone maps a building with no external signal.</p>
+</div>
+
+<p>This section builds directly on inertial navigation and its drift (<a class="cross-ref" href="section-24.4.html">Section 24.4</a>) and on the stance-phase detection developed for gait (<a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>). The correction machinery is an error-state Kalman filter, so if the extended Kalman filter feels shaky, revisit the <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Kalman family in Chapter 9</a>. We assume orientation is already tracked (Sections 24.1 to 24.3) so that specific force can be rotated into the navigation frame and gravity subtracted.</p>
+
+<h2>The zero-velocity update as a pseudo-measurement</h2>
+<p>Mount an IMU on the foot, at the instep or heel. Strap-down integration propagates the standard mechanization: rotate body-frame specific force \(\mathbf{f}^b\) into the navigation frame, subtract gravity, integrate once for velocity and twice for position. Left alone, this drifts. But during the stance phase, from foot-flat to toe-off, the foot velocity is genuinely zero for roughly 0.2 to 0.5 seconds each step. When a stance instant is detected, we assert a measurement</p>
+$$ \mathbf{z}_k = \hat{\mathbf{v}}_k = \mathbf{0} + \boldsymbol{\eta}_k, \qquad \boldsymbol{\eta}_k \sim \mathcal{N}(\mathbf{0}, \mathbf{R}), $$
+<p>where \(\hat{\mathbf{v}}_k\) is the filter's current velocity estimate and \(\mathbf{R}\) encodes how close to zero we believe the foot really is. The measurement residual \(\mathbf{z}_k - \mathbf{0}\) is simply the drifted velocity, and the Kalman gain distributes that correction back not only onto velocity but, through the error-state covariance, onto the accelerometer and gyroscope biases and onto orientation. This last part is the quiet magic: ZUPT does not merely zero the velocity, it observes and trims the biases that caused the drift in the first place, so the position error between steps shrinks too. The result turns an \(O(t^3)\) position-error growth into an error that grows roughly with distance travelled, at typically 0.2 to 1 percent of path length for a well-tuned foot-mounted system.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">ZUPT corrects the cause, not just the symptom</h3>
+<p>It is tempting to think a zero-velocity update just clamps velocity to zero at each footfall. If that were all, position would still ratchet outward, because each swing phase would restart from a fresh, uncorrected bias. The reason ZUPT works so well is that in the error-state formulation velocity error is coupled to bias and tilt error through the state-transition matrix. Observing velocity error therefore makes those hidden states observable, and the filter subtracts the estimated accelerometer bias on every future integration step. One free scalar fact, repeated once per stride, renders the dominant error sources observable. That is why the vertical channel, normally the worst in inertial navigation, becomes usable for stair and floor counting.</p>
+</div>
+
+<h2>Detecting the zero-velocity interval</h2>
+<p>Everything hinges on correctly deciding <em>when</em> the foot is still. Declare stance too often and you inject false zeros during the swing, corrupting the estimate; declare it too rarely and drift creeps back. The classic family of detectors thresholds a windowed statistic. The acceleration-magnitude detector flags stance when \(\lVert \mathbf{f}^b \rVert\) sits near \(g\); the angular-rate energy detector flags it when gyroscope energy is low; the widely used SHOE detector (stance hypothesis optimal estimation) is a generalized likelihood-ratio test that fuses both, comparing accelerometer and gyroscope energy in a short window against thresholds. Because these thresholds are gait- and speed-dependent, a fixed setting that is right for a walk fires late during a run and chatters during a slow shuffle, which is why learned and adaptive stance detectors are an active research thread.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: learned and adaptive stance detection</h3>
+<p>Fixed-threshold detectors like SHOE and ARED degrade sharply across gait modes (walk, jog, crawl, stairs) and footwear. Recent work replaces the threshold with a learned classifier: small LSTM or temporal-convolution networks (for example the SmartZUPT and related lines around 2019 to 2023) predict the zero-velocity label per sample from the raw IMU window, and adaptive-threshold schemes retune the SHOE decision boundary online from the estimated speed. The frontier now blends this with learned inertial odometry, treating the network's stance probability as a soft measurement covariance rather than a hard gate, which is exactly the bridge to the data-driven methods of <a class="cross-ref" href="section-24.6.html">Section 24.6</a>.</p>
+</div>
+
+<p>The snippet below implements a SHOE-style detector and applies the resulting zero-velocity flag as a hard velocity reset, the pedagogical minimal version of a ZUPT. A production system feeds the same flag into an error-state EKF instead of hard-resetting.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def shoe_detector(acc, gyr, fs, g=9.81,
+                  sigma_a=0.5, sigma_w=0.1, win=15, gamma=3.5e5):
+    # acc: (N,3) m/s^2, gyr: (N,3) rad/s from a foot-mounted IMU.
+    N = len(acc)
+    zv = np.zeros(N, dtype=bool)
+    half = win // 2
+    for k in range(half, N - half):
+        sl = slice(k - half, k + half + 1)
+        a_win = acc[sl]
+        w_win = gyr[sl]
+        a_mean = a_win.mean(axis=0)
+        ahat = g * a_mean / np.linalg.norm(a_mean)   # expected gravity direction
+        # Generalized likelihood ratio: accel deviation from g + gyro energy.
+        T = (np.sum((a_win - ahat) ** 2) / sigma_a**2 +
+             np.sum(w_win ** 2) / sigma_w**2) / win
+        zv[sl] = zv[sl] | (T < gamma)                # below threshold => stance
+    return zv
+
+def zupt_track(acc_nav, zv, fs):
+    # acc_nav: (N,3) gravity-removed acceleration already in the nav frame.
+    dt = 1.0 / fs
+    vel = np.zeros_like(acc_nav)
+    pos = np.zeros_like(acc_nav)
+    for k in range(1, len(acc_nav)):
+        vel[k] = vel[k-1] + acc_nav[k] * dt
+        if zv[k]:
+            vel[k] = 0.0                             # zero-velocity update
+        pos[k] = pos[k-1] + vel[k] * dt
+    return pos, vel
+</code></pre>
+<div class="code-caption">A minimal ZUPT tracker: <code>shoe_detector</code> flags stance from windowed accelerometer-plus-gyroscope energy, and <code>zupt_track</code> hard-resets velocity to zero on every stance sample. The hard reset shown here is the didactic form; a deployed system routes the zero-velocity residual through an error-state EKF so biases are also corrected.</div>
+
+<h2>Pedestrian dead reckoning when the foot is out of reach</h2>
+<p>Foot-mounted ZUPT is superb but impractical for a consumer phone or a wristband, where there is no crisp stance signal. The alternative, pedestrian dead reckoning in the step-and-heading form, discards continuous integration entirely. It detects each step as an event (<a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>), estimates a scalar step length \(l_i\), reads a heading \(\psi_i\), and advances the position one stride at a time:</p>
+$$ x_i = x_{i-1} + l_i \cos\psi_i, \qquad y_i = y_{i-1} + l_i \sin\psi_i. $$
+<p>Step length is not measured directly; it is inferred from step frequency and acceleration variance through empirical models. The Weinberg model, \(l_i = K\,(a_{\max}-a_{\min})^{1/4}\), and the linear frequency model \(l_i = a + b f_{\text{step}}\) are both common, with the gain calibrated per user. Because the model is coarse, step-and-heading drift is dominated by two coupled errors: step-length scale error, which stretches or shrinks the whole trajectory, and heading error, which curls it. Heading is the more dangerous of the two, since a slow gyroscope yaw drift, unobservable without an external reference, rotates the entire subsequent path.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Tracking firefighters through a smoke-filled building</h3>
+<p>An incident-command system straps a foot-mounted IMU to each firefighter entering a structure fire, where GNSS is dead and camera-based mapping is blinded by smoke. The commander needs to know which floor and which room each responder is in. A pure INS would place them in the neighbouring building within a minute. The ZUPT-aided navigator instead holds sub-2-percent-of-distance accuracy for the first several minutes, and crucially its corrected vertical channel counts stair flights reliably enough to report floor level. The residual problem is heading: the magnetometer is useless near steel structure and current-carrying cables, so yaw slowly drifts and the tracked path bends away from the true corridor. The deployed fix pairs ZUPT with occasional heading anchors, a known door heading at entry, and building-layout map matching, exactly the fusion story picked up in <a class="cross-ref" href="../module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>.</p>
+</div>
+
+<h2>Heading, and the errors ZUPT cannot fix</h2>
+<p>ZUPT makes velocity error and, through it, tilt and accelerometer bias observable, but it says nothing about yaw. Rotation about the gravity vector leaves the specific-force measurement unchanged, so heading drift is fundamentally unobservable from a zero-velocity update alone. Two partial remedies are standard. The zero-angular-rate update (ZARU) exploits stance instants when the whole body is still, not just the foot, to observe gyroscope bias, which slows yaw drift. Heuristic drift reduction (HDR) assumes indoor walking follows dominant building headings (corridors meet at right angles) and gently snaps heading toward the nearest cardinal-ish direction. Both are crutches; the durable solution is fusing an absolute heading or position reference, whether a magnetometer where the field is clean, a map constraint, or an RF fix, which is why pedestrian dead reckoning is almost never deployed alone. Estimating and propagating the heading uncertainty honestly (<a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>) is what lets a downstream fusion stage weight the dead-reckoned track correctly against those references.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: OpenShoe and existing ZUPT-INS stacks</h3>
+<p>A from-scratch foot-mounted navigator, mechanization plus SHOE detector plus a fifteen-state error-state EKF with bias and tilt states, is several hundred lines and a week of covariance-tuning grief. The open OpenShoe project and the <code>pyshoe</code> reference implementation ship a calibrated ZUPT-aided INS and the SHOE detector as tested modules, collapsing that to roughly one setup call plus your data loader. Filter primitives from <code>filterpy</code> similarly provide the EKF plumbing. Build the loop above once by hand to understand what the covariance coupling buys you, then adopt a validated stack for anything shipped.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take a foot-mounted IMU walk (or synthesize one: a repeating stance-swing acceleration profile plus a constant 0.02 m/s^2 accelerometer bias and white noise). First integrate with no correction and plot the position error versus time; confirm it grows super-linearly. Then run the SHOE detector and the ZUPT tracker and re-plot. Now sweep the threshold \(\gamma\) across two orders of magnitude and report how the closed-loop position error and the fraction of samples labelled stance both change. Identify the failure mode at each extreme.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. A ZUPT resets velocity to zero at every footfall, yet position still slowly drifts. Which error component is responsible, and why is it invisible to a zero-velocity update?</p>
+<p>2. Explain, in terms of the error-state coupling, why ZUPT improves the accelerometer-bias estimate rather than only the velocity.</p>
+<p>3. Your step-and-heading track has the right shape but is uniformly too short by 8 percent. Is this most likely a step-length or a heading error, and which parameter would you recalibrate?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-24.6.html">Section 24.6</a>, we replace the hand-built detector-plus-filter pipeline with a learned inertial odometry network in the IONet style, which regresses displacement directly from raw IMU windows and sidesteps the brittle stance-threshold that this section leaned on so heavily.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

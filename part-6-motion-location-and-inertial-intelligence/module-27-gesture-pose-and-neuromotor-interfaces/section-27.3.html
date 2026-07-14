@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.3: Wearable hand/body pose sensing. Building Sensory AI." name="description"/>
+<title>Section 27.3: Wearable hand/body pose sensing | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Gesture, Pose, and Neuromotor Interfaces</a></div>
+<h1>Wearable hand/body pose sensing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Tell me eleven joint angles and I will draw you a hand. Tell me six accelerations and I will guess the other forty."</p><cite>A Kinematically Constrained AI Agent</cite></blockquote>
+
+<div class="prerequisites"><h3>Prerequisites</h3><p>This section builds directly on the inertial measurement of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> (what an accelerometer and gyroscope actually report) and on the orientation-estimation and drift material of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>, since every body-worn pose system lives or dies by how it fights integration drift. The estimation-under-uncertainty framing comes from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>, and the recurrent sequence models we use to lift sparse sensors to full pose are developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>. Unlike Section 27.2, which classifies discrete inertial gestures, this section estimates a continuous articulated configuration.</p></div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A gesture is a label; a <em>pose</em> is a full articulated configuration: every joint angle of the hand, or the orientation of every segment of the body, recovered continuously in real time. That is a far richer and far harder target. A human hand has roughly 20 to 27 degrees of freedom; a full body skeleton has more than 50. Camera-based motion capture solves this from the outside, but wearables must solve it from the inside, with a handful of sensors strapped to a moving, deforming, sweating body. This section is about that inversion: how flex, stretch, magnetic, and inertial sensors report a low-dimensional shadow of a high-dimensional pose, and how a kinematic model plus a learned prior turns six noisy signals into a plausible forty-joint skeleton. Get this right and you drive avatars, surgical training, rehabilitation, and dexterous teleoperation from a garment instead of a camera rig.</p>
+</div>
+
+<h2>What "pose" means, and why it is underdetermined</h2>
+<p>Represent a hand or body as a kinematic tree: a root segment and a chain of rigid links connected by joints, each joint contributing one or more rotational degrees of freedom. The <strong>pose</strong> is the vector of joint angles \(\boldsymbol{\theta}\); <strong>forward kinematics</strong> maps \(\boldsymbol{\theta}\) to the 3D position of every landmark \(\mathbf{p}_i = \mathrm{FK}_i(\boldsymbol{\theta})\) by composing per-joint rotations down the chain. Pose sensing is the inverse: recover \(\boldsymbol{\theta}\) from measurements. The central difficulty is that wearable sensors are almost always fewer than the degrees of freedom. A five-sensor bend glove gives one number per finger; the hand has three flexion joints per finger plus abduction. Six body-worn IMUs must explain a skeleton with dozens of joints. The map from measurements to pose is therefore <em>underdetermined</em>: many poses fit the data equally well, so recovery is impossible without a prior over how bodies actually move. That prior, whether a hand-tuned coupling ratio or a learned distribution, is the real product of this section.</p>
+
+<h2>Instrumenting the hand: bend, stretch, and magnetic gloves</h2>
+<p>Data gloves attach a sensor across each joint so its output tracks joint angle directly. Three transduction families dominate. <strong>Resistive bend sensors</strong> (the classic CyberGlove approach) are strips whose resistance changes as they flex; two per finger capture the two main flexion joints, and the transfer is near-linear over the usable range but drifts with temperature and glove fit. <strong>Capacitive stretch sensors</strong> use a soft elastomer dielectric whose capacitance rises as it stretches over a knuckle; they are washable, conform to the skin, and are the basis of modern soft sensing gloves, at the cost of hysteresis and a slow viscoelastic relaxation you must model or filter out (the denoising tools of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a> apply directly). <strong>Magnetic and inertial gloves</strong> place a tiny IMU or a magnetic tracker (Polhemus-style) on each fingertip and phalanx, giving orientation rather than a single bend scalar, which resolves abduction and the subtle joints a single bend strip misses, but multiplies wiring, power, and calibration burden.</p>
+<p>Whatever the transducer, the glove reports a per-sensor scalar or orientation that must be turned into anatomically valid joint angles. This needs a <strong>per-user calibration</strong>: the same finger flex produces different raw values on different hands and different glove donnings, so systems ask the user to make a few canonical poses (flat hand, fist, spread) and fit an affine or piecewise map from raw signal to angle. Skipping calibration is the single most common reason a glove that demoed well feels wrong on a new user, a cross-user generalization problem that Section 27.5 attacks head-on for neuromotor signals.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>A wearable never measures pose; it measures a projection of pose plus drift plus body-fit nuisance. The information you are missing is supplied by the kinematic model and a motion prior, not by the sensor. This is why the strongest hand and body trackers are not "better sensors" but better <em>priors</em>: they exploit the fact that human joints are coupled (you cannot bend the last knuckle without the middle one moving), that limbs have fixed lengths, and that real motion occupies a tiny, smooth manifold of the combinatorially huge joint-angle space. The sensor picks the point on that manifold; the prior supplies the manifold.</p>
+</div>
+
+<h2>Full-body inertial mocap and the sparse-IMU problem</h2>
+<p>For the whole body, the dominant wearable approach straps an IMU to each major segment. A dense suit (Xsens MVN uses 17 IMUs; Perception Neuron is similar) covers pelvis, spine, upper and lower limbs, and hands. Each IMU gives a segment orientation via the fusion of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a>; a skeletal model with known bone lengths then chains those orientations into a full pose and, by integrating the root, an approximate trajectory in space. The two enemies are familiar from dead reckoning: <strong>orientation drift</strong> (gyro bias integrated over time, corrected by accelerometer gravity and, where available, magnetometer heading) and <strong>positional drift</strong> of the un-anchored root, which is why inertial suits use foot-contact detection as a zero-velocity update to pin the feet and bound accumulated error.</p>
+<p>Seventeen IMUs is accurate but intrusive; nobody wears a full suit to answer email. The research frontier is the <strong>sparse</strong> regime: recover a full body pose from only five or six IMUs (head, wrists, lower legs, pelvis), or even from the sensors already in a phone, watch, and earbuds. This is severely underdetermined, and it is exactly where learned priors earn their place.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def finger_fk(theta, L=(0.045, 0.028, 0.020)):
+    """Planar forward kinematics of one finger: 3 flexion joints -> fingertip (x, y).
+    theta: (mcp, pip, dip) joint angles in radians. L: phalanx lengths (m)."""
+    x = y = 0.0
+    a = 0.0                      # cumulative angle along the chain
+    for ang, l in zip(theta, L):
+        a += ang                 # each joint rotates relative to the previous segment
+        x += l * np.cos(a)
+        y += l * np.sin(a)
+    return np.array([x, y])
+
+def angles_from_bend(bend, coupling=0.66):
+    """One bend scalar per finger -> 3 joint angles using an anatomical coupling prior.
+    A single sensor underdetermines 3 DOF; the prior distributes flexion across joints."""
+    mcp = bend                                   # sensor tracks the base knuckle
+    pip = coupling * bend                         # coupled: distal joints follow, scaled
+    dip = coupling * coupling * bend
+    return np.array([mcp, pip, dip])
+
+bend = np.deg2rad(60)                             # sensor reads a 60-degree base flexion
+theta = angles_from_bend(bend)
+print("joint angles (deg):", np.round(np.rad2deg(theta), 1))
+print("fingertip (mm):    ", np.round(finger_fk(theta) * 1000, 1))
+</code></pre>
+<div class="code-caption">A minimal hand-pose pipeline: one bend scalar per finger is expanded to three joint angles by an anatomical coupling prior, then forward kinematics places the fingertip. The <code>coupling</code> constant is the entire "model" that resolves the two missing degrees of freedom; a learned prior replaces this hand-picked ratio with a data-driven distribution. Referenced in the underdetermination and learned-prior discussions.</div>
+
+<p>The code above makes the underdetermination concrete: one sensor, three unknowns, closed only by the <code>coupling</code> constant. Replace that constant with a network trained on real hand motion and you have the modern approach.</p>
+
+<h2>Learned priors: lifting sparse sensors to full pose</h2>
+<p>The state of the art casts sparse-IMU pose estimation as sequence-to-sequence regression onto a parametric body model. The near-universal target is <strong>SMPL</strong> (Loper et al., 2015), which represents any body as a low-dimensional pose-and-shape vector that decodes to a full mesh, so the network predicts a compact code instead of dozens of raw angles. <strong>DIP</strong> (Deep Inertial Poser, Huang et al., 2018) first showed a bidirectional RNN mapping six IMUs to full SMPL pose in real time. <strong>TransPose</strong> (Yi et al., 2021) added a multi-stage design that also estimates global translation from the same six sensors, and <strong>PIP</strong> and <strong>Transformer Inertial Poser</strong> (2022) folded in a physics prior and attention so the recovered motion respects balance and foot contact rather than floating or sliding. <strong>IMUPoser</strong> (Mollyn et al., 2023) pushed the idea to the sensors people already carry, a phone, a watch, and earbuds, accepting lower fidelity for zero extra hardware.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The live problem is <em>physically plausible</em> pose from ever-fewer sensors. TransPose and PIP set the modern bar for six-IMU real-time full-body capture, and physics-aware variants now suppress the foot-skating and ground-penetration artifacts that pure regression produces. Two directions are hot: (1) fusing sparse IMUs with a sparse visual or electromagnetic anchor to bound global drift, and (2) self-supervised pretraining on large unlabeled inertial corpora, following the wearable-foundation-model program of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>, so a single backbone transfers across users and sensor layouts without per-person retraining. The open weakness everywhere is heading drift from unreliable indoor magnetometers, which still forces periodic re-anchoring.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: a stroke-rehab glove that had to trust the prior</h3>
+<p>A neurorehabilitation group built a soft capacitive-stretch glove to track home exercises for stroke survivors relearning hand control. The clinical requirement was a faithful joint-angle trace for the therapist, not a game score. Two realities broke the naive readout. First, hemiparetic hands exhibit abnormal <em>coupling</em>: patients often cannot flex one finger without the neighbors flexing too, so a healthy-hand coupling prior systematically mis-estimated exactly the impairment the clinician needed to see. Second, the elastomer's viscoelastic creep meant a held fist slowly drifted in the raw signal even as the hand stayed still. The team fixed both by separating the two roles the prior was silently playing: they kept a strong kinematic prior for bone lengths and joint limits (which are patient-independent) but <em>learned the coupling per patient</em> from a short calibration session, and they modeled the creep as a slow baseline they subtracted, much as the capacitive front end of Section 27.1 tracks and removes drift. The result recovered the pathological coupling as signal instead of erasing it as noise, the exact failure mode a one-size-fits-all prior invites in clinical use.</p>
+</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-build the kinematic tree</h3>
+<p>Composing per-joint rotations, enforcing bone lengths, and decoding to a mesh is hundreds of lines of quaternion bookkeeping that is easy to get subtly wrong (a flipped axis desyncs the whole chain). A parametric-body library does it for you: with the official SMPL/SMPL-X <code>body_models</code> package you pass a pose-and-shape tensor and get posed joints and a full mesh back in about five lines, replacing a multi-hundred-line forward-kinematics and skinning implementation. Feed it the pose your network predicts and it handles skinning, joint regression, and shape blending; hand-roll the tree only for teaching, exactly as the toy code above does.</p>
+</div>
+
+<h2>Fusion, drift, and when a wearable is the right choice</h2>
+<p>Choose a <strong>bend or stretch glove</strong> when you need hand joint angles in a garment, tolerate per-user calibration, and want washable comfort over per-finger orientation. Choose a <strong>per-segment IMU glove or suit</strong> when you need full 3D orientation and abduction and can pay the wiring and calibration cost. Choose the <strong>sparse learned approach</strong> when unobtrusiveness beats millimeter accuracy, for consumer avatars, fitness, and always-on interaction. In every case the wearable's blind spot is <em>global position</em>: IMUs are dead-reckoning devices whose absolute translation drifts without an external anchor, which is why serious systems fuse them with the localization sources of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>, or with a camera, and why the sensor-fusion machinery of <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-48-foundations-of-sensor-fusion/index.html">Chapter 48</a> underlies every production body tracker. Pose feeds forward too: the joint-angle stream this section produces is the input to the activity and behavior recognition of <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a> and to the dexterous teleoperation of robots in <a class="cross-ref" href="../../part-11-tactile-embodied-and-robotic-sensing/module-57-proprioception-exteroception-and-robot/index.html">Chapter 57</a>.</p>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have six body-worn IMUs (head, both wrists, both lower legs, pelvis) streaming orientation at 60&nbsp;Hz, and you want a full SMPL pose. (1) Explain, using the degree-of-freedom count, why a per-frame least-squares fit of joint angles to the six orientations is ill-posed, and name the two priors that make it solvable. (2) The recovered figure "skates" (feet slide along the floor) during walking. Which physical constraint is missing, and how would a zero-velocity foot-contact update or a physics term remove the artifact? (3) Design a leakage-safe evaluation: given a dataset of 30 subjects, how do you split train and test so a reported joint-angle error reflects true cross-user generalization rather than memorized body shapes (recall the discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>)?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. What does forward kinematics compute, and why is pose sensing the harder inverse of it?<br/>
+2. A single bend sensor per finger cannot recover all three flexion angles. What supplies the missing information, and what goes wrong when that prior is copied from healthy hands onto an impaired one?<br/>
+3. Why do inertial pose suits detect foot contact, and which kind of drift does that detection specifically bound?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-27.4.html">Section 27.4</a>, we move from measuring the moving hand to measuring the <em>intent to move</em> it, reading the surface electromyographic signals of the forearm muscles before the fingers act. That shifts the sensing target upstream of kinematics entirely, and it is the basis of the Meta neuromotor wristband and the emg2qwerty typing benchmark.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.4: Map matching. Building Sensory AI." name="description"/>
+<title>Section 25.4: Map matching | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Localization, GNSS, and RF Positioning</a></div>
+<h1>Map matching</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"I was seven meters into a lake, according to the satellites. The map insisted there was a bridge. I chose to believe the map."</p><cite>A Well-Grounded AI Agent</cite></blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The big picture</h3>
+<p>A raw position fix is a cloud of probability, not a point. Around it sits something you already know with near-certainty: the physical world is not a blank plane. Vehicles travel on roads, trains on rails, pedestrians along corridors and past walls. Map matching is the art of folding that geometric prior into the estimate, snapping a noisy trajectory onto the network it must physically have followed. Done well it turns a jittery 10-meter GNSS track into a lane-accurate route; done naively it teleports you across a river. This section is about doing it well: the geometric baseline, why it breaks, and the hidden Markov formulation that replaced it in nearly every production system.</p>
+</div>
+
+<p>This section assumes you are comfortable with a Gaussian noise model for a position fix (Section 25.1 covered GNSS error sources, and the probability machinery lives in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-04-probability-estimation-and-uncertainty-primer/index.html">Chapter 4</a>). Map matching is a spatial constraint applied <em>after</em> positioning, so it composes naturally with the dead-reckoning trajectories from <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-24-orientation-estimation-and-dead-reckoning/index.html">Chapter 24</a> and the RF fixes from Section 25.2.</p>
+
+<h2>What map matching is, and why a map is such a strong prior</h2>
+
+<p>Formally, you are given a sequence of noisy position observations \(z_1, \dots, z_T\) and a map represented as a graph: a set of edges (road segments, corridor centerlines, rail links) with geometry. The goal is to output, for each observation, the map location it corresponds to, and by extension the connected path through the network. The prior is strong because the map removes almost all of the state space. A GNSS fix with 8 meters of standard deviation covers roughly 200 square meters of plausible ground; within that patch there may be only one road, occupying a fraction of a percent of the area. If you trust the map, you have compressed your uncertainty by two orders of magnitude for free.</p>
+
+<p>The catch is that the map is a prior, not an oracle. It can be stale (a new road, a closed lane), it can be topologically dense (a cloverleaf interchange stacks four roadways within GNSS error of each other), and the vehicle can legitimately leave it (a car in a parking lot, a pedestrian cutting across a plaza). Every good matcher is therefore a balance between trusting geometry and admitting that the observation might mean what it says.</p>
+
+<h2>The geometric baseline and where it snaps to the wrong road</h2>
+
+<p>The simplest matcher is point-to-curve snapping: for each fix, find the nearest point on the nearest edge and report that. It is one line of computational geometry and it is genuinely useful for coarse display. Its weakness is that it is memoryless. It has no notion that the previous point was on Elm Street, so at an intersection where two roads pass within a few meters it will happily flip between them fix by fix, producing a route that zig-zags across the junction like a nervous pinball. Point-to-curve also ignores heading: a fix that is geometrically closest to a cross-street can be assigned there even when your velocity vector is clearly along the main road.</p>
+
+<p>Incremental (topological) matchers patch this by scoring candidate edges with a weighted sum of perpendicular distance, heading agreement, and connectivity to the previously chosen edge. They are fast and streaming-friendly, and for clean highway data they are hard to beat. But a greedy per-step decision dooms them in dense networks: one confident wrong turn onto a parallel service road, and every subsequent point is scored relative to that mistake with no mechanism to recover. What you want is a method that defers commitment, weighing whole hypotheses of the path rather than one point at a time.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key insight</h3>
+<p>Map matching is not a nearest-neighbor problem, it is a shortest-path-through-hypotheses problem. The right answer for the fix at time \(t\) can depend on an observation at time \(t+5\), because only later do you learn which branch of an ambiguous junction the trajectory actually committed to. Any matcher that decides each point in isolation will, sooner or later, drive into the lake.</p>
+</div>
+
+<h2>The HMM formulation that won</h2>
+
+<p>The dominant approach, popularized by Newson and Krumm in 2009 and now the backbone of OSRM, Valhalla, and most fleet products, casts map matching as decoding a hidden Markov model. The hidden state at each timestep is <em>which road segment the vehicle is on</em>; the observations are the GNSS fixes. Two probabilities define the model.</p>
+
+<p>The <strong>emission probability</strong> answers "how likely is this fix given that I am really on segment \(r\)?" It is a Gaussian on the great-circle distance from the fix \(z_t\) to its closest point \(x_{t,r}\) on the segment:</p>
+
+$$p(z_t \mid r) = \frac{1}{\sqrt{2\pi}\,\sigma_z}\exp\!\left(-\frac{\lVert z_t - x_{t,r}\rVert^2}{2\sigma_z^2}\right)$$
+
+<p>where \(\sigma_z\) is the positioning noise, typically estimated from the fix's own accuracy field or a fixed value near the GNSS error floor. The <strong>transition probability</strong> answers "how plausible is moving from segment \(r\) at time \(t\) to segment \(s\) at time \(t+1\)?" The insight is that on a real road network the driving distance between the two matched points should be close to the straight-line distance the receiver actually moved. Large discrepancies mean the route would require an implausible detour, so they are penalized with an exponential (equivalently, the difference is modeled as an empirically near-exponential variable):</p>
+
+$$p(s \mid r) \propto \exp\!\left(-\frac{\lvert\, d_{\text{route}}(r,s) - d_{\text{gc}}(z_t, z_{t+1})\,\rvert}{\beta}\right)$$
+
+<p>Here \(d_{\text{route}}\) is the network shortest-path distance between the candidate points, \(d_{\text{gc}}\) is the great-circle distance between consecutive fixes, and \(\beta\) controls tolerance for detours. Decoding the single most likely state sequence is then the classic Viterbi problem: the maximum-probability path through a trellis whose columns are timesteps and whose rows are candidate segments. This is why we said map matching is a shortest-path problem in disguise. The Viterbi backpointer is exactly the mechanism that lets a late observation correct an earlier ambiguous choice.</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Toy HMM map matcher. Two parallel roads (A, B) ~15 m apart.
+# candidates[t] = list of (segment_id, snapped_xy) for fix z[t]
+# We score emission (fix-to-segment distance) and transition
+# (route distance vs. straight-line move) and run Viterbi.
+
+sigma_z, beta = 8.0, 30.0            # GNSS noise (m), detour tolerance (m)
+
+def emission_logp(fix, snap):
+    d = np.linalg.norm(np.asarray(fix) - np.asarray(snap))
+    return -0.5 * (d / sigma_z) ** 2
+
+def transition_logp(prev_snap, cur_snap, fix_prev, fix_cur, route_dist):
+    d_gc = np.linalg.norm(np.asarray(fix_cur) - np.asarray(fix_prev))
+    return -abs(route_dist - d_gc) / beta
+
+def viterbi(fixes, candidates, route):
+    T = len(fixes)
+    log = [{} for _ in range(T)]     # segment_id -> best log-prob
+    bp  = [{} for _ in range(T)]     # segment_id -> predecessor
+    for seg, snap in candidates[0]:
+        log[0][seg] = emission_logp(fixes[0], snap)
+        bp[0][seg] = None
+    for t in range(1, T):
+        for seg, snap in candidates[t]:
+            best, best_prev = -np.inf, None
+            for pseg, psnap in candidates[t - 1]:
+                score = (log[t - 1][pseg]
+                         + transition_logp(psnap, snap, fixes[t - 1],
+                                           fixes[t], route[(pseg, seg)]))
+                if score > best:
+                    best, best_prev = score, pseg
+            log[t][seg] = best + emission_logp(fixes[t], snap)
+            bp[t][seg] = best_prev
+    seg = max(log[T - 1], key=log[T - 1].get)   # backtrack
+    path = [seg]
+    for t in range(T - 1, 0, -1):
+        seg = bp[t][seg]
+        path.append(seg)
+    return path[::-1]
+</code></pre>
+<div class="code-caption">A minimal Viterbi map matcher: emission scores fix-to-road distance, transition penalizes routes whose network length disagrees with the observed straight-line movement. The <code>route</code> dictionary supplies precomputed shortest-path distances between candidate segments; a production system computes these on demand from the road graph.</div>
+
+<p>The code above is the whole idea in forty lines. In practice you replace the toy <code>route</code> lookup with an on-demand shortest-path query over the real network (Dijkstra or contraction hierarchies), gate candidates to those within a few \(\sigma_z\) of each fix to keep the trellis small, and handle the pathological case where no route connects two candidates by assigning a floor probability. The particle-filter alternative from <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-10-nonlinear-and-particle-filtering/index.html">Chapter 10</a> represents the same posterior with samples instead of a discrete trellis, which is what you reach for indoors when the "map" is a set of walls that particles must not cross.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Practical example: last-mile delivery in an urban canyon</h3>
+<p>A logistics company runs cargo e-bikes through a downtown grid where GNSS multipath (Section 25.1) routinely throws fixes 20 meters sideways, straight through building facades. Raw traces made the routing analytics useless: the system reported riders on the wrong one-way streets and computed impossible turn sequences. Switching to an HMM matcher with \(\sigma_z\) driven by each fix's reported accuracy and \(\beta\) tuned to the block size collapsed the error. The transition term did the heavy lifting: a fix flung onto a parallel street would require the route to leave and re-enter the correct road within one sample, a detour the exponential penalty made overwhelmingly unlikely. Matched-route quality rose enough that the team could finally measure per-rider dwell time and detour rate, the metrics the whole analytics effort existed to produce.</p>
+</div>
+
+<h2>Online, offline, and the indoor case</h2>
+
+<p>The Viterbi decode above is offline: it needs the whole sequence before it commits. For post-hoc analytics (fleet reports, trip reconstruction, HD-map trace mining) that is exactly right and gives the best accuracy. For live navigation you need an online variant. The standard trick is a fixed-lag decoder: run Viterbi over a sliding window of the last \(k\) fixes and emit the matched segment for the oldest point in the window, accepting a few seconds of latency in exchange for the correction power of a little future context. Pure greedy online matching is available too when latency is sacred, at the accuracy cost we described for incremental matchers.</p>
+
+<p>Indoors, the map is not a road graph but a floor plan, and the dominant constraint flips from "stay on the line" to "do not pass through walls." Here map matching usually rides inside a particle filter: each particle carries a pedestrian dead-reckoning state (from step detection and heading, per Chapter 24), and any particle whose proposed step crosses a wall polygon is killed. The surviving particle cloud is automatically constrained to the walkable space, and over a corridor or two it converges hard because the building geometry is so informative. This wall-constraint idea is a close cousin of the occupancy constraints used in <a class="cross-ref" href="../../part-10-sensor-fusion-world-models-and-spatial-ai/module-52-slam-and-spatial-ai/index.html">Chapter 52</a>, the difference being that in map matching the map is given rather than built.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: matchers you should not hand-roll in production</h3>
+<p>The teaching Viterbi above is about 40 lines and omits the road graph, shortest-path engine, candidate gating, and geodesic math that a real deployment needs, which together run to a few thousand lines. Established engines package all of it. Valhalla's <code>trace_attributes</code> Meili matcher or OSRM's <code>match</code> service will HMM-match a GPS trace against an OpenStreetMap network in a single HTTP call; the Python <code>leuven-mapmatching</code> library and <code>fmm</code> (Fast Map Matching, which precomputes an upper-bounded origin-destination table for speed) do it locally. You provide a list of coordinates and get back snapped points plus the traversed edge sequence, replacing that few-thousand-line stack with roughly ten lines of client code. Hand-roll the model to understand it; call the library to ship it.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Take the toy matcher and stress it. (1) Add a third candidate segment representing a cross-street at a T-junction and construct a fix sequence where point-to-curve snapping flips onto the cross-street for a single sample while Viterbi keeps the vehicle on the main road; confirm the transition penalty is what saves it. (2) Sweep \(\beta\) from 5 to 200 meters and plot how many segment switches the output contains. What does an over-large \(\beta\) do, and how does that failure differ from the failure at very small \(\beta\)?</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<ol>
+<li>Why does a memoryless point-to-curve matcher fail specifically at intersections and on parallel roads, and which term in the HMM directly repairs that failure?</li>
+<li>What real-world quantity does the transition probability compare against the network shortest-path distance, and why does a large mismatch imply an implausible match?</li>
+<li>You need matched positions live with sub-second latency for turn-by-turn guidance. Which decoding strategy do you choose, and what accuracy do you trade away versus an offline Viterbi decode?</li>
+</ol>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-25.5.html">Section 25.5</a>, we drop the assumption that positioning and motion are separate stages and fuse GNSS fixes directly with inertial measurements, letting the filter carry velocity and heading through the tunnels and urban canyons where satellites vanish and a map alone cannot save you.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

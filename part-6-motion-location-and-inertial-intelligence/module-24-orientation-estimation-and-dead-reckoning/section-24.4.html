@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.4: Inertial navigation and drift. Building Sensory AI." name="description"/>
+<title>Section 24.4: Inertial navigation and drift | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Inertial navigation and drift</h1>
+</header>
+<main class="content" id="main-content">
+
+    <blockquote class="epigraph">
+        <p>"Give me a perfect accelerometer and one honest second, and I will tell you where you are. Give me a real one and a full minute, and I will tell you a beautiful, confident lie."</p>
+        <cite>A Dead-Reckoning AI Agent</cite>
+    </blockquote>
+
+    <div class="callout big-picture">
+        <h3 class="callout-title">Why this section matters</h3>
+        <p>An inertial measurement unit senses acceleration and angular rate, nothing else. It never measures position. To turn those rates into a trajectory you must integrate, and integration is where a tiny, boring measurement error stops being boring: it compounds. This section is about the <em>mechanization</em> that converts raw inertial samples into position, velocity, and attitude, and about the <em>drift</em> that mechanization inevitably grows. Understanding drift is not pessimism; it is the design principle behind every navigation system on Earth. Once you can predict how fast an unaided solution rots, you know exactly how good your aiding source (GNSS, a wheel encoder, a camera, a foot-contact detector) has to be, and how often it must speak up. Everything after this section, from zero-velocity updates to GNSS-inertial fusion, exists to fight the growth curve you are about to derive.</p>
+    </div>
+
+    <p>This section assumes you can already carry an attitude estimate forward in time. <a class="cross-ref" href="section-24.1.html">Section 24.1</a> gave us quaternions and rotation matrices; <a class="cross-ref" href="section-24.2.html">Sections 24.2</a> and <a class="cross-ref" href="section-24.3.html">24.3</a> built filters that keep orientation honest against gravity and the magnetic field. We take that attitude solution as an input and ask the next question: given orientation, the specific-force reading of an accelerometer, and the raw physics of the sensors from <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>, how do we get to a <em>position</em>, and how badly does that position degrade over time? We write the navigation state as position \(\mathbf{p}\), velocity \(\mathbf{v}\), and attitude \(\mathbf{q}\) (or its matrix \(\mathbf{R}\)), all expressed in a navigation frame, and the raw IMU outputs as specific force \(\mathbf{f}^b\) and angular rate \(\boldsymbol{\omega}^b\) in the body frame.</p>
+
+    <h2>Strapdown mechanization: from raw samples to a trajectory</h2>
+    <p>A <em>strapdown</em> inertial navigation system bolts the sensors rigidly to the vehicle (as opposed to the old gimballed platforms that physically held a stable table) and does the stabilization in software. The core loop, called <em>mechanization</em>, runs three integrations in cascade every timestep. First, angular rate updates attitude. Second, the accelerometer's specific force is rotated into the navigation frame, gravity is added back, and the result is integrated into velocity. Third, velocity is integrated into position. In continuous time:</p>
+    $$\dot{\mathbf{q}} = \tfrac{1}{2}\,\mathbf{q}\otimes\begin{bmatrix}0\\ \boldsymbol{\omega}^b\end{bmatrix}, \qquad \dot{\mathbf{v}} = \mathbf{R}(\mathbf{q})\,\mathbf{f}^b + \mathbf{g}, \qquad \dot{\mathbf{p}} = \mathbf{v}.$$
+    <p>The key term is \(\mathbf{R}(\mathbf{q})\,\mathbf{f}^b + \mathbf{g}\). An accelerometer at rest on a table reads roughly \(+9.81\ \mathrm{m/s^2}\) upward, because it senses the normal force holding it up, not the gravitational field itself. Specific force is "acceleration minus gravity," so to recover kinematic acceleration you must <em>add</em> the gravity vector back after rotating the reading into the navigation frame. This single subtraction is the most error-sensitive step in the whole pipeline, and the next subsection explains why.</p>
+
+    <div class="callout key-insight">
+        <h3 class="callout-title">Attitude error leaks straight into position through gravity</h3>
+        <p>Because gravity is about \(9.81\ \mathrm{m/s^2}\), a tilt error of just one degree misaligns the gravity cancellation by \(9.81 \sin(1^\circ) \approx 0.17\ \mathrm{m/s^2}\). That phantom horizontal acceleration is indistinguishable from real motion. Integrated twice over \(60\) seconds it becomes \(\tfrac{1}{2}(0.17)(60)^2 \approx 308\) meters of position error, from a one-degree tilt alone. This is why orientation estimation (the previous three sections) is not a separate hobby from navigation: in a strapdown system, <strong>every attitude error becomes a position error</strong>, amplified by \(g\) and by double integration.</p>
+    </div>
+
+    <h2>The growth of drift: why unaided position error explodes</h2>
+    <p>Drift is what we call the accumulation of error in an integrated quantity. To see its shape, take the simplest possible fault: a constant accelerometer bias \(b_a\), a small offset the sensor adds to every reading. Integrating a constant bias once gives a velocity error that grows <em>linearly</em>, \(\delta v(t) = b_a\, t\). Integrating again gives a position error that grows <em>quadratically</em>:</p>
+    $$\delta p(t) = \tfrac{1}{2}\, b_a\, t^2.$$
+    <p>A gyroscope bias \(b_g\) is worse. It first corrupts attitude linearly, that tilt then couples into the gravity term, and the resulting acceleration error is integrated twice, so unaided position error from gyro bias grows <em>cubically</em>, proportional to \(g\, b_g\, t^3\). White noise on the sensors adds a random walk on top of these deterministic terms. The practical upshot is a hierarchy of time horizons: a good inertial solution is excellent for a fraction of a second, usable for a few seconds, and worthless after a minute unless something external corrects it. Table 24.4.1 makes the horizons concrete for representative bias levels.</p>
+
+    <figure>
+    <table>
+      <caption>Table 24.4.1. Unaided horizontal position drift from a single constant bias, holding everything else perfect. The quadratic and cubic laws mean the error is negligible at one second and catastrophic at one minute.</caption>
+      <thead>
+        <tr><th>Elapsed time</th><th>From accel bias \(b_a = 10\ \mathrm{mg}\) (\(\tfrac{1}{2}b_a t^2\))</th><th>From gyro bias \(b_g = 10\ ^\circ/\mathrm{h}\) (\(\tfrac{1}{6} g\, b_g\, t^3\))</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1 s</td><td>0.05 m</td><td>0.00008 m</td></tr>
+        <tr><td>10 s</td><td>4.9 m</td><td>0.08 m</td></tr>
+        <tr><td>60 s</td><td>177 m</td><td>17 m</td></tr>
+        <tr><td>600 s</td><td>17.7 km</td><td>17 km</td></tr>
+      </tbody>
+    </table>
+    </figure>
+    <p>Table 24.4.1 carries the lesson of the whole section. At short horizons the accelerometer bias dominates (its \(t^2\) starts faster); at long horizons the gyro's \(t^3\) overtakes everything. Neither is survivable unaided beyond a minute at these consumer-grade bias levels. The code below reproduces the accelerometer column so you can watch the parabola open up.</p>
+
+    <pre><code class="language-python">import numpy as np
+
+def dead_reckon_1d(accel, dt, bias=0.0):
+    """Integrate a 1-D specific-force stream into velocity and position."""
+    a = accel + bias                      # sensor adds a constant offset
+    v = np.cumsum(a) * dt                 # first integration -> velocity
+    p = np.cumsum(v) * dt                 # second integration -> position
+    return p
+
+fs, T = 100.0, 60.0                       # 100 Hz for 60 s
+dt = 1.0 / fs
+truth = np.zeros(int(T * fs))             # the object is actually stationary
+bias  = 10e-3 * 9.81                      # 10 mg expressed in m/s^2
+
+p_est = dead_reckon_1d(truth, dt, bias=bias)
+print(f"drift after {T:.0f}s from a 10 mg bias: {p_est[-1]:.1f} m")
+# drift after 60s from a 10 mg bias: 176.6 m
+</code></pre>
+    <div class="code-caption">A stationary object dead-reckoned with a 10 mg accelerometer bias. The double <code>cumsum</code> turns a constant offset into the \(\tfrac{1}{2}b_a t^2\) parabola, reaching 177 m of phantom travel in one minute while the object never moved.</div>
+
+    <h2>Modeling the error: the error-state formulation</h2>
+    <p>Rather than track the full nonlinear navigation state directly inside a filter, inertial engineers almost universally track a small linear <em>error state</em>: the deviation of the estimated position, velocity, and attitude from truth, together with the slowly varying sensor biases. The reason is practical. The true state spans hundreds of meters and many meters per second; the error state stays small, so its dynamics are well approximated by a linear model, which is exactly what a Kalman filter wants. The error propagates as \(\delta\dot{\mathbf{x}} = \mathbf{F}\,\delta\mathbf{x} + \mathbf{G}\,\mathbf{w}\), where \(\mathbf{F}\) encodes the couplings we just derived (velocity error feeds position, attitude error feeds velocity through gravity, gyro bias feeds attitude) and \(\mathbf{w}\) is the sensor noise driving the growth of covariance. This error-state Kalman filter is the backbone of GNSS-inertial navigation; we build the general machinery in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a> and specialize it to positioning in <a class="cross-ref" href="../module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>.</p>
+    <p>A crucial subtlety belongs to <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a>'s territory but bites hardest here: the sensor error model must include not just bias but scale-factor error and axis misalignment, and the biases themselves are temperature-dependent and turn-on-to-turn-on random. A calibration that ignores temperature will leave a residual bias that no filter can distinguish from motion until an aiding measurement contradicts it. This is also where sampling discipline from <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a> matters: an error in \(dt\), or unsynchronized accelerometer and gyroscope timestamps, injects its own drift that masquerades as bias.</p>
+
+    <div class="callout library-shortcut">
+        <h3 class="callout-title">Let a mechanization library do the strapdown loop</h3>
+        <p>A correct strapdown mechanization is more than the three-line cascade above: it needs quaternion normalization, the specific-force-to-navigation-frame rotation, gravity and (for long baselines) Coriolis and transport-rate terms, and coning/sculling correction for high-rate motion. Hand-rolled, a production-grade loop with an error-state filter runs to several hundred lines. Libraries such as <code>ahrs</code> and the strapdown utilities in <code>navpy</code> or <code>pyins</code> collapse the propagation to a handful of calls:</p>
+        <pre><code class="language-python">from ahrs.filters import EKF          # error-state INS/AHRS propagation
+ekf = EKF(gyr=gyro, acc=accel, frequency=100.0)
+attitude = ekf.Q                       # quaternion trajectory, coning-corrected</code></pre>
+        <div class="code-caption">A maintained INS/AHRS library replaces roughly 300 lines of mechanization and error-state bookkeeping with a few calls, handling quaternion integration, gravity handling, and numerical normalization internally.</div>
+        <p>Reach for the library for the mechanization plumbing; keep writing your own error budget by hand, because the drift analysis is the part you actually have to understand to design the system.</p>
+    </div>
+
+    <div class="callout practical-example">
+        <h3 class="callout-title">The automotive tunnel: 30 seconds without GNSS</h3>
+        <p>A production automotive navigation unit relies on GNSS for absolute position, but tunnels, urban canyons, and parking garages routinely black out the satellites for tens of seconds. During those gaps the system dead-reckons on its automotive-grade IMU plus wheel-speed and steering. Engineers size the IMU precisely against the worst expected outage: a 30-second tunnel with a curve. A gyro bias of \(10\ ^\circ/\mathrm{h}\) alone would build tens of meters of cross-track error over that span (Table 24.4.1), enough to place the car in the wrong lane at the exit. The fix is not a magic sensor; it is aiding. Wheel odometry pins the along-track velocity and the non-holonomic constraint (a car cannot slide sideways) pins the cross-track velocity, so the inertial solution only has to coast the short gaps between constraints. This is dead reckoning done right: inertial fills the milliseconds, cheaper sensors bound the drift, and GNSS re-anchors the moment it returns. The same tunnel with a raw phone IMU and no wheel aiding would drift into a neighboring building.</p>
+    </div>
+
+    <div class="callout research-frontier">
+        <h3 class="callout-title">Research frontier: learning to bound inertial drift</h3>
+        <p>The classical answer to drift is external aiding. A newer line replaces or augments the mechanization itself with learned models. TLIO (Liu et al., 2020, "TLIO: Tight Learned Inertial Odometry") trains a network to regress displacement and its uncertainty from raw IMU windows, then feeds those pseudo-measurements into a stochastic-cloning Kalman filter, cutting pedestrian drift by an order of magnitude over strapdown integration. RONIN (Herath et al., 2020) and the earlier IONet showed that a data-driven prior on human motion can constrain the double integral where physics alone cannot. The open frontier is generalization: a network trained on one carry pattern, device, or gait can inherit new biases on another, so uncertainty calibration (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>) is as important as the point estimate. We build these learned inertial-odometry models in <a class="cross-ref" href="section-24.6.html">Section 24.6</a>.</p>
+    </div>
+
+    <div class="callout exercise">
+        <h3 class="callout-title">Exercise: size the IMU for a 20-second dropout</h3>
+        <p>You are designing a delivery robot that loses GNSS for up to 20 seconds under dense tree cover and must not drift more than 2 meters horizontally during a gap. (1) Using \(\delta p = \tfrac{1}{2} b_a t^2\), what is the maximum tolerable constant accelerometer bias, in mg? (2) Using \(\delta p \approx \tfrac{1}{6} g\, b_g\, t^3\), what maximum gyro bias, in degrees per hour, meets the same 2-meter budget? (3) Which sensor is the binding constraint at 20 seconds, and how does the answer change if the dropout is only 5 seconds? Comment on whether a MEMS-grade IMU can meet the budget unaided, or whether you must add odometry.</p>
+    </div>
+
+    <div class="callout self-check">
+        <h3 class="callout-title">Self-check</h3>
+        <ol>
+            <li>An accelerometer at rest reads about \(+9.81\ \mathrm{m/s^2}\), yet it is not accelerating. Explain why in terms of specific force, and describe what the mechanization must add back before the second integration.</li>
+            <li>Rank the growth-with-time of position error from (a) a constant accelerometer bias, (b) a constant gyroscope bias, and (c) white accelerometer noise. Why does the gyro bias eventually dominate?</li>
+            <li>Why do inertial navigation systems track a small <em>error</em> state in the Kalman filter rather than the full navigation state directly? Give the practical reason in one sentence.</li>
+        </ol>
+    </div>
+
+    <h2>What's Next</h2>
+    <p>In <a class="cross-ref" href="section-24.5.html">Section 24.5</a>, we exploit the one moment a strapdown system gets a free measurement: when a foot is planted flat on the ground, its velocity is momentarily zero. Zero-velocity updates and pedestrian dead reckoning turn that fleeting physical fact into a recurring correction that clamps the very drift we just watched explode, and they do it without any external radio, camera, or map.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

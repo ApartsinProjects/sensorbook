@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.6: Learned inertial odometry (IONet-style). Building Sensory AI." name="description"/>
+<title>Section 24.6: Learned inertial odometry (IONet-style) | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Orientation Estimation and Dead Reckoning</a></div>
+<h1>Learned inertial odometry (IONet-style)</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I stopped integrating the accelerometer and started predicting where a person like this, moving like this, tends to end up. My error stopped exploding. Nobody told me walking was so predictable."</p>
+<cite>A Data-Driven AI Agent</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<h3 class="callout-title">Why this section matters</h3>
+<p>The previous two sections fought inertial drift with physics and hand-built logic: mechanize the strap-down equations, detect the stance phase, inject a zero-velocity pseudo-measurement, hand-calibrate a step-length model. It works, but it is brittle. The stance detector needs a foot mount and per-gait threshold tuning; the step-length model needs per-user calibration; the whole edifice cracks when the device is in a swinging hand, a jacket pocket, or a trouser pocket. Learned inertial odometry takes the opposite bet. Instead of double-integrating noisy acceleration, a neural network reads a short window of raw IMU samples and directly regresses how far and in what direction the device moved. It learns, from data, the very regularities that dead reckoning hand-codes: that people walk at bounded speeds, that gait is quasi-periodic, that the carrying pose constrains the motion. The payoff is a phone-in-pocket pedestrian tracker that holds a few meters of error over minutes with no external signal, no foot mount, and no per-user calibration. This section builds the idea from IONet forward, through the output-parameterization tricks that make it generalize, to the uncertainty-aware fusion that makes it deployable.</p>
+</div>
+
+<p>This section assumes the drift story of <a class="cross-ref" href="section-24.4.html">Section 24.4</a> and the ZUPT and pedestrian-dead-reckoning baselines of <a class="cross-ref" href="section-24.5.html">Section 24.5</a>, which learned inertial odometry is designed to replace. The models are sequence regressors, so the recurrent and temporal-convolutional architectures of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a> are the toolbox. We rely on the raw signal characteristics from <a class="cross-ref" href="../module-23-inertial-sensors-and-motion-signals/index.html">Chapter 23</a> and, for the fusion at the end, the Kalman machinery of <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>.</p>
+
+<h2>From double integration to direct regression</h2>
+<p>The root cause of inertial drift is that position is the double integral of a biased, noisy signal, so any constant accelerometer bias \(b\) becomes a position error that grows as \(\tfrac{1}{2} b t^2\). No amount of clever filtering removes an error that the very structure of the estimator amplifies. IONet, introduced by Chen and colleagues in 2018, reframes the problem to break this chain. Rather than estimating instantaneous acceleration and integrating it twice, it treats a fixed window of inertial samples (say two seconds of accelerometer and gyroscope, 200 samples at 100 Hz) as one input and regresses the <em>net displacement over that window</em> as one output. Formally, a network \(f_\theta\) maps a window of six-axis IMU data \(\mathbf{X}_t \in \mathbb{R}^{W \times 6}\) to a planar displacement expressed as a polar vector,</p>
+$$ (\Delta l_t,\ \Delta\psi_t) = f_\theta(\mathbf{X}_t), $$
+<p>where \(\Delta l_t\) is the distance travelled in the window and \(\Delta\psi_t\) is the change of heading. The full trajectory is then a simple sum of these short segments rather than a fragile chain of accelerations. Because the network sees a whole gait cycle at once, it can exploit the periodic acceleration signature to infer speed, the same information the Weinberg step-length model tries to capture with a single hand-picked exponent, but learned end to end and jointly with heading. IONet's original backbone is a two-layer bidirectional LSTM; later work shows temporal convolution and residual networks do at least as well.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">The network learns the motion prior that PDR hand-codes</h3>
+<p>Pedestrian dead reckoning works only because it injects strong human-motion priors: a step is a discrete event, step length is a smooth function of cadence and acceleration variance, heading changes slowly. Each of those priors is a hand-written equation with a coefficient someone tuned. Learned inertial odometry absorbs all of them into \(\theta\), fit from data. This is why it degrades gracefully to arbitrary carrying poses that no one wrote a stance detector for: the network simply learns a different input-to-displacement mapping for the pocket than for the swinging hand, from examples, without a mode switch. The cost is that it inherits the biases of its training distribution, which is precisely why leakage-safe, subject-independent evaluation is non-negotiable here.</p>
+</div>
+
+<h2>Output parameterization and the heading-agnostic frame</h2>
+<p>The single most important design choice is the coordinate frame in which the displacement is expressed, and getting it wrong quietly destroys generalization. If you ask the network to output displacement in the device body frame, it must implicitly learn the device orientation, and it will overfit to the orientations seen in training. If you output in the global world frame, the target depends on an absolute heading the IMU cannot observe. RoNIN, from Herath and colleagues in 2020, resolves this with a <em>heading-agnostic coordinate frame</em>: the ground-truth velocity is rotated into a frame aligned with gravity but with a yaw fixed by the device's own tracked heading, so the network only ever predicts motion relative to where it currently believes it is pointing. The absolute heading is integrated separately from the gyroscope. This decoupling, learn the speed and the turn rate in a self-referential frame, integrate the global heading with classical attitude tracking, is what lets one model work across phone-in-hand, in-pocket, and in-bag placements. IONet's polar \((\Delta l, \Delta\psi)\) output is a compact special case of the same idea, since a distance and a relative heading change are already invariant to the absolute world orientation.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Frontier: RoNIN, TLIO, and neural inertial navigation in the wild</h3>
+<p>The current reference points are RoNIN (Herath et al., 2020), which released ResNet, LSTM, and TCN regressors plus a large multi-subject dataset with visual-inertial ground truth and reports roughly 4 to 5 meters of absolute trajectory error over minutes-long indoor walks; and TLIO (Liu et al., 2020), which regresses three-dimensional displacement together with a full covariance and tightly fuses it in a stochastic-cloning EKF, reaching sub-1-percent-of-distance drift for head-mounted data. Around them sit IONet (Chen et al., 2018) as the origin, RIDI (Yan et al., 2018) which learned to correct double integration rather than replace it, and a growing line (IDOL, IMUNet, and transformer- and state-space-model variants building on <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-15-transformers-for-sensor-data/index.html">Chapter 15</a>) that push cross-device and cross-user robustness. The open frontier is generalizing across IMU hardware and mounting without per-device fine-tuning.</p>
+</div>
+
+<h2>Predicting displacement with calibrated uncertainty, then fusing it</h2>
+<p>A raw displacement regressor is useful, but a displacement regressor that also reports how much to trust each prediction is what turns learned odometry into a full navigation system. TLIO's contribution is to output not just a displacement \(\mathbf{d}_t\) but a diagonal (or full) covariance \(\boldsymbol{\Sigma}_t\), trained by minimizing the Gaussian negative log-likelihood</p>
+$$ \mathcal{L} = \tfrac{1}{2}(\mathbf{d}_t - \hat{\mathbf{d}}_t)^\top \boldsymbol{\Sigma}_t^{-1} (\mathbf{d}_t - \hat{\mathbf{d}}_t) + \tfrac{1}{2}\log\det\boldsymbol{\Sigma}_t, $$
+<p>so the network learns to widen its uncertainty exactly where it is unreliable, for instance during fast turns or unusual motion. That covariance is not a decoration: it becomes the measurement-noise matrix \(\mathbf{R}\) when the displacement is fed as a pseudo-measurement into an error-state EKF that also tracks orientation and IMU biases. This closes a satisfying loop with <a class="cross-ref" href="section-24.5.html">Section 24.5</a>: the learned displacement plays the same structural role the zero-velocity update played, a data-driven pseudo-measurement that makes bias and drift observable, but without needing a foot mount or a stance threshold. Honest, calibrated variance is what lets the filter weight the network against other sensors correctly, and calibrating it is the subject of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class IONetLite(nn.Module):
+    """Regress planar displacement (dx, dy) from a window of 6-axis IMU."""
+    def __init__(self, in_ch=6, hidden=128, layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(in_ch, hidden, layers,
+                            batch_first=True, bidirectional=True)
+        self.head = nn.Linear(2 * hidden, 2)   # (dx, dy) in the heading-agnostic frame
+
+    def forward(self, x):                       # x: (B, W, 6)
+        out, _ = self.lstm(x)                   # (B, W, 2*hidden)
+        return self.head(out[:, -1])            # use the last step's summary
+
+def integrate(disps):
+    """Sum per-window displacements into a trajectory. disps: (T, 2)."""
+    return torch.cumsum(disps, dim=0)
+
+model = IONetLite()
+window = torch.randn(4, 200, 6)                 # 4 windows, 2 s at 100 Hz
+print(model(window).shape)                      # torch.Size([4, 2])
+</code></pre>
+<div class="code-caption">A minimal IONet-style regressor: a bidirectional LSTM maps a 200-sample IMU window to a planar displacement in the heading-agnostic frame, and <code>integrate</code> sums the per-window displacements into a trajectory. A production model would add a covariance head (predicting \(\log\sigma^2\) per axis) and train with the Gaussian negative-log-likelihood loss above.</div>
+
+<p>The snippet shows the core: no hand-tuned threshold, no explicit integration of acceleration, just a window-to-displacement map plus a cumulative sum. Adding a second output head for \(\log\sigma^2\) and swapping the mean-squared-error loss for the likelihood above upgrades it to the TLIO-style uncertainty-aware form.</p>
+
+<div class="callout practical-example">
+<h3 class="callout-title">Indoor navigation for a mixed-reality headset</h3>
+<p>A standalone augmented-reality headset needs to keep its virtual content locked to the room even when the visual-inertial tracker briefly fails, walking through a dark corridor, facing a blank white wall, or when the cameras are duty-cycled to save battery. During those blackout windows a learned inertial odometry model runs on the head-mounted IMU alone, regressing three-dimensional displacement with covariance in the TLIO style and feeding it to the pose filter. Because the model was trained on head-motion data with visual-inertial ground truth, it captures the characteristic bob and turn of a walking wearer far better than raw integration, and its reported covariance grows during the fast head turns it handles worst, so the filter automatically leans back on vision the instant the cameras recover. The result is content that does not visibly swim during the blackout, using no extra sensor beyond the IMU already on the board.</p>
+</div>
+
+<h2>Training data, generalization, and leakage-safe evaluation</h2>
+<p>Learned inertial odometry is only as good as its ground truth and its splits. Training needs paired IMU-and-trajectory data, and the trajectory is supplied by a reference system the IMU never sees at inference: an optical motion-capture rig, a visual-inertial SLAM system, or a survey-grade setup. The target displacement per window is read off that reference. Two failure modes dominate. First, the network can memorize subject-specific and device-specific quirks; a model that reports low error when the same person's later walk appears in the test set is measuring memorization, not odometry. Subject-independent and device-independent splits are mandatory, exactly the leakage-safe discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. Second, because the model integrates its own gyroscope-derived heading, a slow yaw drift still curls long trajectories, so evaluation reports both a heading-sensitive metric (absolute trajectory error) and a heading-agnostic one (relative or position drift). Those metrics, and why you need more than one, are the subject of <a class="cross-ref" href="section-24.7.html">Section 24.7</a>. Where an absolute heading or position reference is available, the learned track is fused with it rather than trusted alone, the fusion picked up in <a class="cross-ref" href="../module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>.</p>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right tool: start from RoNIN and TLIO reference code</h3>
+<p>Reproducing this from scratch, data loader, heading-agnostic frame construction, ResNet or LSTM regressor, covariance head, and a stochastic-cloning EKF, is well over a thousand lines and weeks of dataset wrangling before a single trajectory looks right. The public RoNIN and TLIO repositories ship the network definitions, the pretrained weights, the coordinate-frame preprocessing, and the fusion filter as tested modules, collapsing the effort to a data-loader adapter plus a fine-tune loop, roughly one to two hundred lines. Build the tiny regressor above once to internalize the window-to-displacement idea, then adopt a reference stack, whose heading-frame handling and covariance calibration are the parts most painful to get right unaided.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>Using any pedestrian IMU dataset with ground-truth trajectories (RoNIN and OxIOD are public), train the <code>IONetLite</code> regressor above to predict per-window planar displacement in a heading-agnostic frame, and integrate its output into a trajectory. Compare its absolute trajectory error against a classical step-and-heading baseline from <a class="cross-ref" href="section-24.5.html">Section 24.5</a> on a strictly subject-independent test split. Then hold out an entire carrying pose (train on hand and pocket, test on bag) and quantify how much the error grows; this is the generalization gap that separates a demo from a deployable model.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-check</h3>
+<p>1. Why does regressing net displacement over a window escape the \(\tfrac{1}{2}bt^2\) error growth that dooms raw double integration?</p>
+<p>2. What goes wrong if you train the network to output displacement in the device body frame, and how does the heading-agnostic frame fix it?</p>
+<p>3. TLIO outputs a covariance alongside each displacement. Give two distinct reasons that covariance is worth the extra output head, one for training and one for fusion.</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-24.7.html">Section 24.7</a>, we make the comparisons in this section rigorous: how to score a trajectory estimate faithfully, separating absolute from relative error, aligning estimated and reference paths, and reporting drift as a fraction of distance so a classical filter and a learned odometry model can be judged on the same, leakage-safe footing.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

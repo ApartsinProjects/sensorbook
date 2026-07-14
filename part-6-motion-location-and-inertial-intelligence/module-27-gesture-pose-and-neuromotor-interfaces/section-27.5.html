@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.5: Cross-user, calibration-free neuromotor decoding. Building Sensory AI." name="description"/>
+<title>Section 27.5: Cross-user, calibration-free neuromotor decoding | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Motion, Location, and Inertial Intelligence</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Gesture, Pose, and Neuromotor Interfaces</a></div>
+<h1>Cross-user, calibration-free neuromotor decoding</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph"><p>"Every wrist is a different antenna listening to the same nerves. My trick is to learn what the nerves say, not what the antenna sounds like."</p><cite>A Subject-Invariant AI Agent</cite></blockquote>
+
+<div class="prerequisites"><h3>Prerequisites</h3><p>This section continues directly from <a class="cross-ref" href="section-27.4.html">Section 27.4</a>, which introduced surface EMG, the Meta neuromotor wristband, and the emg2qwerty benchmark; read it first. The generalization machinery here rests on self-supervised and contrastive pretraining from <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>, distribution shift and test-time adaptation from <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, and the leakage-safe, subject-disjoint splitting discipline of <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>. The user-adaptation ideas parallel those developed for activity recognition in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p></div>
+
+<div class="callout big-picture">
+<h3 class="callout-title">The Big Picture</h3>
+<p>A neuromotor interface that demands ten minutes of calibration every time you put it on will never ship to a billion wrists. The dream, and, as of 2025, the demonstrated reality, is a wristband you strap on cold and it just works: no per-user training, no gesture rehearsal, no session warm-up. That is what "calibration-free, cross-user" means. The obstacle is that surface EMG is one of the most person-specific signals in this book. The same intended finger pinch produces wildly different waveforms on your wrist and mine, because the electrodes sit over different muscle anatomy, at a different rotation, over skin of different thickness and hydration. This section is about the one hard question that separates a lab demo from a product: how do you train a decoder whose accuracy on a <em>user it has never seen</em> is high enough to control a computer on the first try? The answer reframes neuromotor decoding as a domain-generalization problem and pulls in the heaviest machinery in the book, large multi-user corpora, subject-invariant representations, and foundation-model-scale pretraining.</p>
+</div>
+
+<h2>Why the same intent looks different on every wrist</h2>
+<p>Start by naming the shift precisely, because vague talk of "user variability" hides three distinct nuisance variables that a decoder must survive. First, <strong>anatomy</strong>: muscle bulk, the depth of the flexor tendons, wrist circumference, and subcutaneous fat all reshape how motor-unit action potentials volume-conduct to the skin. Second, <strong>electrode placement</strong>: a wristband rotates a few degrees and shifts a centimeter each time you don it, so a given channel now sees a different muscle. Third, <strong>skin-electrode coupling</strong>: impedance changes with sweat, temperature, hair, and lotion, scaling and filtering the signal within a single session. Formally, if \(z\) is the neural intent and \(u\) the user-and-session nuisance, the observed EMG is \(x = g(z, u)\), and a naive decoder learns \(p(z \mid x)\) that is entangled with the particular \(u\) values seen in training. Evaluate it on a new \(u\) and accuracy collapses. This is textbook covariate and conditional shift, the exact failure mode analyzed in <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>, wearing a neuromotor costume.</p>
+<p>The old escape hatch was calibration: collect a minute of labeled gestures from the new user and fit or fine-tune a personal decoder, effectively estimating \(u\) at don time. It works, and per-user models remain the accuracy ceiling. It also fails the product test, because users hate rehearsing gestures, and any decoder that needs fresh labels cannot help a first-time user or a clinical patient who cannot reliably produce the calibration gestures at all.</p>
+
+<h2>Scale as the primary lever: the generic decoder</h2>
+<p>The result that changed the field is blunt: with enough distinct users in training, a single fixed model generalizes to strangers without any calibration. Meta's 2025 <em>Nature</em> report on a generic surface-EMG wristband trained on data from thousands of participants and showed out-of-the-box decoding of discrete gestures, handwriting, and one-dimensional wrist-pose control on held-out users, with optional personalization narrowing the residual gap rather than being a prerequisite. The mechanism is the same one that makes large models generalize everywhere: if training spans a broad enough distribution of the nuisance \(u\), the network is forced to route its capacity toward the invariant intent \(z\), because memorizing per-user quirks no longer pays. Cross-user generalization is, first and foremost, a data-diversity problem, and only secondarily an architecture problem.</p>
+<p>This is why the community organized around a shared, subject-rich benchmark. <strong>emg2qwerty</strong> (Meta / CTRL-labs, released 2024) provides many hours of wristband EMG from more than a hundred people typing on a QWERTY keyboard, with the explicit, leakage-safe protocol of a <em>generic</em> split (test users never appear in training) versus a <em>personalized</em> split. Reporting both numbers, and reporting them on subject-disjoint folds, is now the honesty bar for any cross-user claim, and it is the same leave-one-subject-out discipline you met in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+
+<div class="callout key-insight">
+<h3 class="callout-title">Key Insight</h3>
+<p>"Calibration-free" is not a decoding algorithm; it is a property that emerges when the training distribution over users is wide enough that the test user is no longer out-of-distribution. You do not primarily engineer invariance into the model, you engineer it into the dataset, then let the model discover that ignoring \(u\) is the cheapest way to lower the loss. Every technique below, augmentation, adversarial invariance, self-supervision, is a way to <em>simulate or enlarge</em> that distribution when you cannot simply collect thousands more wrists.</p>
+</div>
+
+<h2>Four ways to buy invariance without more subjects</h2>
+<p>Collecting thousands of users is expensive, so most teams combine the following, each answering "how do I make the model see more of \(u\) than I recorded?"</p>
+<p><strong>Nuisance-simulating augmentation.</strong> The cheapest and most effective lever exploits the wristband's known symmetry. Because electrodes are arranged in a ring, a rotation of the band is approximately a cyclic shift of the channel axis, so randomly rolling channels during training synthesizes new "placements" for free. Add per-channel gain and offset jitter to mimic impedance changes, small time warps for speed variation, and band-limited noise for motion artifact. These physically motivated augmentations attack placement and coupling shift directly.</p>
+<p><strong>Self-supervised pretraining.</strong> Labeled gestures are scarce, but unlabeled EMG is cheap: people can wear the band all day. Masked or contrastive pretraining on large unlabeled, multi-user EMG (the recipe of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-17-self-supervised-and-contrastive-sensor-learning/index.html">Chapter 17</a>) learns a representation of neural drive that already factors out much of \(u\) before any labels are spent, exactly the strategy that produced the wearable foundation models of <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a>.</p>
+<p><strong>Explicit invariance objectives.</strong> When user identity labels are available, you can push invariance into the loss: a domain-adversarial head tries to predict which user produced an embedding while a gradient-reversal layer trains the encoder to make that impossible, yielding features that carry intent but not identity. Its cousins are subject-conditional batch normalization and correlation-alignment penalties.</p>
+<p><strong>Test-time adaptation.</strong> Even a generic model can quietly refit its normalization statistics to the current session using only the unlabeled stream flowing in, the entropy-minimization and BatchNorm-recalibration methods of <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a>. This is still calibration-free from the user's view: no gestures are rehearsed, the model simply watches itself.</p>
+
+<pre><code class="language-python">import numpy as np
+
+def rotation_augment(emg, max_shift=4, gain_sd=0.1, rng=None):
+    """Simulate a re-donned wristband: cyclic channel roll (band rotation)
+    plus per-channel gain jitter (skin-electrode impedance change).
+    emg: (channels, time) array from one ring of electrodes."""
+    rng = rng or np.random.default_rng()
+    shift = rng.integers(-max_shift, max_shift + 1)     # electrodes are a ring: rotation == cyclic shift
+    x = np.roll(emg, shift, axis=0)
+    gain = np.exp(rng.normal(0.0, gain_sd, size=(emg.shape[0], 1)))  # log-normal, strictly positive
+    return x * gain
+
+def subject_disjoint_split(user_ids, frac_test=0.2, rng=None):
+    """Leakage-safe generic split: NO test user appears in training."""
+    rng = rng or np.random.default_rng(0)
+    users = np.unique(user_ids)
+    rng.shuffle(users)
+    n_test = max(1, int(round(frac_test * len(users))))
+    test_u = set(users[:n_test].tolist())
+    is_test = np.array([u in test_u for u in user_ids])
+    return ~is_test, is_test          # boolean masks: train, test
+
+emg = np.random.default_rng(0).normal(0, 1, size=(16, 200))   # 16-channel ring, 200 samples
+print(rotation_augment(emg).shape)                            # -> (16, 200), a "new placement"
+tr, te = subject_disjoint_split(np.array([0,0,1,1,2,2,3,3]))
+print(tr.sum(), te.sum())                                     # users, not windows, are held out
+</code></pre>
+<div class="code-caption">Two building blocks of calibration-free decoding: ring-rotation-plus-gain augmentation that synthesizes new electrode placements from one recording, and a subject-disjoint split so reported cross-user accuracy is honest. Both are referenced in the invariance and evaluation discussions; the augmentation is the single cheapest generalization win in practice.</div>
+
+<div class="callout library-shortcut">
+<h3 class="callout-title">Right Tool: don't hand-roll the domain-adversarial plumbing</h3>
+<p>Wiring a gradient-reversal layer, a user-classifier head, the adversarial loss schedule, and the warmup ramp by hand is roughly 120 lines of fiddly PyTorch that is easy to get subtly wrong (a sign error in the reversal silently trains the wrong way). A domain-adaptation library such as <code>pytorch-adapt</code> or <code>skorch</code>-based DANN wrappers exposes the whole scheme as a configured hook in under 15 lines, handling the reversal coefficient annealing and the alternating updates for you. Hand-roll only when you are researching a novel invariance objective the library does not implement.</p>
+</div>
+
+<div class="callout practical-example">
+<h3 class="callout-title">In Practice: the clinical wristband that could not be calibrated</h3>
+<p>A rehabilitation group piloted an EMG wristband to let post-stroke patients drive a cursor and trigger discrete selections, restoring a channel of computer control to hands that could no longer use a mouse. Their first system was per-user: each patient produced a minute of labeled pinches to fit a personal decoder. It failed in the clinic for a reason no lab test caught, the patients could not reliably produce the calibration gestures. The very impairment being assisted corrupted the labels the decoder needed, so weak or inconsistent attempts poisoned the fit and the cursor drifted. Switching to a generic decoder, pretrained on a large able-bodied and mixed cohort with heavy ring-rotation augmentation and adapting only its normalization statistics at don time, removed the calibration step entirely. Patients strapped on the band and had usable control in seconds, and clinicians could later collect clean labels passively during real use to personalize gently. The episode is the cross-user thesis in miniature: calibration is not merely inconvenient, for some of the highest-value users it is impossible, so generalization has to come from the training distribution, not from the patient.</p>
+</div>
+
+<h2>Evaluating and shipping the claim without fooling yourself</h2>
+<p>Cross-user accuracy is trivially inflated by a single leak, so the protocol matters as much as the model. Always report on a <strong>subject-disjoint</strong> split, and when sessions are timestamped, on a <strong>session-disjoint</strong> one too, since a decoder can cheat by memorizing a user's Tuesday to ace their Wednesday. Report the generic number (zero calibration) and the personalized number (after \(k\) minutes of user data) as a curve, not a point, because the shape of that curve, how fast personalization closes the gap, is the real usability story. Because a calibration-free decoder will still meet genuinely out-of-distribution wrists, pair it with the uncertainty and conformal-prediction tooling of <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a> so the interface can abstain or fall back rather than emit confident garbage. And keep the deeper neuromuscular modeling in view: the physiology of motor units and the richer decoding targets are developed in <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-32-emg-and-neuromuscular-ai/index.html">Chapter 32</a>, which this interaction-focused section deliberately only skims.</p>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier</h3>
+<p>The 2025 <em>Nature</em> generic neuromotor interface from Meta / CTRL-labs is the current high-water mark: a single non-invasive surface-EMG model that decodes gestures, handwriting, and continuous wrist control for users it never trained on, with personalization as an optional refinement rather than a gate. The open <strong>emg2qwerty</strong> benchmark (NeurIPS 2024 Datasets and Benchmarks) has made the generic-versus-personalized gap a public leaderboard target. Live frontiers: EMG foundation models pretrained on all-day unlabeled wear (extending <a class="cross-ref" href="../../part-5-foundation-models-and-agentic-sensing/module-20-sensor-and-wearable-foundation-models/index.html">Chapter 20</a> to neuromotor signals); few-shot don-time adaptation that personalizes from a handful of unlabeled seconds; and closing the generalization gap to clinical and pediatric populations underrepresented in able-bodied training corpora, a fairness concern shared with <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout exercise">
+<h3 class="callout-title">Exercise</h3>
+<p>You have emg2qwerty-style data: 16-channel wristband EMG from 100 users typing, with key labels. (1) Build two splits, a subject-disjoint generic split and a within-subject personalized split, and explain what a large gap between their accuracies tells you versus a small gap. (2) Add ring-rotation-plus-gain augmentation and measure its effect on the <em>generic</em> split only; predict and then check why it helps generic far more than personalized accuracy. (3) Implement a test-time adaptation that refits only BatchNorm statistics on each held-out user's unlabeled stream, and argue why this remains "calibration-free" from the user's perspective. Split subjects, never windows, following <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout self-check">
+<h3 class="callout-title">Self-Check</h3>
+<p>1. Name the three distinct nuisance factors that make the same intended gesture produce different EMG across donnings, and say which one ring-rotation augmentation directly targets.<br/>
+2. Why is cross-user generalization described here as "primarily a data problem, secondarily an architecture problem"?<br/>
+3. A team reports 96% cross-user accuracy but split their data by time windows rather than by subject. What specifically is wrong, and which direction does it bias the number?</p>
+</div>
+
+<h2>What's Next</h2>
+<p>In <a class="cross-ref" href="section-27.6.html">Section 27.6</a>, we stop treating neuromotor decoding as a single channel and fuse it with the others in this chapter, touch, inertial gesture, and pose, into one multimodal interaction stack, where EMG intent, an IMU flick, and a capacitive touch reinforce and disambiguate one another, and the design question becomes how to combine confident-but-sparse and noisy-but-continuous modalities into an interface that feels like a single sense.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>
