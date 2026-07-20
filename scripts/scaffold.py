@@ -222,15 +222,9 @@ def build(structure: dict) -> None:
         )
 
     toc_body = "\n".join(toc_parts)
-    (ROOT / "index.html").write_text(
-        head("", BOOK_TITLE, f"{BOOK_FULL}.")
-        + '<header class="chapter-header">\n<div class="part-label">Hands-On AI Science Series</div>\n'
-        f'<h1>{escape(BOOK_TITLE)}</h1>\n<p class="chapter-subtitle">Machine Perception of the Physical World</p>\n</header>\n'
-        '<main class="content" id="main-content">\n'
-        '<p>14 parts, 72 chapters. Generated table of contents; run <code>python scripts/scaffold.py</code> to regenerate from the plan.</p>\n'
-        + toc_body + "\n</main>\n" + footer(""),
-        encoding="utf-8",
-    )
+    # NOTE: index.html is the house-style landing page, authored by
+    # scripts/gen_landing.py. This script owns toc.html only and must never
+    # overwrite the landing page.
     (ROOT / "toc.html").write_text(
         head("", f"Contents | {BOOK_TITLE}", f"Table of contents. {BOOK_TITLE}.")
         + '<header class="chapter-header">\n<nav class="header-nav">\n'
