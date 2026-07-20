@@ -152,6 +152,8 @@ def main() -> None:
 <div aria-hidden="true" class="cover-separator"><span>&#10022;</span></div>
 <p class="cover-authors">
 <a href="front-matter/about-authors.html">Alexander (Sasha) Apartsin, Ph.D.</a>
+<span class="amp">&amp;</span>
+<a href="front-matter/about-authors.html">Yehudit Aperstein, Ph.D.</a>
 </p>
 <p class="cover-promise">{escape(PROMISE)}</p>
 <nav aria-label="Primary" class="cover-cta">
@@ -202,7 +204,7 @@ def main() -> None:
 
 <footer class="cover-footer">
 <p class="footer-title">{escape(TITLE)}: {escape(ARC)}, First Edition</p>
-<p>&#169; 2026 Alexander Apartsin &#183; <a href="toc.html">Contents</a></p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="toc.html">Contents</a></p>
 </footer>
 
 </body>

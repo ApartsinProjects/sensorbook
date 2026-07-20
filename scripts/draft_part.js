@@ -69,7 +69,7 @@ EXACT PAGE STRUCTURE (house convention; this file is 2 levels below the book roo
 </main>
 <footer>
 <p class="footer-title">${BOOK}: Machine Perception of the Physical World</p>
-<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
 </footer>
 </body>
 </html>

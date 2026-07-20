@@ -150,7 +150,7 @@ def footer(up: str) -> str:
     return (
         "<footer>\n"
         f"<p class=\"footer-title\">{escape(BOOK_FULL)}</p>\n"
-        f"<p>&#169; 2026 Alexander Apartsin &#183; <a href=\"{up}toc.html\">Contents</a></p>\n"
+        f"<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href=\"{up}toc.html\">Contents</a></p>\n"
         "</footer>\n</body>\n</html>\n"
     )
 
