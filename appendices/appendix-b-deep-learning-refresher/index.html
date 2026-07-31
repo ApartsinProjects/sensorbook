@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Appendix B. Deep Learning Refresher for Sequences and Tensors. Building Sensory AI." name="description"/>
+<title>Appendix B. Deep Learning Refresher for Sequences and Tensors | Building Sensory AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer src="../../vendor/katex/katex.min.js"></script>
+<script defer onload="renderMathInElement(document.body, {delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}],throwOnError:false});" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Sensory AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<h1>Appendix B. Deep Learning Refresher for Sequences and Tensors</h1>
+</header>
+<main class="content" id="main-content">
+
+<p>This appendix is a fast, sensor-flavored refresher on the deep-learning machinery the rest of the book leans on. It assumes you have trained a model before and want the vocabulary and shapes pinned down for time-series and multichannel sensor data, not a from-scratch course. Every idea here is unpacked in its own chapter; this is the one-page map.</p>
+
+<h2>Tensors and shapes for sensor windows</h2>
+<p>A tensor is an n-dimensional array with a fixed dtype and a device (CPU or GPU). Deep learning is bookkeeping over tensor shapes, and for sensor data the shape convention that trips people up most is the one for a batch of time windows. PyTorch's 1D convolution and most sequence layers expect <strong>channels before time</strong>, that is a tensor of shape \((N, C, L)\): \(N\) windows in the batch, \(C\) sensor channels, \(L\) time steps per window. A batch of 32 windows from a 6-axis inertial measurement unit, each 128 samples long, is a \((32, 6, 128)\) tensor. Recurrent layers and transformers instead default to <strong>time before channels</strong>, \((N, L, C)\), so a single <code>permute</code> or <code>transpose</code> sits between a convolutional front end and an attention block more often than any real bug. The table below is the reference to keep next to your model code.</p>
+
+<table>
+<thead>
+<tr><th>Layout</th><th>Meaning</th><th>Layers that expect it</th></tr>
+</thead>
+<tbody>
+<tr><td>\((N, C, L)\)</td><td>batch, channels, time</td><td><code>Conv1d</code>, <code>BatchNorm1d</code>, pooling</td></tr>
+<tr><td>\((N, L, C)\)</td><td>batch, time, channels</td><td><code>LSTM</code>/<code>GRU</code>, <code>Transformer</code> (with <code>batch_first=True</code>)</td></tr>
+<tr><td>\((N, C, H, W)\)</td><td>batch, channels, height, width</td><td><code>Conv2d</code> on spectrograms or camera frames</td></tr>
+</tbody>
+</table>
+
+<p>Two habits save hours: annotate the expected shape in a comment at every layer boundary, and print <code>x.shape</code> the first time a new module runs. A mismatch between \((N, C, L)\) and \((N, L, C)\) rarely raises an error; it silently convolves across the wrong axis and quietly trains to nonsense.</p>
+
+<h2>Automatic differentiation and backpropagation</h2>
+<p>Training reduces to minimizing a scalar loss \(L(\theta)\) over parameters \(\theta\) by gradient descent, and the gradient \(\nabla_\theta L\) is computed by <em>automatic differentiation</em>, not by hand and not numerically. As the forward pass runs, the framework records every elementary operation into a computation graph. Backpropagation is the reverse-mode traversal of that graph: it applies the chain rule from the loss backward to each parameter, reusing intermediate results so the whole gradient costs about the same as one or two forward passes regardless of how many parameters there are. In PyTorch you never write this; calling <code>loss.backward()</code> populates <code>p.grad</code> for every tensor with <code>requires_grad=True</code>. The one rule worth internalizing: gradients <em>accumulate</em> into <code>.grad</code>, so you must call <code>optimizer.zero_grad()</code> each step or last step's gradient contaminates this one.</p>
+
+<h2>The training loop</h2>
+<p>Every training run, however elaborate, is the same five-line rhythm repeated over minibatches: move a batch to the device, compute predictions and loss on the forward pass, zero old gradients, backpropagate, and let the optimizer step the parameters. An <em>epoch</em> is one pass over the training set; you run many. Periodically you switch the model to evaluation mode and measure a held-out metric, which for sensor work must sit behind a leakage-safe split (see <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>). The code block at the end of this appendix shows the whole loop for a 1D-CNN.</p>
+
+<h2>Loss functions</h2>
+<p>The loss encodes what "correct" means. For regression of a continuous quantity (estimating heart rate, orientation, concentration) the default is mean squared error, \(L = \frac{1}{N}\sum_i (\hat{y}_i - y_i)^2\), or its more outlier-tolerant cousin the Huber loss. For classification (activity recognition, fault versus normal) the default is cross-entropy, \(L = -\sum_c y_c \log \hat{y}_c\), applied to logits via <code>CrossEntropyLoss</code>, which folds in the softmax for numerical stability. When classes are imbalanced, as they nearly always are for rare-event detection on sensors, weight the loss by inverse class frequency or reach for focal loss rather than accepting a model that predicts "normal" every time.</p>
+
+<h2>Optimizers and learning-rate schedules</h2>
+<p>An optimizer turns the gradient into a parameter update. Plain <em>stochastic gradient descent (SGD)</em> steps \(\theta \leftarrow \theta - \eta\, \nabla_\theta L\) with learning rate \(\eta\), usually with momentum to smooth the trajectory. <em>Adam</em> keeps per-parameter running averages of the gradient and its square, adapting the effective step size to each parameter; it is the reliable default that trains most sensor models with little tuning, while SGD with momentum plus a schedule often wins the last fraction of accuracy once the architecture is settled. The learning rate is the single most important hyperparameter, and holding it fixed is rarely best. A <em>schedule</em> lowers it over training: cosine annealing eases it smoothly to near zero, step decay cuts it by a factor at set epochs, and a short linear <em>warmup</em> at the start stabilizes the first few hundred steps, which matters most for transformer and state-space models.</p>
+
+<h2>Regularization</h2>
+<p>Sensor datasets are often small relative to model capacity, so controlling overfitting is not optional. <em>Weight decay</em> adds an \(\ell_2\) penalty \(\lambda \lVert \theta \rVert^2\) that pulls weights toward zero and improves generalization. <em>Dropout</em> randomly zeros a fraction of activations during training so the network cannot lean on any single feature. <em>Early stopping</em> halts training when the validation metric stops improving, keeping the best checkpoint. Most powerful of all for signals is <em>data augmentation</em>: jitter, scaling, time-warping, channel dropout, and small rotations of inertial axes expand an accelerometer dataset far more cheaply than collecting new subjects, and they encode the invariances you actually want.</p>
+
+<h2>Core layers and when each fits a time series</h2>
+<p>Five layer families cover almost every sensor model, and choosing among them is mostly about how far apart in time the informative structure lies.</p>
+
+<table>
+<thead>
+<tr><th>Layer</th><th>What it does</th><th>Best when</th></tr>
+</thead>
+<tbody>
+<tr><td>Linear (dense)</td><td>affine mix \(Wx + b\) of a fixed-size vector</td><td>features already extracted; final classifier head</td></tr>
+<tr><td>1D convolution</td><td>slides learned filters along time, sharing weights</td><td>local, translation-invariant motifs (gait cycles, ECG beats)</td></tr>
+<tr><td>Recurrence (LSTM/GRU)</td><td>carries a hidden state sample by sample</td><td>strictly causal streaming; moderate-range dependence</td></tr>
+<tr><td>Attention (transformer)</td><td>weights every step against every other step</td><td>long-range dependence; enough data to train it</td></tr>
+<tr><td>State-space (S4, Mamba)</td><td>linear recurrence with long effective memory</td><td>very long windows where attention's cost is prohibitive</td></tr>
+</tbody>
+</table>
+
+<p>In practice a convolutional front end that reduces a raw window to a shorter feature sequence, followed by an attention or recurrent block for context and a linear head, is a strong and cheap starting architecture for multivariate sensor data. State-space layers are the current frontier for long streams because their cost grows linearly, not quadratically, with sequence length. These are developed fully across <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/index.html">Part IV</a>.</p>
+
+<h2>Normalization</h2>
+<p>Normalization keeps activations at a usable scale so gradients flow. <em>Batch normalization</em> standardizes each channel across the batch and time dimensions and is the common partner for 1D-CNNs, though it behaves poorly with tiny batches. <em>Layer normalization</em> standardizes across features within each sample and is the default inside transformers and recurrent stacks, since it does not depend on batch statistics and so behaves identically at training and inference. Separate from these learnable layers is input normalization: standardize each sensor channel using statistics computed on the training split only, and apply them causally at inference, or you leak the future (see <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-01-what-is-sensory-ai/section-1.2.html">Section 1.2</a>).</p>
+
+<h2>A practical training recipe</h2>
+<p>For a fresh multivariate sensor problem, this default converges reliably before you tune anything: window the stream into fixed-length overlapping segments shaped \((N, C, L)\); split by subject or by time, never by random sample; standardize channels on the training split; start with a small 1D-CNN, Adam at learning rate \(10^{-3}\), weight decay \(10^{-4}\), and cosine annealing; add dropout of 0.1 to 0.3 and light augmentation; watch a validation metric and stop early. Only after this baseline is honest is it worth swapping in attention or state-space blocks. The minimal loop below is that baseline in code.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class SensorCNN(nn.Module):
+    def __init__(self, in_ch=6, n_classes=5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, 32, kernel_size=5, padding=2),  # (N, 32, L)
+            nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),      # (N, 64, L)
+            nn.BatchNorm1d(64), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1))                           # (N, 64, 1)
+        self.head = nn.Linear(64, n_classes)
+
+    def forward(self, x):            # x: (N, C, L) = (batch, channels, time)
+        z = self.net(x).squeeze(-1)  # (N, 64)
+        return self.head(z)          # (N, n_classes) logits
+
+model = SensorCNN().to("cuda")
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn = nn.CrossEntropyLoss()
+
+model.train()
+for xb, yb in train_loader:                 # xb: (N, 6, 128), yb: (N,)
+    xb, yb = xb.to("cuda"), yb.to("cuda")
+    logits = loss_fn(model(xb), yb)          # forward + loss
+    opt.zero_grad(); logits.backward(); opt.step()</code></pre>
+<div class="code-caption">A minimal 1D-CNN and training step for 6-channel inertial windows of length 128. Two convolution blocks extract local motifs along time, adaptive average pooling collapses the time axis to a fixed vector, and a linear head produces class logits. The four-line inner loop (forward, zero, backward, step) is the whole of gradient descent; note the explicit \((N, C, L)\) shape at the layer boundaries.</div>
+
+<h2>What's Next</h2>
+<p>The notation used here matches <a class="cross-ref" href="../appendix-a-math-reference/index.html">Appendix A</a>, and each layer family, optimizer, and regularizer named above has a dedicated treatment in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/index.html">Part IV</a>. Keep the two shape conventions, \((N, C, L)\) for convolution and \((N, L, C)\) for sequence models, within arm's reach; they resolve most of the friction of building sensor models in PyTorch.</p>
+
+</main>
+<footer>
+<p class="footer-title">Building Sensory AI: Machine Perception of the Physical World</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+</footer>
+</body>
+</html>

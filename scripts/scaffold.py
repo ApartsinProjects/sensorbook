@@ -221,7 +221,38 @@ def build(structure: dict) -> None:
             '<ul class="toc-chapter-list">\n' + "\n".join(toc_chaps) + "\n</ul>"
         )
 
-    toc_body = "\n".join(toc_parts)
+    front_block = (
+        '<h2>Front Matter</h2>\n<ul class="toc-chapter-list">\n'
+        '<li><a href="front-matter/foreword.html">Foreword</a></li>\n'
+        '<li><a href="front-matter/fm-what-this-book-covers.html">What This Book Covers</a></li>\n'
+        '<li><a href="front-matter/fm-who-should-read.html">Who Should Read This Book</a></li>\n'
+        '<li><a href="front-matter/fm-how-to-use.html">How to Use This Book</a></li>\n'
+        '<li><a href="front-matter/about-authors.html">About the Authors</a></li>\n'
+        '<li><a href="front-matter/about-the-series.html">About the Series</a></li>\n'
+        '<li><a href="front-matter/copyright.html">Copyright</a></li>\n</ul>'
+    )
+    appx = [
+        ("a-math-reference", "A. Mathematical and Signal-Processing Reference"),
+        ("b-deep-learning-refresher", "B. Deep Learning Refresher for Sequences and Tensors"),
+        ("c-sensor-hardware", "C. Sensor Hardware Guide"),
+        ("d-toolchain", "D. The Sensory AI Toolchain"),
+        ("e-datasets-benchmarks", "E. Sensor Datasets and Benchmarks"),
+        ("f-evaluation-metrics", "F. Evaluation Metrics Reference"),
+        ("g-synthetic-data", "G. Synthetic Data and Simulation Resources"),
+        ("h-course-syllabi", "H. Course Syllabi"),
+        ("i-solutions", "I. Solutions to Selected Exercises"),
+        ("j-notation-glossary", "J. Notation and Glossary"),
+    ]
+    appx_block = (
+        '<h2><a href="appendices/index.html">Appendices</a></h2>\n<ul class="toc-chapter-list">\n'
+        + "\n".join(f'<li><a href="appendices/appendix-{slug}/index.html">Appendix {title}</a></li>' for slug, title in appx)
+        + "\n</ul>"
+    )
+    capstone_block = (
+        '<h2><a href="capstone/index.html">Capstone</a></h2>\n<ul class="toc-chapter-list">\n'
+        '<li><a href="capstone/index.html">End-to-End Sensory AI System</a></li>\n</ul>'
+    )
+    toc_body = front_block + "\n" + "\n".join(toc_parts) + "\n" + appx_block + "\n" + capstone_block
     # NOTE: index.html is the house-style landing page, authored by
     # scripts/gen_landing.py. This script owns toc.html only and must never
     # overwrite the landing page.
