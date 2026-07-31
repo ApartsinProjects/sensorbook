@@ -69,7 +69,17 @@
 
     <h2>Rows, columns, and chunks: why layout is destiny</h2>
     <p>The deepest split in sensor storage is <strong>row-major</strong> versus <strong>columnar</strong>. A row-major file (CSV, JSON lines, a naive database table) stores all fields of record 1, then all fields of record 2, and so on. A columnar file (Parquet, Arrow, ORC) stores all values of channel A contiguously, then all of channel B. For telemetry the columnar layout is transformative for three concrete reasons. First, <em>selective reads</em>: an analyst who wants only <code>rpm</code> and <code>oil_temp</code> from a two-hundred-channel truck log reads two columns off disk and skips the rest, instead of parsing every byte of every row. Second, <em>compression</em>: values within one channel are similar (temperature changes slowly), so a column of them compresses far better than interleaved heterogeneous rows; run-length and dictionary encoding routinely shrink telemetry by five to twenty times. Third, <em>predicate pushdown</em>: column statistics stored per block let a reader skip entire chunks whose value range cannot match a filter, so "give me the rows where RPM exceeded 6000" touches only the blocks that could contain them.</p>
+    <p data-agent="02"><strong>Parquet</strong>, named repeatedly above, is the concrete workhorse worth pinning down: it is an open columnar file format that stores each channel as its own compressed, statistics-tagged block inside a single self-contained file. It matters because it delivers all three columnar wins (selective reads, per-column compression, predicate pushdown) with no custom code, which is why it has become the default container for tabular telemetry. Mechanically, it partitions the table into "row groups" and, inside each, writes every column contiguously with a dictionary and min/max statistics, so a reader can seek straight to the exact columns and blocks a query needs. Reach for Parquet on wide, sparse, mixed-type streams like telemetry and event logs; prefer a chunked-array format such as HDF5 or Zarr when the data is instead a single dense uniform waveform.</p>
+    <div class="callout warning" data-agent="10">
+        <h4>Common Misconception</h4>
+        <p>The misconception is "moving from CSV to Parquet is just a compression trick that makes files smaller." Smaller files are the least of it: the layout change also decides which queries are cheap (columnar makes two-of-two-hundred-channel reads nearly free) and whether the signal's physics survives, since a well-chosen format carries units, sample rate, and provenance that a bare CSV silently discards.</p>
+    </div>
     <p>Waveforms want a different discipline. A dense uniform signal has no per-sample metadata worth storing, so the right structure is a <strong>chunked array</strong>: a long contiguous block of one dtype, split into fixed-size chunks along the time axis, with the sample rate, units, dtype, start time, and device identity held once as attributes. HDF5 and Zarr do exactly this; the venerable WAV and biosignal EDF (European Data Format) containers do a domain-specific version of the same idea. Chunking is what makes a multi-hour recording streamable: you read the ten-second window you need without materializing the whole file, which is precisely the access pattern <a class="cross-ref" href="section-5.2.html">Section 5.2</a> builds windows on. The recurring principle across both cases is that <em>timestamps for a uniform signal are computed, never stored</em>: sample \(n\) sits at time \(t_0 + n/f_s\), so persisting a timestamp column would waste space and, worse, let rounding error desynchronize the axis. Getting \(t_0\) and \(f_s\) right ties directly back to the synchronization discipline of <a class="cross-ref" href="../module-03-signals-sampling-time-and-synchronization/index.html">Chapter 3</a>.</p>
+
+    <div class="callout tip" data-agent="06">
+        <h4>Mental Model</h4>
+        <p>Think of a sheet of music. The composer does not write a wall-clock time next to every note; that would be enormous and would drift the instant one note were mistimed. Instead the tempo (say 120 beats per minute) is marked once at the top, and each note's position in the bar tells you exactly when it sounds. A uniform waveform stores time the same way: the sample rate \(f_s\) is the tempo written once, the start time \(t_0\) is the downbeat, and sample \(n\) plays at \(t_0 + n/f_s\). Storing a timestamp per sample is like scribbling a clock reading beside every note: bulky, and the moment one reading is rounded the whole piece falls out of step.</p>
+    </div>
 
     <div class="callout practical-example">
         <h3 class="callout-title">In Practice: a wind-turbine fleet drowning in CSV</h3>
@@ -130,6 +140,23 @@ cols = pd.read_parquet("telemetry.parquet", columns=["rpm", "oil_temp"])</code><
         <p class="quiz-question">1. Why is storing a per-sample timestamp column for a uniformly sampled waveform both wasteful and dangerous?</p>
         <p class="quiz-question">2. Give two concrete reasons columnar storage beats row-major storage for wide, multi-channel telemetry.</p>
         <p class="quiz-question">3. A point cloud and a telemetry table are both "sensor data." Name the two structural properties of a point cloud that forbid storing it as a fixed-width rectangular table.</p>
+    </div>
+
+    <div class="callout research-frontier" data-agent="18">
+        <h4>Research Frontier</h4>
+        <p>Parquet was designed for analytics scans, not for the shuffled, random-access reads a training loop makes when it pulls scattered windows from a huge sensor corpus. Two 2023-plus formats target exactly that gap. <strong>Lance</strong> (the storage layer behind LanceDB, 2023) is a columnar format built for fast random row access, zero-copy versioning, and vector search, reporting order-of-magnitude faster point lookups than Parquet on ML workloads. <strong>Vortex</strong> (Spiral, 2024) pushes further with a cascade of lightweight, decode-in-place compression codecs and reports both smaller files and faster random access than Parquet. Watching these mature is worthwhile because leakage-safe training over sensor windows is dominated by random reads, which is the one access pattern the classic columnar format handles worst.</p>
+    </div>
+
+    <div class="callout practical-example" data-agent="23">
+        <h4>Try It: round-trip a waveform three ways</h4>
+        <p>Measure for yourself how layout, not physics, drives file size and query speed, using only NumPy, pandas, and pyarrow on a laptop.</p>
+        <ol>
+            <li>Synthesize ten seconds of vibration: <code>fs = 25_600</code>, <code>sig = np.random.randn(fs * 10).astype(np.float32)</code>, and build a matching UTC time axis <code>t = t0 + np.arange(sig.size) / fs</code>.</li>
+            <li>Write it three ways: (a) a CSV with two columns <code>time,accel</code>; (b) a Parquet table of the same two columns; (c) a Parquet table of only the <code>accel</code> column with <code>sample_rate_hz</code> and <code>start_epoch_utc</code> attached via <code>replace_schema_metadata</code> (as in Listing 5.1.1).</li>
+            <li>Record the on-disk size of each file with <code>os.path.getsize</code> and print the ratios; the timestamp-free metadata version should be the smallest by a wide margin.</li>
+            <li>Time reading back just the signal from each: <code>pd.read_csv</code> versus <code>pq.read_table(..., columns=["accel"])</code>, using <code>time.perf_counter</code>.</li>
+            <li>From version (c), reconstruct the time axis from the two metadata numbers alone and assert it matches your original <code>t</code> to floating-point tolerance, confirming you lost nothing by never storing timestamps.</li>
+        </ol>
     </div>
 
     <h2>What's Next</h2>

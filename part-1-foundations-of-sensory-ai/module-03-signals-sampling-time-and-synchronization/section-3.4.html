@@ -49,6 +49,16 @@
 
 <p>Borrowing the standard statistical taxonomy, missing data is <em>missing completely at random</em> (MCAR) when the dropout is independent of everything, <em>missing at random</em> (MAR) when it depends on observed covariates, and <em>missing not at random</em> (MNAR) when it depends on the unobserved value itself. This distinction is not academic. A pulse oximeter that drops readings precisely when the patient moves (motion also being what makes the reading dangerous) is MNAR: the gaps are correlated with the events you care most about. Imputing those gaps with the local mean will systematically erase the very episodes your model is meant to catch, and no amount of downstream accuracy on clean segments will reveal the bias. Characterizing whether your gaps are MCAR, MAR, or MNAR is a prerequisite for choosing any repair strategy, and it directly shapes the leakage-safe splits you will build in <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a>.</p>
 
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of an end-of-course feedback survey that students fill out voluntarily. If a few random students forget, the missing forms tell you nothing special (MCAR). If evening-section students reply less because they are tired, you can still correct using the section label you already recorded (MAR). But if the students who fail the course are precisely the ones who never submit the survey, then the missing responses are tied to the very quantity you wanted to measure, satisfaction, and averaging the forms you did get will read far too rosy (MNAR). The danger is not the count of blank forms; it is that their blankness is caused by the hidden value itself, so no reweighting on what you observed can undo the bias.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>The misconception is "as long as the delivery ratio is high, the missing data is harmless." Wrongness of missing data is governed by <em>which</em> samples are gone, not merely how many: a 2 percent MNAR loss concentrated on exactly the high-acceleration events a fall detector cares about can be far more damaging than a 20 percent MCAR loss spread uniformly across quiet stretches.</p>
+</div>
+
 <div class="callout practical-example">
 <h3 class="callout-title">Practical Example: A wrist wearable in a crowded gym</h3>
 <p>A fitness band streams a 50 Hz accelerometer over Bluetooth Low Energy to a phone. In a quiet room the phone receives a clean 20 ms cadence. Walk onto a gym floor packed with other 2.4 GHz radios and the picture changes: the BLE link layer retransmits, the connection interval stretches, and whole notification packets (each carrying a batch of samples) are lost. The phone now sees bursts of 40 to 60 missing samples every few seconds, plus jitter of several milliseconds on the packets that do arrive. A naive activity classifier trained on lab data collapses, not because the motion changed, but because its input grid quietly developed holes. The fix is not a better model first; it is measuring the loss, marking it, and making the model gap-aware, in that order.</p>
@@ -57,6 +67,8 @@
 <h2>Measuring defects from timestamps</h2>
 
 <p>You cannot repair what you have not measured. Given a vector of arrival timestamps, three numbers tell you almost everything: the distribution of inter-sample intervals \(\Delta t_n\), the count and duration of gaps (intervals exceeding a threshold such as \(1.5\,T_s\)), and the delivery ratio (received samples divided by expected samples over a window). The code below computes all three and, crucially, produces an explicit boolean <em>missingness mask</em> on a uniform reference grid rather than silently filling the holes.</p>
+
+<p data-agent="02">The <strong>delivery ratio</strong> is precisely the count of samples you actually received divided by the count the nominal rate says you should have received over the same interval, \(N_\text{obs} / N_\text{expected}\) where \(N_\text{expected} = \lfloor (t_{-1} - t_0)/T_s \rfloor + 1\); it is the single scalar that tells you how much of the promised timeline reached your process. It matters because it is a cheap, unit-free health gauge you can compute continuously and alarm on before any modeling begins. The mechanism is a simple ratio, so its one weakness is bluntness: a delivery ratio hides <em>where</em> the losses fell, which is why you pair it with the gap count and the boolean mask rather than trusting it alone. Reach for the delivery ratio when you need a fast per-window quality score for dashboards or gating; reach for the full mask when a downstream stage must know exactly which slots are empty.</p>
 
 <pre><code class="language-python">import numpy as np
 
@@ -106,9 +118,26 @@ print(f"delivery     : {p['delivery_ratio']*100:5.1f} %")
 
 <p>Once holes are marked, you have four broad options, in ascending order of assumption. <strong>Leave them</strong>: many models, from the Kalman filter to modern attention, can consume a mask and simply skip absent inputs; a Kalman update, covered in <a class="cross-ref" href="../../part-3-state-estimation-and-classical-inference/module-09-bayesian-filtering-and-the-kalman-family/index.html">Chapter 9</a>, naturally handles a missing measurement by running the prediction step alone and letting uncertainty grow. <strong>Interpolate</strong>: linear or spline fills are cheap and fine for short gaps in slowly varying signals, but they fabricate high-frequency content and will fool a spectral feature extractor. <strong>Filter-based reconstruction</strong>: model-aware smoothing, the subject of <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-06-filtering-and-denoising-sensor-signals/index.html">Chapter 6</a>, respects the signal's bandwidth when bridging gaps. <strong>Learned imputation</strong>: powerful, but it can hallucinate plausible values and, worse, leak information if fit on data that overlaps your evaluation set. The golden rule: interpolate for visualization freely, but never let an imputed value enter a training label or a safety-critical decision without a flag that says it was invented.</p>
 
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The methods here treat the irregular grid as a defect to patch. A newer line treats continuous time as the native representation and never snaps to a grid at all. ContiFormer (Chen et al., NeurIPS 2023) fuses neural ordinary differential equations with the attention mechanism so that a Transformer can attend across genuinely continuous, irregularly sampled timestamps, learning the dynamics between observed points rather than imputing them first. On the standard irregular-time-series benchmarks it outperforms both discrete Transformers fed interpolated inputs and earlier neural-ODE models, which points toward a future where the missingness mask is an input the model reasons over natively instead of a hole you fill before training.</p>
+</div>
+
 <div class="callout exercise">
 <h3 class="callout-title">Exercise</h3>
 <p>Take a 100 Hz IMU recording (or synthesize one). Delete samples under three regimes: MCAR (drop 10 percent uniformly at random), bursty (drop five contiguous 200 ms windows), and MNAR (drop samples whenever \(|a| &gt; 2g\)). For each, compute the RMS error of linear interpolation against the ground truth and the resulting shift in the signal's spectral centroid. Which regime does interpolation handle worst, and why does the MNAR case damage a fall-detection feature far more than its raw RMS error suggests?</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Profile and repair a lossy stream in 20 minutes</h4>
+<p>Build the whole measure-then-repair loop end to end on your laptop with only NumPy, SciPy, and Matplotlib.</p>
+<ol>
+<li>Synthesize ground truth: <code>t = np.arange(0, 20, 1/100)</code> and <code>x = np.sin(2*np.pi*3*t) + 0.3*np.sin(2*np.pi*17*t)</code>, a 100 Hz signal with a 3 Hz and a 17 Hz component.</li>
+<li>Corrupt it: add 3 ms Gaussian jitter to <code>t</code>, then delete every sample falling inside three 300 ms windows to simulate bursty packet loss. Keep the surviving <code>(t, x)</code> pairs.</li>
+<li>Profile the survivors with the <code>profile_stream</code> function from this section and print the jitter RMS, missing count, and delivery ratio.</li>
+<li>Repair two ways on the uniform grid: fill the holes with <code>numpy.interp</code> (linear) and again with <code>scipy.interpolate.CubicSpline</code>. Overlay both against the ground truth and compute the RMS error of each.</li>
+<li>Take an FFT of the original, the linear fill, and the spline fill, and check what happened to the 17 Hz peak. Confirm for yourself that the interpolation smeared the high-frequency component even where the RMS error looked small.</li>
+</ol>
 </div>
 
 <div class="callout self-check">

@@ -45,6 +45,11 @@
     <p>Here \(\theta_i\) is the <em>offset</em> (how far the clock is ahead or behind at \(t=0\)) and \(\epsilon_i\) is the <em>skew</em> (its fractional rate error, the reason it gains or loses time). Skew is quoted in parts per million (ppm): a garden-variety consumer crystal is rated at \(\pm 20\) to \(\pm 50\) ppm. That sounds negligible until you unpack the unit. One ppm is one microsecond of error per second, which is about \(86\ \mathrm{ms}\) per day. A 50 ppm crystal can therefore drift more than four seconds in a single day if left uncorrected. Two independent 50 ppm clocks can move apart at up to 100 ppm relative to each other. <em>Drift</em> is the slow change of \(\epsilon_i\) itself, driven mostly by temperature: the same crystal that reads 20 ppm on a bench can swing tens of ppm as a device warms in a pocket or a bearing housing.</p>
     <p>The practical takeaway is that offset and skew are not one-time nuisances you subtract once. Offset must be re-estimated because clocks are set imperfectly; skew must be re-estimated because a fixed rate error accumulates without bound; and drift means both estimates go stale, so synchronization is a process you run continuously, not a calibration you do at the factory.</p>
 
+    <div class="callout tip">
+        <h4>Mental Model</h4>
+        <p>Picture two cheap kitchen wall clocks. If you hang one reading 3:00 next to another reading 3:05, that constant five-minute gap is <em>offset</em>: subtract it once and they line up. But suppose one clock's motor runs slightly fast, gaining a minute a day; now no single subtraction keeps them matched, because the gap widens steadily, and that growing gap is <em>skew</em>, a rate error rather than a fixed one. And if the fast clock hangs above a radiator so it gains more on hot days than cold ones, the rate itself wanders from day to day: that is <em>drift</em>, and it is exactly why you cannot correct the pair once and walk away.</p>
+    </div>
+
     <div class="callout key-insight">
         <h3 class="callout-title">Alignment is a linear-map estimation problem</h3>
         <p>Putting sensor \(i\) onto a reference timeline means estimating two numbers, \(\theta_i\) and \(\epsilon_i\), that map \(C_i\) back to \(t\). That is the entire mathematical content of clock synchronization at this level: fit a line. Everything harder (PTP, GPS discipline, cross-correlation) is a better way to gather the paired timestamps you fit that line to, or a way to re-fit it as it drifts.</p>
@@ -62,7 +67,13 @@
     <h2>Mechanisms that pull sensors onto one clock</h2>
     <p>There is a ladder of synchronization techniques, and the right rung depends on how tightly your sensors must agree. From loosest to tightest:</p>
     <p><strong>NTP (Network Time Protocol)</strong> disciplines a host's wall clock over an ordinary network to within a few milliseconds on a LAN, tens of milliseconds over the internet. It is enough to correlate slow logs and timestamp events for humans, and nowhere near enough to fuse a 100 Hz IMU with a camera. <strong>PTP (Precision Time Protocol, IEEE 1588)</strong> uses hardware timestamping in the network interface to exchange delay-measurement messages and reach sub-microsecond agreement across devices on the same switched network; it is the backbone of synchronized industrial and automotive sensor buses. <strong>GPS with a PPS (pulse-per-second) signal</strong> gives every receiver a physical electrical edge aligned to UTC to within tens of nanoseconds, which is why GPS-disciplined clocks anchor large outdoor multi-sensor rigs and are covered further in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-25-localization-gnss-and-rf-positioning/index.html">Chapter 25</a>. <strong>A hardware trigger</strong> is the tightest of all: one electrical line fires multiple sensors at the same instant, so they share not just a clock but a common exposure event, eliminating offset by construction.</p>
+    <p data-agent="02">NTP deserves a closer look, because it is the timebase you inherit whether or not you plan for it. Precisely, it is a client-server protocol that repeatedly asks a set of time servers for the current time, measures the round-trip delay of each exchange, and gently slews the local wall clock to minimize the estimated offset; it matters because it is the zero-cost baseline already running on essentially every networked machine, so it is the clock quality you start from before any deliberate effort. Mechanically it records four timestamps per exchange (send and receive at each end) and, assuming the network path is symmetric, splits the round trip to estimate one-way delay and offset. Reach for NTP when a few milliseconds of agreement over a routed network is enough (correlating logs, tagging coarse events for humans), and step up to PTP or a hardware trigger the moment a fusion pipeline needs sub-millisecond alignment, because NTP's symmetry assumption breaks down exactly where tight sensor fusion lives.</p>
     <p>When you cannot rewire the hardware, you fall back to <strong>post-hoc software alignment</strong>: record the best timestamps you have, then estimate the residual offset from the data itself. If two sensors observe the same physical event (a shake felt by two IMUs, an audio-visual clap), the lag that maximizes their cross-correlation is a direct estimate of \(\theta_i - \theta_j\). This is cheap, requires no special hardware, and is the workhorse for aligning consumer devices that were never designed to be synchronized. It cannot fix skew on its own, though, so for long recordings you fit the full affine map, not just a constant shift.</p>
+
+    <div class="callout research-frontier">
+        <h4>Research Frontier</h4>
+        <p>The two-device cross-correlation trick scales surprisingly far. The <strong>EgoExo4D</strong> dataset (Grauman et al., CVPR 2024) had to place hundreds of hours of simultaneously recorded egocentric and third-person cameras on one timeline without wiring them together, and it does so by cross-correlating the audio each device captured, turning a shared sound into the synchronizing event for dozens of independent clocks at once. This pushes past what the section teaches in two directions: the alignment is estimated at data-collection scale across many devices rather than a single pair, and it is validated to frame-level agreement so the recordings can train video models that assume tight temporal correspondence. The open frontier is doing this continuously and skew-aware for streams whose only common signal is noisy ambient audio, rather than as a one-shot offset per clip.</p>
+    </div>
 
     <pre><code class="language-python">import numpy as np
 
@@ -116,6 +127,19 @@ aligned = pd.merge_asof(cam, imu, on="t",
             <li>Distinguish a hardware timestamp, an arrival timestamp, and a host timestamp, and explain why fusing on arrival timestamps was the root cause of the smeared lidar-camera projection in the worked example.</li>
             <li>You have two consumer phones that were never designed to be synchronized. Which mechanism from this section lets you align their recordings after the fact, what shared signal does it need, and what can it <em>not</em> correct on its own?</li>
         </ol>
+    </div>
+
+    <div class="callout practical-example" data-agent="23">
+        <h4>Try It: recover a hidden clock skew from paired timestamps</h4>
+        <p>You can reproduce the whole affine-alignment idea on a laptop in a few minutes with only <code>numpy</code> and <code>matplotlib</code>.</p>
+        <ol>
+            <li>Build a reference timeline: <code>ref = np.arange(0, 60, 0.5)</code> (two samples per second for a minute).</li>
+            <li>Manufacture a "device" clock with a skew and offset you pick, plus a little noise: choose <code>true_ppm = 120</code> and <code>true_offset = 0.030</code>, then compute <code>device = (1 + true_ppm/1e6) * ref + true_offset + np.random.normal(0, 5e-4, ref.shape)</code>.</li>
+            <li>Pretend you only kept a handful of paired readings by slicing every eighth sample (<code>device[::8]</code>, <code>ref[::8]</code>), stack them with <code>np.vstack([dev_pairs, np.ones_like(dev_pairs)]).T</code>, and solve for slope and intercept with <code>np.linalg.lstsq</code>.</li>
+            <li>Convert the recovered slope to ppm with <code>(a - 1) * 1e6</code> and print it next to <code>true_ppm</code>; the two should match to a few ppm despite the noise.</li>
+            <li>Now break the symmetry assumption: add a fixed <code>0.010</code> second latency to only the second half of the device samples before fitting, refit, and plot the residuals <code>(a*device + b) - ref</code>. Watch the residuals split into two levels, which is the fingerprint of an unmodeled step in the timing path.</li>
+        </ol>
+        <p>Step 5 is the lesson that outlasts the code: a clean line-fit hides nothing, but the residual plot exposes the exact moment your affine model stops describing the clock.</p>
     </div>
 
     <h2>What's Next</h2>

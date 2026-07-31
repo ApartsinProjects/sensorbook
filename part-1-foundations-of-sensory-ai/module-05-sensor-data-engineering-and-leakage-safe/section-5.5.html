@@ -46,6 +46,8 @@
 $$ \tilde{x}_{c} = \frac{x_{c} - \mu_{c}}{\sigma_{c}}, $$
 <p>where \(\mu_c\) and \(\sigma_c\) are estimated statistics. <strong>When to prefer which.</strong> Use z-score as the default for roughly symmetric signals; use robust scaling when outliers and spikes are common (vibration, EMG bursts), because a single clipping event can wreck a standard deviation; use min-max only when a signal has hard physical bounds and you truly want to preserve them. <strong>How, and the part everyone gets wrong.</strong> The statistics \(\mu_c, \sigma_c\) are learned parameters of your pipeline, so they must be estimated on the training split alone and then applied unchanged to validation and test. Estimating them over the full dataset lets the test set's mean and variance leak backward into training, which is exactly the failure <a class="cross-ref" href="section-5.3.html">Section 5.3</a> warns against.</p>
 
+<p data-agent="02"><strong>Min-max, precisely.</strong> Min-max normalization linearly maps a channel onto a fixed interval with \(\tilde{x} = (x - x_{\min})/(x_{\max} - x_{\min})\), so the smallest observed value becomes 0 and the largest becomes 1 while every gap between them stays proportional. It matters because a bounded \([0,1]\) range keeps signals with real physical limits (a normalized pixel intensity, a percent-of-scale humidity reading) inside the span a bounded activation expects, and it does this through one assumption-free subtract-and-divide rather than any distributional estimate. Reach for it only when those limits are genuine and stable; prefer z-score or robust scaling when the extremes are noisy, because a single spike moves \(x_{\max}\) and silently rescales every other sample.</p>
+
 <div class="callout key-insight">
 <h3 class="callout-title">Key Insight</h3>
 <p>A normalizer is a model. It has parameters (\(\mu\), \(\sigma\), min, max) that you <em>fit</em>, and fitting on data you later evaluate on is leakage, plain and simple. The tell-tale symptom is a small but stubborn gap: your leakage-free pipeline scores a point or two lower than the "fit-on-everything" version, and the difference is precisely the free information you leaked. The discipline is one sentence: <em>fit the scaler inside the training fold, freeze it, transform everything else.</em> In cross-validation this means re-fitting the scaler on each fold's training portion, never once over the whole array.</p>
@@ -55,6 +57,11 @@ $$ \tilde{x}_{c} = \frac{x_{c} - \mu_{c}}{\sigma_{c}}, $$
 
 <p><strong>What.</strong> Calibration removes the sensor-specific transfer function so that a known input maps to a known output on every unit. The classic two-point linear calibration solves for gain and offset from two reference stimuli \(s_1, s_2\) with measured responses \(x_1, x_2\): \(g = (x_2 - x_1)/(s_2 - s_1)\) and \(b = x_1 - g\,s_1\), then recovers \(\hat{s} = (x - b)/g\). <strong>Why it is separate from normalization.</strong> Normalization uses statistics of your data; calibration uses references from the physical world (a level surface for an IMU, ice and boiling water for a thermistor, a zero-gas purge for a chemical sensor). Calibration can be done per device with no labels at all, which is powerful, because it attacks device shift at its source rather than hoping the model averages it out. <strong>When you lack references.</strong> If you cannot bench-calibrate, per-device normalization is the pragmatic stand-in: compute each device's own baseline statistics (from a resting period, or a rolling window) and normalize each device by its own numbers. This does not need the true \(g, b\), only that each device is made internally consistent.</p>
 
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>The misconception is that normalization and per-device calibration are two names for the same step, so performing one makes the other redundant. They are not: normalization rescales using statistics of your collected data and only makes channels comparable in magnitude, whereas calibration uses physical references to undo a specific device's gain and offset, so a perfectly normalized fleet can still disagree unit-to-unit until each device is calibrated (or per-device debiased) against a known input.</p>
+</div>
+
 <div class="callout practical-example">
 <h3 class="callout-title">Practical Example: an air-quality fleet that aged out of its own model</h3>
 <p>A city deployed a few hundred low-cost electrochemical NO\(_2\) sensors on lampposts. The first model, trained on three months of data referenced against a regulatory-grade station, performed beautifully in validation. Six months later, accuracy had collapsed on half the fleet. The cause was baseline drift: each electrochemical cell's zero-offset creeps as the electrolyte ages, at a rate unique to each unit. The single global normalizer, fit once at deployment, had frozen a baseline that every sensor had since wandered away from. The fix was a per-device rolling baseline: each unit subtracts its own recent low-percentile reading (its estimated zero) before normalization, so the model sees drift-corrected concentrations regardless of a cell's age. Accuracy recovered without retraining. The lesson: when the offset is per-device and time-varying, the correction must be per-device and time-varying too, and this is squarely a distribution-shift problem of the kind <a class="cross-ref" href="../../part-13-trust-safety-evaluation-and-operations/module-66-distribution-shift-ood-and-test-time-adaptation/index.html">Chapter 66</a> treats in depth.</p>
@@ -63,6 +70,16 @@ $$ \tilde{x}_{c} = \frac{x_{c} - \mu_{c}}{\sigma_{c}}, $$
 <h2>Instance normalization and the shift it defends against</h2>
 
 <p><strong>What.</strong> Instead of (or in addition to) a fixed dataset scaler, you can normalize each window by its own statistics at inference time: subtract the window mean and divide by its standard deviation per channel. This is instance normalization, and its reversible form (normalize the input, then add the statistics back to the output) is known in the forecasting literature as reversible instance normalization. <strong>Why.</strong> It removes slow per-window offset and scale shifts that a global scaler cannot track, which is exactly the drift that breaks cross-device and cross-day generalization. <strong>When.</strong> Prefer instance normalization when the absolute level carries little class information and the shape does the work (activity recognition, many fault-detection tasks); avoid it when the absolute level <em>is</em> the signal (a barometer for altitude, a thermometer for fever), because you would normalize away the very thing you want to predict. This is the same augmentation-and-normalization design space that <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-13-neural-representations-for-sensor-streams/index.html">Chapter 13</a> revisits for deep models.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Instance normalization is the auto-level button in a photo app. Point a camera at the same scene at noon and at dusk and the two shots differ mostly in overall brightness and contrast, not in what is pictured; auto-level rescales each photo by its own histogram so the darkest pixel becomes black and the brightest becomes white, and the two suddenly look alike. Normalizing each window by its own mean and standard deviation does the identical thing to a signal: it strips away the per-window brightness (offset) and contrast (scale) so the model compares the shape of the event rather than the lighting it happened under. And just as auto-level ruins a photo whose subject literally is the sky's brightness, instance normalization erases the answer when the absolute level is the label.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Fixed instance normalization removes only a single mean and scale per window, yet real sensor drift changes both within a window and across it. SAN (Slice Adaptive Normalization), introduced by Liu and colleagues in "Adaptive Normalization for Non-stationary Time Series Forecasting: A Temporal Slice Perspective" (NeurIPS 2023), splits each series into slices, learns to predict each slice's evolving statistics, and normalizes then denormalizes per slice. On non-stationary forecasting benchmarks it improves on the earlier reversible instance normalization (RevIN, 2022) precisely because it tracks statistics that move inside the window instead of freezing one per-window estimate, a direction that speaks directly to the cross-device, time-varying drift this section handles by hand.</p>
+</div>
 
 <p>The code below shows the leakage-safe pattern end to end: fit a per-channel scaler on the training devices only, then apply a per-device baseline correction that each device computes from its own resting statistics. Note that nothing about the validation devices touches the fitted scaler's parameters.</p>
 
@@ -107,6 +124,19 @@ print(X_train.shape[-1], "channels; scaler frozen on train")
 <li>Give one sensing task where instance (per-window) normalization would destroy the label, and explain why.</li>
 <li>Your fleet's sensors drift at different rates over months. Why can a single global normalizer fit at deployment not fix this, and what per-device correction can?</li>
 </ol>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: watch leakage inflate your score</h4>
+<p>You can reproduce the leakage gap in well under an hour with a laptop and scikit-learn.</p>
+<ol>
+<li>Load the UCI Human Activity Recognition dataset (or any multi-subject IMU set) with <code>sklearn.datasets</code> or a CSV read, keeping the per-subject IDs and treating each subject as a "device".</li>
+<li>Build a subject-disjoint split with <code>GroupShuffleSplit(n_splits=1, test_size=0.3)</code> using the subject IDs as groups, so no subject appears in both train and test.</li>
+<li>Fit a <code>StandardScaler</code> on the ENTIRE feature matrix, transform train and test with it, train a <code>LogisticRegression</code>, and record test accuracy. This is the leaky baseline.</li>
+<li>Now put <code>StandardScaler</code> and <code>LogisticRegression</code> in a <code>Pipeline</code>, fit it on the training subjects only, and record test accuracy again; the point-or-two drop is the leakage you just removed.</li>
+<li>Add a constant \(0.3\) offset to one test subject's channels, watch accuracy fall, then subtract that subject's own per-channel mean before scoring and confirm the honest pipeline recovers most of the loss.</li>
+</ol>
+<p>The gap between steps 3 and 4 is the free information leakage buys you, and step 5 shows per-device debiasing paying it back honestly.</p>
 </div>
 
 <p>Normalization and calibration are the last preprocessing step before modeling and the one most likely to quietly corrupt an otherwise careful pipeline. Treat the scaler as a fitted model with a strict train-only fitting rule, keep hardware calibration distinct from data-statistics normalization, and push per-device corrections down to the device when its bias is private and time-varying. These habits are what let a model cross the gap from the devices it trained on to the ones it will actually run on.</p>

@@ -40,6 +40,11 @@
 
 <p><strong>What.</strong> Annotation quality is the degree to which the recorded label matches the true state of the world the sensor observed. <strong>Why it is hard for sensors specifically.</strong> Image and text labels are usually verifiable by the same human who assigns them; sensor labels are not. The annotator does not perceive the signal directly, so they annotate a <em>surrogate</em> (a synchronized video, a self-report diary, a lab reference instrument) and hope it aligns with the trace. Every gap between surrogate and signal becomes label noise.</p>
 
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p><strong>"The labeled data is the ground truth, so agreement with it defines correctness."</strong> This conflates the label with the state of the world it stands in for; a label is an estimate produced by a fallible proxy, and a model that matches the label set perfectly has only learned to reproduce the annotators, complete with their quirks. Treat the label column as a noisy measurement of truth, not truth itself, and reserve the phrase "ground truth" for references you have actually validated against an independent standard.</p>
+</div>
+
 <p><strong>How to quantify it.</strong> The workhorse is inter-rater agreement. Have multiple raters label the same windows and compute Cohen's \(\kappa\) (two raters) or Fleiss' \(\kappa\) (many), which correct raw agreement for chance:</p>
 $$ \kappa = \frac{p_o - p_e}{1 - p_e}, $$
 <p>where \(p_o\) is observed agreement and \(p_e\) is the agreement expected by chance. A \(\kappa\) of 0.9 says humans barely disagree, so a model scoring 0.88 is near the human ceiling; a \(\kappa\) of 0.55 says your "ground truth" is soft, and a model reporting 0.95 accuracy against it is almost certainly fitting rater idiosyncrasies. <strong>When to insist on it.</strong> Any project where the label is a human judgement (sleep stages, activity type, pain, arrhythmia class) needs at least a subset double-annotated. Skipping this is how teams ship a "97% accurate" classifier that argues with cardiologists.</p>
@@ -54,6 +59,11 @@ $$ \kappa = \frac{p_o - p_e}{1 - p_e}, $$
 <p><strong>What.</strong> A <em>weak</em> label is one that is cheaper and lower-fidelity than the label you actually want. Three flavours dominate sensor work. <em>Coarse (multiple-instance) labels</em>: you know a 30-minute recording "contains snoring" but not which seconds, so the bag is labeled while its instances are not. <em>Indirect (distant) labels</em>: a maintenance log says a pump failed on Tuesday, and you retro-attach "faulty" to the preceding week of vibration without knowing when degradation truly began. <em>Programmatic labels</em>: a heuristic ("heart rate above 100 and motion low implies stress") stamps millions of windows automatically.</p>
 
 <p><strong>Why bother.</strong> Because hand-labeling sensor data at scale is brutal. A single subject-day of high-rate IMU is millions of samples; expert biosignal annotation runs at minutes per record. Weak supervision trades label <em>fidelity</em> for label <em>volume</em>, and for pretraining or coarse tasks that trade often wins. <strong>How to use weak labels without poisoning the model.</strong> The modern recipe is a <em>label model</em>: treat each heuristic (each "labeling function") as a noisy voter, estimate each voter's accuracy and correlations from their agreement pattern (no ground truth needed), then combine them into probabilistic labels \(\tilde{y} \in [0,1]\). Train on the soft labels rather than hard-voted ones so the model inherits uncertainty instead of overconfident errors, a theme developed in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-18-uncertainty-calibration-and-conformal-prediction/index.html">Chapter 18</a>.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Picture a room of wall clocks, none of them showing the certified time. You cannot check any single clock against a reference, yet by noting which clocks tend to agree and which one is always five minutes fast during the afternoon, you can infer each clock's reliability and reconstruct the likely true time from a weighted vote. A label model does exactly this with labeling functions: it never sees ground truth, but it reads the pattern of agreements and disagreements to estimate how trustworthy each noisy voter is (even conditionally, like a clock that only drifts when the room is warm), then blends them into a calibrated probability instead of a naive majority count.</p>
+</div>
 
 <div class="callout practical-example">
 <h3 class="callout-title">Practical Example: bootstrapping an arrhythmia detector from partial cardiologist review</h3>
@@ -74,6 +84,8 @@ $$ \kappa = \frac{p_o - p_e}{1 - p_e}, $$
 <h2>Measuring and living with label noise</h2>
 
 <p>You cannot fix what you cannot find. <em>Confident learning</em> gives a practical, model-agnostic way to locate likely-mislabeled windows: train a classifier with cross-validation so every example gets an out-of-fold predicted probability, then flag examples the model confidently disagrees with. Examples where the given label has low self-confidence and another class has high confidence are your prime suspects for relabeling. The snippet below implements the core idea on a windowed sensor dataset.</p>
+
+<p data-agent="02"><strong>Confident learning, precisely.</strong> It is a model-agnostic procedure that estimates the joint distribution between the labels on file (possibly wrong) and the true latent classes, using only a classifier's out-of-fold predicted probabilities and per-class confidence thresholds rather than any external oracle. It matters because it converts the vague question "which labels are wrong?" into a calibrated ranking, and it works by counting how often the model confidently prefers a class other than the recorded one, then normalizing those counts into an estimated noise matrix that orders windows by their probability of being mislabeled. Reach for it when you have enough data to cross-validate reliably; prefer a robust loss function or simply collecting cleaner labels when the dataset is too small for the out-of-fold probabilities to be trustworthy.</p>
 
 <pre><code class="language-python">import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -109,6 +121,11 @@ print(f"flagged {len(idx)} windows; "
 <p>Rolling your own label model (estimating labeling-function accuracies and correlations from their agreement matrix) or a full confident-learning pipeline (per-class thresholds, joint noise-matrix estimation, ranking) is roughly 150 to 300 lines of subtle probability code. <code>snorkel</code>'s <code>LabelModel</code> turns a stack of weak labeling functions into calibrated soft labels in about 5 lines, and <code>cleanlab</code>'s <code>find_label_issues</code> reduces the audit above to a single call over out-of-fold probabilities. You still supply the labeling functions and the model; the library handles the estimation math that is easy to get quietly wrong.</p>
 </div>
 
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Confident learning audits one label column at a time, but real sensor datasets fail in several ways at once: near-duplicate windows, outliers, drift, and ambiguous overlap. Cleanlab's <em>Datalab</em> (2023) generalizes the out-of-fold-probability idea into a single audit that flags label errors, outliers, (near-)duplicates, and class imbalance together, turning the manual triage in this section into one automated report. On the weak-supervision side, 2023-era systems increasingly replace hand-written labeling functions with zero-shot foundation-model annotators whose noisy votes feed the same label-model machinery, so the human effort shifts from writing heuristics to auditing the aggregated soft labels. The frontier direction is a unified data-centric pass that scores noise, redundancy, and coverage jointly before a single epoch of training runs.</p>
+</div>
+
 <div class="callout exercise">
 <h3 class="callout-title">Exercise</h3>
 <p>Take a labeled activity-recognition recording (for example the human-activity data revisited in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>). (a) Inject a constant 400 ms label delay and score a simple change-point detector with exact-match and with \(\pm250\) ms and \(\pm500\) ms tolerance; report how the F1 changes. (b) Estimate the injected delay by cross-correlating windowed signal energy against the label edges and confirm you recover roughly 400 ms. (c) Flip 3% of window labels at random, run the confident-learning audit from the code above, and report precision and recall of the flagged set against the known flips. Write two sentences on which defect, delay or noise, would have hurt a naive model more.</p>
@@ -120,6 +137,18 @@ print(f"flagged {len(idx)} windows; "
 <li>Your classifier reports 0.94 accuracy and the two annotators who defined the labels agree at \(\kappa = 0.61\). What is the most likely explanation, and what should you do before celebrating?</li>
 <li>Why should a label model output soft probabilities rather than hard majority votes over the labeling functions, and where does that uncertainty help downstream?</li>
 <li>You detect a constant 120 ms offset between predicted and labeled impact times. Name one fix at the label level and one at the evaluation level, and say which you would prefer for a production detector and why.</li>
+</ol>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: catch your own planted label errors</h4>
+<p>Validate the entire audit loop on data where you control the truth, so you can measure whether it actually works.</p>
+<ol>
+<li>Load any labeled tabular or windowed dataset into <code>X</code> and <code>y</code> with NumPy or pandas (for example <code>sklearn.datasets.load_digits</code>, or a human-activity CSV of window features).</li>
+<li>Corrupt a known 5% of the labels: draw random indices with a fixed seed, flip each to a different class, and save that index array as your ground-truth error set.</li>
+<li>Run the <code>suspect_labels</code> function from this section (or <code>cleanlab.filter.find_label_issues</code>) on the corrupted <code>X</code>, <code>y</code> to get the flagged windows.</li>
+<li>Compute precision and recall of the flagged set against your saved indices in a few lines of NumPy, so you know how many planted errors it caught and how many clean windows it wrongly accused.</li>
+<li>Sweep the confidence <code>threshold</code> from 0.3 to 0.8 and plot precision and recall with matplotlib to see the triage tradeoff you would hand a human reviewer.</li>
 </ol>
 </div>
 

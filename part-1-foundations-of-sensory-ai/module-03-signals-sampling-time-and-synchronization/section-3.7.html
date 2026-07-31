@@ -43,7 +43,14 @@
 
     <p><strong>What it is.</strong> Getting a sample from a transducer to storage crosses at least two protocol layers. At the <em>bus</em> level, a microcontroller pulls raw registers over a wired interface: I2C and SPI for on-board chips (an IMU or a pressure sensor), UART or CAN in vehicles, and analog lines into an ADC for everything else. At the <em>transport</em> level, framed samples travel to a host or the cloud over MQTT, gRPC, WebSocket, a ROS topic, or Lab Streaming Layer. Each layer imposes its own bandwidth ceiling, its own framing, and its own failure mode.</p>
 
+    <p data-agent="02">Take I2C, the most common on-board bus, as the concrete case. It is a two-wire serial standard (one clock line, one data line) on which a single controller addresses each sensor by a 7-bit address and clocks registers out one bit at a time, so its 100 kHz to 400 kHz ceiling is shared across every chip on the pair rather than granted to each. That matters because aggregate throughput, not per-sensor throughput, is the budget you must respect: hang eight chips off two pins and the bus, not the sensor, becomes the bottleneck. Reach for I2C when pin count and board space dominate and rates are modest, and switch to SPI, which gives each device its own line and tens of megahertz, when one high-rate sensor needs the bandwidth to itself.</p>
+
     <p><strong>Why the choice matters.</strong> The protocol decides three things a model inherits. First, <em>ordering and loss</em>: a lossy transport (UDP, BLE notifications) can reorder or drop frames, so you cannot assume sample \(n+1\) followed sample \(n\) in time (revisit <a href="section-3.4.html">Section 3.4</a> on packet loss). Second, <em>where the timestamp is stamped</em>: a clock applied at the sensor MCU is worth far more than one applied when a buffer finally reaches the host, because the intervening queue delay is variable and unknown. Third, <em>throughput headroom</em>: an I2C bus at 400 kHz cannot sustain a 4 kHz burst across eight chips, so the driver silently decimates and your effective rate is a fiction. The competent answer is to timestamp as early as physically possible, prefer transports that expose sequence numbers, and measure the real delivered rate rather than trusting the configured one.</p>
+
+    <div class="callout warning" data-agent="10">
+        <h4>Common Misconception</h4>
+        <p>The misconception is that the sample rate you configure is the sample rate you get. Writing 4 kHz to a control register is a request, not a guarantee: bus contention, FIFO overflow, host scheduling jitter, and dropped frames routinely leave the delivered rate below the configured one, and the samples you receive are still evenly numbered even though they are no longer evenly spaced in time. This is exactly why the metadata must record the <em>measured</em> rate alongside the nominal one, and why the ingestion gate later in this section cross-checks the two rather than believing the register.</p>
+    </div>
 
     <p><strong>Push versus pull.</strong> Two acquisition disciplines dominate. In <em>polling</em>, the host reads on a timer, which is simple but couples your timeline to the host scheduler's jitter. In <em>interrupt or FIFO</em> mode, the sensor buffers samples on-chip and raises a data-ready line, so timing is governed by the sensor's own crystal and the host merely drains a queue. FIFO acquisition is almost always the right default for anything above a few hundred hertz, because it decouples the sample clock from the noisy host and lets you batch transfers to save power, a tradeoff that returns in force in <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>.</p>
 
@@ -52,6 +59,11 @@
     <p><strong>What it is.</strong> Metadata is the set of facts required to interpret a sample that are not themselves samples. A defensible sensor record carries, at minimum: a device and channel identifier, the nominal and <em>measured</em> sample rate, physical units and the scale factor from raw counts to those units, the sensor range and configured gain, the timestamp source and its epoch and timezone, the firmware and calibration versions, and the sensor's placement or mounting. None of these are optional decoration. Each answers a question a downstream model or auditor will eventually ask, and each is cheap to record now and impossible to recover later.</p>
 
     <p><strong>Why it is load-bearing.</strong> Consider what breaks without each field. No units, and a fusion stage adds acceleration in \(g\) to acceleration in \(\text{m/s}^2\). No measured rate, and your spectral analysis in <a class="cross-ref" href="../../part-2-classical-signal-processing-and-feature/module-07-spectral-and-time-frequency-analysis/index.html">Chapter 7</a> places every peak at the wrong frequency. No calibration version, and a firmware update that changed the gain silently splits your dataset into two incompatible populations. No device ID, and you cannot split train and test by device, the single most important guard against the leakage that <a class="cross-ref" href="../../part-1-foundations-of-sensory-ai/module-05-sensor-data-engineering-and-leakage-safe/index.html">Chapter 5</a> is built around. Metadata is the join key between a raw stream and its physical meaning.</p>
+
+    <div class="callout tip" data-agent="06">
+        <h4>Mental Model</h4>
+        <p>Think of a jar of homemade jam. The jam is the samples; the handwritten label (fruit, sugar ratio, date canned) is the metadata. If you keep the labels on a separate list in a kitchen drawer, the first time a jar gets moved to another shelf the list and the jars drift apart, and you are reduced to opening lids and tasting to guess what each one holds. Glue the label to the jar itself, the way a self-describing format glues attributes to the array, and the two can never separate: whoever picks up the jar knows instantly what is inside and when it was made, with no external index to consult or lose.</p>
+    </div>
 
     <div class="callout key-insight">
         <h3 class="callout-title">Key insight</h3>
@@ -63,6 +75,11 @@
     <p><strong>Why standards exist.</strong> Every lab that invents its own metadata layout invents its own way to be incompatible with everyone else, including its future self. Community schemas encode the hard-won list of required fields so you do not rediscover it after losing a dataset. In biosignals, EDF+ standardized channel labels, per-channel scaling, and annotations for clinical recordings; the neuroimaging world formalized folder-level provenance as BIDS. For self-describing arrays, HDF5 and its cloud-native cousin Zarr attach named dimensions and arbitrary attributes directly to the data, so units and sample rate travel <em>inside</em> the file rather than in a fragile sidecar. For sensor descriptions on the web, W3C's SOSA/SSN ontology and OGC SensorML give a vocabulary for observations, procedures, and platforms. Robotics leans on ROS bag files and message definitions to keep a timestamped, typed record of every topic.</p>
 
     <p><strong>The FAIR frame.</strong> The unifying principle is that data should be Findable, Accessible, Interoperable, and Reusable. In practice FAIR reduces to a discipline you can apply on any project: a stable identifier per recording, a documented schema, units and vocabularies that other tools recognize, and enough provenance that a result can be reproduced. You do not need a heavyweight ontology on day one; you need to pick one self-describing container and never write a bare CSV of unlabeled columns again.</p>
+
+    <div class="callout research-frontier" data-agent="18">
+        <h4>Research Frontier</h4>
+        <p>The standards above describe sensors and files; the newer frontier is describing the whole <em>dataset</em> in a way an ML pipeline can load without human glue code. MLCommons Croissant (2024) is a JSON-LD metadata format that layers on schema.org to bundle a dataset's structure, provenance, field units, and train/test splits into a single machine-readable manifest, and it is already consumed directly by Hugging Face, Kaggle, and TensorFlow Datasets. For sensor work it points toward a future where the acquisition metadata this section insists on is not merely written down but becomes the loader itself, carrying the device-wise split and unit declarations straight into training so the leakage failure in the automotive story cannot recur.</p>
+    </div>
 
     <div class="callout practical-example">
         <h3 class="callout-title">In practice: the automotive fleet whose two trucks disagreed</h3>
@@ -144,6 +161,18 @@ print(window.attrs["units"], window.sizes)</code></pre>
     <div class="callout lab">
         <h3 class="callout-title">Lab 3</h3>
         <p>build a streaming ingestion pipeline with windowing, missing-data markers, and cross-sensor time alignment.</p>
+    </div>
+
+    <div class="callout practical-example" data-agent="23">
+        <h4>Try It: give a CSV amnesia, then cure it</h4>
+        <p>Feel the difference between a bare array and a self-describing one on your own laptop, using only <code>numpy</code>, <code>pandas</code>, and <code>xarray</code> (<code>pip install xarray netcdf4</code>).</p>
+        <ol>
+            <li>Synthesize a gyro stream: <code>x = np.random.randn(1000)</code> sampled at 200 Hz, and save it with <code>pd.DataFrame({"col0": x}).to_csv("gyro.csv", index=False)</code>, deliberately writing one unlabeled column and nothing else.</li>
+            <li>Reopen only <code>gyro.csv</code> and try to answer three questions from the file alone: what are the units, what is the sample rate, and when did acquisition start? You cannot, and that is the point.</li>
+            <li>Rebuild the same numbers as an <code>xr.DataArray</code> with <code>dims=("time",)</code>, a real <code>coords={"time": np.arange(1000)/200.0}</code>, and <code>attrs={"units": "rad/s", "device_id": "imu-0421", "nominal_rate_hz": 200.0, "firmware": "2.3.1"}</code>, then write it with <code>da.to_netcdf("gyro.nc")</code>.</li>
+            <li>Reload with <code>xr.open_dataarray("gyro.nc")</code> and print <code>.attrs</code> and <code>.sizes</code>; confirm the units, rate, and device ID survived the round trip that the CSV destroyed.</li>
+            <li>Slice one second with <code>.sel(time=slice(0.0, 1.0))</code> and print the slice's <code>.attrs</code>; verify the physical metadata is still attached to the sub-window, not stripped off by the operation.</li>
+        </ol>
     </div>
 
     <section class="bibliography" id="bibliography">

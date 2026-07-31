@@ -42,6 +42,11 @@
 
 <p>The ring buffer's capacity is a design decision with real consequences. Too small and a brief consumer stall causes the write pointer to lap the read pointer, silently overwriting unread samples: this is <strong>buffer overrun</strong>, and it manifests downstream exactly like the packet loss of <a class="cross-ref" href="section-3.4.html">Section 3.4</a>, except that you caused it yourself. Too large and you pay for it in latency: a sample sitting near the back of a deep buffer waits a long time before the consumer reaches it. Size the buffer to cover the worst-case consumer stall you are willing to tolerate, and no larger. A useful rule of thumb: the buffer must hold at least the number of samples produced during your longest expected scheduling gap, plus one full frame.</p>
 
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of a home security camera's fixed-capacity recorder. It writes footage onto a disk that holds, say, exactly seven days; when the disk fills, the newest recording is laid down directly over the oldest, and the write head just keeps circling. The disk never grows and never asks permission: that circular overwrite is the ring buffer, the write head is the write pointer, and your act of reviewing footage is the read pointer. As long as you review each clip before the loop comes back around to it, nothing is lost. But leave for a ten-day vacation and the recorder laps you: day one is silently painted over by day eight before you ever watched it. That silent painting-over, the head lapping the reviewer, is exactly a buffer overrun, and just like the missing footage, the downstream viewer has no way to know the erased samples ever existed.</p>
+</div>
+
 <div class="callout key-insight">
 <h3 class="callout-title">Key Insight</h3>
 <p>A buffer converts a <em>throughput</em> problem into a <em>latency</em> problem, and that is usually a good trade, but it is never free. Every sample you buffer is a sample your model has not yet acted on. In a music-recommendation pipeline nobody notices 200 ms of buffering; in a fall-detection wearable or a robot's collision reflex, that same 200 ms is the difference between a useful system and a dangerous one. Decide your latency budget first, then let it bound your buffer depth and frame length. Never let the buffer depth be an accident of default library settings.</p>
@@ -51,9 +56,16 @@
 
 <p>Once samples are safely in the buffer, framing extracts fixed-length windows from them. Three parameters define the policy. The <strong>window length</strong> \(L\) is how many samples each frame contains; it sets the temporal context the model sees and, through \(L/f_s\), the frequency resolution available to any spectral stage. The <strong>hop</strong> \(H\) (also called stride or step) is how far the window advances between consecutive frames. The <strong>overlap</strong> is the shared region, \(L - H\) samples, usually quoted as a fraction \(1 - H/L\). When \(H = L\) the frames tile the stream with no overlap; when \(H < L\) they overlap; \(H > L\) would skip samples and is almost always a bug.</p>
 
+<p data-agent="02"><strong>Fixed-length framing</strong> is the policy of slicing a stream into equal-sized, regularly spaced blocks defined entirely by \(L\) and \(H\), independent of what the signal is doing. It matters because it gives every downstream stage a predictable, uniform tensor shape and a constant frame rate, which is what makes batching, feature extraction, and real-time scheduling tractable. Mechanically, a frame is emitted the instant \(L\) contiguous samples exist and the read pointer then advances by exactly \(H\), so timing is governed by sample arithmetic rather than signal content. Use fixed framing when you need steady throughput and stationary-within-a-frame statistics; prefer <em>event-triggered</em> or <em>onset-based</em> segmentation instead when the phenomena of interest are sparse and bursty (a heartbeat, an impact, a keystroke), because a fixed grid then wastes compute on silence and still splits events across boundaries.</p>
+
 <p>Overlap exists to solve a real problem: an event that straddles a frame boundary is split across two windows and may be under-represented in both. Overlapping frames guarantee that any event shorter than the overlap appears whole in at least one window. The cost is compute. The number of frames per second is \(f_s / H\), so halving the hop doubles how often your model runs. This is the master tradeoff of streaming framing:</p>
 
 $$\text{frame rate} = \frac{f_s}{H}, \qquad \text{overlap fraction} = 1 - \frac{H}{L}, \qquad \text{latency} \ge \frac{L}{f_s}.$$
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>The misconception is that <em>more overlap gives you more information or finer frequency resolution</em>: students reach for 90 percent overlap expecting a sharper spectrogram. It does not: overlap adds no new samples and no new resolution (resolution is fixed by \(L\), through \(L/f_s\)), it only raises the frame rate \(f_s/H\) so the model runs more often and events are less likely to be split at a boundary, and you pay for every extra frame in pure compute.</p>
+</div>
 
 <p>That last inequality is the one people forget. A causal frame cannot be emitted until its last sample has arrived, so a window of length \(L\) imposes an inherent latency of at least \(L/f_s\) regardless of how fast your model runs. Doubling \(L\) to get finer frequency resolution also doubles your minimum response time. Human-activity recognizers commonly use windows of 1 to 2 seconds with 50 percent overlap, a choice examined closely in <a class="cross-ref" href="../../part-6-motion-location-and-inertial-intelligence/module-26-human-activity-and-behavior-recognition/index.html">Chapter 26</a>; that already commits the system to at least a one-second reaction time before any clever engineering.</p>
 
@@ -118,6 +130,23 @@ for chunk in [range(0, 100), range(100, 400), range(400, 610)]:
 <li>A 200 Hz signal is framed with \(L = 400\) and \(H = 100\). What is the overlap fraction, the frame rate in frames per second, and the minimum causal latency of the first complete frame?</li>
 <li>Explain, in terms of the write and read pointers, exactly what goes wrong when a ring buffer overruns, and why the symptom is indistinguishable from packet loss to any downstream stage.</li>
 <li>Your teammate frames the whole dataset with 75 percent overlap and then does a random 80/20 split, reporting 99 percent accuracy. Why should you distrust that number, and what single change to the pipeline order fixes it?</li>
+</ol>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Fixed windowing exists because most models cannot consume a stream one sample at a time, but that assumption is now being challenged directly. Selective state-space models, introduced by <strong>Mamba</strong> (Gu and Dao, 2023), process a sequence recurrently in linear time and constant memory, carrying a compressed hidden state forward sample by sample instead of re-reading a fixed block, and their signal-processing lineage is spelled out in the same authors' earlier <strong>S4</strong> line of work. On raw-audio and biosignal benchmarks such models match or beat framed spectrogram pipelines while emitting an output after every sample, collapsing the \(L/f_s\) framing latency toward the sampling period itself. The open question the frontier is chasing is whether a truly frame-free streaming model can keep this constant-memory promise on hours-long, multi-sensor inputs without the boundary and leakage bookkeeping this section spends its effort managing.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: See overlap trade compute for coverage</h4>
+<p>Build a tiny experiment on a laptop with NumPy, SciPy, and Matplotlib to feel the framing tradeoff in your own numbers.</p>
+<ol>
+<li>Synthesize a 5-second, 16 kHz signal that is silent except for three 8 ms "clicks" (unit impulses) placed at deliberately awkward times, for example 1.0000 s, 2.4995 s, and 3.7503 s, so some clicks land near frame boundaries.</li>
+<li>Write a function <code>frames(x, L, H)</code> using <code>numpy.lib.stride_tricks.sliding_window_view(x, L)[::H]</code>, and for each frame compute a single scalar, its peak absolute value.</li>
+<li>Run it with \(L = 400\) fixed and hop \(H\) in {400, 200, 100, 40} (that is, 0, 50, 75, and 90 percent overlap). For each, record the number of frames produced and the number of clicks whose full 8 ms fits inside at least one frame.</li>
+<li>Plot frame count (compute cost) on one axis and clicks fully captured (coverage) on the other, one point per hop value.</li>
+<li>Confirm the curve: coverage rises then saturates while frame count keeps climbing, and read off the smallest overlap that captures all three clicks. That knee is your latency-versus-coverage operating point.</li>
 </ol>
 </div>
 

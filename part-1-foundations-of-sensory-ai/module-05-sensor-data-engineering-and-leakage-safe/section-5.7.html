@@ -46,9 +46,19 @@ $$\text{dataset\_id} = H\big(\text{raw\_hash},\ \text{code\_commit},\ \text{conf
 
 <p>where \(H\) is a cryptographic hash. If any input changes, the id changes, and you have caught a silent mutation before it reached a model. If all four match, re-running the build is guaranteed to reproduce the same tensors, which is the whole game.</p>
 
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the <code>dataset_id</code> like the batch code stamped on a carton of milk. That code is not a name someone typed; it is computed from the exact farm, the exact day, and the exact processing line, so it falls out of the ingredients rather than being chosen. If the dairy quietly switches suppliers, the code on the next carton changes on its own, and a shop that receives a carton whose code does not match the one on its invoice knows something was swapped before anyone tastes it. Your four inputs (raw bytes, code commit, config, environment) are the farm, day, and line; the hash is the stamp; a mismatched id at delivery is the swapped carton caught at the loading dock rather than in a customer's cereal.</p>
+</div>
+
 <div class="callout key-insight">
 <h3 class="callout-title">Key Insight</h3>
 <p>The reproducibility failure that actually bites sensor teams is almost never model randomness; it is <em>silent input drift</em>. A model retrain is loud and expected. A resampler that changed its interpolation default, or a raw-data directory someone quietly re-uploaded with a bug fix, changes your data with no signal at all. Content-addressing the raw bytes and hashing the config is worth more than a hundred fixed seeds, because it converts an undetectable change into a changed id that fails a check. Reproducibility is less about repeating success and more about making unrequested change impossible to hide.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>The misconception is that <em>reproducible</em> implies <em>correct</em>: readers assume that if a build regenerates byte-for-byte it must be right. Reproducibility only guarantees that the same inputs yield the same outputs, so a pipeline with a wrong filter cutoff or a leaky split will reproduce that flaw perfectly on every run; content-addressing catches unrequested <em>change</em>, while it is the data contract, not the hash, that catches data which is <em>wrong</em>.</p>
 </div>
 
 <h2>Data contracts: promises the pipeline must keep</h2>
@@ -65,6 +75,8 @@ $$\text{dataset\_id} = H\big(\text{raw\_hash},\ \text{code\_commit},\ \text{conf
 <h2>Building a versioned pipeline in practice</h2>
 
 <p><strong>How to structure it.</strong> Express the pipeline as a directed acyclic graph of stages, each a pure function from an input artifact to an output artifact, each tagged with the hash of its inputs plus its config. This buys you two things automatically: <em>caching</em> (a stage whose input hash is unchanged is skipped, so rebuilds are cheap) and <em>lineage</em> (every tensor can name the raw file, code commit, and config that produced it). When a reviewer asks "where did this training example come from", the answer is a lookup, not an archaeology project. <strong>When to version what.</strong> Version the raw data (immutably, content-addressed), the code (git commit), the config (in the repo), and the resulting dataset (a manifest recording the four-part id above). Do not version derived tensors by copying them everywhere; version the recipe that regenerates them and cache the output.</p>
+
+<p data-agent="02">A <em>directed acyclic graph</em> (DAG) is precisely a set of stages joined by dependency edges that never form a cycle, so there is always a well-defined order in which to run them and no stage can depend, directly or transitively, on its own output. It matters because that acyclic structure is exactly what lets the build compute each stage's input hash before it runs, which is what makes caching and lineage possible at all. Mechanically the graph is walked in topological order, and any stage whose combined input-and-config hash matches the previous run is skipped rather than recomputed. Reach for a DAG runner instead of a linear script the moment stages start sharing intermediate artifacts or you want partial rebuilds; a plain top-to-bottom script is fine only while the pipeline is a single unbranched chain.</p>
 
 <p>The snippet below computes the dataset identity from its four inputs and writes a manifest. It is deliberately small; the point is that the identity is a deterministic function of pinned inputs, so two people running it on the same commit and config get the same id and can prove they built the same data.</p>
 
@@ -111,6 +123,11 @@ if __name__ == "__main__":
 <p>The manifest above is instructive but it is roughly 30 lines you would then have to grow into caching, remote storage, and a lineage graph, easily a few hundred more. Purpose-built tools do this for you. DVC turns <code>dvc add raw/</code> plus a short <code>dvc.yaml</code> stage file into content-addressed raw data, cached deterministic stages, and a git-tracked lineage graph in under ten lines of config; a rebuild after an unchanged input is a no-op it detects automatically. For the contract half, Pandera or Great Expectations expresses a full schema-plus-range check as a short declarative object instead of dozens of hand-written asserts, and produces a readable failure report naming the offending column and rows. The rule of thumb: hand-roll the manifest once so you understand the four-part id, then adopt the tools so caching, storage, and validation reports are not your code to maintain.</p>
 </div>
 
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The manifest and contract in this section are per-team conventions; the field is now standardizing them. MLCommons' <em>Croissant</em> format (Akhtar et al., "Croissant: A Metadata Format for ML-Ready Datasets," NeurIPS 2024) defines a machine-readable JSON-LD schema that ships a dataset's structure, provenance, and column-level semantics inside the dataset itself, and it is already the ingestion format for Hugging Face, Kaggle, and OpenML. Its 2024 <em>Croissant-RAI</em> extension adds responsible-AI and data-collection fields well suited to sensor provenance, moving the schema half of a data contract away from bespoke Pandera objects and toward a portable standard that a downstream tool can read without running any of your code.</p>
+</div>
+
 <h2>When reproducibility is worth the cost, and when it is not</h2>
 
 <p><strong>What it costs.</strong> Full versioning adds friction: hashing large raw archives takes time, pinned environments must be rebuilt, and a contract that fails closed will occasionally block a build at an inconvenient hour. <strong>When to pay it.</strong> Pay in full whenever a result will be published, audited, or shipped to a device you cannot easily update, and whenever more than one person touches the pipeline. A clinical study, a regulated wearable (the validation regime of <a class="cross-ref" href="../../part-7-health-biosignals-and-wearable-ai/module-34-clinical-validation-regulation-and-biometric/index.html">Chapter 34</a>), and any leaderboard submission all demand it, because the question "is this the same data" must have a provable answer. <strong>When to lighten up.</strong> A solo exploratory notebook that will be thrown away next week does not need a content-addressed remote; pin the seed and the library versions and move on. The skill is matching the ceremony to the stakes: enough determinism that you can trust and defend the number, not so much that exploration grinds to a halt.</p>
@@ -118,6 +135,18 @@ if __name__ == "__main__":
 <div class="callout exercise">
 <h3 class="callout-title">Exercise</h3>
 <p>Take a small human-activity dataset and build it twice through the same windowing and split code, but on the second run bump one library (say, change your resampling library's minor version) without touching your own code. Compute the <code>dataset_id</code> both times using the manifest approach above. Confirm the id changes even though your code did not, then write the two-line data contract (sampling interval and accelerometer-magnitude-at-rest range) that would have flagged whichever run produced physically wrong values. Report which of the four id components differed and why.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: catch a silent unit change with a 20-line contract</h4>
+<p>You need only <code>numpy</code>, <code>pandas</code>, and <code>pandera</code> (<code>pip install pandera</code>).</p>
+<ol>
+<li>Generate a synthetic resting-accelerometer file: <code>df = pd.DataFrame({"accel_mag": np.random.normal(9.81, 0.05, 10000)})</code>, then save it with <code>df.to_parquet("good.parquet")</code>.</li>
+<li>Write a Pandera schema with one range check: <code>DataFrameSchema({"accel_mag": Column(float, Check.in_range(2, 40))})</code>, matching the physical range of resting acceleration in m/s squared, and confirm <code>schema.validate(df)</code> passes.</li>
+<li>Simulate the vendor swap to units of g with <code>bad = df / 9.81</code>, run <code>schema.validate(bad, lazy=True)</code>, and read the failure report naming the out-of-range column.</li>
+<li>Compute a <code>dataset_id</code> for <code>good.parquet</code> and for a re-saved <code>bad.parquet</code> using the <code>build_manifest</code> function from this section, and confirm the two ids differ even though your validation code never changed.</li>
+<li>Add a second clause on the sampling interval (assert the median <code>diff</code> of a timestamp column equals <code>1/fs</code> within a small tolerance) and re-run to watch both contract clauses enforced in one pass.</li>
+</ol>
 </div>
 
 <div class="callout self-check">
