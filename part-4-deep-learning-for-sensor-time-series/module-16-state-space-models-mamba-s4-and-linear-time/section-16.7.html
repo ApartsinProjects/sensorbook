@@ -38,7 +38,7 @@
 
 <h2>The three questions that pick the architecture</h2>
 
-<p>Nearly every sensor modeling choice collapses onto three axes. Answer them honestly for your problem and the architecture usually falls out.</p>
+<p>Nearly every sensor modeling choice collapses onto three axes. Answer them plainly and the architecture chooses itself.</p>
 
 <p><strong>1. How long is the effective context, and how does it grow?</strong> Attention costs \(O(L^2)\) time and memory in sequence length \(L\); an SSM costs \(O(L)\) to scan and, crucially, \(O(1)\) memory per emitted step when run as a recurrence. If your window is 128 samples of accelerometer data for a gesture, \(L^2\) is nothing and the SSM advantage is invisible. If your window is a 24-hour photoplethysmography (PPG) trace at 25 Hz, that is over two million samples, and the quadratic term is fatal. The SSM's linear scan is not a nice-to-have there; it is the difference between training and not training.</p>
 
@@ -47,6 +47,11 @@
 $$h_t = \bar{A}\, h_{t-1} + \bar{B}\, x_t, \qquad y_t = C\, h_t,$$
 
 <p>so at deployment you keep one small state vector and update it per sample in constant time and constant memory, forever. A transformer, by contrast, either recomputes over a growing cache or slides a fixed window and forgets. For an always-on wearable or an industrial monitor that must run for weeks between resets, that bounded state is the whole argument. See <a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-60-streaming-inference-and-online-learning/index.html">Chapter 60</a> for the streaming-inference machinery this enables.</p>
+
+<div class="callout warning">
+<h3 class="callout-title">Misconception: O(1) memory is a training-time property</h3>
+<p>It is tempting to read the recurrence above and assume training inherits the same constant footprint as inference. It does not. The bounded state describes the causal, step-by-step recurrence you run <em>after</em> training, one sample at a time. During training, gradients must flow through the whole sequence, so implementations fall back to a parallel scan (or the equivalent convolutional form from 16.2) that processes the sequence at once on a GPU; that form needs memory proportional to \(L\), the same as any other model that backpropagates through a long sequence. The SSM's memory advantage is a deployment-time story, not a training-time one, so budget your training hardware accordingly.</p>
+</div>
 
 <p><strong>3. What is the compute and memory envelope of the deployment target?</strong> A cloud GPU forgives a lot; a microcontroller forgives nothing. The SSM's constant per-step cost and small parameter footprint make it a natural fit for the edge (<a class="cross-ref" href="../../part-12-edge-embedded-streaming-and-federated-sensor-ai/module-59-edge-ai-fundamentals-and-model-optimization/index.html">Chapter 59</a>), but the selective scan needs a hardware-aware kernel to hit its theoretical speed, and that kernel is not free on every accelerator.</p>
 
@@ -78,7 +83,7 @@ $$h_t = \bar{A}\, h_{t-1} + \bar{B}\, x_t, \qquad y_t = C\, h_t,$$
 
 <p>Three failure modes catch teams who adopt SSMs on hype rather than on fit.</p>
 
-<p><strong>Kernel dependence.</strong> Mamba's speed comes from a fused selective-scan CUDA kernel. On a platform without it (some edge NPUs, older toolchains, WebGPU), you fall back to a slower path and the latency advantage over a well-tuned TCN can evaporate. Confirm the kernel exists for your target before you commit.</p>
+<p><strong>Kernel dependence.</strong> Mamba's speed comes from a fused selective-scan CUDA kernel: it discretizes \(A\), \(B\), \(C\) at each step and runs the scan without ever materializing the full \((L, N)\) hidden-state tensor in slow off-chip memory, the same memory-bound bottleneck that limits naive RNN implementations. That fusion, not the \(O(L)\) asymptotic alone, is why Mamba beats attention in wall-clock time; a plain loop over the same recurrence is memory-bound and can run slower than a well-tuned transformer despite doing less arithmetic. On a platform without the kernel (some edge NPUs, older toolchains, WebGPU), you fall back to that slow path and the latency advantage over a well-tuned TCN evaporates. Confirm the kernel exists for your target, and benchmark wall-clock time rather than trust the complexity class, before you commit.</p>
 
 <p><strong>Retrieval weakness.</strong> A fixed-size hidden state is a lossy summary. When the task needs exact recall of a specific earlier event (find the one heartbeat that looked like this), pure SSMs underperform attention, which is exactly why the hybrids of 16.6 exist. If your task is recall-heavy, budget for attention somewhere in the stack.</p>
 
@@ -91,7 +96,7 @@ $$h_t = \bar{A}\, h_{t-1} + \bar{B}\, x_t, \qquad y_t = C\, h_t,$$
 
 <h2>A quick screening test before you build</h2>
 
-<p>Before committing to any architecture, run the cheap screen below. It computes the two ratios that most reliably predict whether an SSM pays off, so you learn the answer in seconds rather than after a week of training.</p>
+<p>Before committing to any architecture, run the cheap screen below. It turns the three decision questions into a single score that reliably predicts whether an SSM pays off, so you learn the answer in seconds rather than after a week of training.</p>
 
 <pre><code class="language-python">def ssm_fit_score(seq_len, streaming, ram_kb, needs_exact_recall):
     """Heuristic screen: is a selective SSM the right first bet?"""
@@ -115,7 +120,7 @@ print(ssm_fit_score(seq_len=2_160_000, streaming=True,
 # ('reach for an SSM', ['long context favors O(L) scan',
 #  'O(1) recurrent state fits streaming', 'bounded state fits small RAM'])
 </code></pre>
-<div class="code-caption">A ten-line screening heuristic that turns the three decision questions into a score. It is a conversation starter, not a substitute for the Lab 16 benchmark, but it reliably flags the two clear cases: the long-plus-streaming win and the recall-heavy caution.</div>
+<div class="code-caption">A short screening heuristic that turns the three decision questions into a score. It is a conversation starter, not a substitute for the Lab 16 benchmark, but it reliably flags the two clear cases: the long-plus-streaming win and the recall-heavy caution.</div>
 
 <p>The <code>ssm_fit_score</code> function above encodes exactly the three-question logic: it rewards long context and streaming, gives a small bonus for tight RAM, and penalizes tasks that need exact retrieval. When it returns "reach for an SSM," you still verify empirically, but you start with a strong prior instead of a blank page.</p>
 
@@ -126,7 +131,8 @@ print(ssm_fit_score(seq_len=2_160_000, streaming=True,
 block = Mamba(d_model=64, d_state=16, d_conv=4, expand=2)  # 1 line
 y = block(x)   # x: (batch, seq_len, 64) -> same shape, linear-time scan
 </code></pre>
-<p>That single constructor replaces roughly 150 lines of hand-written discretization, parallel-scan, and CUDA-kernel plumbing, and it ships the hardware-aware kernel that makes the linear-time claim real. Your job shrinks to choosing <code>d_state</code> and confirming the kernel exists on your target.</p>
+<div class="code-caption">Three lines replace roughly 150 lines of hand-written discretization, parallel-scan, and CUDA-kernel plumbing, and the block ships the hardware-aware kernel that makes the linear-time claim real.</div>
+<p>Your job shrinks to choosing <code>d_state</code> and confirming the kernel exists on your target.</p>
 </div>
 
 <div class="callout research-frontier">

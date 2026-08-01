@@ -42,7 +42,7 @@
 
 $$ R = 1 + D\,(k-1). $$
 
-<p>To cover 128 samples with \(k=3\) you would need 64 layers. That is expensive, hard to train, and wasteful, because most of those layers add resolution the task does not need. The multiresolution question is: how do we reach far-apart samples with few layers while keeping fine detail available where it matters?</p>
+<p>To cover 128 samples with \(k=3\) you would need 64 layers. That is expensive, hard to train, and wasteful, because most of those layers add resolution the task does not need. The multiresolution question is simple to state and expensive to ignore: reach far, without going deep.</p>
 
 <h2>Dilated convolutions: exponential reach for free</h2>
 
@@ -58,6 +58,11 @@ $$ R = 1 + (k-1)\sum_{\ell=0}^{D-1} 2^{\ell} = 1 + (k-1)\,(2^{D}-1). $$
 
 <p><strong>How.</strong> In every mainstream framework dilation is a single argument on the convolution layer; you do not build the zero-stuffed kernel yourself. The one subtlety is padding: to keep the length \(L\) fixed you pad each layer by \((k-1)d/2\) on each side (symmetric), or pad only on the left when the model must be causal (no peeking into the future), which matters for the streaming inference you will meet in <a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-14-recurrent-and-temporal-convolutional-models/index.html">Chapter 14</a>.</p>
 
+<div class="callout warning">
+<h3 class="callout-title">Common Misconception: Dilation Is Not Stride</h3>
+<p>Because both operations "skip" samples, it is tempting to treat dilation and stride as the same trick. They are not, and they solve opposite problems. A strided convolution with stride \(s>1\) reads a contiguous span of input but writes only every \(s\)-th output position, so the sequence <em>shortens</em> and later layers see fewer, coarser time steps. A dilated convolution keeps stride at 1: it spreads its \(k\) taps over a wider input span but still writes one output for every input position, so the sequence length never changes. Mixing them up produces two concrete bugs: expecting dilated layers to shrink activation memory (they will not, by design), or reaching for stride to grow the receptive field and losing the precise sample index a streaming detector needs to timestamp an event.</p>
+</div>
+
 <div class="callout key-insight">
 <h3 class="callout-title">Key Insight</h3>
 <p>Dilation buys <em>reach</em>, not <em>resolution</em>. A single deep dilated stack can see far, but a pure doubling schedule leaves gridding artifacts: some output positions never attend to certain input phases, because the sampled taps interleave badly. The fix is to combine scales rather than rely on one ladder. Either interleave dilation cycles (1, 2, 4, 1, 2, 4) or run several widths in parallel and fuse them, which is the multiresolution-branch idea below. Reach and resolution are different resources; a good design spends on both.</p>
@@ -65,7 +70,7 @@ $$ R = 1 + (k-1)\sum_{\ell=0}^{D-1} 2^{\ell} = 1 + (k-1)\,(2^{D}-1). $$
 
 <h2>Parallel multiresolution branches</h2>
 
-<p>The complementary strategy runs several kernel sizes on the <em>same</em> input in parallel, then concatenates their outputs along the channel axis. A branch with \(k=3\) captures sharp transients; a branch with \(k=39\) captures slow envelope shape; the concatenation hands the next layer a feature vector that already mixes scales. This is the InceptionTime pattern for time series, itself borrowed from Inception in vision. A common trick keeps it cheap: a \(1\times1\) "bottleneck" convolution reduces the channel count before the wide kernels run, so the wide branches cost far less than their width suggests.</p>
+<p>The complementary strategy runs several kernel sizes on the <em>same</em> input in parallel, then concatenates their outputs along the channel axis. A branch with \(k=3\) captures sharp transients; a branch with \(k=39\) captures slow envelope shape; the concatenation hands the next layer a feature vector that already mixes scales. This is the InceptionTime pattern for time series, itself borrowed from Inception in vision. What makes wide branches affordable is a \(1\times1\) "bottleneck" convolution placed before them: a kernel of width 1 mixes channels at each time step without touching neighboring samples, so it is pure linear recombination, not temporal filtering. It saves compute because a convolution's multiply-adds scale as (input channels) \(\times\) (output channels) \(\times\) (kernel width); shrinking the channel count first, say from 64 down to 16, cuts a width-39 branch's cost by the same factor of four before that expensive wide kernel ever runs. Each branch gets its own bottleneck sized to its kernel width, and the branches' outputs are concatenated afterward so the next layer still sees the full channel budget; skip the bottleneck only when the input already has few channels, such as a raw 3-axis IMU stream, where there is nothing left to compress.</p>
 
 <p>Why prefer parallel branches over a deeper dilated stack? Because the network chooses, per feature, which scale is informative, instead of committing to one growth schedule. Two-second bearing vibration and 100 ms fault clicks can coexist as separate learned channels rather than fighting for the same kernel. The cost is more parameters and memory at each layer, so branches suit richer models while dilation suits long, thin, streaming ones.</p>
 
@@ -103,6 +108,11 @@ print("params:", sum(p.numel() for p in net.parameters()))
 <div class="callout library-shortcut">
 <h3 class="callout-title">Library Shortcut</h3>
 <p>Zero-stuffing a kernel and re-deriving the convolution by hand is dozens of lines and an easy source of off-by-one bugs. In PyTorch the entire mechanism is one keyword: <code>nn.Conv1d(ch, ch, kernel_size=3, dilation=8, padding=8)</code>. The framework handles the sparse tap placement, the padding arithmetic, and a fused CUDA kernel that never materializes the zeros. That replaces roughly 30 lines of manual striding and indexing with one, and it stays correct when you switch to causal padding for streaming.</p>
+</div>
+
+<div class="callout research-frontier">
+<h3 class="callout-title">Research Frontier: Should the Schedule Be Learned?</h3>
+<p>The dilation-doubling schedule and the InceptionTime branch widths in this section are hand-picked heuristics, not derived quantities, and an active line of work asks whether the network should choose its own reach. Adaptive and deformable dilated convolutions let the effective dilation vary per channel or per input rather than following a fixed \(1, 2, 4, 8, \dots\) ladder. At the far end of the reach problem, when even seven or eight dilation-doubling layers cannot afford the required span, state-space sequence models such as S4 and Mamba (<a class="cross-ref" href="../../part-4-deep-learning-for-sensor-time-series/module-16-state-space-models-mamba-s4-and-linear-time/index.html">Chapter 16</a>) offer reach that grows without a deepening stack at all; comparing them against dilated CNNs on long sensor streams is an open question rather than a settled one.</p>
 </div>
 
 <div class="callout exercise">
