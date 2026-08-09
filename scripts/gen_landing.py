@@ -24,7 +24,7 @@ TITLE = "Building Sensory AI"
 ARC = "Machine Perception of the Physical World"
 SUB = ("A practitioner's guide to the full sensing chain: signal processing, state estimation, "
        "deep learning and foundation models for sensor data, multimodal fusion, and trustworthy deployment.")
-DOMAIN = "https://sensorbook.apartsin.com"
+DOMAIN = "https://sensorbook.icsgen-ai.org"
 
 PROMISE = ("Most AI meets the world through text and pictures. Sensory AI starts earlier, at the device that "
            "measures reality imperfectly. This book is one connected journey through the theories, models, and "
@@ -53,15 +53,15 @@ TEACH = [
 ]
 
 SERIES = [
-    ("Building Language AI", "From Tokens to Agents.", "https://llmbook.apartsin.com", "https://www.amazon.com/dp/B0H1MQH23D"),
-    ("Building Vision AI", "From Pixels to Generative Models.", "https://visionbook.apartsin.com", "https://www.amazon.com/dp/B0H5BT8Y75"),
-    ("Building Temporal AI", "From Forecasting to Sequential Decision Making.", "https://temporalbook.apartsin.com", "https://www.amazon.com/dp/B0H5KRJFCD"),
-    ("Building Scalable AI", "From Big Data Algorithms to Distributed Intelligence.", "https://scalablebook.apartsin.com", "https://www.amazon.com/dp/B0H5Q1471R"),
-    ("Building Embodied AI", "From Perception to Autonomous Action.", "https://embodiedbook.apartsin.com", None),
-    ("Building Agentic AI", "From Goals to Autonomous Systems.", "https://agenticbook.apartsin.com", None),
-    ("Building Discovery AI", "From Vibe Coding to Autonomous Science.", "https://discoverybook.apartsin.com", None),
-    ("Building Neuromorphic AI", "From Spiking Neurons to Edge Intelligence.", "https://neuromorphicbook.apartsin.com", None),
-    ("Building Quantum AI", "From Qubits to Quantum Machine Learning.", "https://quantumbook.apartsin.com", None),
+    ("Building Language AI", "From Tokens to Agents.", "https://llmbook.icsgen-ai.org", "https://www.amazon.com/dp/B0H1MQH23D"),
+    ("Building Vision AI", "From Pixels to Generative Models.", "https://visionbook.icsgen-ai.org", "https://www.amazon.com/dp/B0H5BT8Y75"),
+    ("Building Temporal AI", "From Forecasting to Sequential Decision Making.", "https://temporalbook.icsgen-ai.org", "https://www.amazon.com/dp/B0H5KRJFCD"),
+    ("Building Scalable AI", "From Big Data Algorithms to Distributed Intelligence.", "https://scalablebook.icsgen-ai.org", "https://www.amazon.com/dp/B0H5Q1471R"),
+    ("Building Embodied AI", "From Perception to Autonomous Action.", "https://embodiedbook.icsgen-ai.org", None),
+    ("Building Agentic AI", "From Goals to Autonomous Systems.", "https://agenticbook.icsgen-ai.org", None),
+    ("Building Discovery AI", "From Vibe Coding to Autonomous Science.", "https://discoverybook.icsgen-ai.org", None),
+    ("Building Neuromorphic AI", "From Spiking Neurons to Edge Intelligence.", "https://neuromorphicbook.icsgen-ai.org", None),
+    ("Building Quantum AI", "From Qubits to Quantum Machine Learning.", "https://quantumbook.icsgen-ai.org", None),
     ("Building Sensory AI", "Machine Perception of the Physical World.", None, None),  # you are here
 ]
 
